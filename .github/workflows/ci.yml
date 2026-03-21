@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      DEEPAGENT_CONFIG: deepagent.toml
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Validate Python imports
+        run: uv run python -c "import chainlit_bridge, deepagent_runtime, main"
+
+      - name: Byte-compile application modules
+        run: uv run python -m compileall main.py deepagent_runtime.py chainlit_bridge.py
+
+      - name: Validate extension config
+        run: |
+          uv run python - <<'PY'
+          from deepagent_runtime import load_extensions_config
+
+          config = load_extensions_config()
+          print(
+              {
+                  "config_path": str(config.config_path) if config.config_path else None,
+                  "skills": list(config.skills),
+                  "mcp_servers": sorted((config.mcp_servers or {}).keys()),
+                  "subagents": [subagent.name for subagent in config.subagents],
+              }
+          )
+          PY
