@@ -1,0 +1,56 @@
+[project]
+user_env = []
+session_timeout = 3600
+user_session_timeout = 1296000
+cache = false
+persist_user_env = false
+mask_user_env = false
+allow_origins = ["*"]
+
+[features]
+unsafe_allow_html = false
+latex = false
+user_message_markdown = true
+user_message_autoscroll = true
+assistant_message_autoscroll = true
+auto_tag_thread = true
+edit_message = true
+allow_thread_sharing = false
+favorites = false
+
+[features.spontaneous_file_upload]
+enabled = false
+accept = ["*/*"]
+max_files = 20
+max_size_mb = 500
+
+[features.audio]
+enabled = false
+sample_rate = 24000
+
+[features.mcp]
+enabled = false
+
+[features.mcp.sse]
+enabled = true
+
+[features.mcp.streamable-http]
+enabled = true
+
+[features.mcp.stdio]
+enabled = true
+allowed_executables = ["npx", "uvx"]
+
+[UI]
+name = "Workspace Deep Agent"
+description = "A local-first LangChain Deep Agent running on Ollama with native reasoning, tool, and response streaming."
+layout = "wide"
+cot = "full"
+custom_css = "/public/chainlit-overrides.css"
+confirm_new_chat = true
+alert_style = "modern"
+logo_file_url = ""
+default_avatar_file_url = ""
+
+[meta]
+generated_by = "2.10.0"

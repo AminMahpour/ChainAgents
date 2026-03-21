@@ -1,0 +1,19 @@
+[mcp]
+tool_name_prefix = true
+
+[mcp.servers.repo]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
+cwd = "."
+
+[agent]
+skills = ["skills"]
+mcp_servers = ["repo"]
+
+[[subagents]]
+name = "repo-researcher"
+description = "Researches the current repository, explains architecture, and identifies the right files to change."
+system_prompt_file = "prompts/repo-researcher.md"
+skills = ["skills"]
+mcp_servers = ["repo"]

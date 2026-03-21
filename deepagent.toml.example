@@ -1,0 +1,37 @@
+[mcp]
+tool_name_prefix = true
+
+[mcp.servers.repo]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
+cwd = "."
+
+[mcp.servers.docs]
+transport = "http"
+url = "http://localhost:8000/mcp"
+
+[agent]
+# Relative skill source paths are resolved from this file and mapped to /workspace/...
+# This directory should contain one or more skill folders, each with its own SKILL.md.
+skills = ["skills"]
+mcp_servers = ["repo"]
+
+[[subagents]]
+name = "repo-researcher"
+description = "Researches the codebase and produces concise implementation guidance."
+system_prompt_file = "prompts/repo-researcher.md"
+skills = ["skills/research"]
+mcp_servers = ["repo", "docs"]
+# model = "gpt-oss:20b"
+
+[[subagents]]
+name = "reviewer"
+description = "Reviews proposed changes for bugs, regressions, and missing tests."
+system_prompt = """
+You are a strict code reviewer.
+Focus on correctness, regressions, and missing tests.
+Keep findings concise and actionable.
+"""
+skills = ["skills/reviewer"]
+mcp_servers = ["repo"]

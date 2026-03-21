@@ -1,0 +1,27 @@
+button[id^="step-"]:not(.loading-shimmer) {
+  position: relative;
+}
+
+button[id^="step-"]:not(.loading-shimmer) > svg {
+  visibility: hidden;
+}
+
+button[id^="step-"]:not(.loading-shimmer)::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: 50%;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 9999px;
+  transform: translateY(-50%);
+  background: #15803d center / 0.625rem 0.625rem no-repeat
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5 6.5 11.5 12.5 5.5'/%3E%3C/svg%3E");
+  box-shadow: 0 0 0 1px rgba(21, 128, 61, 0.24);
+}
+
+button[id^="step-"].text-red-500:not(.loading-shimmer)::after {
+  background: #b91c1c center / 0.625rem 0.625rem no-repeat
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M8 4v5'/%3E%3Cpath d='M8 11.75h.01'/%3E%3C/svg%3E");
+  box-shadow: 0 0 0 1px rgba(185, 28, 28, 0.24);
+}
