@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import json
 from dataclasses import dataclass, field
@@ -7,6 +8,8 @@ from typing import Any
 
 import chainlit as cl
 from chainlit.utils import utc_now
+
+AUTO_COLLAPSE_DELAY_SECONDS = 3
 
 
 def stringify_content(value: Any) -> str:
@@ -506,6 +509,8 @@ class ChainlitEventBridge:
         self.reasoning_steps: dict[str, cl.Step] = {}
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
+        self.collapse_scheduled_step_ids: set[str] = set()
+        self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
 
     async def start(self) -> None:
         self.response_message = await cl.Message(content="").send()
@@ -598,7 +603,11 @@ class ChainlitEventBridge:
 
         step = self.reasoning_steps.get(source)
         if step is None:
-            step = cl.Step(name=f"{source} reasoning", type="llm")
+            step = cl.Step(
+                name=f"{source} reasoning",
+                type="llm",
+                default_open=True,
+            )
             step.input = self.prompt if source == "main-agent" else ""
             step.start = utc_now()
             await step.send()
@@ -631,6 +640,7 @@ class ChainlitEventBridge:
             step = cl.Step(
                 name=f"{source} tool",
                 type="tool",
+                default_open=True,
                 show_input="json",
                 language="json",
             )
@@ -671,6 +681,7 @@ class ChainlitEventBridge:
             step = cl.Step(
                 name=f"{source} · {getattr(tool_message, 'name', 'tool')}",
                 type="tool",
+                default_open=True,
                 show_input="json",
                 language="json",
             )
@@ -688,6 +699,7 @@ class ChainlitEventBridge:
         state.step.output = pretty_data(getattr(tool_message, "content", ""))
         state.step.end = utc_now()
         await state.step.update()
+        self._schedule_step_auto_collapse(state.step)
         if self.run_task_list is not None:
             await self.run_task_list.mark_tool_finished(
                 state.call_id,
@@ -740,10 +752,30 @@ class ChainlitEventBridge:
             if not state.step.end:
                 state.step.end = utc_now()
             await state.step.update()
+            self._schedule_step_auto_collapse(state.step)
         self.tool_steps.clear()
 
         for step in self.reasoning_steps.values():
             if not step.end:
                 step.end = utc_now()
             await step.update()
+            self._schedule_step_auto_collapse(step)
         self.reasoning_steps.clear()
+
+    def _schedule_step_auto_collapse(self, step: cl.Step) -> None:
+        if step.id in self.collapse_scheduled_step_ids:
+            return
+
+        self.collapse_scheduled_step_ids.add(step.id)
+
+        async def collapse_later() -> None:
+            try:
+                await asyncio.sleep(AUTO_COLLAPSE_DELAY_SECONDS)
+                step.auto_collapse = True
+                await step.update()
+            except Exception:
+                return
+
+        task = asyncio.create_task(collapse_later())
+        self.pending_collapse_tasks.add(task)
+        task.add_done_callback(self.pending_collapse_tasks.discard)
