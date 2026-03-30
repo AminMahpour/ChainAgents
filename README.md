@@ -45,15 +45,10 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 You only need Postgres if you want durable LangGraph checkpoints and `/memories/`.
 If `DATABASE_URL` is unset, the app runs fully in memory for the current process.
 
-The quickest local setup is Docker:
+This repo includes a Compose file for a local Postgres instance:
 
 ```bash
-docker run --name chainagents-postgres \
-  -e POSTGRES_USER=chainagents \
-  -e POSTGRES_PASSWORD=chainagents \
-  -e POSTGRES_DB=chainagents \
-  -p 5432:5432 \
-  -d postgres:17
+docker compose up -d postgres
 ```
 
 Point the app at that database:
@@ -65,11 +60,12 @@ export DATABASE_URL="postgresql://chainagents:chainagents@127.0.0.1:5432/chainag
 Optional verification:
 
 ```bash
-docker exec -it chainagents-postgres psql -U chainagents -d chainagents -c "select 1;"
+docker compose exec postgres psql -U chainagents -d chainagents -c "select 1;"
 ```
 
 Notes:
 
+- The Compose file lives at [compose.yaml](compose.yaml) and creates a persistent `postgres-data` volume.
 - If you already have Postgres installed locally, create an empty database and set `DATABASE_URL` to that instance instead.
 - No separate migration step is required for this app. On startup it calls the LangGraph Postgres store and checkpointer `setup()` routines automatically.
 

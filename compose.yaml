@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: chainagents-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chainagents
+      POSTGRES_PASSWORD: chainagents
+      POSTGRES_DB: chainagents
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chainagents -d chainagents"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:
