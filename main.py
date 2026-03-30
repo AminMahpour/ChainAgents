@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
 import traceback
 from contextlib import suppress
 from typing import Any
 
 import chainlit as cl
 from chainlit.input_widget import Select, TextInput
+from chainlit.types import ThreadDict
 
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
 from deepagent_runtime import (
@@ -19,6 +22,30 @@ from deepagent_runtime import (
 
 SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
+AUTH_USERNAME = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
+AUTH_PASSWORD = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
+AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
+AUTH_ENABLED = bool(AUTH_SECRET and AUTH_USERNAME and AUTH_PASSWORD)
+
+
+def current_chainlit_thread_id() -> str:
+    try:
+        session = cl.context.session
+    except Exception:
+        return ""
+    thread_id = getattr(session, "thread_id", None) or getattr(session, "id", None)
+    return str(thread_id or "").strip()
+
+
+def settings_payload(settings: AppSettings) -> dict[str, str]:
+    return {
+        "reasoning_level": settings.reasoning_level,
+        "thread_id": settings.thread_id,
+    }
+
+
+def store_settings(settings: AppSettings) -> None:
+    cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
 
 
 def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
@@ -36,7 +63,10 @@ def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
                 id="thread_id",
                 label="LangGraph Thread ID",
                 initial=settings.thread_id,
-                description="Reuse this ID to continue the same persisted LangGraph thread.",
+                description=(
+                    "Defaults to the current Chainlit thread. Override it only if you want "
+                    "to point this chat at a different persisted LangGraph thread."
+                ),
             ),
         ]
     )
@@ -50,10 +80,29 @@ def coerce_settings(raw_settings: AppSettings | dict[str, Any] | None) -> AppSet
     reasoning_level = normalize_reasoning_level(
         raw_settings.get("reasoning_level", DEFAULT_REASONING_LEVEL)
     )
-    thread_id = str(raw_settings.get("thread_id") or cl.context.session.id).strip()
+    thread_id = str(
+        raw_settings.get("thread_id") or current_chainlit_thread_id()
+    ).strip()
     if not thread_id:
-        thread_id = cl.context.session.id
+        thread_id = current_chainlit_thread_id()
     return AppSettings(reasoning_level=reasoning_level, thread_id=thread_id.strip())
+
+
+if AUTH_ENABLED:
+
+    @cl.password_auth_callback
+    def password_auth_callback(username: str, password: str) -> cl.User | None:
+        if not (
+            secrets.compare_digest(username, AUTH_USERNAME)
+            and secrets.compare_digest(password, AUTH_PASSWORD)
+        ):
+            return None
+
+        return cl.User(
+            identifier=AUTH_USERNAME,
+            display_name=AUTH_USERNAME,
+            metadata={"provider": "credentials"},
+        )
 
 
 async def get_runtime_or_notify() -> AgentRuntime | None:
@@ -83,14 +132,19 @@ async def on_chat_start() -> None:
     await run_task_list.show_ready()
     settings = AppSettings(
         reasoning_level=runtime.config.default_reasoning,
-        thread_id=cl.context.session.id,
+        thread_id=current_chainlit_thread_id(),
     )
-    cl.user_session.set(SESSION_SETTINGS_KEY, settings)
+    store_settings(settings)
     await build_chat_settings(settings).send()
     persistence_line = (
         "- Persistence: Postgres-backed LangGraph checkpoints and `/memories/`\n"
         if runtime.persistence_enabled
         else "- Persistence: in-memory only for this process; set `DATABASE_URL` to enable durable checkpoints and `/memories/`\n"
+    )
+    history_line = (
+        "- History bar: enabled for authenticated users\n"
+        if runtime.persistence_enabled and AUTH_ENABLED
+        else "- History bar: disabled; set `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` to enable native Chainlit history\n"
     )
     extensions = runtime.config.extensions
     extensions_line = (
@@ -106,6 +160,7 @@ async def on_chat_start() -> None:
             f"- Model: `{runtime.config.ollama_model}`\n"
             f"- Thread ID: `{settings.thread_id}`\n"
             f"{persistence_line}"
+            f"{history_line}"
             f"{extensions_line}"
             "- Real repo files live under `/workspace/`\n"
             "- Agent memory is available under `/memories/`"
@@ -114,10 +169,28 @@ async def on_chat_start() -> None:
     ).send()
 
 
+@cl.on_chat_resume
+async def on_chat_resume(thread: ThreadDict) -> None:
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+
+    run_task_list = await get_run_task_list()
+    await run_task_list.show_ready()
+
+    metadata = thread.get("metadata") or {}
+    raw_settings = (
+        metadata.get(SESSION_SETTINGS_KEY) if isinstance(metadata, dict) else None
+    )
+    settings = coerce_settings(raw_settings)
+    store_settings(settings)
+    await build_chat_settings(settings).send()
+
+
 @cl.on_settings_update
 async def on_settings_update(raw_settings: dict[str, Any]) -> None:
     settings = coerce_settings(raw_settings)
-    cl.user_session.set(SESSION_SETTINGS_KEY, settings)
+    store_settings(settings)
 
 
 @cl.on_message

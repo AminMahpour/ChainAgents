@@ -19,6 +19,9 @@ export OLLAMA_BASE_URL="http://127.0.0.1:11434"
 export OLLAMA_MODEL="gpt-oss:20b"
 export OLLAMA_REASONING="medium"
 export DEEPAGENT_CONFIG="deepagent.toml"
+export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
+export CHAINLIT_AUTH_USERNAME="admin"
+export CHAINLIT_AUTH_PASSWORD="change-me"
 ```
 
 `DATABASE_URL` is optional now:
@@ -30,6 +33,12 @@ export DEEPAGENT_CONFIG="deepagent.toml"
 
 - defaults to `deepagent.toml` in the project root
 - if the file is missing, the app runs without extra skills, MCP servers, or custom subagents
+
+`CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
+
+- when all three are set, the app enables Chainlit password authentication
+- together with `DATABASE_URL`, that unlocks the native Chainlit history bar and chat resume UI
+- when they are unset, the app stays unauthenticated and the history bar remains unavailable
 
 ## Optional: Install Postgres
 
@@ -63,6 +72,26 @@ Notes:
 
 - If you already have Postgres installed locally, create an empty database and set `DATABASE_URL` to that instance instead.
 - No separate migration step is required for this app. On startup it calls the LangGraph Postgres store and checkpointer `setup()` routines automatically.
+
+## Optional: Enable Native Chainlit History
+
+Chainlit only shows its built-in history sidebar when both persistence and authentication are enabled.
+
+This app includes a simple password-based auth callback driven by environment variables:
+
+```bash
+export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
+export CHAINLIT_AUTH_USERNAME="admin"
+export CHAINLIT_AUTH_PASSWORD="change-me"
+```
+
+With both `DATABASE_URL` and the `CHAINLIT_AUTH_*` variables set:
+
+- users can sign in through Chainlit's native auth screen
+- the history sidebar can list and reopen prior chats
+- resumed chats default the LangGraph thread ID to the persisted Chainlit thread ID for that conversation
+
+If you leave auth disabled, Chainlit can still persist thread records in Postgres, but the native history bar will stay hidden.
 
 ## Setup
 
@@ -256,8 +285,8 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 
 ## Notes
 
-- Chainlit native chat-history resume is not configured in this version.
-- If `DATABASE_URL` is set, Chainlit can also persist its own thread records. Without authentication, those records are stored but not browseable from the UI.
+- Native Chainlit history is available when both `DATABASE_URL` and the `CHAINLIT_AUTH_*` variables are configured.
+- If `DATABASE_URL` is set but authentication is not configured, Chainlit still persists thread records, but they are not browseable from the UI.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.
 - On startup, the UI shows how many skill sources, MCP servers, and custom subagents were loaded from `deepagent.toml`.
