@@ -31,6 +31,39 @@ export DEEPAGENT_CONFIG="deepagent.toml"
 - defaults to `deepagent.toml` in the project root
 - if the file is missing, the app runs without extra skills, MCP servers, or custom subagents
 
+## Optional: Install Postgres
+
+You only need Postgres if you want durable LangGraph checkpoints and `/memories/`.
+If `DATABASE_URL` is unset, the app runs fully in memory for the current process.
+
+The quickest local setup is Docker:
+
+```bash
+docker run --name chainagents-postgres \
+  -e POSTGRES_USER=chainagents \
+  -e POSTGRES_PASSWORD=chainagents \
+  -e POSTGRES_DB=chainagents \
+  -p 5432:5432 \
+  -d postgres:17
+```
+
+Point the app at that database:
+
+```bash
+export DATABASE_URL="postgresql://chainagents:chainagents@127.0.0.1:5432/chainagents?sslmode=disable"
+```
+
+Optional verification:
+
+```bash
+docker exec -it chainagents-postgres psql -U chainagents -d chainagents -c "select 1;"
+```
+
+Notes:
+
+- If you already have Postgres installed locally, create an empty database and set `DATABASE_URL` to that instance instead.
+- No separate migration step is required for this app. On startup it calls the LangGraph Postgres store and checkpointer `setup()` routines automatically.
+
 ## Setup
 
 Install dependencies and ensure Ollama has the model:
