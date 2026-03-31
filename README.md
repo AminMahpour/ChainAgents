@@ -286,3 +286,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.
 - On startup, the UI shows how many skill sources, MCP servers, and custom subagents were loaded from `deepagent.toml`.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
