@@ -366,6 +366,11 @@ def load_file_config() -> FileConfig:
     )
 
 
+def load_extensions_config() -> ExtensionsConfig:
+    # Keep the previous public helper for existing imports and tests.
+    return load_file_config().extensions
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     database_url: str | None
