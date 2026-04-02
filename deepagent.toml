@@ -1,3 +1,9 @@
+[model]
+endpoint = "http://127.0.0.1"
+port = 11434
+name = "gpt-oss:20b"
+reasoning_effort = "medium"
+
 [mcp]
 tool_name_prefix = true
 

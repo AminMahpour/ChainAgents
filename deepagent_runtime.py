@@ -7,6 +7,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from deepagents import create_deep_agent
 from deepagents.backends import (
@@ -26,6 +27,8 @@ from langgraph.store.postgres.aio import AsyncPostgresStore
 ReasoningLevel = Literal["low", "medium", "high"]
 PersistenceMode = Literal["memory", "postgres"]
 DEFAULT_MODEL = "gpt-oss:20b"
+DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
+DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
@@ -54,11 +57,59 @@ Availability questions:
 """.strip()
 
 
-def normalize_reasoning_level(value: str | None) -> ReasoningLevel:
-    candidate = (value or DEFAULT_REASONING_LEVEL).strip().lower()
+def normalize_reasoning_level(
+    value: str | None,
+    *,
+    default: ReasoningLevel = DEFAULT_REASONING_LEVEL,
+) -> ReasoningLevel:
+    candidate = (value or default).strip().lower()
     if candidate not in {"low", "medium", "high"}:
-        return DEFAULT_REASONING_LEVEL
+        return default
     return candidate  # type: ignore[return-value]
+
+
+def normalize_model_endpoint(value: str | None) -> str:
+    candidate = (value or DEFAULT_OLLAMA_ENDPOINT).strip()
+    if not candidate:
+        candidate = DEFAULT_OLLAMA_ENDPOINT
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+    return candidate.rstrip("/")
+
+
+def normalize_model_port(value: Any | None) -> int:
+    if value is None:
+        return DEFAULT_OLLAMA_PORT
+
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_OLLAMA_PORT
+
+    if 1 <= port <= 65535:
+        return port
+    return DEFAULT_OLLAMA_PORT
+
+
+def compose_base_url(endpoint: str, port: int) -> str:
+    parsed = urlsplit(normalize_model_endpoint(endpoint))
+    hostname = parsed.hostname
+    if hostname is None:
+        return DEFAULT_OLLAMA_BASE_URL
+
+    auth = ""
+    if parsed.username:
+        auth = parsed.username
+        if parsed.password:
+            auth = f"{auth}:{parsed.password}"
+        auth = f"{auth}@"
+
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    netloc = f"{auth}{hostname}:{port}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme or "http", netloc, path, parsed.query, parsed.fragment))
 
 
 def resolve_local_path(path_value: str, base_dir: Path) -> Path:
@@ -159,17 +210,50 @@ class ExtensionsConfig:
         return bool(self.skills or self.agent_mcp_servers or self.subagents)
 
 
-def load_extensions_config() -> ExtensionsConfig:
-    config_name = os.getenv("DEEPAGENT_CONFIG", DEFAULT_EXTENSIONS_CONFIG).strip()
-    config_path = resolve_local_path(config_name or DEFAULT_EXTENSIONS_CONFIG, PROJECT_ROOT)
-    if not config_path.exists():
-        return ExtensionsConfig(config_path=None)
+@dataclass(frozen=True)
+class ModelDefaults:
+    endpoint: str = DEFAULT_OLLAMA_ENDPOINT
+    port: int = DEFAULT_OLLAMA_PORT
+    name: str = DEFAULT_MODEL
+    reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
 
-    with config_path.open("rb") as fh:
-        raw_config = tomllib.load(fh)
+    @property
+    def base_url(self) -> str:
+        return compose_base_url(self.endpoint, self.port)
 
+
+@dataclass(frozen=True)
+class FileConfig:
+    model: ModelDefaults
+    extensions: ExtensionsConfig
+
+
+def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
+    raw_model = raw_config.get("model", {})
+    if raw_model and not isinstance(raw_model, dict):
+        raise ValueError("The top-level 'model' config must be a table/object.")
+
+    return ModelDefaults(
+        endpoint=normalize_model_endpoint(raw_model.get("endpoint")),
+        port=normalize_model_port(raw_model.get("port")),
+        name=str(raw_model.get("name", DEFAULT_MODEL)).strip() or DEFAULT_MODEL,
+        reasoning_effort=normalize_reasoning_level(
+            raw_model.get("reasoning_effort"),
+            default=DEFAULT_REASONING_LEVEL,
+        ),
+    )
+
+
+def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> ExtensionsConfig:
     base_dir = config_path.parent
     mcp_section = raw_config.get("mcp", {})
+    if mcp_section and not isinstance(mcp_section, dict):
+        raise ValueError("The top-level 'mcp' config must be a table/object.")
+
+    agent_section = raw_config.get("agent", {})
+    if agent_section and not isinstance(agent_section, dict):
+        raise ValueError("The top-level 'agent' config must be a table/object.")
+
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -177,7 +261,6 @@ def load_extensions_config() -> ExtensionsConfig:
             raise ValueError(f"MCP server '{name}' must be a table/object.")
         mcp_servers[str(name)] = normalize_mcp_server_config(raw_server, base_dir)
 
-    agent_section = raw_config.get("agent", {})
     raw_skill_paths = agent_section.get("skills", [])
     skill_paths = tuple(
         normalize_skill_source_path(str(path_value), base_dir)
@@ -196,6 +279,8 @@ def load_extensions_config() -> ExtensionsConfig:
             )
 
     raw_subagents = raw_config.get("subagents", [])
+    if raw_subagents and not isinstance(raw_subagents, list):
+        raise ValueError("The top-level 'subagents' config must be an array of tables.")
     subagents: list[SubagentConfig] = []
     for index, raw_subagent in enumerate(raw_subagents, start=1):
         if not isinstance(raw_subagent, dict):
@@ -263,6 +348,24 @@ def load_extensions_config() -> ExtensionsConfig:
     )
 
 
+def load_file_config() -> FileConfig:
+    config_name = os.getenv("DEEPAGENT_CONFIG", DEFAULT_EXTENSIONS_CONFIG).strip()
+    config_path = resolve_local_path(config_name or DEFAULT_EXTENSIONS_CONFIG, PROJECT_ROOT)
+    if not config_path.exists():
+        return FileConfig(
+            model=ModelDefaults(),
+            extensions=ExtensionsConfig(config_path=None),
+        )
+
+    with config_path.open("rb") as fh:
+        raw_config = tomllib.load(fh)
+
+    return FileConfig(
+        model=parse_model_defaults(raw_config),
+        extensions=parse_extensions_config(raw_config, config_path),
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     database_url: str | None
@@ -274,20 +377,25 @@ class RuntimeConfig:
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
+        file_config = load_file_config()
+        model_defaults = file_config.model
         database_url = os.getenv("DATABASE_URL", "").strip() or None
+        ollama_model = os.getenv("OLLAMA_MODEL", "").strip() or model_defaults.name
+        ollama_base_url = (
+            os.getenv("OLLAMA_BASE_URL", "").strip() or model_defaults.base_url
+        )
+        default_reasoning = normalize_reasoning_level(
+            os.getenv("OLLAMA_REASONING", "").strip(),
+            default=model_defaults.reasoning_effort,
+        )
 
         return cls(
             database_url=database_url,
-            ollama_model=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
-            ollama_base_url=(
-                os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL).strip()
-                or DEFAULT_OLLAMA_BASE_URL
-            ),
-            default_reasoning=normalize_reasoning_level(
-                os.getenv("OLLAMA_REASONING", DEFAULT_REASONING_LEVEL)
-            ),
+            ollama_model=ollama_model,
+            ollama_base_url=ollama_base_url,
+            default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
-            extensions=load_extensions_config(),
+            extensions=file_config.extensions,
         )
 
 

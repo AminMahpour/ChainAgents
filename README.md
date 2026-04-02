@@ -4,14 +4,14 @@ This project runs a local-first LangChain Deep Agent behind a Chainlit UI.
 
 The app is wired for:
 
-- `ChatOllama` with `gpt-oss:20b`
+- `ChatOllama` with a configurable local model
 - native Chainlit streaming for reasoning, tool calls, and final response
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
 
 ## Environment
 
-Set these variables before starting the app:
+Set these variables before starting the app if you want environment-based overrides:
 
 ```bash
 export DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=disable"
@@ -32,7 +32,7 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 `DEEPAGENT_CONFIG` is optional:
 
 - defaults to `deepagent.toml` in the project root
-- if the file is missing, the app runs without extra skills, MCP servers, or custom subagents
+- if the file is missing, the app falls back to built-in model defaults and runs without extra skills, MCP servers, or custom subagents
 
 `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
 
@@ -100,6 +100,7 @@ ollama pull gpt-oss:20b
 
 This repo now includes a live [deepagent.toml](deepagent.toml) with:
 
+- model defaults for endpoint, port, model name, and reasoning effort
 - a real `repo` MCP server pinned to `npx @modelcontextprotocol/server-filesystem@2025.8.21`
 - a `repo-researcher` subagent using [prompts/repo-researcher.md](prompts/repo-researcher.md)
 - the repo-local `skills/` source for both the main agent and the subagent
@@ -113,6 +114,26 @@ Start the Chainlit app:
 ```bash
 chainlit run main.py -w
 ```
+
+## Model Config
+
+You can keep the model defaults in `deepagent.toml`:
+
+```toml
+[model]
+endpoint = "http://127.0.0.1"
+port = 11434
+name = "gpt-oss:20b"
+reasoning_effort = "medium"
+```
+
+Notes:
+
+- `endpoint` can be a host like `"127.0.0.1"` or a URL like `"http://127.0.0.1"`.
+- `port` is combined with `endpoint` to build `ChatOllama(base_url=...)`.
+- `name` sets the default `ChatOllama(model=...)`.
+- `reasoning_effort` sets the default Chainlit reasoning level for new chats.
+- `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work and override the TOML defaults when set.
 
 ## Add Skills
 

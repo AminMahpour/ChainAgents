@@ -14,11 +14,11 @@ Local-first LangChain Deep Agent UI running on Ollama.
 - Memory is available under `/memories/`.
 - Reuse the `LangGraph Thread ID` setting to continue a persisted thread.
 
-## Required Environment
+## Model Defaults
 
-- `OLLAMA_BASE_URL` defaults to `http://127.0.0.1:11434`
-- `OLLAMA_MODEL` defaults to `gpt-oss:20b`
-- `OLLAMA_REASONING` defaults to `medium`
+- `deepagent.toml` can define `[model]` with `endpoint`, `port`, `name`, and `reasoning_effort`
+- if `deepagent.toml` is missing, the runtime defaults to `http://127.0.0.1:11434`, `gpt-oss:20b`, and `medium`
+- `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still override the TOML defaults when set
 
 ## Optional Persistence
 

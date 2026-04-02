@@ -11,3 +11,4 @@ wheels/
 
 # Chainlit file storage
 .files/
+.codex

@@ -57,7 +57,7 @@ def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
                 label="Reasoning Level",
                 values=reasoning_levels,
                 initial_index=reasoning_levels.index(settings.reasoning_level),
-                description="Controls `ChatOllama(reasoning=...)` for `gpt-oss:20b`.",
+                description="Controls `ChatOllama(reasoning=...)` for the configured model.",
             ),
             TextInput(
                 id="thread_id",
