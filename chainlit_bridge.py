@@ -3,13 +3,48 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import chainlit as cl
 from chainlit.utils import utc_now
 
-AUTO_COLLAPSE_DELAY_SECONDS = 3
+
+DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
+CHAINLIT_APP_CONFIG_PATH = Path(__file__).resolve().parent / "chainlit.toml"
+
+
+def load_auto_collapse_delay_seconds() -> float:
+    if not CHAINLIT_APP_CONFIG_PATH.exists():
+        return DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS
+
+    try:
+        with CHAINLIT_APP_CONFIG_PATH.open("rb") as fh:
+            raw_config = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS
+
+    steps_config = raw_config.get("steps", {})
+    if not isinstance(steps_config, dict):
+        return DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS
+
+    raw_delay = steps_config.get(
+        "auto_collapse_delay_seconds",
+        DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS,
+    )
+    try:
+        delay = float(raw_delay)
+    except (TypeError, ValueError):
+        return DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS
+
+    if delay < 0:
+        return DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS
+    return delay
+
+
+AUTO_COLLAPSE_DELAY_SECONDS = load_auto_collapse_delay_seconds()
 
 
 def stringify_content(value: Any) -> str:

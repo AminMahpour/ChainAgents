@@ -7,6 +7,7 @@ Local-first LangChain Deep Agent UI running on Ollama.
 - Final assistant response streams into the main chat message.
 - Raw model reasoning is shown in Chain of Thought steps.
 - Tool calls and tool outputs are rendered as native Chainlit tool steps.
+- Completed reasoning and tool steps auto-collapse based on `chainlit.toml`.
 
 ## Workspace Contract
 
@@ -29,3 +30,8 @@ Local-first LangChain Deep Agent UI running on Ollama.
 
 - Use `deepagent.toml` to add skills, MCP servers, and custom subagents.
 - Each subagent can have its own `skills` and `mcp_servers`.
+
+## App Config
+
+- `.chainlit/config.toml` controls native Chainlit settings.
+- `chainlit.toml` controls app-owned UI settings such as `[steps].auto_collapse_delay_seconds`.

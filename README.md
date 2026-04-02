@@ -135,6 +135,21 @@ Notes:
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work and override the TOML defaults when set.
 
+## Chainlit App Config
+
+This repo also includes an app-specific `chainlit.toml` for UI behavior that the bridge owns:
+
+```toml
+[steps]
+auto_collapse_delay_seconds = 3
+```
+
+Notes:
+
+- `chainlit.toml` is separate from Chainlit's native [`.chainlit/config.toml`](.chainlit/config.toml).
+- `[steps].auto_collapse_delay_seconds` controls how long completed reasoning and tool steps stay expanded before auto-collapsing.
+- If `chainlit.toml` is missing or invalid, the app falls back to `3` seconds.
+
 ## Add Skills
 
 The runtime now supports Deep Agents skill sources through `deepagent.toml`.
