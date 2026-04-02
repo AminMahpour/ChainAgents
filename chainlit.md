@@ -18,7 +18,7 @@ Local-first LangChain Deep Agent UI running on Ollama.
 
 ## Model Defaults
 
-- `deepagent.toml` can define `[model]` with `endpoint`, `port`, `name`, and `reasoning_effort`
+- `deepagent.toml` can define `[model]` with `endpoint`, `port`, `temperature`, `name`, and `reasoning_effort`
 - if `deepagent.toml` is missing, the runtime defaults to `http://127.0.0.1:11434`, `gpt-oss:20b`, and `medium`
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still override the TOML defaults when set
 

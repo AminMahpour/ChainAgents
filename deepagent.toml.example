@@ -1,6 +1,7 @@
 [model]
 endpoint = "http://127.0.0.1"
 port = 11434
+temperature = 0
 name = "gpt-oss:20b"
 reasoning_effort = "medium"
 

@@ -124,6 +124,7 @@ You can keep the model defaults in `deepagent.toml`:
 [model]
 endpoint = "http://127.0.0.1"
 port = 11434
+temperature = 0
 name = "gpt-oss:20b"
 reasoning_effort = "medium"
 ```
@@ -132,6 +133,7 @@ Notes:
 
 - `endpoint` can be a host like `"127.0.0.1"` or a URL like `"http://127.0.0.1"`.
 - `port` is combined with `endpoint` to build `ChatOllama(base_url=...)`.
+- `temperature` sets the default `ChatOllama(temperature=...)`.
 - `name` sets the default `ChatOllama(model=...)`.
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work and override the TOML defaults when set.

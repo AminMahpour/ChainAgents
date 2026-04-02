@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import tomllib
 from contextlib import AsyncExitStack
@@ -31,6 +32,7 @@ DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
 DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
+DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -89,6 +91,20 @@ def normalize_model_port(value: Any | None) -> int:
     if 1 <= port <= 65535:
         return port
     return DEFAULT_OLLAMA_PORT
+
+
+def normalize_model_temperature(value: Any | None) -> float:
+    if value is None:
+        return DEFAULT_TEMPERATURE
+
+    try:
+        temperature = float(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_TEMPERATURE
+
+    if not math.isfinite(temperature):
+        return DEFAULT_TEMPERATURE
+    return temperature
 
 
 def compose_base_url(endpoint: str, port: int) -> str:
@@ -216,6 +232,7 @@ class ModelDefaults:
     port: int = DEFAULT_OLLAMA_PORT
     name: str = DEFAULT_MODEL
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
+    temperature: float = DEFAULT_TEMPERATURE
 
     @property
     def base_url(self) -> str:
@@ -240,6 +257,9 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
         reasoning_effort=normalize_reasoning_level(
             raw_model.get("reasoning_effort"),
             default=DEFAULT_REASONING_LEVEL,
+        ),
+        temperature=normalize_model_temperature(
+            raw_model.get("temperature", raw_model.get("tempreature"))
         ),
     )
 
@@ -376,6 +396,7 @@ class RuntimeConfig:
     database_url: str | None
     ollama_model: str
     ollama_base_url: str
+    ollama_temperature: float
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
@@ -398,6 +419,7 @@ class RuntimeConfig:
             database_url=database_url,
             ollama_model=ollama_model,
             ollama_base_url=ollama_base_url,
+            ollama_temperature=model_defaults.temperature,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
             extensions=file_config.extensions,
@@ -479,7 +501,7 @@ class AgentRuntime:
                     model=self.config.ollama_model,
                     base_url=self.config.ollama_base_url,
                     reasoning=reasoning_level,
-                    temperature=0,
+                    temperature=self.config.ollama_temperature,
                 )
                 main_tools = await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
                 agent = create_deep_agent(
