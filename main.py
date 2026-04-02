@@ -18,6 +18,12 @@ from deepagent_runtime import (
     AppSettings,
     normalize_reasoning_level,
 )
+from response_exports import (
+    DOWNLOAD_MARKDOWN_ACTION,
+    DOWNLOAD_PDF_ACTION,
+    send_markdown_export,
+    send_pdf_export,
+)
 
 
 SESSION_SETTINGS_KEY = "agent_settings"
@@ -191,6 +197,16 @@ async def on_chat_resume(thread: ThreadDict) -> None:
 async def on_settings_update(raw_settings: dict[str, Any]) -> None:
     settings = coerce_settings(raw_settings)
     store_settings(settings)
+
+
+@cl.action_callback(DOWNLOAD_MARKDOWN_ACTION)
+async def download_response_markdown(action: cl.Action) -> None:
+    await send_markdown_export(action)
+
+
+@cl.action_callback(DOWNLOAD_PDF_ACTION)
+async def download_response_pdf(action: cl.Action) -> None:
+    await send_pdf_export(action)
 
 
 @cl.on_message

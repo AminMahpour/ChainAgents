@@ -11,6 +11,7 @@ from typing import Any
 import chainlit as cl
 from chainlit.utils import utc_now
 
+from response_exports import attach_response_export_actions
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
 CHAINLIT_APP_CONFIG_PATH = Path(__file__).resolve().parent / "chainlit.toml"
@@ -563,6 +564,11 @@ class ChainlitEventBridge:
     async def finish(self) -> None:
         await self._close_all_open_steps()
         if self.response_message is not None:
+            attach_response_export_actions(
+                self.response_message,
+                prompt=self.prompt,
+                response_text=self.response_buffer,
+            )
             await self.response_message.update()
         if self.run_task_list is not None:
             await self.run_task_list.finish()

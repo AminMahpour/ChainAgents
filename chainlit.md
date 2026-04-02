@@ -7,6 +7,7 @@ Local-first LangChain Deep Agent UI running on Ollama.
 - Final assistant response streams into the main chat message.
 - Raw model reasoning is shown in Chain of Thought steps.
 - Tool calls and tool outputs are rendered as native Chainlit tool steps.
+- Each completed assistant response includes Markdown and PDF download buttons.
 - Completed reasoning and tool steps auto-collapse based on `chainlit.toml`.
 
 ## Workspace Contract

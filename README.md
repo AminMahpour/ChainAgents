@@ -6,6 +6,7 @@ The app is wired for:
 
 - `ChatOllama` with a configurable local model
 - native Chainlit streaming for reasoning, tool calls, and final response
+- per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
 
