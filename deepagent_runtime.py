@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import tomllib
@@ -18,16 +19,20 @@ from deepagents.backends import (
     StoreBackend,
 )
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 
+ModelProvider = Literal["ollama", "openai_compatible"]
 ReasoningLevel = Literal["low", "medium", "high"]
 PersistenceMode = Literal["memory", "postgres"]
 DEFAULT_MODEL = "gpt-oss:20b"
+DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
 DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
 DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
@@ -35,6 +40,7 @@ DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 PROJECT_ROOT = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
@@ -68,6 +74,27 @@ def normalize_reasoning_level(
     if candidate not in {"low", "medium", "high"}:
         return default
     return candidate  # type: ignore[return-value]
+
+
+def normalize_model_provider(
+    value: Any | None,
+    *,
+    default: ModelProvider = DEFAULT_MODEL_PROVIDER,
+) -> ModelProvider:
+    candidate = str(value or default).strip().lower().replace("-", "_")
+    if not candidate:
+        return default
+    if candidate not in {"ollama", "openai_compatible"}:
+        raise ValueError(
+            "The model provider must be 'ollama' or 'openai_compatible'."
+        )
+    return candidate  # type: ignore[return-value]
+
+
+def format_model_provider(provider: ModelProvider) -> str:
+    if provider == "openai_compatible":
+        return "OpenAI-compatible"
+    return "Ollama"
 
 
 def normalize_model_endpoint(value: str | None) -> str:
@@ -107,7 +134,28 @@ def normalize_model_temperature(value: Any | None) -> float:
     return temperature
 
 
-def compose_base_url(endpoint: str, port: int) -> str:
+def normalize_model_base_url(
+    value: Any | None,
+    *,
+    default: str | None = None,
+    required_message: str | None = None,
+) -> str:
+    candidate = str(value or default or "").strip()
+    if not candidate:
+        if required_message:
+            raise ValueError(required_message)
+        return ""
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+    return candidate.rstrip("/")
+
+
+def normalize_optional_string(value: Any | None) -> str | None:
+    candidate = str(value or "").strip()
+    return candidate or None
+
+
+def compose_base_url(endpoint: str | None, port: int) -> str:
     parsed = urlsplit(normalize_model_endpoint(endpoint))
     hostname = parsed.hostname
     if hostname is None:
@@ -228,15 +276,13 @@ class ExtensionsConfig:
 
 @dataclass(frozen=True)
 class ModelDefaults:
-    endpoint: str = DEFAULT_OLLAMA_ENDPOINT
-    port: int = DEFAULT_OLLAMA_PORT
+    provider: ModelProvider = DEFAULT_MODEL_PROVIDER
+    base_url: str = DEFAULT_OLLAMA_BASE_URL
     name: str = DEFAULT_MODEL
+    api_key: str | None = None
+    name_is_explicit: bool = False
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
     temperature: float = DEFAULT_TEMPERATURE
-
-    @property
-    def base_url(self) -> str:
-        return compose_base_url(self.endpoint, self.port)
 
 
 @dataclass(frozen=True)
@@ -250,10 +296,39 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
     if raw_model and not isinstance(raw_model, dict):
         raise ValueError("The top-level 'model' config must be a table/object.")
 
+    provider = normalize_model_provider(raw_model.get("provider"))
+    raw_name = str(raw_model.get("name", "")).strip()
+    if provider == "openai_compatible" and not raw_name:
+        raise ValueError(
+            "OpenAI-compatible model config must define a non-empty 'name'."
+        )
+
+    raw_base_url = str(raw_model.get("base_url", "")).strip()
+    if provider == "ollama":
+        if raw_base_url:
+            base_url = normalize_model_base_url(
+                raw_base_url,
+                default=DEFAULT_OLLAMA_BASE_URL,
+            )
+        else:
+            base_url = compose_base_url(
+                raw_model.get("endpoint"),
+                normalize_model_port(raw_model.get("port")),
+            )
+    else:
+        base_url = normalize_model_base_url(
+            raw_model.get("base_url"),
+            required_message=(
+                "OpenAI-compatible model config must define a non-empty 'base_url'."
+            ),
+        )
+
     return ModelDefaults(
-        endpoint=normalize_model_endpoint(raw_model.get("endpoint")),
-        port=normalize_model_port(raw_model.get("port")),
-        name=str(raw_model.get("name", DEFAULT_MODEL)).strip() or DEFAULT_MODEL,
+        provider=provider,
+        base_url=base_url,
+        name=raw_name or DEFAULT_MODEL,
+        api_key=normalize_optional_string(raw_model.get("api_key")),
+        name_is_explicit=bool(raw_name),
         reasoning_effort=normalize_reasoning_level(
             raw_model.get("reasoning_effort"),
             default=DEFAULT_REASONING_LEVEL,
@@ -394,9 +469,11 @@ def load_extensions_config() -> ExtensionsConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     database_url: str | None
-    ollama_model: str
-    ollama_base_url: str
-    ollama_temperature: float
+    model_provider: ModelProvider
+    model_name: str
+    model_base_url: str
+    model_api_key: str | None
+    model_temperature: float
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
@@ -406,20 +483,66 @@ class RuntimeConfig:
         file_config = load_file_config()
         model_defaults = file_config.model
         database_url = os.getenv("DATABASE_URL", "").strip() or None
-        ollama_model = os.getenv("OLLAMA_MODEL", "").strip() or model_defaults.name
-        ollama_base_url = (
-            os.getenv("OLLAMA_BASE_URL", "").strip() or model_defaults.base_url
+        model_provider_override = normalize_optional_string(
+            os.getenv("DEEPAGENT_MODEL_PROVIDER")
+        )
+        model_provider = normalize_model_provider(
+            model_provider_override,
+            default=model_defaults.provider,
+        )
+        generic_model_name = os.getenv("DEEPAGENT_MODEL_NAME", "").strip()
+        generic_model_base_url = os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
+        generic_model_reasoning = os.getenv("DEEPAGENT_MODEL_REASONING", "").strip()
+        model_name_alias = os.getenv("OLLAMA_MODEL", "").strip() if model_provider == "ollama" else ""
+        model_base_url_alias = (
+            os.getenv("OLLAMA_BASE_URL", "").strip() if model_provider == "ollama" else ""
+        )
+        model_reasoning_alias = (
+            os.getenv("OLLAMA_REASONING", "").strip() if model_provider == "ollama" else ""
+        )
+
+        if (
+            model_provider_override
+            and model_provider != model_defaults.provider
+            and not generic_model_base_url
+        ):
+            raise ValueError(
+                "Switching model providers via DEEPAGENT_MODEL_PROVIDER also requires "
+                "DEEPAGENT_MODEL_BASE_URL so the new provider does not inherit an "
+                "incompatible endpoint."
+            )
+
+        if (
+            model_provider == "openai_compatible"
+            and not generic_model_name
+            and not model_defaults.name_is_explicit
+        ):
+            raise ValueError(
+                "OpenAI-compatible runtime must define DEEPAGENT_MODEL_NAME "
+                "or set a non-empty [model].name in deepagent.toml."
+            )
+
+        model_name = generic_model_name or model_name_alias or model_defaults.name
+        model_base_url = normalize_model_base_url(
+            generic_model_base_url or model_base_url_alias or model_defaults.base_url,
+            required_message="The model base URL cannot be empty.",
+        )
+        model_api_key = (
+            normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+            or model_defaults.api_key
         )
         default_reasoning = normalize_reasoning_level(
-            os.getenv("OLLAMA_REASONING", "").strip(),
+            generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
         )
 
         return cls(
             database_url=database_url,
-            ollama_model=ollama_model,
-            ollama_base_url=ollama_base_url,
-            ollama_temperature=model_defaults.temperature,
+            model_provider=model_provider,
+            model_name=model_name,
+            model_base_url=model_base_url,
+            model_api_key=model_api_key,
+            model_temperature=model_defaults.temperature,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
             extensions=file_config.extensions,
@@ -497,13 +620,10 @@ class AgentRuntime:
         async with self._agent_lock:
             agent = self._agents.get(reasoning_level)
             if agent is None:
-                model = ChatOllama(
-                    model=self.config.ollama_model,
-                    base_url=self.config.ollama_base_url,
-                    reasoning=reasoning_level,
-                    temperature=self.config.ollama_temperature,
+                model = self._build_model(reasoning_level)
+                main_tools = self._sanitize_tools_for_model(
+                    await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
                 )
-                main_tools = await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
                 agent = create_deep_agent(
                     model=model,
                     tools=main_tools or None,
@@ -514,7 +634,9 @@ class AgentRuntime:
                     skills=list(self.config.extensions.skills) or None,
                     subagents=[
                         subagent.to_deepagents_spec(
-                            tools=await self._get_mcp_tools(subagent.mcp_servers)
+                            tools=self._sanitize_tools_for_model(
+                                await self._get_mcp_tools(subagent.mcp_servers)
+                            )
                         )
                         for subagent in self.config.extensions.subagents
                     ]
@@ -522,6 +644,55 @@ class AgentRuntime:
                 )
                 self._agents[reasoning_level] = agent
             return agent
+
+    def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
+        if self.config.model_provider != "openai_compatible":
+            return list(tools)
+
+        compatible_tools: list[Any] = []
+        skipped_tool_names: list[str] = []
+        for tool in tools:
+            if self._tool_supports_openai_compatible_schema(tool):
+                compatible_tools.append(tool)
+                continue
+            skipped_tool_names.append(getattr(tool, "name", type(tool).__name__))
+
+        if skipped_tool_names:
+            logger.warning(
+                "Skipping %d tool(s) with non-object JSON schemas for OpenAI-compatible "
+                "tool calling: %s",
+                len(skipped_tool_names),
+                ", ".join(skipped_tool_names),
+            )
+
+        return compatible_tools
+
+    @staticmethod
+    def _tool_supports_openai_compatible_schema(tool: Any) -> bool:
+        try:
+            schema = convert_to_openai_tool(tool)
+        except Exception:
+            return False
+
+        parameters = schema.get("function", {}).get("parameters")
+        return isinstance(parameters, dict) and parameters.get("type") == "object"
+
+    def _build_model(self, reasoning_level: ReasoningLevel) -> Any:
+        if self.config.model_provider == "ollama":
+            return ChatOllama(
+                model=self.config.model_name,
+                base_url=self.config.model_base_url,
+                reasoning=reasoning_level,
+                temperature=self.config.model_temperature,
+            )
+
+        kwargs: dict[str, Any] = {
+            "model": self.config.model_name,
+            "base_url": self.config.model_base_url,
+            "api_key": self.config.model_api_key or "deepagent",
+            "temperature": self.config.model_temperature,
+        }
+        return ChatOpenAI(**kwargs)
 
     async def _get_mcp_tools(self, server_names: tuple[str, ...]) -> list[Any]:
         if not server_names or self._mcp_client is None:

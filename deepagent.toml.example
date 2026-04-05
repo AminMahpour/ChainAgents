@@ -1,9 +1,14 @@
 [model]
-endpoint = "http://127.0.0.1"
-port = 11434
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
 temperature = 0
 name = "gpt-oss:20b"
 reasoning_effort = "medium"
+# For LM Studio or another OpenAI-compatible server, switch to:
+# provider = "openai_compatible"
+# base_url = "http://127.0.0.1:1234/v1"
+# name = "your-loaded-model-id"
+# api_key = ""
 
 [mcp]
 tool_name_prefix = true

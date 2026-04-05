@@ -4,7 +4,7 @@ This project runs a local-first LangChain Deep Agent behind a Chainlit UI.
 
 The app is wired for:
 
-- `ChatOllama` with a configurable local model
+- `ChatOllama` or `ChatOpenAI` with a configurable local model backend
 - native Chainlit streaming for reasoning, tool calls, and final response
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
@@ -16,9 +16,11 @@ Set these variables before starting the app if you want environment-based overri
 
 ```bash
 export DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=disable"
-export OLLAMA_BASE_URL="http://127.0.0.1:11434"
-export OLLAMA_MODEL="gpt-oss:20b"
-export OLLAMA_REASONING="medium"
+export DEEPAGENT_MODEL_PROVIDER="ollama"
+export DEEPAGENT_MODEL_BASE_URL="http://127.0.0.1:11434"
+export DEEPAGENT_MODEL_NAME="gpt-oss:20b"
+export DEEPAGENT_MODEL_REASONING="medium"
+# export DEEPAGENT_MODEL_API_KEY="optional-for-secured-openai-compatible-servers"
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
 export CHAINLIT_AUTH_USERNAME="admin"
@@ -34,6 +36,12 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 
 - defaults to `deepagent.toml` in the project root
 - if the file is missing, the app falls back to built-in model defaults and runs without extra skills, MCP servers, or custom subagents
+
+`DEEPAGENT_MODEL_*` variables are optional:
+
+- they override the matching `[model]` values in `deepagent.toml`
+- `DEEPAGENT_MODEL_API_KEY` is only needed for secured OpenAI-compatible servers
+- `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
 
 `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
 
@@ -92,16 +100,18 @@ If you leave auth disabled, Chainlit can still persist thread records in Postgre
 
 ## Setup
 
-Install dependencies and ensure Ollama has the model:
+Install dependencies, then either pull an Ollama model or point `deepagent.toml` at an OpenAI-compatible server such as LM Studio:
 
 ```bash
 uv sync
 ollama pull gpt-oss:20b
 ```
 
+If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
+
 This repo now includes a live [deepagent.toml](deepagent.toml) with:
 
-- model defaults for endpoint, port, model name, and reasoning effort
+- model defaults for provider, base URL, model name, and reasoning effort
 - a real `repo` MCP server pinned to `npx @modelcontextprotocol/server-filesystem@2025.8.21`
 - a `repo-researcher` subagent using [prompts/repo-researcher.md](prompts/repo-researcher.md)
 - the repo-local `skills/` source for both the main agent and the subagent
@@ -122,21 +132,34 @@ You can keep the model defaults in `deepagent.toml`:
 
 ```toml
 [model]
-endpoint = "http://127.0.0.1"
-port = 11434
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
 temperature = 0
 name = "gpt-oss:20b"
 reasoning_effort = "medium"
 ```
 
+For LM Studio or another OpenAI-compatible server:
+
+```toml
+[model]
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:1234/v1"
+temperature = 0
+name = "your-loaded-model-id"
+reasoning_effort = "medium"
+# api_key = "optional"
+```
+
 Notes:
 
-- `endpoint` can be a host like `"127.0.0.1"` or a URL like `"http://127.0.0.1"`.
-- `port` is combined with `endpoint` to build `ChatOllama(base_url=...)`.
-- `temperature` sets the default `ChatOllama(temperature=...)`.
-- `name` sets the default `ChatOllama(model=...)`.
-- `reasoning_effort` sets the default Chainlit reasoning level for new chats.
-- `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work and override the TOML defaults when set.
+- `provider` selects `ChatOllama` or `ChatOpenAI`.
+- Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
+- `api_key` is optional and only used for `provider = "openai_compatible"`. When omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
+- Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
+- `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
+- `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, and `DEEPAGENT_MODEL_REASONING` override the TOML defaults when set.
+- `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
 
 ## Chainlit App Config
 

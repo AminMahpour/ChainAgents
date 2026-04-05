@@ -16,6 +16,7 @@ from deepagent_runtime import (
     DEFAULT_REASONING_LEVEL,
     AgentRuntime,
     AppSettings,
+    format_model_provider,
     normalize_reasoning_level,
 )
 from response_exports import (
@@ -63,7 +64,10 @@ def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
                 label="Reasoning Level",
                 values=reasoning_levels,
                 initial_index=reasoning_levels.index(settings.reasoning_level),
-                description="Controls `ChatOllama(reasoning=...)` for the configured model.",
+                description=(
+                    "Controls the configured model's reasoning setting when the active "
+                    "provider supports it."
+                ),
             ),
             TextInput(
                 id="thread_id",
@@ -163,7 +167,8 @@ async def on_chat_start() -> None:
     await cl.Message(
         content=(
             "Workspace agent ready.\n\n"
-            f"- Model: `{runtime.config.ollama_model}`\n"
+            f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
+            f"- Model: `{runtime.config.model_name}`\n"
             f"- Thread ID: `{settings.thread_id}`\n"
             f"{persistence_line}"
             f"{history_line}"
