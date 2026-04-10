@@ -1,10 +1,11 @@
-#[model]
-#provider = "ollama"
-#base_url = "http://127.0.0.1:11434"
-#temperature = 0
-#name = "gemma4:31b"
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+temperature = 0
+name = "gemma4:26b"
 #name = "gpt-oss:20b"
-#reasoning_effort = "medium"
+reasoning_effort = "medium"
+
 # For LM Studio or another OpenAI-compatible server, switch to:
 # provider = "openai_compatible"
 # base_url = "http://127.0.0.1:1234/v1"
@@ -12,12 +13,12 @@
 # api_key = ""
 
 
-[model]
-provider = "openai_compatible"
-base_url = "http://127.0.0.1:1234/v1"
-temperature = 0
-name = "google/gemma-4-26b-a4b"
-reasoning_effort = "medium"
+#[model]
+#provider = "openai_compatible"
+#base_url = "http://127.0.0.1:1234/v1"
+#temperature = 0
+#name = "google/gemma-4-26b-a4b"
+#reasoning_effort = "medium"
 # api_key = "optional"
 
 
@@ -34,6 +35,18 @@ cwd = "."
 [agent]
 skills = ["skills"]
 mcp_servers = ["repo"]
+
+# Async subagent backed by the local LangGraph Agent Protocol server.
+[[async_subagents]]
+name = "async-researcher"
+description = "Runs longer research jobs in the background, such as reading documentation or running code analysis tools."
+graph_id = "async-researcher"
+url = "http://127.0.0.1:2024"
+
+# If you run only the co-deployed langgraph.json setup, omit url for ASGI transport.
+# In Chainlit, set url here or use CHAINLIT_ASYNC_SUBAGENT_URL for HTTP transport.
+#url = "https://researcher-deployment.langsmith.dev"
+#headers = { Authorization = "Bearer ${RESEARCHER_TOKEN}" }
 
 [[subagents]]
 name = "repo-researcher"

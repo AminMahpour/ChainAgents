@@ -1,0 +1,17 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": [
+    ".",
+    "deepagents>=0.5.0",
+    "langchain-mcp-adapters>=0.1.9",
+    "langchain-ollama>=1.0.1",
+    "langchain-openai>=1.0.1",
+    "langgraph-checkpoint-postgres>=1.0.0",
+    "psycopg[binary,pool]>=3.2.0"
+  ],
+  "graphs": {
+    "supervisor": "./langgraph_app.py:supervisor",
+    "async-researcher": "./langgraph_app.py:async_researcher"
+  },
+  "python_version": "3.12"
+}

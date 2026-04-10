@@ -47,3 +47,12 @@ Keep findings concise and actionable.
 """
 skills = ["skills/reviewer"]
 mcp_servers = ["repo"]
+
+[[async_subagents]]
+name = "remote-researcher"
+description = "Runs longer research jobs in the background on an Agent Protocol server."
+graph_id = "researcher"
+# Omit url for ASGI transport in a co-deployed LangGraph setup.
+# Set url for HTTP transport to a remote Agent Protocol server.
+# url = "https://researcher-deployment.langsmith.dev"
+# headers = { Authorization = "Bearer ${RESEARCHER_TOKEN}" }

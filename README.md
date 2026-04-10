@@ -6,6 +6,7 @@ The app is wired for:
 
 - `ChatOllama` or `ChatOpenAI` with a configurable local model backend
 - native Chainlit streaming for reasoning, tool calls, and final response
+- config-driven synchronous and async DeepAgents subagents
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
@@ -269,6 +270,59 @@ Supported subagent fields:
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional model override
 
+## Add Async Subagents
+
+Async subagents are loaded from `deepagent.toml` as background Agent Protocol jobs. They are useful for long-running or remote work where the main agent should return a task ID immediately and let you check, update, cancel, or list tasks later.
+
+Example:
+
+```toml
+[[async_subagents]]
+name = "remote-researcher"
+description = "Runs longer research jobs in the background on an Agent Protocol server."
+graph_id = "researcher"
+# Omit url for ASGI transport in a co-deployed LangGraph setup.
+# Set url for HTTP transport to a remote Agent Protocol server.
+# url = "https://researcher-deployment.langsmith.dev"
+# headers = { Authorization = "Bearer ${RESEARCHER_TOKEN}" }
+```
+
+Supported async subagent fields:
+
+- `name`: required
+- `description`: required
+- `graph_id`: required graph or assistant ID on the Agent Protocol server
+- `url`: optional remote Agent Protocol server URL; omit for ASGI transport in co-deployed LangGraph setups
+- `headers`: optional request headers for remote/self-hosted Agent Protocol servers
+
+For compatibility with DeepAgents' native discriminator, a `[[subagents]]` entry with a `graph_id` is also treated as an async subagent. Async subagents cannot define sync-only fields such as `system_prompt`, `skills`, `mcp_servers`, or `model`; those capabilities are configured on the remote graph.
+
+This repo includes a LangGraph co-deployment entrypoint for ASGI transport:
+
+- [langgraph.json](langgraph.json) registers `supervisor` and `async-researcher`
+- [langgraph_app.py](langgraph_app.py) exports both graphs
+- omit `url` in `deepagent.toml` when running through LangGraph Agent Server
+
+Run the co-deployed Agent Protocol server with enough worker capacity for the supervisor plus background tasks:
+
+```bash
+uv run --with "langgraph-cli[inmem]" langgraph dev --n-jobs-per-worker 10
+```
+
+ASGI transport is only available in this LangGraph server path. If you launch the UI with `chainlit run main.py -w`, use HTTP transport instead by setting `url = "http://127.0.0.1:2024"` on the async subagent.
+
+Chainlit also starts a background notifier for launched async tasks. It polls the Agent Protocol server and posts a message when a task reaches `success`, `error`, `cancelled`, `interrupted`, or `timeout`. If `deepagent.toml` omits `url` for ASGI co-deployment, Chainlit defaults to `http://127.0.0.1:2024`, the usual `langgraph dev` URL. Override it with:
+
+```bash
+export CHAINLIT_ASYNC_SUBAGENT_URL="http://127.0.0.1:2024"
+```
+
+Optional:
+
+```bash
+export CHAINLIT_ASYNC_TASK_POLL_SECONDS="5"
+```
+
 ## Add MCP Servers
 
 MCP servers are defined once in `deepagent.toml` and then attached by name to the main agent or any subagent.
@@ -330,6 +384,7 @@ Notes:
 Current scope of this config support:
 
 - it supports Deep Agents built-in tool surface plus config-driven skills and MCP tools
+- it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
 - if you need custom Python tools, extend [deepagent_runtime.py](deepagent_runtime.py)
 
@@ -347,7 +402,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 - If `DATABASE_URL` is set but authentication is not configured, Chainlit still persists thread records, but they are not browseable from the UI.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.
-- On startup, the UI shows how many skill sources, MCP servers, and custom subagents were loaded from `deepagent.toml`.
+- On startup, the UI shows how many skill sources, MCP servers, custom subagents, and async subagents were loaded from `deepagent.toml`.
 
 ## License
 

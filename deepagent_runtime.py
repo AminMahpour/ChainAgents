@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from deepagents import create_deep_agent
+from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
@@ -236,6 +236,18 @@ def normalize_mcp_server_config(raw_server: dict[str, Any], base_dir: Path) -> d
     return server
 
 
+def normalize_string_mapping(
+    value: Any | None,
+    *,
+    field_name: str,
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"'{field_name}' must be a table/object.")
+    return {str(key): str(raw_value) for key, raw_value in value.items()}
+
+
 @dataclass(frozen=True)
 class SubagentConfig:
     name: str
@@ -261,6 +273,32 @@ class SubagentConfig:
 
 
 @dataclass(frozen=True)
+class AsyncSubagentConfig:
+    name: str
+    description: str
+    graph_id: str
+    url: str | None = None
+    headers: dict[str, str] | None = None
+
+    def to_deepagents_spec(
+        self,
+        *,
+        url_override: str | None = None,
+    ) -> AsyncSubAgent:
+        spec: AsyncSubAgent = {
+            "name": self.name,
+            "description": self.description,
+            "graph_id": self.graph_id,
+        }
+        url = self.url or url_override
+        if url:
+            spec["url"] = url
+        if self.headers:
+            spec["headers"] = dict(self.headers)
+        return spec
+
+
+@dataclass(frozen=True)
 class ExtensionsConfig:
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
@@ -268,10 +306,16 @@ class ExtensionsConfig:
     skills: tuple[str, ...] = ()
     agent_mcp_servers: tuple[str, ...] = ()
     subagents: tuple[SubagentConfig, ...] = ()
+    async_subagents: tuple[AsyncSubagentConfig, ...] = ()
 
     @property
     def enabled(self) -> bool:
-        return bool(self.skills or self.agent_mcp_servers or self.subagents)
+        return bool(
+            self.skills
+            or self.agent_mcp_servers
+            or self.subagents
+            or self.async_subagents
+        )
 
 
 @dataclass(frozen=True)
@@ -339,6 +383,110 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
     )
 
 
+def parse_async_subagent_config(
+    raw_subagent: dict[str, Any],
+    *,
+    index: int,
+    source_name: str,
+) -> AsyncSubagentConfig:
+    name = str(raw_subagent.get("name", "")).strip()
+    description = str(raw_subagent.get("description", "")).strip()
+    graph_id = str(raw_subagent.get("graph_id", "")).strip()
+    if not name or not description or not graph_id:
+        raise ValueError(
+            f"{source_name} entry #{index} must include non-empty "
+            "'name', 'description', and 'graph_id'."
+        )
+
+    unsupported_fields = sorted(
+        field
+        for field in (
+            "system_prompt",
+            "system_prompt_file",
+            "skills",
+            "mcp_servers",
+            "model",
+        )
+        if field in raw_subagent
+    )
+    if unsupported_fields:
+        raise ValueError(
+            f"Async subagent '{name}' cannot define sync-only field(s): "
+            f"{', '.join(unsupported_fields)}."
+        )
+
+    return AsyncSubagentConfig(
+        name=name,
+        description=description,
+        graph_id=graph_id,
+        url=normalize_optional_string(
+            normalize_model_base_url(raw_subagent.get("url"))
+        ),
+        headers=normalize_string_mapping(
+            raw_subagent.get("headers"),
+            field_name=f"async subagent '{name}' headers",
+        ),
+    )
+
+
+def parse_sync_subagent_config(
+    raw_subagent: dict[str, Any],
+    *,
+    index: int,
+    base_dir: Path,
+    mcp_servers: dict[str, dict[str, Any]],
+) -> SubagentConfig:
+    name = str(raw_subagent.get("name", "")).strip()
+    description = str(raw_subagent.get("description", "")).strip()
+    if not name or not description:
+        raise ValueError(
+            f"Subagent entry #{index} must include non-empty 'name' and 'description'."
+        )
+
+    inline_prompt = raw_subagent.get("system_prompt")
+    prompt_file = raw_subagent.get("system_prompt_file")
+    if inline_prompt and prompt_file:
+        raise ValueError(
+            f"Subagent '{name}' cannot define both 'system_prompt' and 'system_prompt_file'."
+        )
+    if prompt_file:
+        prompt_path = resolve_local_path(str(prompt_file), base_dir)
+        system_prompt = prompt_path.read_text(encoding="utf-8").strip()
+    else:
+        system_prompt = str(inline_prompt or "").strip()
+    if not system_prompt:
+        raise ValueError(
+            f"Subagent '{name}' must include 'system_prompt' or 'system_prompt_file'."
+        )
+
+    raw_subagent_skill_paths = raw_subagent.get("skills", [])
+    subagent_skill_paths = tuple(
+        normalize_skill_source_path(str(path_value), base_dir)
+        for path_value in raw_subagent_skill_paths
+    )
+    raw_subagent_mcp_servers = tuple(
+        str(server_name).strip()
+        for server_name in raw_subagent.get("mcp_servers", [])
+        if str(server_name).strip()
+    )
+    for server_name in raw_subagent_mcp_servers:
+        if server_name not in mcp_servers:
+            raise ValueError(
+                f"Subagent '{name}' references unknown MCP server '{server_name}'. "
+                f"Defined servers: {sorted(mcp_servers)}"
+            )
+
+    model = str(raw_subagent.get("model", "")).strip() or None
+    return SubagentConfig(
+        name=name,
+        description=description,
+        system_prompt=system_prompt,
+        skills=subagent_skill_paths,
+        mcp_servers=raw_subagent_mcp_servers,
+        model=model,
+    )
+
+
 def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> ExtensionsConfig:
     base_dir = config_path.parent
     mcp_section = raw_config.get("mcp", {})
@@ -374,62 +522,44 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
             )
 
     raw_subagents = raw_config.get("subagents", [])
-    if raw_subagents and not isinstance(raw_subagents, list):
+    if not isinstance(raw_subagents, list):
         raise ValueError("The top-level 'subagents' config must be an array of tables.")
     subagents: list[SubagentConfig] = []
+    async_subagents: list[AsyncSubagentConfig] = []
     for index, raw_subagent in enumerate(raw_subagents, start=1):
         if not isinstance(raw_subagent, dict):
             raise ValueError(f"Subagent entry #{index} must be a table/object.")
-
-        name = str(raw_subagent.get("name", "")).strip()
-        description = str(raw_subagent.get("description", "")).strip()
-        if not name or not description:
-            raise ValueError(
-                f"Subagent entry #{index} must include non-empty 'name' and 'description'."
-            )
-
-        inline_prompt = raw_subagent.get("system_prompt")
-        prompt_file = raw_subagent.get("system_prompt_file")
-        if inline_prompt and prompt_file:
-            raise ValueError(
-                f"Subagent '{name}' cannot define both 'system_prompt' and 'system_prompt_file'."
-            )
-        if prompt_file:
-            prompt_path = resolve_local_path(str(prompt_file), base_dir)
-            system_prompt = prompt_path.read_text(encoding="utf-8").strip()
-        else:
-            system_prompt = str(inline_prompt or "").strip()
-        if not system_prompt:
-            raise ValueError(
-                f"Subagent '{name}' must include 'system_prompt' or 'system_prompt_file'."
-            )
-
-        raw_subagent_skill_paths = raw_subagent.get("skills", [])
-        subagent_skill_paths = tuple(
-            normalize_skill_source_path(str(path_value), base_dir)
-            for path_value in raw_subagent_skill_paths
-        )
-        raw_subagent_mcp_servers = tuple(
-            str(server_name).strip()
-            for server_name in raw_subagent.get("mcp_servers", [])
-            if str(server_name).strip()
-        )
-        for server_name in raw_subagent_mcp_servers:
-            if server_name not in mcp_servers:
-                raise ValueError(
-                    f"Subagent '{name}' references unknown MCP server '{server_name}'. "
-                    f"Defined servers: {sorted(mcp_servers)}"
+        if "graph_id" in raw_subagent:
+            async_subagents.append(
+                parse_async_subagent_config(
+                    raw_subagent,
+                    index=index,
+                    source_name="Subagent",
                 )
-
-        model = str(raw_subagent.get("model", "")).strip() or None
+            )
+            continue
         subagents.append(
-            SubagentConfig(
-                name=name,
-                description=description,
-                system_prompt=system_prompt,
-                skills=subagent_skill_paths,
-                mcp_servers=raw_subagent_mcp_servers,
-                model=model,
+            parse_sync_subagent_config(
+                raw_subagent,
+                index=index,
+                base_dir=base_dir,
+                mcp_servers=mcp_servers,
+            )
+        )
+
+    raw_async_subagents = raw_config.get("async_subagents", [])
+    if not isinstance(raw_async_subagents, list):
+        raise ValueError(
+            "The top-level 'async_subagents' config must be an array of tables."
+        )
+    for index, raw_async_subagent in enumerate(raw_async_subagents, start=1):
+        if not isinstance(raw_async_subagent, dict):
+            raise ValueError(f"Async subagent entry #{index} must be a table/object.")
+        async_subagents.append(
+            parse_async_subagent_config(
+                raw_async_subagent,
+                index=index,
+                source_name="Async subagent",
             )
         )
 
@@ -440,6 +570,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         skills=skill_paths,
         agent_mcp_servers=raw_agent_mcp_servers,
         subagents=tuple(subagents),
+        async_subagents=tuple(async_subagents),
     )
 
 
@@ -549,6 +680,73 @@ class RuntimeConfig:
         )
 
 
+def build_model(config: RuntimeConfig, reasoning_level: ReasoningLevel) -> Any:
+    if config.model_provider == "ollama":
+        return ChatOllama(
+            model=config.model_name,
+            base_url=config.model_base_url,
+            reasoning=reasoning_level,
+            temperature=config.model_temperature,
+        )
+
+    kwargs: dict[str, Any] = {
+        "model": config.model_name,
+        "base_url": config.model_base_url,
+        "api_key": config.model_api_key or "deepagent",
+        "temperature": config.model_temperature,
+    }
+    return ChatOpenAI(**kwargs)
+
+
+def build_deepagent_backend() -> CompositeBackend:
+    return CompositeBackend(
+        default=StateBackend(),
+        routes={
+            "/workspace/": FilesystemBackend(
+                root_dir=str(PROJECT_ROOT),
+                virtual_mode=True,
+            ),
+            "/memories/": StoreBackend(),
+        },
+    )
+
+
+def build_graph_subagent_specs(
+    config: RuntimeConfig,
+    *,
+    include_async_subagents: bool,
+) -> list[Any]:
+    subagent_specs: list[Any] = [
+        subagent.to_deepagents_spec()
+        for subagent in config.extensions.subagents
+    ]
+    if include_async_subagents:
+        subagent_specs.extend(
+            subagent.to_deepagents_spec()
+            for subagent in config.extensions.async_subagents
+        )
+    return subagent_specs
+
+
+def create_configured_graph(
+    *,
+    include_async_subagents: bool,
+    system_prompt: str = SYSTEM_PROMPT,
+) -> Any:
+    config = RuntimeConfig.from_env()
+    subagent_specs = build_graph_subagent_specs(
+        config,
+        include_async_subagents=include_async_subagents,
+    )
+    return create_deep_agent(
+        model=build_model(config, config.default_reasoning),
+        system_prompt=system_prompt,
+        backend=build_deepagent_backend(),
+        skills=list(config.extensions.skills) or None,
+        subagents=subagent_specs or None,
+    )
+
+
 @dataclass(frozen=True)
 class AppSettings:
     reasoning_level: ReasoningLevel
@@ -563,7 +761,7 @@ class AgentRuntime:
         self.config = config
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
-        self._agents: dict[ReasoningLevel, object] = {}
+        self._agents: dict[tuple[ReasoningLevel, str | None], object] = {}
         self._mcp_client: MultiServerMCPClient | None = None
         self._mcp_tools_cache: dict[tuple[str, ...], list[Any]] = {}
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
@@ -616,13 +814,33 @@ class AgentRuntime:
         )
         await self.checkpointer.setup()
 
-    async def get_agent(self, reasoning_level: ReasoningLevel):
+    async def get_agent(
+        self,
+        reasoning_level: ReasoningLevel,
+        *,
+        async_subagent_url_override: str | None = None,
+    ):
+        cache_key = (reasoning_level, async_subagent_url_override)
         async with self._agent_lock:
-            agent = self._agents.get(reasoning_level)
+            agent = self._agents.get(cache_key)
             if agent is None:
                 model = self._build_model(reasoning_level)
                 main_tools = self._sanitize_tools_for_model(
                     await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
+                )
+                subagent_specs: list[Any] = [
+                    subagent.to_deepagents_spec(
+                        tools=self._sanitize_tools_for_model(
+                            await self._get_mcp_tools(subagent.mcp_servers)
+                        )
+                    )
+                    for subagent in self.config.extensions.subagents
+                ]
+                subagent_specs.extend(
+                    subagent.to_deepagents_spec(
+                        url_override=async_subagent_url_override,
+                    )
+                    for subagent in self.config.extensions.async_subagents
                 )
                 agent = create_deep_agent(
                     model=model,
@@ -632,17 +850,9 @@ class AgentRuntime:
                     store=self.store,
                     checkpointer=self.checkpointer,
                     skills=list(self.config.extensions.skills) or None,
-                    subagents=[
-                        subagent.to_deepagents_spec(
-                            tools=self._sanitize_tools_for_model(
-                                await self._get_mcp_tools(subagent.mcp_servers)
-                            )
-                        )
-                        for subagent in self.config.extensions.subagents
-                    ]
-                    or None,
+                    subagents=subagent_specs or None,
                 )
-                self._agents[reasoning_level] = agent
+                self._agents[cache_key] = agent
             return agent
 
     def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
@@ -678,21 +888,7 @@ class AgentRuntime:
         return isinstance(parameters, dict) and parameters.get("type") == "object"
 
     def _build_model(self, reasoning_level: ReasoningLevel) -> Any:
-        if self.config.model_provider == "ollama":
-            return ChatOllama(
-                model=self.config.model_name,
-                base_url=self.config.model_base_url,
-                reasoning=reasoning_level,
-                temperature=self.config.model_temperature,
-            )
-
-        kwargs: dict[str, Any] = {
-            "model": self.config.model_name,
-            "base_url": self.config.model_base_url,
-            "api_key": self.config.model_api_key or "deepagent",
-            "temperature": self.config.model_temperature,
-        }
-        return ChatOpenAI(**kwargs)
+        return build_model(self.config, reasoning_level)
 
     async def _get_mcp_tools(self, server_names: tuple[str, ...]) -> list[Any]:
         if not server_names or self._mcp_client is None:
@@ -711,13 +907,4 @@ class AgentRuntime:
         return list(tools)
 
     def _build_backend(self, runtime):
-        return CompositeBackend(
-            default=StateBackend(runtime),
-            routes={
-                "/workspace/": FilesystemBackend(
-                    root_dir=str(PROJECT_ROOT),
-                    virtual_mode=True,
-                ),
-                "/memories/": StoreBackend(runtime),
-            },
-        )
+        return build_deepagent_backend()

@@ -11,6 +11,7 @@ import chainlit as cl
 from chainlit.input_widget import Select, TextInput
 from chainlit.types import ThreadDict
 
+from async_task_notifications import AsyncTaskNotifier, async_subagent_url_override
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
 from deepagent_runtime import (
     DEFAULT_REASONING_LEVEL,
@@ -29,6 +30,7 @@ from response_exports import (
 
 SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
+SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 AUTH_USERNAME = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
 AUTH_PASSWORD = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
 AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
@@ -133,6 +135,34 @@ async def get_run_task_list() -> RunTaskList:
     return run_task_list
 
 
+def get_async_task_notifier(
+    *,
+    agent: Any,
+    runtime: AgentRuntime,
+    url_override: str | None,
+) -> AsyncTaskNotifier | None:
+    if not runtime.config.extensions.async_subagents:
+        return None
+
+    notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
+    if (
+        isinstance(notifier, AsyncTaskNotifier)
+        and notifier.matches(agent=agent, url_override=url_override)
+    ):
+        return notifier
+
+    if isinstance(notifier, AsyncTaskNotifier):
+        notifier.cancel()
+
+    notifier = AsyncTaskNotifier(
+        agent=agent,
+        async_subagents=runtime.config.extensions.async_subagents,
+        url_override=url_override,
+    )
+    cl.user_session.set(SESSION_ASYNC_TASK_NOTIFIER_KEY, notifier)
+    return notifier
+
+
 @cl.on_chat_start
 async def on_chat_start() -> None:
     runtime = await get_runtime_or_notify()
@@ -161,6 +191,7 @@ async def on_chat_start() -> None:
         f"- Skill sources: `{len(extensions.skills)}`\n"
         f"- MCP servers: `{len(extensions.mcp_servers or {})}`\n"
         f"- Custom subagents: `{len(extensions.subagents)}`\n"
+        f"- Async subagents: `{len(extensions.async_subagents)}`\n"
     )
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
@@ -196,6 +227,19 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     settings = coerce_settings(raw_settings)
     store_settings(settings)
     await build_chat_settings(settings).send()
+    async_url_override = async_subagent_url_override()
+    agent = await runtime.get_agent(
+        settings.reasoning_level,
+        async_subagent_url_override=async_url_override,
+    )
+    async_task_notifier = get_async_task_notifier(
+        agent=agent,
+        runtime=runtime,
+        url_override=async_url_override,
+    )
+    if async_task_notifier is not None:
+        with suppress(Exception):
+            await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
 
 
 @cl.on_settings_update
@@ -221,7 +265,16 @@ async def on_message(message: cl.Message) -> None:
     if runtime is None:
         return
     run_task_list = await get_run_task_list()
-    agent = await runtime.get_agent(settings.reasoning_level)
+    async_url_override = async_subagent_url_override()
+    agent = await runtime.get_agent(
+        settings.reasoning_level,
+        async_subagent_url_override=async_url_override,
+    )
+    async_task_notifier = get_async_task_notifier(
+        agent=agent,
+        runtime=runtime,
+        url_override=async_url_override,
+    )
     bridge = ChainlitEventBridge(prompt=message.content, run_task_list=run_task_list)
     await bridge.start()
 
@@ -258,3 +311,13 @@ async def on_message(message: cl.Message) -> None:
             await stream.aclose()
 
     await bridge.finish()
+    if async_task_notifier is not None:
+        with suppress(Exception):
+            await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
+
+
+@cl.on_chat_end
+async def on_chat_end() -> None:
+    notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
+    if isinstance(notifier, AsyncTaskNotifier):
+        notifier.cancel()

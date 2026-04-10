@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "asyncpg>=0.30.0",
     "chainlit>=2.8.0",
-    "deepagents>=0.4.4",
+    "deepagents>=0.5.0",
     "langchain-mcp-adapters>=0.1.9",
     "langchain-ollama>=1.0.1",
     "langchain-openai>=1.0.1",

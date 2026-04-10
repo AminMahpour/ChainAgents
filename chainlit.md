@@ -29,8 +29,11 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 
 ## Optional Extensions
 
-- Use `deepagent.toml` to add skills, MCP servers, and custom subagents.
-- Each subagent can have its own `skills` and `mcp_servers`.
+- Use `deepagent.toml` to add skills, MCP servers, custom subagents, and async subagents.
+- Each sync subagent can have its own `skills` and `mcp_servers`.
+- Async subagents are Agent Protocol background jobs configured with `graph_id` and optional `url`/`headers`.
+- Omit async subagent `url` only when running the co-deployed graphs from `langgraph.json`; Chainlit-only runs need an HTTP `url`.
+- Chainlit uses `http://127.0.0.1:2024` as the default HTTP fallback for launch and completion notifications; override it with `CHAINLIT_ASYNC_SUBAGENT_URL`.
 
 ## App Config
 
