@@ -110,6 +110,12 @@ ollama pull gpt-oss:20b
 
 If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
 
+If you enable workspace-docs RAG with Ollama embeddings, also pull an embedding model such as:
+
+```bash
+ollama pull nomic-embed-text
+```
+
 This repo now includes a live [deepagent.toml](deepagent.toml) with:
 
 - model defaults for provider, base URL, model name, and reasoning effort
@@ -161,6 +167,36 @@ Notes:
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, and `DEEPAGENT_MODEL_REASONING` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
+
+## Optional: Enable Workspace Docs RAG
+
+The app can build a local-first RAG index over repo documentation and expose it to the main agent as the `search_workspace_knowledge` tool.
+
+Example config:
+
+```toml
+[rag]
+enabled = true
+persist_directory = ".rag"
+include_globs = ["README.md", "chainlit.md", "prompts/**/*.md", "skills/**/*.md"]
+exclude_globs = ["AGENTS.md", "AGENT.md"]
+chunk_size = 1200
+chunk_overlap = 200
+top_k = 4
+
+[rag.embedding]
+provider = "auto"
+```
+
+Notes:
+
+- The default corpus is docs-only: `README.md`, `chainlit.md`, `prompts/**/*.md`, and `skills/**/*.md`.
+- The persisted local index lives under [`.rag/`](.rag/) and is safe to delete and rebuild.
+- With `provider = "auto"`, the embedding backend follows the active chat-model provider.
+- For Ollama, the default embedding model is `nomic-embed-text`.
+- For OpenAI-compatible embeddings, set `[rag.embedding].model` explicitly.
+- On startup, the UI reports whether RAG is ready and how many files/chunks were indexed.
+- The startup message includes a `Rebuild Knowledge Index` action so you can refresh the index after documentation changes.
 
 ## Chainlit App Config
 

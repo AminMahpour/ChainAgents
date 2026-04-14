@@ -31,6 +31,7 @@ from response_exports import (
 SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
+REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
 AUTH_USERNAME = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
 AUTH_PASSWORD = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
 AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
@@ -55,6 +56,32 @@ def settings_payload(settings: AppSettings) -> dict[str, str]:
 
 def store_settings(settings: AppSettings) -> None:
     cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
+
+
+def build_rag_action() -> cl.Action:
+    return cl.Action(
+        name=REBUILD_RAG_INDEX_ACTION,
+        payload={},
+        label="Rebuild Knowledge Index",
+        tooltip="Rebuild the local documentation RAG index.",
+        icon="refresh-cw",
+    )
+
+
+def rag_status_line(runtime: AgentRuntime) -> str:
+    status = runtime.rag_status
+    if not status.enabled:
+        return "- RAG: disabled\n"
+    if status.ready:
+        return (
+            f"- RAG: ready (`{status.file_count}` files, "
+            f"`{status.chunk_count}` chunks)\n"
+        )
+
+    reason = (status.reason or "unknown error").strip()
+    if len(reason) > 160:
+        reason = f"{reason[:157].rstrip()}..."
+    return f"- RAG: unavailable; {reason}\n"
 
 
 def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
@@ -195,7 +222,7 @@ async def on_chat_start() -> None:
     )
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
-    await cl.Message(
+    startup_message = cl.Message(
         content=(
             "Workspace agent ready.\n\n"
             f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
@@ -203,12 +230,16 @@ async def on_chat_start() -> None:
             f"- Thread ID: `{settings.thread_id}`\n"
             f"{persistence_line}"
             f"{history_line}"
+            f"{rag_status_line(runtime)}"
             f"{extensions_line}"
             "- Real repo files live under `/workspace/`\n"
             "- Agent memory is available under `/memories/`"
         ),
         author="System",
-    ).send()
+    )
+    if runtime.rag_enabled:
+        startup_message.actions = [build_rag_action()]
+    await startup_message.send()
 
 
 @cl.on_chat_resume
@@ -256,6 +287,30 @@ async def download_response_markdown(action: cl.Action) -> None:
 @cl.action_callback(DOWNLOAD_PDF_ACTION)
 async def download_response_pdf(action: cl.Action) -> None:
     await send_pdf_export(action)
+
+
+@cl.action_callback(REBUILD_RAG_INDEX_ACTION)
+async def rebuild_knowledge_index(action: cl.Action) -> None:
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+
+    status = await runtime.rebuild_rag_index()
+    if status.ready:
+        content = (
+            "Knowledge index rebuilt.\n\n"
+            f"- Files indexed: `{status.file_count}`\n"
+            f"- Chunks indexed: `{status.chunk_count}`"
+        )
+    elif status.enabled:
+        content = f"Knowledge index rebuild failed: {status.reason or 'unknown error'}"
+    else:
+        content = "RAG is currently disabled in `deepagent.toml`."
+
+    message = cl.Message(content=content, author="System")
+    if runtime.rag_enabled:
+        message.actions = [build_rag_action()]
+    await message.send()
 
 
 @cl.on_message

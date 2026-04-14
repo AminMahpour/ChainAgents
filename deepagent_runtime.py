@@ -26,6 +26,16 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
+from rag_runtime import (
+    RagConfig,
+    RagStatus,
+    ResolvedRagConfig,
+    WorkspaceDocsRAG,
+    compose_rag_system_prompt,
+    create_search_workspace_knowledge_tool,
+    parse_rag_config,
+    resolve_rag_config,
+)
 
 
 ModelProvider = Literal["ollama", "openai_compatible"]
@@ -333,6 +343,7 @@ class ModelDefaults:
 class FileConfig:
     model: ModelDefaults
     extensions: ExtensionsConfig
+    rag: RagConfig = RagConfig()
 
 
 def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
@@ -581,6 +592,7 @@ def load_file_config() -> FileConfig:
         return FileConfig(
             model=ModelDefaults(),
             extensions=ExtensionsConfig(config_path=None),
+            rag=RagConfig(),
         )
 
     with config_path.open("rb") as fh:
@@ -589,6 +601,7 @@ def load_file_config() -> FileConfig:
     return FileConfig(
         model=parse_model_defaults(raw_config),
         extensions=parse_extensions_config(raw_config, config_path),
+        rag=parse_rag_config(raw_config, config_path),
     )
 
 
@@ -608,6 +621,9 @@ class RuntimeConfig:
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    rag_requested: bool = False
+    rag: ResolvedRagConfig | None = None
+    rag_error: str | None = None
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
@@ -666,6 +682,18 @@ class RuntimeConfig:
             generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
         )
+        rag_requested = file_config.rag.enabled
+        rag = None
+        rag_error = None
+        if rag_requested:
+            try:
+                rag = resolve_rag_config(
+                    file_config.rag,
+                    model_provider=model_provider,
+                    model_base_url=model_base_url,
+                )
+            except ValueError as exc:
+                rag_error = str(exc)
 
         return cls(
             database_url=database_url,
@@ -677,6 +705,9 @@ class RuntimeConfig:
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
             extensions=file_config.extensions,
+            rag_requested=rag_requested,
+            rag=rag,
+            rag_error=rag_error,
         )
 
 
@@ -711,6 +742,42 @@ def build_deepagent_backend() -> CompositeBackend:
     )
 
 
+def sanitize_tools_for_model(
+    model_provider: ModelProvider,
+    tools: list[Any],
+) -> list[Any]:
+    if model_provider != "openai_compatible":
+        return list(tools)
+
+    compatible_tools: list[Any] = []
+    skipped_tool_names: list[str] = []
+    for tool in tools:
+        if tool_supports_openai_compatible_schema(tool):
+            compatible_tools.append(tool)
+            continue
+        skipped_tool_names.append(getattr(tool, "name", type(tool).__name__))
+
+    if skipped_tool_names:
+        logger.warning(
+            "Skipping %d tool(s) with non-object JSON schemas for OpenAI-compatible "
+            "tool calling: %s",
+            len(skipped_tool_names),
+            ", ".join(skipped_tool_names),
+        )
+
+    return compatible_tools
+
+
+def tool_supports_openai_compatible_schema(tool: Any) -> bool:
+    try:
+        schema = convert_to_openai_tool(tool)
+    except Exception:
+        return False
+
+    parameters = schema.get("function", {}).get("parameters")
+    return isinstance(parameters, dict) and parameters.get("type") == "object"
+
+
 def build_graph_subagent_specs(
     config: RuntimeConfig,
     *,
@@ -738,9 +805,23 @@ def create_configured_graph(
         config,
         include_async_subagents=include_async_subagents,
     )
+    tools: list[Any] = []
+    if config.rag is not None:
+        tools.append(
+            create_search_workspace_knowledge_tool(
+                WorkspaceDocsRAG(config.rag, project_root=PROJECT_ROOT)
+            )
+        )
+    else:
+        if config.rag_requested and config.rag_error:
+            logger.warning("RAG is configured but unavailable: %s", config.rag_error)
     return create_deep_agent(
         model=build_model(config, config.default_reasoning),
-        system_prompt=system_prompt,
+        tools=sanitize_tools_for_model(config.model_provider, tools) or None,
+        system_prompt=compose_rag_system_prompt(
+            system_prompt,
+            rag_enabled=config.rag is not None,
+        ),
         backend=build_deepagent_backend(),
         skills=list(config.extensions.skills) or None,
         subagents=subagent_specs or None,
@@ -766,6 +847,7 @@ class AgentRuntime:
         self._mcp_tools_cache: dict[tuple[str, ...], list[Any]] = {}
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
+        self._rag_service: WorkspaceDocsRAG | None = None
 
     @classmethod
     async def get(cls) -> "AgentRuntime":
@@ -792,6 +874,23 @@ class AgentRuntime:
     def persistence_enabled(self) -> bool:
         return self.config.persistence_mode == "postgres"
 
+    @property
+    def rag_enabled(self) -> bool:
+        return self.config.rag_requested
+
+    @property
+    def rag_status(self) -> RagStatus:
+        if self._rag_service is not None:
+            return self._rag_service.snapshot()
+        if self.config.rag_requested:
+            return RagStatus.unavailable(
+                reason=self.config.rag_error or "Knowledge index is unavailable.",
+                persist_directory=(
+                    self.config.rag.persist_directory if self.config.rag is not None else None
+                ),
+            )
+        return RagStatus.disabled()
+
     async def _initialize(self) -> None:
         if self.config.extensions.mcp_servers:
             self._mcp_client = MultiServerMCPClient(
@@ -802,17 +901,27 @@ class AgentRuntime:
         if not self.config.database_url:
             self._store = InMemoryStore()
             self._checkpointer = MemorySaver()
-            return
+        else:
+            self._store = await self._exit_stack.enter_async_context(
+                AsyncPostgresStore.from_conn_string(self.config.database_url)
+            )
+            await self.store.setup()
 
-        self._store = await self._exit_stack.enter_async_context(
-            AsyncPostgresStore.from_conn_string(self.config.database_url)
-        )
-        await self.store.setup()
+            self._checkpointer = await self._exit_stack.enter_async_context(
+                AsyncPostgresSaver.from_conn_string(self.config.database_url)
+            )
+            await self.checkpointer.setup()
 
-        self._checkpointer = await self._exit_stack.enter_async_context(
-            AsyncPostgresSaver.from_conn_string(self.config.database_url)
-        )
-        await self.checkpointer.setup()
+        if self.config.rag is not None:
+            self._rag_service = WorkspaceDocsRAG(
+                self.config.rag,
+                project_root=PROJECT_ROOT,
+            )
+            rag_status = await asyncio.to_thread(self._rag_service.ensure_ready)
+            if not rag_status.ready and rag_status.reason:
+                logger.warning("RAG initialization failed: %s", rag_status.reason)
+        elif self.config.rag_requested and self.config.rag_error:
+            logger.warning("RAG is configured but unavailable: %s", self.config.rag_error)
 
     async def get_agent(
         self,
@@ -825,13 +934,18 @@ class AgentRuntime:
             agent = self._agents.get(cache_key)
             if agent is None:
                 model = self._build_model(reasoning_level)
-                main_tools = self._sanitize_tools_for_model(
-                    await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
+                rag_tool_enabled = (
+                    self._rag_service is not None and self._rag_service.snapshot().ready
+                )
+                main_tools = sanitize_tools_for_model(
+                    self.config.model_provider,
+                    await self._build_main_tools(),
                 )
                 subagent_specs: list[Any] = [
                     subagent.to_deepagents_spec(
-                        tools=self._sanitize_tools_for_model(
-                            await self._get_mcp_tools(subagent.mcp_servers)
+                        tools=sanitize_tools_for_model(
+                            self.config.model_provider,
+                            await self._get_mcp_tools(subagent.mcp_servers),
                         )
                     )
                     for subagent in self.config.extensions.subagents
@@ -845,7 +959,10 @@ class AgentRuntime:
                 agent = create_deep_agent(
                     model=model,
                     tools=main_tools or None,
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=compose_rag_system_prompt(
+                        SYSTEM_PROMPT,
+                        rag_enabled=rag_tool_enabled,
+                    ),
                     backend=self._build_backend,
                     store=self.store,
                     checkpointer=self.checkpointer,
@@ -855,37 +972,29 @@ class AgentRuntime:
                 self._agents[cache_key] = agent
             return agent
 
+    async def rebuild_rag_index(self) -> RagStatus:
+        if self._rag_service is None:
+            if self.config.rag_requested:
+                return RagStatus.unavailable(
+                    reason=self.config.rag_error or "Knowledge index is unavailable.",
+                    persist_directory=(
+                        self.config.rag.persist_directory
+                        if self.config.rag is not None
+                        else None
+                    ),
+                )
+            return RagStatus.disabled()
+
+        status = await asyncio.to_thread(self._rag_service.rebuild)
+        await self._clear_agent_cache()
+        return status
+
     def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
-        if self.config.model_provider != "openai_compatible":
-            return list(tools)
-
-        compatible_tools: list[Any] = []
-        skipped_tool_names: list[str] = []
-        for tool in tools:
-            if self._tool_supports_openai_compatible_schema(tool):
-                compatible_tools.append(tool)
-                continue
-            skipped_tool_names.append(getattr(tool, "name", type(tool).__name__))
-
-        if skipped_tool_names:
-            logger.warning(
-                "Skipping %d tool(s) with non-object JSON schemas for OpenAI-compatible "
-                "tool calling: %s",
-                len(skipped_tool_names),
-                ", ".join(skipped_tool_names),
-            )
-
-        return compatible_tools
+        return sanitize_tools_for_model(self.config.model_provider, tools)
 
     @staticmethod
     def _tool_supports_openai_compatible_schema(tool: Any) -> bool:
-        try:
-            schema = convert_to_openai_tool(tool)
-        except Exception:
-            return False
-
-        parameters = schema.get("function", {}).get("parameters")
-        return isinstance(parameters, dict) and parameters.get("type") == "object"
+        return tool_supports_openai_compatible_schema(tool)
 
     def _build_model(self, reasoning_level: ReasoningLevel) -> Any:
         return build_model(self.config, reasoning_level)
@@ -905,6 +1014,17 @@ class AgentRuntime:
 
         self._mcp_tools_cache[cache_key] = tools
         return list(tools)
+
+    async def _build_main_tools(self) -> list[Any]:
+        tools = await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
+        if self._rag_service is not None and self._rag_service.snapshot().ready:
+            tools = list(tools)
+            tools.append(create_search_workspace_knowledge_tool(self._rag_service))
+        return tools
+
+    async def _clear_agent_cache(self) -> None:
+        async with self._agent_lock:
+            self._agents.clear()
 
     def _build_backend(self, runtime):
         return build_deepagent_backend()
