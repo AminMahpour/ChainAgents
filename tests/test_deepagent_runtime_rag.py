@@ -15,8 +15,10 @@ from deepagent_runtime import (
 from rag_runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
     RagStatus,
+    RagUploadResult,
     ResolvedRagConfig,
     ResolvedRagEmbeddingConfig,
+    UploadedRagFile,
 )
 
 
@@ -141,7 +143,13 @@ def test_get_agent_includes_rag_tool_when_ready(
                 persist_directory=tmp_path / ".rag",
             )
 
-        def search(self, *, query: str, top_k: int | None = None):
+        def search(
+            self,
+            *,
+            query: str,
+            top_k: int | None = None,
+            thread_id: str | None = None,
+        ):
             return {"query": query, "results": []}
 
     monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
@@ -151,13 +159,13 @@ def test_get_agent_includes_rag_tool_when_ready(
     runtime._checkpointer = MemorySaver()
     runtime._rag_service = ReadyRAG()
 
-    asyncio.run(runtime.get_agent("medium"))
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
 
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" in tool_names
 
 
-def test_get_agent_omits_rag_tool_when_unavailable(
+def test_get_agent_omits_rag_tool_when_service_is_missing(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -168,21 +176,13 @@ def test_get_agent_omits_rag_tool_when_unavailable(
         captured["kwargs"] = kwargs
         return object()
 
-    class UnavailableRAG:
-        def snapshot(self) -> RagStatus:
-            return RagStatus.unavailable(
-                reason="boom",
-                persist_directory=tmp_path / ".rag",
-            )
-
     monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
-    runtime._rag_service = UnavailableRAG()
 
-    asyncio.run(runtime.get_agent("medium"))
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
 
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" not in tool_names
@@ -204,9 +204,36 @@ def test_rebuild_rag_index_clears_cached_agents(
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     runtime._rag_service = RebuildableRAG()
-    runtime._agents[("medium", None)] = object()
+    runtime._agents[("medium", "thread-1", None)] = object()
 
     status = asyncio.run(runtime.rebuild_rag_index())
 
     assert status.ready is True
     assert runtime._agents == {}
+
+
+def test_ingest_rag_uploads_delegates_to_rag_service(tmp_path: Path) -> None:
+    class UploadableRAG:
+        def ingest_uploaded_files(self, *, thread_id: str, uploads: list[UploadedRagFile]) -> RagUploadResult:
+            return RagUploadResult(
+                thread_id=thread_id,
+                added_files=tuple(upload.name for upload in uploads),
+                indexed_files=len(uploads),
+                chunk_count=len(uploads),
+            )
+
+    upload_path = tmp_path / "notes.md"
+    upload_path.write_text("hello", encoding="utf-8")
+
+    runtime = AgentRuntime(make_runtime_config(tmp_path))
+    runtime._rag_service = UploadableRAG()
+
+    result = asyncio.run(
+        runtime.ingest_rag_uploads(
+            thread_id="thread-9",
+            uploads=[UploadedRagFile(path=upload_path, name="notes.md")],
+        )
+    )
+
+    assert result.success is True
+    assert result.added_files == ("notes.md",)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 from dataclasses import dataclass
@@ -37,6 +38,23 @@ DEFAULT_RAG_TOP_K = 4
 DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 RAG_MANIFEST_VERSION = 1
 RAG_COLLECTION_NAME = "workspace_docs"
+RAG_UPLOADS_DIRECTORY_NAME = "uploads"
+RAG_UPLOAD_FILES_DIRECTORY_NAME = "files"
+RAG_UPLOAD_COLLECTION_DIRECTORY_NAME = "chroma"
+RAG_UPLOAD_MANIFEST_FILENAME = "manifest.json"
+ALLOWED_RAG_UPLOAD_EXTENSIONS = (
+    ".csv",
+    ".json",
+    ".log",
+    ".md",
+    ".py",
+    ".rst",
+    ".text",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+)
 
 RAG_SYSTEM_PROMPT_SUFFIX = """
 
@@ -200,6 +218,26 @@ class RagStatus:
         )
 
 
+@dataclass(frozen=True)
+class UploadedRagFile:
+    path: Path
+    name: str
+
+
+@dataclass(frozen=True)
+class RagUploadResult:
+    thread_id: str
+    added_files: tuple[str, ...] = ()
+    indexed_files: int = 0
+    chunk_count: int = 0
+    rejected_files: tuple[str, ...] = ()
+    reason: str | None = None
+
+    @property
+    def success(self) -> bool:
+        return bool(self.added_files) and self.reason is None
+
+
 def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig:
     raw_rag = raw_config.get("rag", {})
     if raw_rag and not isinstance(raw_rag, dict):
@@ -320,7 +358,11 @@ class SearchWorkspaceKnowledgeInput(BaseModel):
     )
 
 
-def create_search_workspace_knowledge_tool(rag: "WorkspaceDocsRAG") -> BaseTool:
+def create_search_workspace_knowledge_tool(
+    rag: "WorkspaceDocsRAG",
+    *,
+    thread_id: str | None = None,
+) -> BaseTool:
     @tool(
         "search_workspace_knowledge",
         args_schema=SearchWorkspaceKnowledgeInput,
@@ -329,7 +371,7 @@ def create_search_workspace_knowledge_tool(rag: "WorkspaceDocsRAG") -> BaseTool:
     def search_workspace_knowledge(query: str, top_k: int | None = None) -> dict[str, Any]:
         """Search the persisted workspace documentation index for relevant excerpts."""
 
-        return rag.search(query=query, top_k=top_k)
+        return rag.search(query=query, top_k=top_k, thread_id=thread_id)
 
     return search_workspace_knowledge
 
@@ -346,8 +388,10 @@ class WorkspaceDocsRAG:
         self.persist_directory = config.persist_directory.resolve()
         self.collection_directory = self.persist_directory / "chroma"
         self.manifest_path = self.persist_directory / "manifest.json"
+        self.uploads_root = self.persist_directory / RAG_UPLOADS_DIRECTORY_NAME
         self._lock = threading.RLock()
         self._vectorstore: Chroma | None = None
+        self._uploaded_vectorstores: dict[str, Chroma] = {}
         self._status = RagStatus.unavailable(
             reason="Knowledge index has not been initialized yet.",
             persist_directory=self.persist_directory,
@@ -385,21 +429,79 @@ class WorkspaceDocsRAG:
                 )
                 return self._status
 
-    def search(self, *, query: str, top_k: int | None = None) -> dict[str, Any]:
+    def ingest_uploaded_files(
+        self,
+        *,
+        thread_id: str,
+        uploads: list[UploadedRagFile],
+    ) -> RagUploadResult:
+        normalized_thread_id = thread_id.strip()
+        if not normalized_thread_id:
+            raise ValueError("A non-empty thread ID is required for uploaded RAG files.")
+
+        with self._lock:
+            added_files, rejected_files = self._store_uploaded_files_locked(
+                normalized_thread_id,
+                uploads,
+            )
+            if not added_files:
+                return RagUploadResult(
+                    thread_id=normalized_thread_id,
+                    rejected_files=tuple(rejected_files),
+                    reason="No supported text files were uploaded.",
+                )
+
+            indexed_files, chunk_count = self._rebuild_thread_uploads_locked(
+                normalized_thread_id
+            )
+            return RagUploadResult(
+                thread_id=normalized_thread_id,
+                added_files=tuple(added_files),
+                indexed_files=indexed_files,
+                chunk_count=chunk_count,
+                rejected_files=tuple(rejected_files),
+            )
+
+    def search(
+        self,
+        *,
+        query: str,
+        top_k: int | None = None,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
         normalized_query = query.strip()
         if not normalized_query:
             return {"query": "", "results": []}
 
         with self._lock:
-            status = self.ensure_ready()
-            if not status.ready:
-                raise RuntimeError(status.reason or "Knowledge index is unavailable.")
+            limit = top_k or self.config.top_k
+            matches: list[tuple[Document, float]] = []
+            has_any_store = False
 
-            store = self._load_vectorstore_locked()
-            matches = store.similarity_search_with_relevance_scores(
-                normalized_query,
-                k=top_k or self.config.top_k,
-            )
+            status = self.ensure_ready()
+            if status.ready:
+                has_any_store = True
+                matches.extend(
+                    self._search_store_locked(
+                        self._load_vectorstore_locked(),
+                        normalized_query,
+                        limit=limit,
+                    )
+                )
+
+            normalized_thread_id = (thread_id or "").strip()
+            if normalized_thread_id:
+                upload_matches = self._search_thread_uploads_locked(
+                    normalized_thread_id,
+                    normalized_query,
+                    limit=limit,
+                )
+                if upload_matches:
+                    has_any_store = True
+                    matches.extend(upload_matches)
+
+            if not has_any_store:
+                raise RuntimeError(status.reason or "Knowledge index is unavailable.")
 
         results = [
             {
@@ -407,7 +509,7 @@ class WorkspaceDocsRAG:
                 "excerpt": self._excerpt(doc.page_content),
                 "score": float(score),
             }
-            for doc, score in matches
+            for doc, score in sorted(matches, key=lambda item: item[1], reverse=True)[:limit]
         ]
         return {
             "query": normalized_query,
@@ -416,10 +518,15 @@ class WorkspaceDocsRAG:
 
     def _rebuild_locked(self) -> RagStatus:
         source_paths = self.discover_source_paths()
-        documents = self._load_source_documents(source_paths)
+        documents = self._load_documents(
+            source_paths,
+            display_path_for=self._relative_path,
+            loader=self._read_workspace_document,
+        )
         chunks = self._split_documents(documents)
 
-        shutil.rmtree(self.persist_directory, ignore_errors=True)
+        shutil.rmtree(self.collection_directory, ignore_errors=True)
+        self.manifest_path.unlink(missing_ok=True)
         self.collection_directory.mkdir(parents=True, exist_ok=True)
         self.persist_directory.mkdir(parents=True, exist_ok=True)
 
@@ -442,6 +549,7 @@ class WorkspaceDocsRAG:
             source_paths,
             file_count=len(documents),
             chunk_count=len(chunks),
+            display_path_for=self._relative_path,
         )
         self._write_manifest_locked(manifest)
         self._status = RagStatus.ready_status(
@@ -464,14 +572,20 @@ class WorkspaceDocsRAG:
                 discovered[relative] = candidate.resolve()
         return [discovered[path] for path in sorted(discovered)]
 
-    def _load_source_documents(self, source_paths: list[Path]) -> list[Document]:
+    def _load_documents(
+        self,
+        source_paths: list[Path],
+        *,
+        display_path_for,
+        loader,
+    ) -> list[Document]:
         documents: list[Document] = []
         for path in source_paths:
             documents.append(
                 Document(
-                    page_content=path.read_text(encoding="utf-8"),
+                    page_content=loader(path),
                     metadata={
-                        "path": self._relative_path(path),
+                        "path": display_path_for(path),
                     },
                 )
             )
@@ -492,7 +606,10 @@ class WorkspaceDocsRAG:
             return False
         if not self.collection_directory.exists():
             return False
-        current_signature = self._signature_for_paths(self.discover_source_paths())
+        current_signature = self._signature_for_paths(
+            self.discover_source_paths(),
+            display_path_for=self._relative_path,
+        )
         return manifest.get("signature") == current_signature
 
     def _status_from_manifest_locked(self) -> RagStatus:
@@ -534,16 +651,25 @@ class WorkspaceDocsRAG:
         *,
         file_count: int,
         chunk_count: int,
+        display_path_for,
     ) -> dict[str, Any]:
         return {
             "built_at": datetime.now(timezone.utc).isoformat(),
             "chunk_count": chunk_count,
             "file_count": file_count,
-            "signature": self._signature_for_paths(source_paths),
+            "signature": self._signature_for_paths(
+                source_paths,
+                display_path_for=display_path_for,
+            ),
             "version": RAG_MANIFEST_VERSION,
         }
 
-    def _signature_for_paths(self, source_paths: list[Path]) -> dict[str, Any]:
+    def _signature_for_paths(
+        self,
+        source_paths: list[Path],
+        *,
+        display_path_for,
+    ) -> dict[str, Any]:
         return {
             "chunk_overlap": self.config.chunk_overlap,
             "chunk_size": self.config.chunk_size,
@@ -556,7 +682,7 @@ class WorkspaceDocsRAG:
             "files": [
                 {
                     "mtime_ns": path.stat().st_mtime_ns,
-                    "path": self._relative_path(path),
+                    "path": display_path_for(path),
                     "size": path.stat().st_size,
                 }
                 for path in source_paths
@@ -578,6 +704,203 @@ class WorkspaceDocsRAG:
         self.persist_directory.mkdir(parents=True, exist_ok=True)
         with self.manifest_path.open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
+
+    def _read_workspace_document(self, path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    def _read_uploaded_document(self, path: Path) -> str:
+        raw = path.read_bytes()
+        if b"\x00" in raw:
+            raise ValueError(f"Uploaded file '{path.name}' is not a supported text document.")
+
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+
+        raise ValueError(f"Could not decode uploaded file '{path.name}' as text.")
+
+    def _store_uploaded_files_locked(
+        self,
+        thread_id: str,
+        uploads: list[UploadedRagFile],
+    ) -> tuple[list[str], list[str]]:
+        files_directory = self._thread_upload_files_directory(thread_id)
+        files_directory.mkdir(parents=True, exist_ok=True)
+
+        added_files: list[str] = []
+        rejected_files: list[str] = []
+        for upload in uploads:
+            upload_name = Path(upload.name).name
+            if not self._supports_uploaded_file(upload_name):
+                rejected_files.append(upload_name)
+                continue
+
+            destination = self._unique_upload_destination(files_directory, upload_name)
+            shutil.copy2(upload.path, destination)
+            added_files.append(destination.name)
+
+        return added_files, rejected_files
+
+    def _rebuild_thread_uploads_locked(self, thread_id: str) -> tuple[int, int]:
+        files_directory = self._thread_upload_files_directory(thread_id)
+        source_paths = sorted(path for path in files_directory.glob("*") if path.is_file())
+        collection_directory = self._thread_upload_collection_directory(thread_id)
+        manifest_path = self._thread_upload_manifest_path(thread_id)
+
+        shutil.rmtree(collection_directory, ignore_errors=True)
+        manifest_path.unlink(missing_ok=True)
+        self._uploaded_vectorstores.pop(thread_id, None)
+
+        if not source_paths:
+            return 0, 0
+
+        documents = self._load_documents(
+            source_paths,
+            display_path_for=self._uploaded_display_path,
+            loader=self._read_uploaded_document,
+        )
+        chunks = self._split_documents(documents)
+
+        collection_directory.mkdir(parents=True, exist_ok=True)
+        embeddings = self._build_embeddings()
+        if chunks:
+            store = Chroma.from_documents(
+                documents=chunks,
+                embedding=embeddings,
+                collection_name=self._thread_upload_collection_name(thread_id),
+                persist_directory=str(collection_directory),
+            )
+        else:
+            store = Chroma(
+                collection_name=self._thread_upload_collection_name(thread_id),
+                embedding_function=embeddings,
+                persist_directory=str(collection_directory),
+            )
+
+        self._uploaded_vectorstores[thread_id] = store
+        manifest = self._build_manifest(
+            source_paths,
+            file_count=len(documents),
+            chunk_count=len(chunks),
+            display_path_for=self._uploaded_display_path,
+        )
+        self._write_json(manifest_path, manifest)
+        return len(documents), len(chunks)
+
+    def _search_thread_uploads_locked(
+        self,
+        thread_id: str,
+        query: str,
+        *,
+        limit: int,
+    ) -> list[tuple[Document, float]]:
+        if not self._thread_has_uploaded_files(thread_id):
+            return []
+
+        if self._thread_upload_manifest_is_current_locked(thread_id):
+            store = self._load_thread_upload_store_locked(thread_id)
+        else:
+            _, chunk_count = self._rebuild_thread_uploads_locked(thread_id)
+            if chunk_count == 0:
+                return []
+            store = self._load_thread_upload_store_locked(thread_id)
+
+        return self._search_store_locked(store, query, limit=limit)
+
+    def _search_store_locked(
+        self,
+        store: Chroma,
+        query: str,
+        *,
+        limit: int,
+    ) -> list[tuple[Document, float]]:
+        return store.similarity_search_with_relevance_scores(query, k=limit)
+
+    def _thread_has_uploaded_files(self, thread_id: str) -> bool:
+        files_directory = self._thread_upload_files_directory(thread_id)
+        return files_directory.exists() and any(path.is_file() for path in files_directory.glob("*"))
+
+    def _thread_upload_manifest_is_current_locked(self, thread_id: str) -> bool:
+        manifest = self._read_json(self._thread_upload_manifest_path(thread_id))
+        if manifest is None:
+            return False
+
+        collection_directory = self._thread_upload_collection_directory(thread_id)
+        if not collection_directory.exists():
+            return False
+
+        files_directory = self._thread_upload_files_directory(thread_id)
+        source_paths = sorted(path for path in files_directory.glob("*") if path.is_file())
+        current_signature = self._signature_for_paths(
+            source_paths,
+            display_path_for=self._uploaded_display_path,
+        )
+        return manifest.get("signature") == current_signature
+
+    def _load_thread_upload_store_locked(self, thread_id: str) -> Chroma:
+        store = self._uploaded_vectorstores.get(thread_id)
+        if store is not None:
+            return store
+
+        store = Chroma(
+            collection_name=self._thread_upload_collection_name(thread_id),
+            embedding_function=self._build_embeddings(),
+            persist_directory=str(self._thread_upload_collection_directory(thread_id)),
+        )
+        self._uploaded_vectorstores[thread_id] = store
+        return store
+
+    def _thread_upload_root(self, thread_id: str) -> Path:
+        return self.uploads_root / self._normalize_thread_id(thread_id)
+
+    def _thread_upload_files_directory(self, thread_id: str) -> Path:
+        return self._thread_upload_root(thread_id) / RAG_UPLOAD_FILES_DIRECTORY_NAME
+
+    def _thread_upload_collection_directory(self, thread_id: str) -> Path:
+        return self._thread_upload_root(thread_id) / RAG_UPLOAD_COLLECTION_DIRECTORY_NAME
+
+    def _thread_upload_manifest_path(self, thread_id: str) -> Path:
+        return self._thread_upload_root(thread_id) / RAG_UPLOAD_MANIFEST_FILENAME
+
+    def _thread_upload_collection_name(self, thread_id: str) -> str:
+        return f"{self.config.collection_name}_{self._normalize_thread_id(thread_id)}"
+
+    def _normalize_thread_id(self, thread_id: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", thread_id.strip())
+        return normalized or "thread"
+
+    def _uploaded_display_path(self, path: Path) -> str:
+        return f"uploaded/{path.name}"
+
+    def _supports_uploaded_file(self, name: str) -> bool:
+        return Path(name).suffix.lower() in ALLOWED_RAG_UPLOAD_EXTENSIONS
+
+    def _unique_upload_destination(self, directory: Path, upload_name: str) -> Path:
+        original = Path(upload_name)
+        stem = original.stem or "upload"
+        suffix = original.suffix
+        candidate = directory / f"{stem}{suffix}"
+        counter = 2
+        while candidate.exists():
+            candidate = directory / f"{stem}-{counter}{suffix}"
+            counter += 1
+        return candidate
+
+    def _read_json(self, path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as handle:
+            raw_value = json.load(handle)
+        if not isinstance(raw_value, dict):
+            return None
+        return raw_value
+
+    def _write_json(self, path: Path, value: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
 
     def _is_excluded(self, relative_path: str) -> bool:
         candidate = PurePosixPath(relative_path)

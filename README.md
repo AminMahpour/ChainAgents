@@ -197,6 +197,9 @@ Notes:
 - For OpenAI-compatible embeddings, set `[rag.embedding].model` explicitly.
 - On startup, the UI reports whether RAG is ready and how many files/chunks were indexed.
 - The startup message includes a `Rebuild Knowledge Index` action so you can refresh the index after documentation changes.
+- The startup message also includes `Upload File For RAG`, which lets you add text-based files to the current chat thread's knowledge index.
+- Composer file attachments are enabled for text-based uploads; attached files are automatically ingested into the current thread's RAG store before the model responds.
+- Uploaded files are thread-scoped and persist under `.rag/uploads/`, so they do not leak into other chat threads.
 
 ## Chainlit App Config
 

@@ -36,6 +36,21 @@ cwd = "."
 skills = ["skills"]
 mcp_servers = ["repo"]
 
+[rag]
+enabled = true
+persist_directory = ".rag"
+include_globs = ["README.md", "chainlit.md", "prompts/**/*.md", "skills/**/*.md"]
+exclude_globs = ["AGENTS.md", "AGENT.md"]
+chunk_size = 1200
+chunk_overlap = 200
+top_k = 4
+
+[rag.embedding]
+provider = "auto"
+# For Ollama, the default embedding model is "nomic-embed-text".
+# model = "nomic-embed-text"
+# base_url = "http://127.0.0.1:11434"
+
 # Async subagent backed by the local LangGraph Agent Protocol server.
 [[async_subagents]]
 name = "async-researcher"

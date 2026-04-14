@@ -15,6 +15,7 @@ from rag_runtime import (
     RagEmbeddingConfig,
     ResolvedRagConfig,
     ResolvedRagEmbeddingConfig,
+    UploadedRagFile,
     WorkspaceDocsRAG,
     create_search_workspace_knowledge_tool,
     parse_rag_config,
@@ -67,15 +68,14 @@ class DummyChroma:
         *,
         k: int,
     ) -> list[tuple[Document, float]]:
-        return [
+        results = [
             (
-                Document(
-                    page_content=f"Result for {query}",
-                    metadata={"path": "README.md"},
-                ),
-                0.9,
+                document,
+                1.0 if query.lower() in document.page_content.lower() else 0.5,
             )
-        ][:k]
+            for document in self.documents
+        ]
+        return results[:k]
 
 
 def make_resolved_rag_config(project_root: Path) -> ResolvedRagConfig:
@@ -182,7 +182,13 @@ def test_manifest_staleness_detects_doc_changes(tmp_path: Path, monkeypatch: pyt
 
 def test_search_workspace_knowledge_tool_has_object_schema() -> None:
     class FakeRAG:
-        def search(self, *, query: str, top_k: int | None = None) -> dict[str, object]:
+        def search(
+            self,
+            *,
+            query: str,
+            top_k: int | None = None,
+            thread_id: str | None = None,
+        ) -> dict[str, object]:
             return {"query": query, "results": [{"path": "README.md", "excerpt": "", "score": 1.0}]}
 
     tool = create_search_workspace_knowledge_tool(FakeRAG())
@@ -192,3 +198,53 @@ def test_search_workspace_knowledge_tool_has_object_schema() -> None:
     assert parameters["type"] == "object"
     assert "query" in parameters["properties"]
     assert "top_k" in parameters["properties"]
+
+
+def test_ingest_uploaded_files_adds_thread_scoped_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rag_runtime, "Chroma", DummyChroma)
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: object())
+
+    upload_source = tmp_path / "notes.md"
+    upload_source.write_text("uploaded content about release notes", encoding="utf-8")
+
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    upload_result = service.ingest_uploaded_files(
+        thread_id="thread-1",
+        uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+    )
+
+    assert upload_result.success is True
+    assert upload_result.added_files == ("notes.md",)
+
+    search_result = service.search(
+        query="release notes",
+        thread_id="thread-1",
+    )
+
+    assert search_result["results"]
+    assert search_result["results"][0]["path"] == "uploaded/notes.md"
+
+
+def test_ingest_uploaded_files_rejects_unsupported_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rag_runtime, "Chroma", DummyChroma)
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: object())
+
+    upload_source = tmp_path / "binary.exe"
+    upload_source.write_text("not really binary", encoding="utf-8")
+
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    upload_result = service.ingest_uploaded_files(
+        thread_id="thread-2",
+        uploads=[UploadedRagFile(path=upload_source, name="binary.exe")],
+    )
+
+    assert upload_result.success is False
+    assert upload_result.rejected_files == ("binary.exe",)
