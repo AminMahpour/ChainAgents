@@ -1,6 +1,6 @@
 [model]
 provider = "ollama"
-base_url = "http://127.0.0.1:11434"
+base_url = "http://10.0.1.152:11434"
 temperature = 0
 name = "gemma4:26b"
 #name = "gpt-oss:20b"
@@ -24,7 +24,7 @@ reasoning_effort = "medium"
 
 
 [mcp]
-tool_name_prefix = true
+tool_name_prefix = false
 
 [mcp.servers.repo]
 transport = "stdio"
@@ -32,12 +32,16 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
+[mcp.servers.ToolUniverse]
+transport = "http"
+url = "http://127.0.0.1:8090/mcp"
+
 [agent]
 skills = ["skills"]
-mcp_servers = ["repo"]
+mcp_servers = ["repo", "ToolUniverse"]
 
 [rag]
-enabled = true
+enabled = false
 persist_directory = ".rag"
 include_globs = ["README.md", "chainlit.md", "prompts/**/*.md", "skills/**/*.md"]
 exclude_globs = ["AGENTS.md", "AGENT.md"]
@@ -52,11 +56,11 @@ provider = "auto"
 # base_url = "http://127.0.0.1:11434"
 
 # Async subagent backed by the local LangGraph Agent Protocol server.
-[[async_subagents]]
-name = "async-researcher"
-description = "Runs longer research jobs in the background, such as reading documentation or running code analysis tools."
-graph_id = "async-researcher"
-url = "http://127.0.0.1:2024"
+#[[async_subagents]]
+#name = "async-researcher"
+#description = "Runs longer research jobs in the background, such as reading documentation or running code analysis tools."
+#graph_id = "async-researcher"
+#url = "http://127.0.0.1:2024"
 
 # If you run only the co-deployed langgraph.json setup, omit url for ASGI transport.
 # In Chainlit, set url here or use CHAINLIT_ASYNC_SUBAGENT_URL for HTTP transport.
@@ -69,3 +73,20 @@ description = "Researches the current repository, explains architecture, and ide
 system_prompt_file = "prompts/repo-researcher.md"
 skills = ["skills"]
 mcp_servers = ["repo"]
+
+[[subagents]]
+name = "tool-universe-specialist"
+description = "Lists, searches, inspects, and executes ToolUniverse MCP tools for external integrations."
+system_prompt = """
+You are the ToolUniverse MCP specialist.
+The ToolUniverse MCP server exposes compact-mode discovery and execution tools.
+When asked what ToolUniverse can do, start with `list_tools`, `grep_tools`,
+or `find_tools`.
+Use `get_tool_info` to inspect candidate tools before execution.
+Use `execute_tool` to run a discovered ToolUniverse tool by name.
+If MCP tool name prefixing is enabled, these same tool names may appear with a
+server prefix such as `ToolUniverse_list_tools`.
+Prefer the smallest number of tool calls that completes the task.
+Return concise results to the parent agent and include exact tool names when relevant.
+"""
+mcp_servers = ["ToolUniverse"]

@@ -938,19 +938,29 @@ class AgentRuntime:
             if agent is None:
                 model = self._build_model(reasoning_level)
                 rag_tool_enabled = self._rag_service is not None
+                had_mcp_errors = False
+                main_tools_raw, main_tools_had_errors = await self._build_main_tools(
+                    thread_id=thread_id
+                )
+                had_mcp_errors = had_mcp_errors or main_tools_had_errors
                 main_tools = sanitize_tools_for_model(
                     self.config.model_provider,
-                    await self._build_main_tools(thread_id=thread_id),
+                    main_tools_raw,
                 )
-                subagent_specs: list[Any] = [
-                    subagent.to_deepagents_spec(
-                        tools=sanitize_tools_for_model(
-                            self.config.model_provider,
-                            await self._get_mcp_tools(subagent.mcp_servers),
+                subagent_specs: list[Any] = []
+                for subagent in self.config.extensions.subagents:
+                    subagent_tools, subagent_had_errors = await self._load_mcp_tools(
+                        subagent.mcp_servers
+                    )
+                    had_mcp_errors = had_mcp_errors or subagent_had_errors
+                    subagent_specs.append(
+                        subagent.to_deepagents_spec(
+                            tools=sanitize_tools_for_model(
+                                self.config.model_provider,
+                                subagent_tools,
+                            )
                         )
                     )
-                    for subagent in self.config.extensions.subagents
-                ]
                 subagent_specs.extend(
                     subagent.to_deepagents_spec(
                         url_override=async_subagent_url_override,
@@ -970,7 +980,8 @@ class AgentRuntime:
                     skills=list(self.config.extensions.skills) or None,
                     subagents=subagent_specs or None,
                 )
-                self._agents[cache_key] = agent
+                if not had_mcp_errors:
+                    self._agents[cache_key] = agent
             return agent
 
     async def rebuild_rag_index(self) -> RagStatus:
@@ -1018,24 +1029,41 @@ class AgentRuntime:
     def _build_model(self, reasoning_level: ReasoningLevel) -> Any:
         return build_model(self.config, reasoning_level)
 
-    async def _get_mcp_tools(self, server_names: tuple[str, ...]) -> list[Any]:
+    async def _load_mcp_tools(self, server_names: tuple[str, ...]) -> tuple[list[Any], bool]:
         if not server_names or self._mcp_client is None:
-            return []
+            return [], False
 
         cache_key = tuple(server_names)
         cached = self._mcp_tools_cache.get(cache_key)
         if cached is not None:
-            return list(cached)
+            return list(cached), False
 
         tools: list[Any] = []
+        had_errors = False
         for server_name in cache_key:
-            tools.extend(await self._mcp_client.get_tools(server_name=server_name))
+            try:
+                tools.extend(await self._mcp_client.get_tools(server_name=server_name))
+            except Exception as exc:
+                had_errors = True
+                logger.warning(
+                    "Skipping MCP server '%s' after tool loading failed: %s",
+                    server_name,
+                    exc,
+                    exc_info=True,
+                )
 
-        self._mcp_tools_cache[cache_key] = tools
-        return list(tools)
+        if not had_errors:
+            self._mcp_tools_cache[cache_key] = tools
+        return list(tools), had_errors
 
-    async def _build_main_tools(self, *, thread_id: str | None) -> list[Any]:
-        tools = await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
+    async def _get_mcp_tools(self, server_names: tuple[str, ...]) -> list[Any]:
+        tools, _ = await self._load_mcp_tools(server_names)
+        return tools
+
+    async def _build_main_tools(self, *, thread_id: str | None) -> tuple[list[Any], bool]:
+        tools, had_errors = await self._load_mcp_tools(
+            self.config.extensions.agent_mcp_servers
+        )
         if self._rag_service is not None:
             tools = list(tools)
             tools.append(
@@ -1044,7 +1072,7 @@ class AgentRuntime:
                     thread_id=thread_id,
                 )
             )
-        return tools
+        return tools, had_errors
 
     async def _clear_agent_cache(self) -> None:
         async with self._agent_lock:

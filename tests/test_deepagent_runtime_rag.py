@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -11,6 +12,7 @@ from deepagent_runtime import (
     AgentRuntime,
     ExtensionsConfig,
     RuntimeConfig,
+    SubagentConfig,
 )
 from rag_runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
@@ -186,6 +188,60 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
 
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" not in tool_names
+
+
+def test_get_agent_does_not_cache_partial_mcp_loads(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_agents: list[object] = []
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        agent = object()
+        created_agents.append(agent)
+        return agent
+
+    async def fake_build_main_tools(*, thread_id: str | None):
+        return [], False
+
+    async def fake_load_mcp_tools(server_names: tuple[str, ...]):
+        return [], server_names == ("ToolUniverse",)
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(
+        replace(
+            make_runtime_config(tmp_path),
+            extensions=ExtensionsConfig(
+                config_path=None,
+                mcp_servers={
+                    "ToolUniverse": {
+                        "transport": "http",
+                        "url": "http://127.0.0.1:8090/mcp",
+                    }
+                },
+                subagents=(
+                    SubagentConfig(
+                        name="tool-universe-specialist",
+                        description="Uses ToolUniverse tools.",
+                        system_prompt="Use ToolUniverse when needed.",
+                        mcp_servers=("ToolUniverse",),
+                    ),
+                ),
+            ),
+        )
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+    monkeypatch.setattr(runtime, "_build_main_tools", fake_build_main_tools)
+    monkeypatch.setattr(runtime, "_load_mcp_tools", fake_load_mcp_tools)
+
+    first_agent = asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+    second_agent = asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert first_agent is not second_agent
+    assert created_agents == [first_agent, second_agent]
+    assert runtime._agents == {}
 
 
 def test_rebuild_rag_index_clears_cached_agents(
