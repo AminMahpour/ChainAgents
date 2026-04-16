@@ -37,7 +37,10 @@ jobs:
         run: uv run python -c "import chainlit_bridge, deepagent_runtime, main"
 
       - name: Byte-compile application modules
-        run: uv run python -m compileall main.py deepagent_runtime.py chainlit_bridge.py
+        run: uv run python -m compileall main.py deepagent_runtime.py chainlit_bridge.py rag_runtime.py
+
+      - name: Run tests
+        run: uv run pytest
 
       - name: Validate extension config
         run: |

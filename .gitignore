@@ -12,3 +12,6 @@ wheels/
 # Chainlit file storage
 .files/
 .codex
+
+# Local RAG index
+.rag/
