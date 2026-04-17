@@ -21,6 +21,7 @@ from deepagents.backends import (
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -314,6 +315,7 @@ class AsyncSubagentConfig:
 class ExtensionsConfig:
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
+    mcp_stateful: bool = False
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
     agent_mcp_servers: tuple[str, ...] = ()
@@ -579,6 +581,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     return ExtensionsConfig(
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
+        mcp_stateful=bool(mcp_section.get("stateful", False)),
         mcp_servers=mcp_servers or None,
         skills=skill_paths,
         agent_mcp_servers=raw_agent_mcp_servers,
@@ -846,7 +849,8 @@ class AgentRuntime:
         self._agent_lock = asyncio.Lock()
         self._agents: dict[tuple[ReasoningLevel, str | None, str | None], object] = {}
         self._mcp_client: MultiServerMCPClient | None = None
-        self._mcp_tools_cache: dict[tuple[str, ...], list[Any]] = {}
+        self._mcp_tools_cache: dict[tuple[str | None, tuple[str, ...]], list[Any]] = {}
+        self._mcp_sessions: dict[tuple[str | None, str], Any] = {}
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
@@ -946,7 +950,10 @@ class AgentRuntime:
                     subagent.to_deepagents_spec(
                         tools=sanitize_tools_for_model(
                             self.config.model_provider,
-                            await self._get_mcp_tools(subagent.mcp_servers),
+                            await self._get_mcp_tools(
+                                subagent.mcp_servers,
+                                thread_id=thread_id,
+                            ),
                         )
                     )
                     for subagent in self.config.extensions.subagents
@@ -1018,24 +1025,69 @@ class AgentRuntime:
     def _build_model(self, reasoning_level: ReasoningLevel) -> Any:
         return build_model(self.config, reasoning_level)
 
-    async def _get_mcp_tools(self, server_names: tuple[str, ...]) -> list[Any]:
+    async def _get_stateful_mcp_session(
+        self,
+        *,
+        server_name: str,
+        thread_id: str | None,
+    ) -> Any:
+        cache_key = (thread_id, server_name)
+        session = self._mcp_sessions.get(cache_key)
+        if session is not None:
+            return session
+
+        if self._mcp_client is None:
+            raise RuntimeError("MCP client is not initialized.")
+
+        session = await self._exit_stack.enter_async_context(
+            self._mcp_client.session(server_name)
+        )
+        self._mcp_sessions[cache_key] = session
+        return session
+
+    async def _get_mcp_tools(
+        self,
+        server_names: tuple[str, ...],
+        *,
+        thread_id: str | None = None,
+    ) -> list[Any]:
         if not server_names or self._mcp_client is None:
             return []
 
-        cache_key = tuple(server_names)
+        tool_scope = thread_id if self.config.extensions.mcp_stateful else None
+        cache_key = (tool_scope, tuple(server_names))
         cached = self._mcp_tools_cache.get(cache_key)
         if cached is not None:
             return list(cached)
 
         tools: list[Any] = []
-        for server_name in cache_key:
+        for server_name in cache_key[1]:
+            if self.config.extensions.mcp_stateful:
+                session = await self._get_stateful_mcp_session(
+                    server_name=server_name,
+                    thread_id=thread_id,
+                )
+                tools.extend(
+                    await load_mcp_tools(
+                        session,
+                        callbacks=self._mcp_client.callbacks,
+                        tool_interceptors=self._mcp_client.tool_interceptors,
+                        server_name=server_name,
+                        tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
+                    )
+                )
+                continue
+
             tools.extend(await self._mcp_client.get_tools(server_name=server_name))
 
         self._mcp_tools_cache[cache_key] = tools
         return list(tools)
 
     async def _build_main_tools(self, *, thread_id: str | None) -> list[Any]:
-        tools = await self._get_mcp_tools(self.config.extensions.agent_mcp_servers)
+        tools = await self._get_mcp_tools(
+            self.config.extensions.agent_mcp_servers,
+            thread_id=thread_id,
+        )
         if self._rag_service is not None:
             tools = list(tools)
             tools.append(

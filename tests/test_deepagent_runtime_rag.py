@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -39,7 +41,11 @@ def make_runtime_rag_config(project_root: Path) -> ResolvedRagConfig:
     )
 
 
-def make_runtime_config(project_root: Path) -> RuntimeConfig:
+def make_runtime_config(
+    project_root: Path,
+    *,
+    extensions: ExtensionsConfig | None = None,
+) -> RuntimeConfig:
     return RuntimeConfig(
         database_url=None,
         model_provider="ollama",
@@ -49,10 +55,23 @@ def make_runtime_config(project_root: Path) -> RuntimeConfig:
         model_temperature=0.0,
         default_reasoning="medium",
         persistence_mode="memory",
-        extensions=ExtensionsConfig(config_path=None),
+        extensions=extensions or ExtensionsConfig(config_path=None),
         rag_requested=True,
         rag=make_runtime_rag_config(project_root),
         rag_error=None,
+    )
+
+
+def make_extensions_config(
+    *,
+    mcp_stateful: bool = False,
+    agent_mcp_servers: tuple[str, ...] = (),
+) -> ExtensionsConfig:
+    return ExtensionsConfig(
+        config_path=None,
+        mcp_stateful=mcp_stateful,
+        mcp_servers={"repo": {"transport": "stdio", "command": "npx", "args": []}},
+        agent_mcp_servers=agent_mcp_servers,
     )
 
 
@@ -84,6 +103,33 @@ provider = "auto"
     assert config.rag is None
     assert config.rag_error is not None
     assert "rag.embedding.model" in config.rag_error
+
+
+def test_load_extensions_config_reads_mcp_stateful_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[mcp]
+stateful = true
+
+[mcp.servers.repo]
+transport = "stdio"
+command = "npx"
+args = ["server"]
+
+[agent]
+mcp_servers = ["repo"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.load_extensions_config()
+
+    assert config.mcp_stateful is True
 
 
 def test_agent_runtime_initialize_runs_rag_startup_check(
@@ -186,6 +232,75 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
 
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" not in tool_names
+
+
+def test_stateful_mcp_reuses_session_per_thread(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_sessions: list[tuple[str, object]] = []
+    load_calls: list[tuple[object, str]] = []
+
+    class FakeMCPClient:
+        callbacks = object()
+        tool_interceptors: list[object] = []
+
+        @asynccontextmanager
+        async def session(self, server_name: str, *, auto_initialize: bool = True):
+            session = object()
+            created_sessions.append((server_name, session))
+            yield session
+
+        async def get_tools(self, *, server_name: str | None = None):
+            raise AssertionError("stateful MCP mode should not call get_tools()")
+
+    async def fake_load_mcp_tools(
+        session,
+        *,
+        server_name: str | None = None,
+        **kwargs,
+    ):
+        assert kwargs["tool_name_prefix"] is True
+        load_calls.append((session, str(server_name)))
+        return [SimpleNamespace(name=f"{server_name}_tool", session=session)]
+
+    monkeypatch.setattr(deepagent_runtime, "load_mcp_tools", fake_load_mcp_tools)
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=make_extensions_config(
+                mcp_stateful=True,
+                agent_mcp_servers=("repo",),
+            ),
+        )
+    )
+    runtime._mcp_client = FakeMCPClient()
+
+    async def exercise_runtime():
+        thread_1_tools_first = await runtime._get_mcp_tools(
+            ("repo",),
+            thread_id="thread-1",
+        )
+        thread_1_tools_second = await runtime._get_mcp_tools(
+            ("repo",),
+            thread_id="thread-1",
+        )
+        thread_2_tools = await runtime._get_mcp_tools(
+            ("repo",),
+            thread_id="thread-2",
+        )
+        await runtime._exit_stack.aclose()
+        return thread_1_tools_first, thread_1_tools_second, thread_2_tools
+
+    thread_1_tools_first, thread_1_tools_second, thread_2_tools = asyncio.run(
+        exercise_runtime()
+    )
+
+    assert len(created_sessions) == 2
+    assert len(load_calls) == 2
+    assert thread_1_tools_first[0].session is thread_1_tools_second[0].session
+    assert thread_1_tools_first[0].session is not thread_2_tools[0].session
 
 
 def test_rebuild_rag_index_clears_cached_agents(

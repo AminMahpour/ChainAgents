@@ -25,6 +25,7 @@ reasoning_effort = "medium"
 
 [mcp]
 tool_name_prefix = true
+stateful = true
 
 [mcp.servers.repo]
 transport = "stdio"

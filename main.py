@@ -327,9 +327,15 @@ async def on_chat_start() -> None:
         else "- History bar: disabled; set `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` to enable native Chainlit history\n"
     )
     extensions = runtime.config.extensions
+    mcp_session_mode_line = (
+        "- MCP session mode: stateful per LangGraph thread while this app process stays alive\n"
+        if extensions.mcp_stateful
+        else "- MCP session mode: stateless; a new MCP session is created for each tool call\n"
+    )
     extensions_line = (
         f"- Skill sources: `{len(extensions.skills)}`\n"
         f"- MCP servers: `{len(extensions.mcp_servers or {})}`\n"
+        f"{mcp_session_mode_line}"
         f"- Custom subagents: `{len(extensions.subagents)}`\n"
         f"- Async subagents: `{len(extensions.async_subagents)}`\n"
     )
