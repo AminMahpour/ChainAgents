@@ -24,7 +24,7 @@ reasoning_effort = "medium"
 
 
 [mcp]
-tool_name_prefix = true
+tool_name_prefix = false
 stateful = true
 
 [mcp.servers.repo]
