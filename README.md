@@ -269,6 +269,7 @@ Example:
 ```toml
 [mcp]
 tool_name_prefix = true
+stateful = true
 
 [mcp.servers.repo]
 transport = "stdio"
@@ -371,6 +372,7 @@ Example:
 ```toml
 [mcp]
 tool_name_prefix = true
+stateful = true
 
 [mcp.servers.repo]
 transport = "stdio"
@@ -406,6 +408,7 @@ mcp_servers = ["github"]
 Supported MCP config fields:
 
 - top-level `[mcp] tool_name_prefix = true|false`
+- top-level `[mcp] stateful = true|false`
 - `[mcp.servers.<name>] transport`
 - for `stdio`: `command`, `args`, optional `cwd`, optional `env`
 - for `http`, `streamable_http`, `streamable-http`: `url`, optional `headers`
@@ -419,6 +422,8 @@ Notes:
 - Skills and MCP servers are independent. You can use neither, either, or both on any subagent.
 - Relative `cwd` values are resolved from the location of `deepagent.toml`.
 - `tool_name_prefix = true` is recommended when multiple MCP servers expose overlapping tool names.
+- `stateful = true` keeps MCP sessions open per LangGraph thread while the app process is running.
+- `stateful = false` recreates the MCP session for every tool call.
 
 Current scope of this config support:
 
@@ -441,6 +446,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 - If `DATABASE_URL` is set but authentication is not configured, Chainlit still persists thread records, but they are not browseable from the UI.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.
+- MCP stateful sessions are process-local. They survive tool calls in the same thread, but not an app restart.
 - On startup, the UI shows how many skill sources, MCP servers, custom subagents, and async subagents were loaded from `deepagent.toml`.
 
 ## License
