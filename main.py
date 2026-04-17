@@ -116,6 +116,28 @@ def rag_actions() -> list[cl.Action]:
     return [build_rag_action(), build_upload_rag_action()]
 
 
+def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
+    icon_by_target = {
+        "prompt": "square-pen",
+        "subagent": "bot",
+        "mcp_tool": "wrench",
+    }
+    return [
+        {
+            "id": command.name,
+            "description": command.description,
+            "icon": icon_by_target.get(command.target, "terminal"),
+            "button": False,
+            "persistent": True,
+        }
+        for command in runtime.config.extensions.chainlit_commands
+    ]
+
+
+async def publish_native_commands(runtime: AgentRuntime) -> None:
+    await cl.context.emitter.set_commands(build_native_command_specs(runtime))
+
+
 def rag_status_line(runtime: AgentRuntime) -> str:
     status = runtime.rag_status
     if not status.enabled:
@@ -372,6 +394,7 @@ async def on_chat_start() -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    await publish_native_commands(runtime)
     run_task_list = await get_run_task_list()
     await run_task_list.show_ready()
     settings = AppSettings(
@@ -437,6 +460,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    await publish_native_commands(runtime)
 
     run_task_list = await get_run_task_list()
     await run_task_list.show_ready()

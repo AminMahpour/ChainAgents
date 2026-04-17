@@ -314,6 +314,9 @@ Supported subagent fields:
 
 You can configure slash-style commands that run from the Chainlit composer before the model call.
 
+Place this config in `deepagent.toml` or whatever file `DEEPAGENT_CONFIG` points to.
+Do not put it in the app UI file `chainlit.toml` or Chainlit's native [`.chainlit/config.toml`](.chainlit/config.toml).
+
 Example:
 
 ```toml
@@ -333,6 +336,7 @@ commands = [
 
 Notes:
 
+- The `[chainlit]` table for native commands belongs in `deepagent.toml`, alongside `[model]`, `[agent]`, `[mcp]`, `[[subagents]]`, and `[[async_subagents]]`.
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.
 - For `mcp_tool`, user command arguments must be valid JSON, e.g. `/repo-readme {"path":"README.md"}`.

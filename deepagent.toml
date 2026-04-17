@@ -70,3 +70,10 @@ description = "Researches the current repository, explains architecture, and ide
 system_prompt_file = "prompts/repo-researcher.md"
 skills = ["skills"]
 mcp_servers = ["repo"]
+
+[chainlit]
+commands = [
+  { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
+  { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
+  { name = "summarize", description = "Apply a prompt template.", target = "prompt", value = "Summarize the input", template = "Summarize this:\n{input}" }
+]
