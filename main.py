@@ -6,9 +6,8 @@ import os
 import secrets
 import traceback
 from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import chainlit as cl
 from chainlit.input_widget import Select, TextInput
@@ -177,9 +176,7 @@ def upload_result_message(upload_result) -> str:
 
     return upload_result.reason or "No files were added to RAG."
 
-
-@dataclass(frozen=True)
-class ParsedNativeCommand:
+class ParsedNativeCommand(NamedTuple):
     command_name: str
     raw_args: str
 
