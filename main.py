@@ -216,6 +216,25 @@ def parse_native_command(raw_text: str) -> ParsedNativeCommand | None:
     )
 
 
+def resolve_native_command(
+    *,
+    raw_text: str,
+    selected_command: str | None = None,
+) -> ParsedNativeCommand | None:
+    parsed = parse_native_command(raw_text)
+    if parsed is not None:
+        return parsed
+
+    command_name = str(selected_command or "").strip().lstrip("/").lower()
+    if not command_name:
+        return None
+
+    return ParsedNativeCommand(
+        command_name=command_name,
+        raw_args=raw_text.strip(),
+    )
+
+
 def apply_native_template(template: str | None, raw_args: str) -> str:
     if template is None:
         return raw_args.strip()
@@ -576,10 +595,13 @@ async def on_message(message: cl.Message) -> None:
             upload_message.actions = rag_actions()
         await upload_message.send()
 
-    if not message.content.strip() and uploaded_files:
+    parsed_command = resolve_native_command(
+        raw_text=message.content,
+        selected_command=getattr(message, "command", None),
+    )
+    if not message.content.strip() and uploaded_files and parsed_command is None:
         return
 
-    parsed_command = parse_native_command(message.content)
     if parsed_command is not None:
         try:
             transformed_prompt = await handle_native_command(
