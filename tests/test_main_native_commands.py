@@ -81,7 +81,7 @@ class _DummyMessage:
         return None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) -> None:
     runtime = _DummyRuntime()
     settings = SimpleNamespace(thread_id="thread-1")
