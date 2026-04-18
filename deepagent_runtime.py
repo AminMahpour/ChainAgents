@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import tomllib
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -19,6 +20,8 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
+from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
+from langchain_core.messages import ToolMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -28,6 +31,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
+from langgraph.types import Command
 from rag_runtime import (
     RagConfig,
     RagStatus,
@@ -54,6 +58,7 @@ DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 PROJECT_ROOT = Path(__file__).resolve().parent
+DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = f"""
@@ -190,6 +195,85 @@ def compose_base_url(endpoint: str | None, port: int) -> str:
     return urlunsplit((parsed.scheme or "http", netloc, path, parsed.query, parsed.fragment))
 
 
+def deepagent_artifacts_root(project_root: Path | None = None) -> Path:
+    root = (project_root or PROJECT_ROOT).resolve()
+    return root / DEEPAGENT_ARTIFACTS_DIRECTORY
+
+
+def deepagent_artifacts_route_prefix(project_root: Path | None = None) -> str:
+    return f"{deepagent_artifacts_root(project_root).as_posix().rstrip('/')}/"
+
+
+def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
+    detail = " ".join(str(exc).split()).strip()
+    if not detail:
+        return exc.__class__.__name__
+    summary = detail
+    if detail != exc.__class__.__name__:
+        summary = f"{exc.__class__.__name__}: {detail}"
+    if len(summary) > limit:
+        return f"{summary[: limit - 3].rstrip()}..."
+    return summary
+
+
+class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
+    def _error_tool_message(
+        self,
+        request: ToolCallRequest,
+        exc: Exception,
+    ) -> ToolMessage:
+        tool_name = (
+            str(request.tool_call.get("name") or getattr(request.tool, "name", "tool")).strip()
+            or "tool"
+        )
+        tool_call_id = str(request.tool_call.get("id") or tool_name)
+        summary = summarize_tool_exception(exc)
+        logger.exception(
+            "Tool call failed without aborting the run: %s (%s)",
+            tool_name,
+            tool_call_id,
+            exc_info=exc,
+        )
+        return ToolMessage(
+            content=(
+                f"Tool execution failed for `{tool_name}`: {summary}\n\n"
+                "The tool error was returned without aborting the run. "
+                "Adjust the tool inputs or continue with another approach."
+            ),
+            name=tool_name,
+            tool_call_id=tool_call_id,
+            status="error",
+        )
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        try:
+            return handler(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return self._error_tool_message(request, exc)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        try:
+            return await handler(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return self._error_tool_message(request, exc)
+
+
+def build_agent_middleware() -> list[AgentMiddleware[Any, Any, Any]]:
+    return [ToolExecutionResilienceMiddleware()]
+
+
 def resolve_local_path(path_value: str, base_dir: Path) -> Path:
     path = Path(path_value)
     if not path.is_absolute():
@@ -271,7 +355,12 @@ class SubagentConfig:
     mcp_servers: tuple[str, ...] = ()
     model: str | None = None
 
-    def to_deepagents_spec(self, *, tools: list[Any] | None = None) -> dict[str, Any]:
+    def to_deepagents_spec(
+        self,
+        *,
+        tools: list[Any] | None = None,
+        middleware: list[AgentMiddleware[Any, Any, Any]] | None = None,
+    ) -> dict[str, Any]:
         spec: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
@@ -281,6 +370,8 @@ class SubagentConfig:
             spec["skills"] = list(self.skills)
         if tools:
             spec["tools"] = tools
+        if middleware:
+            spec["middleware"] = list(middleware)
         if self.model:
             spec["model"] = self.model
         return spec
@@ -808,15 +899,21 @@ def build_model(config: RuntimeConfig, reasoning_level: ReasoningLevel) -> Any:
 
 
 def build_deepagent_backend() -> CompositeBackend:
+    artifacts_root = deepagent_artifacts_root()
     return CompositeBackend(
         default=StateBackend(),
         routes={
+            deepagent_artifacts_route_prefix(): FilesystemBackend(
+                root_dir=str(artifacts_root),
+                virtual_mode=True,
+            ),
             "/workspace/": FilesystemBackend(
                 root_dir=str(PROJECT_ROOT),
                 virtual_mode=True,
             ),
             "/memories/": StoreBackend(),
         },
+        artifacts_root=str(artifacts_root),
     )
 
 
@@ -861,8 +958,9 @@ def build_graph_subagent_specs(
     *,
     include_async_subagents: bool,
 ) -> list[Any]:
+    middleware = build_agent_middleware()
     subagent_specs: list[Any] = [
-        subagent.to_deepagents_spec()
+        subagent.to_deepagents_spec(middleware=middleware)
         for subagent in config.extensions.subagents
     ]
     if include_async_subagents:
@@ -900,6 +998,7 @@ def create_configured_graph(
             system_prompt,
             rag_enabled=config.rag is not None,
         ),
+        middleware=build_agent_middleware(),
         backend=build_deepagent_backend(),
         skills=list(config.extensions.skills) or None,
         subagents=subagent_specs or None,
@@ -1019,6 +1118,7 @@ class AgentRuntime:
                     self.config.model_provider,
                     await self._build_main_tools(thread_id=thread_id),
                 )
+                middleware = build_agent_middleware()
                 subagent_specs: list[Any] = [
                     subagent.to_deepagents_spec(
                         tools=sanitize_tools_for_model(
@@ -1027,7 +1127,8 @@ class AgentRuntime:
                                 subagent.mcp_servers,
                                 thread_id=thread_id,
                             ),
-                        )
+                        ),
+                        middleware=middleware,
                     )
                     for subagent in self.config.extensions.subagents
                 ]
@@ -1044,6 +1145,7 @@ class AgentRuntime:
                         SYSTEM_PROMPT,
                         rag_enabled=rag_tool_enabled,
                     ),
+                    middleware=middleware,
                     backend=self._build_backend,
                     store=self.store,
                     checkpointer=self.checkpointer,
