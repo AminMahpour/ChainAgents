@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -312,6 +313,16 @@ class AsyncSubagentConfig:
 
 
 @dataclass(frozen=True)
+class ChainlitCommandConfig:
+    name: str
+    description: str
+    target: Literal["prompt", "subagent", "mcp_tool"]
+    value: str
+    template: str | None = None
+    mcp_server: str | None = None
+
+
+@dataclass(frozen=True)
 class ExtensionsConfig:
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
@@ -321,6 +332,7 @@ class ExtensionsConfig:
     agent_mcp_servers: tuple[str, ...] = ()
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
+    chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -329,6 +341,7 @@ class ExtensionsConfig:
             or self.agent_mcp_servers
             or self.subagents
             or self.async_subagents
+            or self.chainlit_commands
         )
 
 
@@ -578,6 +591,65 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
             )
         )
 
+    chainlit_section = raw_config.get("chainlit", {})
+    if chainlit_section and not isinstance(chainlit_section, dict):
+        raise ValueError("The top-level 'chainlit' config must be a table/object.")
+
+    raw_chainlit_commands = chainlit_section.get("commands", [])
+    if not isinstance(raw_chainlit_commands, list):
+        raise ValueError("The top-level 'chainlit.commands' config must be an array of tables.")
+
+    chainlit_commands: list[ChainlitCommandConfig] = []
+    seen_commands: set[str] = set()
+    for index, raw_chainlit_command in enumerate(raw_chainlit_commands, start=1):
+        if not isinstance(raw_chainlit_command, dict):
+            raise ValueError(
+                f"Chainlit command entry #{index} must be a table/object."
+            )
+        name = str(raw_chainlit_command.get("name", "")).strip().lstrip("/").lower()
+        description = str(raw_chainlit_command.get("description", "")).strip()
+        target = str(raw_chainlit_command.get("target", "")).strip().lower()
+        value = str(raw_chainlit_command.get("value", "")).strip()
+        template = normalize_optional_string(raw_chainlit_command.get("template"))
+        mcp_server = normalize_optional_string(raw_chainlit_command.get("mcp_server"))
+        if not name or " " in name:
+            raise ValueError(
+                f"Chainlit command entry #{index} must define a slash-compatible 'name' with no spaces."
+            )
+        if name in seen_commands:
+            raise ValueError(f"Chainlit command '/{name}' is defined more than once.")
+        if not description:
+            raise ValueError(f"Chainlit command '/{name}' must include a non-empty 'description'.")
+        if target not in {"prompt", "subagent", "mcp_tool"}:
+            raise ValueError(
+                f"Chainlit command '/{name}' target must be one of: prompt, subagent, mcp_tool."
+            )
+        if not value:
+            raise ValueError(f"Chainlit command '/{name}' must include a non-empty 'value'.")
+        if target == "subagent":
+            valid_subagent_names = {subagent.name for subagent in subagents}
+            if value not in valid_subagent_names:
+                raise ValueError(
+                    f"Chainlit command '/{name}' references unknown subagent '{value}'. "
+                    f"Defined subagents: {sorted(valid_subagent_names)}"
+                )
+        if target == "mcp_tool" and mcp_server and mcp_server not in mcp_servers:
+            raise ValueError(
+                f"Chainlit command '/{name}' references unknown MCP server '{mcp_server}'. "
+                f"Defined servers: {sorted(mcp_servers)}"
+            )
+        chainlit_commands.append(
+            ChainlitCommandConfig(
+                name=name,
+                description=description,
+                target=target,  # type: ignore[arg-type]
+                value=value,
+                template=template,
+                mcp_server=mcp_server,
+            )
+        )
+        seen_commands.add(name)
+
     return ExtensionsConfig(
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
@@ -587,6 +659,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_mcp_servers=raw_agent_mcp_servers,
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
+        chainlit_commands=tuple(chainlit_commands),
     )
 
 
@@ -1014,6 +1087,63 @@ class AgentRuntime:
             thread_id=thread_id,
             uploads=uploads,
         )
+
+    def resolve_chainlit_command(self, name: str) -> ChainlitCommandConfig | None:
+        normalized = name.strip().lstrip("/").lower()
+        if not normalized:
+            return None
+        for command in self.config.extensions.chainlit_commands:
+            if command.name == normalized:
+                return command
+        return None
+
+    async def invoke_mcp_tool_command(
+        self,
+        *,
+        tool_name: str,
+        raw_args: str,
+        thread_id: str | None = None,
+        server_name: str | None = None,
+    ) -> Any:
+        candidate_servers: tuple[str, ...]
+        if server_name:
+            candidate_servers = (server_name,)
+        else:
+            available_servers = self.config.extensions.mcp_servers or {}
+            candidate_servers = tuple(available_servers.keys())
+
+        tools = await self._get_mcp_tools(candidate_servers, thread_id=thread_id)
+        selected_tool = next(
+            (
+                tool
+                for tool in tools
+                if str(getattr(tool, "name", "")).strip() == tool_name
+            ),
+            None,
+        )
+        if selected_tool is None:
+            available = sorted(
+                {
+                    str(getattr(tool, "name", "")).strip()
+                    for tool in tools
+                    if str(getattr(tool, "name", "")).strip()
+                }
+            )
+            raise ValueError(
+                f"MCP tool '{tool_name}' is unavailable."
+                + (f" Available tools: {available}" if available else "")
+            )
+
+        parsed_args: Any = {}
+        raw_text = raw_args.strip()
+        if raw_text:
+            try:
+                parsed_args = json.loads(raw_text)
+            except json.JSONDecodeError:
+                raise ValueError(
+                    f"Command arguments for MCP tool '{tool_name}' must be valid JSON."
+                ) from None
+        return await selected_tool.ainvoke(parsed_args)
 
     def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
         return sanitize_tools_for_model(self.config.model_provider, tools)

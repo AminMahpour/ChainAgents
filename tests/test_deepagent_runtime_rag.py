@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
+import pytest
 
 import deepagent_runtime
 from deepagent_runtime import (
@@ -352,3 +353,95 @@ def test_ingest_rag_uploads_delegates_to_rag_service(tmp_path: Path) -> None:
 
     assert result.success is True
     assert result.added_files == ("notes.md",)
+
+
+def test_load_extensions_config_parses_chainlit_commands(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[mcp.servers.repo]
+transport = "stdio"
+command = "npx"
+args = ["server"]
+
+[[subagents]]
+name = "repo-researcher"
+description = "Researches the repo"
+system_prompt = "Do research"
+
+[chainlit]
+commands = [
+  { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "repo-researcher" },
+  { name = "run-tool", description = "Call MCP tool", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo" },
+  { name = "rewrite", description = "Prompt rewrite", target = "prompt", value = "Rewrite prompt", template = "Rewrite: {input}" }
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert len(extensions.chainlit_commands) == 3
+    assert extensions.chainlit_commands[0].name == "ask-researcher"
+    assert extensions.chainlit_commands[1].target == "mcp_tool"
+    assert extensions.chainlit_commands[2].template == "Rewrite: {input}"
+
+
+def test_load_extensions_config_rejects_unknown_chainlit_subagent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+commands = [
+  { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "missing-subagent" }
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="unknown subagent"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:
+    class FakeTool:
+        name = "repo_read_file"
+
+        async def ainvoke(self, payload):
+            return {"ok": True, "payload": payload}
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                mcp_servers={"repo": {"transport": "stdio", "command": "npx", "args": []}},
+            ),
+        )
+    )
+
+    async def fake_get_mcp_tools(server_names, *, thread_id=None):
+        assert server_names == ("repo",)
+        assert thread_id == "thread-1"
+        return [FakeTool()]
+
+    runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
+
+    result = asyncio.run(
+        runtime.invoke_mcp_tool_command(
+            tool_name="repo_read_file",
+            raw_args='{"path":"README.md"}',
+            thread_id="thread-1",
+            server_name="repo",
+        )
+    )
+
+    assert result == {"ok": True, "payload": {"path": "README.md"}}

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import traceback
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import chainlit as cl
 from chainlit.input_widget import Select, TextInput
@@ -115,6 +116,28 @@ def rag_actions() -> list[cl.Action]:
     return [build_rag_action(), build_upload_rag_action()]
 
 
+def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
+    icon_by_target = {
+        "prompt": "square-pen",
+        "subagent": "bot",
+        "mcp_tool": "wrench",
+    }
+    return [
+        {
+            "id": command.name,
+            "description": command.description,
+            "icon": icon_by_target.get(command.target, "terminal"),
+            "button": False,
+            "persistent": True,
+        }
+        for command in runtime.config.extensions.chainlit_commands
+    ]
+
+
+async def publish_native_commands(runtime: AgentRuntime) -> None:
+    await cl.context.emitter.set_commands(build_native_command_specs(runtime))
+
+
 def rag_status_line(runtime: AgentRuntime) -> str:
     status = runtime.rag_status
     if not status.enabled:
@@ -174,6 +197,89 @@ def upload_result_message(upload_result) -> str:
         return f"No supported text files were added to RAG. Rejected: {rejected}"
 
     return upload_result.reason or "No files were added to RAG."
+
+class ParsedNativeCommand(NamedTuple):
+    command_name: str
+    raw_args: str
+
+
+def parse_native_command(raw_text: str) -> ParsedNativeCommand | None:
+    text = raw_text.strip()
+    if not text.startswith("/"):
+        return None
+    tokens = text[1:].split(None, 1)
+    if not tokens:
+        return None
+    return ParsedNativeCommand(
+        command_name=tokens[0].strip().lower(),
+        raw_args=tokens[1].strip() if len(tokens) > 1 else "",
+    )
+
+
+def resolve_native_command(
+    *,
+    raw_text: str,
+    selected_command: str | None = None,
+) -> ParsedNativeCommand | None:
+    parsed = parse_native_command(raw_text)
+    if parsed is not None:
+        return parsed
+
+    command_name = str(selected_command or "").strip().lstrip("/").lower()
+    if not command_name:
+        return None
+
+    return ParsedNativeCommand(
+        command_name=command_name,
+        raw_args=raw_text.strip(),
+    )
+
+
+def apply_native_template(template: str | None, raw_args: str) -> str:
+    if template is None:
+        return raw_args.strip()
+    return template.replace("{input}", raw_args.strip()).strip()
+
+
+async def handle_native_command(
+    *,
+    runtime: AgentRuntime,
+    settings: AppSettings,
+    parsed: ParsedNativeCommand,
+) -> str | None:
+    command = runtime.resolve_chainlit_command(parsed.command_name)
+    if command is None:
+        return None
+
+    if command.target == "mcp_tool":
+        tool_raw_args = apply_native_template(command.template, parsed.raw_args)
+        result = await runtime.invoke_mcp_tool_command(
+            tool_name=command.value,
+            raw_args=tool_raw_args,
+            thread_id=settings.thread_id,
+            server_name=command.mcp_server,
+        )
+        await cl.Message(
+            author="System",
+            content=(
+                f"Ran `/{command.name}` ({command.description}).\n\n"
+                "Tool result:\n```json\n"
+                f"{json.dumps(result, indent=2, sort_keys=True, ensure_ascii=True, default=str)}\n"
+                "```"
+            ),
+        ).send()
+        return ""
+
+    transformed = apply_native_template(command.template, parsed.raw_args)
+    if command.target == "prompt":
+        return transformed or command.value
+
+    return (
+        f"Delegate this request to the configured `{command.value}` subagent.\n\n"
+        f"Command: `/{command.name}`\n"
+        f"Description: {command.description}\n\n"
+        f"User request:\n{transformed or parsed.raw_args or command.value}"
+    ).strip()
 
 
 async def ask_for_rag_upload() -> list[UploadedRagFile]:
@@ -308,6 +414,7 @@ async def on_chat_start() -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    await publish_native_commands(runtime)
     run_task_list = await get_run_task_list()
     await run_task_list.show_ready()
     settings = AppSettings(
@@ -338,7 +445,14 @@ async def on_chat_start() -> None:
         f"{mcp_session_mode_line}"
         f"- Custom subagents: `{len(extensions.subagents)}`\n"
         f"- Async subagents: `{len(extensions.async_subagents)}`\n"
+        f"- Native commands: `{len(extensions.chainlit_commands)}`\n"
     )
+    if extensions.chainlit_commands:
+        command_lines = "\n".join(
+            f"  - `/{command.name}` ({command.target}): {command.description}"
+            for command in extensions.chainlit_commands
+        )
+        extensions_line += f"Configured commands:\n{command_lines}\n"
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
     startup_message = cl.Message(
@@ -366,6 +480,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    await publish_native_commands(runtime)
 
     run_task_list = await get_run_task_list()
     await run_task_list.show_ready()
@@ -481,8 +596,41 @@ async def on_message(message: cl.Message) -> None:
             upload_message.actions = rag_actions()
         await upload_message.send()
 
-    if not message.content.strip() and uploaded_files:
+    parsed_command = resolve_native_command(
+        raw_text=message.content,
+        selected_command=getattr(message, "command", None),
+    )
+    slash_command_from_text = parse_native_command(message.content)
+    if not message.content.strip() and uploaded_files and parsed_command is None:
         return
+
+    if parsed_command is not None:
+        try:
+            transformed_prompt = await handle_native_command(
+                runtime=runtime,
+                settings=settings,
+                parsed=parsed_command,
+            )
+        except Exception as exc:
+            await cl.Message(
+                author="System",
+                content=f"Native command `/{parsed_command.command_name}` failed: {exc}",
+            ).send()
+            return
+        if transformed_prompt is None:
+            if slash_command_from_text is None:
+                await cl.Message(
+                    author="System",
+                    content=(
+                        f"Unknown command `/{parsed_command.command_name}`.\n"
+                        "Use a configured command from startup or send a normal prompt."
+                    ),
+                ).send()
+                return
+        else:
+            if not transformed_prompt.strip():
+                return
+            message.content = transformed_prompt
 
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
