@@ -34,6 +34,7 @@ mcp_servers = ["repo"]
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },
+  { name = "review-skill", description = "Run the repository reviewer skill.", target = "skill", value = "reviewer", template = "{input}" },
   { name = "ask-researcher", description = "Delegate to repo-researcher subagent.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Call MCP filesystem read_file on README.md.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\": \"README.md\"}" },
 ]

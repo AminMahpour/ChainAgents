@@ -376,6 +376,7 @@ system_prompt = "Do research"
 commands = [
   { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "repo-researcher" },
   { name = "run-tool", description = "Call MCP tool", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo" },
+  { name = "review-skill", description = "Use reviewer skill", target = "skill", value = "reviewer" },
   { name = "rewrite", description = "Prompt rewrite", target = "prompt", value = "Rewrite prompt", template = "Rewrite: {input}" }
 ]
 """.strip(),
@@ -385,10 +386,11 @@ commands = [
 
     extensions = deepagent_runtime.load_extensions_config()
 
-    assert len(extensions.chainlit_commands) == 3
+    assert len(extensions.chainlit_commands) == 4
     assert extensions.chainlit_commands[0].name == "ask-researcher"
     assert extensions.chainlit_commands[1].target == "mcp_tool"
-    assert extensions.chainlit_commands[2].template == "Rewrite: {input}"
+    assert extensions.chainlit_commands[2].target == "skill"
+    assert extensions.chainlit_commands[3].template == "Rewrite: {input}"
 
 
 def test_load_extensions_config_rejects_unknown_chainlit_subagent(

@@ -324,6 +324,7 @@ Example:
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
+  { name = "review-skill", description = "Run the reviewer skill.", target = "skill", value = "reviewer", template = "{input}" },
   { name = "summarize", description = "Apply a prompt template.", target = "prompt", value = "Summarize the input", template = "Summarize this:\n{input}" }
 ]
 ```
@@ -331,6 +332,7 @@ commands = [
 `target` modes:
 
 - `prompt`: rewrites the user prompt before sending it to the agent.
+- `skill`: rewrites the user prompt to direct the runtime toward a configured skill name.
 - `subagent`: rewrites the user prompt to direct the runtime to delegate via the configured subagent.
 - `mcp_tool`: invokes the configured MCP tool directly and returns tool output in chat.
 

@@ -121,6 +121,7 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
         "prompt": "square-pen",
         "subagent": "bot",
         "mcp_tool": "wrench",
+        "skill": "sparkles",
     }
     return [
         {
@@ -272,6 +273,13 @@ async def handle_native_command(
     transformed = apply_native_template(command.template, parsed.raw_args)
     if command.target == "prompt":
         return transformed or command.value
+    if command.target == "skill":
+        return (
+            f"Use the configured `{command.value}` skill for this request.\n\n"
+            f"Command: `/{command.name}`\n"
+            f"Description: {command.description}\n\n"
+            f"User request:\n{transformed or parsed.raw_args or command.value}"
+        ).strip()
 
     return (
         f"Delegate this request to the configured `{command.value}` subagent.\n\n"

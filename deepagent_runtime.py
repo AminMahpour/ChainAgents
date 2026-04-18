@@ -316,7 +316,7 @@ class AsyncSubagentConfig:
 class ChainlitCommandConfig:
     name: str
     description: str
-    target: Literal["prompt", "subagent", "mcp_tool"]
+    target: Literal["prompt", "subagent", "mcp_tool", "skill"]
     value: str
     template: str | None = None
     mcp_server: str | None = None
@@ -620,9 +620,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
             raise ValueError(f"Chainlit command '/{name}' is defined more than once.")
         if not description:
             raise ValueError(f"Chainlit command '/{name}' must include a non-empty 'description'.")
-        if target not in {"prompt", "subagent", "mcp_tool"}:
+        if target not in {"prompt", "subagent", "mcp_tool", "skill"}:
             raise ValueError(
-                f"Chainlit command '/{name}' target must be one of: prompt, subagent, mcp_tool."
+                f"Chainlit command '/{name}' target must be one of: prompt, subagent, mcp_tool, skill."
             )
         if not value:
             raise ValueError(f"Chainlit command '/{name}' must include a non-empty 'value'.")
