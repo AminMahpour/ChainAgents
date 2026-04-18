@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+from langchain.agents.middleware.types import ToolCallRequest
+from langchain_core.messages import ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 import pytest
@@ -14,6 +16,9 @@ from deepagent_runtime import (
     AgentRuntime,
     ExtensionsConfig,
     RuntimeConfig,
+    ToolExecutionResilienceMiddleware,
+    deepagent_artifacts_root,
+    deepagent_artifacts_route_prefix,
 )
 from rag_runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
@@ -133,6 +138,59 @@ mcp_servers = ["repo"]
     assert config.mcp_stateful is True
 
 
+def test_build_deepagent_backend_stores_large_tool_results_inside_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(deepagent_runtime, "PROJECT_ROOT", tmp_path)
+
+    backend = deepagent_runtime.build_deepagent_backend()
+    artifacts_root = deepagent_artifacts_root()
+    offloaded_path = f"{deepagent_artifacts_route_prefix()}large_tool_results/tool-call-1"
+
+    write_result = backend.write(offloaded_path, "tool output")
+
+    assert write_result.error is None
+    assert write_result.path == offloaded_path
+    assert backend.artifacts_root == artifacts_root.as_posix()
+    assert (artifacts_root / "large_tool_results" / "tool-call-1").read_text(
+        encoding="utf-8"
+    ) == "tool output"
+
+    read_result = backend.read(offloaded_path)
+
+    assert read_result.error is None
+    assert read_result.file_data is not None
+    assert read_result.file_data["content"] == "tool output"
+
+
+def test_tool_execution_resilience_middleware_returns_error_tool_message() -> None:
+    middleware = ToolExecutionResilienceMiddleware()
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "repo_read_file",
+            "args": {"path": "README.md"},
+            "type": "tool_call",
+        },
+        tool=SimpleNamespace(name="repo_read_file"),
+        state={},
+        runtime=SimpleNamespace(),
+    )
+
+    async def failing_handler(_request: ToolCallRequest):
+        raise ValueError("bad path")
+
+    result = asyncio.run(middleware.awrap_tool_call(request, failing_handler))
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert result.tool_call_id == "call-1"
+    assert result.name == "repo_read_file"
+    assert "ValueError: bad path" in str(result.content)
+    assert "without aborting the run" in str(result.content)
+
+
 def test_agent_runtime_initialize_runs_rag_startup_check(
     tmp_path: Path,
     monkeypatch,
@@ -210,6 +268,8 @@ def test_get_agent_includes_rag_tool_when_ready(
 
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" in tool_names
+    middleware = captured["kwargs"]["middleware"]
+    assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
 
 
 def test_get_agent_omits_rag_tool_when_service_is_missing(
@@ -233,6 +293,8 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
 
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" not in tool_names
+    middleware = captured["kwargs"]["middleware"]
+    assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
 
 
 def test_stateful_mcp_reuses_session_per_thread(
