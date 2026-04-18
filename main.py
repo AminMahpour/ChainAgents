@@ -252,9 +252,10 @@ async def handle_native_command(
         return None
 
     if command.target == "mcp_tool":
+        tool_raw_args = apply_native_template(command.template, parsed.raw_args)
         result = await runtime.invoke_mcp_tool_command(
             tool_name=command.value,
-            raw_args=parsed.raw_args,
+            raw_args=tool_raw_args,
             thread_id=settings.thread_id,
             server_name=command.mcp_server,
         )
@@ -599,6 +600,7 @@ async def on_message(message: cl.Message) -> None:
         raw_text=message.content,
         selected_command=getattr(message, "command", None),
     )
+    slash_command_from_text = parse_native_command(message.content)
     if not message.content.strip() and uploaded_files and parsed_command is None:
         return
 
@@ -616,17 +618,19 @@ async def on_message(message: cl.Message) -> None:
             ).send()
             return
         if transformed_prompt is None:
-            await cl.Message(
-                author="System",
-                content=(
-                    f"Unknown command `/{parsed_command.command_name}`.\n"
-                    "Use a configured command from startup or send a normal prompt."
-                ),
-            ).send()
-            return
-        if not transformed_prompt.strip():
-            return
-        message.content = transformed_prompt
+            if slash_command_from_text is None:
+                await cl.Message(
+                    author="System",
+                    content=(
+                        f"Unknown command `/{parsed_command.command_name}`.\n"
+                        "Use a configured command from startup or send a normal prompt."
+                    ),
+                ).send()
+                return
+        else:
+            if not transformed_prompt.strip():
+                return
+            message.content = transformed_prompt
 
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
