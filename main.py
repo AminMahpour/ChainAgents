@@ -121,6 +121,7 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
         "prompt": "square-pen",
         "subagent": "bot",
         "mcp_tool": "wrench",
+        "skill": "book-open",
     }
     return [
         {
@@ -130,7 +131,7 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
             "button": False,
             "persistent": True,
         }
-        for command in runtime.config.extensions.chainlit_commands
+        for command in runtime.chainlit_commands
     ]
 
 
@@ -241,6 +242,25 @@ def apply_native_template(template: str | None, raw_args: str) -> str:
     return template.replace("{input}", raw_args.strip()).strip()
 
 
+def build_skill_command_prompt(*, skill_name: str, skill_path: str, raw_args: str) -> str:
+    prelude = (
+        f"Use the configured `{skill_name}` skill for this request.\n"
+        f"Read `{skill_path}` before taking any other action and follow it for this entire turn.\n"
+        "Skill usage is mandatory for this request.\n"
+    )
+    request = raw_args.strip()
+    if request:
+        return (
+            f"{prelude}\n"
+            "After reading the skill, complete the user's request below.\n\n"
+            f"User request:\n{request}"
+        ).strip()
+    return (
+        f"{prelude}\n"
+        "After reading the skill, briefly explain what it does and ask the user for the specific task."
+    ).strip()
+
+
 async def handle_native_command(
     *,
     runtime: AgentRuntime,
@@ -250,6 +270,13 @@ async def handle_native_command(
     command = runtime.resolve_chainlit_command(parsed.command_name)
     if command is None:
         return None
+
+    if command.target == "skill":
+        return build_skill_command_prompt(
+            skill_name=command.name,
+            skill_path=command.value,
+            raw_args=parsed.raw_args,
+        )
 
     if command.target == "mcp_tool":
         tool_raw_args = apply_native_template(command.template, parsed.raw_args)
@@ -434,6 +461,10 @@ async def on_chat_start() -> None:
         else "- History bar: disabled; set `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` to enable native Chainlit history\n"
     )
     extensions = runtime.config.extensions
+    configured_command_count = len(extensions.chainlit_commands)
+    skill_command_count = sum(
+        1 for command in runtime.chainlit_commands if command.target == "skill"
+    )
     mcp_session_mode_line = (
         "- MCP session mode: stateful per LangGraph thread while this app process stays alive\n"
         if extensions.mcp_stateful
@@ -445,14 +476,19 @@ async def on_chat_start() -> None:
         f"{mcp_session_mode_line}"
         f"- Custom subagents: `{len(extensions.subagents)}`\n"
         f"- Async subagents: `{len(extensions.async_subagents)}`\n"
-        f"- Native commands: `{len(extensions.chainlit_commands)}`\n"
+        f"- Configured commands: `{configured_command_count}`\n"
+        f"- Skill-backed commands: `{skill_command_count}`\n"
+        f"- Native commands: `{len(runtime.chainlit_commands)}`\n"
     )
-    if extensions.chainlit_commands:
+    if runtime.chainlit_commands:
         command_lines = "\n".join(
             f"  - `/{command.name}` ({command.target}): {command.description}"
-            for command in extensions.chainlit_commands
+            for command in runtime.chainlit_commands
         )
-        extensions_line += f"Configured commands:\n{command_lines}\n"
+        extensions_line += f"Available commands:\n{command_lines}\n"
+    if runtime.chainlit_command_notes:
+        note_lines = "\n".join(f"  - {note}" for note in runtime.chainlit_command_notes)
+        extensions_line += f"Command notes:\n{note_lines}\n"
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
     startup_message = cl.Message(

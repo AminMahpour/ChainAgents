@@ -40,9 +40,9 @@ def test_resolve_native_command_returns_none_without_command() -> None:
 
 
 class _DummyRuntime:
-    def __init__(self) -> None:
+    def __init__(self, command=None) -> None:
         self.invocation: dict[str, str | None] | None = None
-        self.command = SimpleNamespace(
+        self.command = command or SimpleNamespace(
             name="repo-readme",
             description="Read repository README",
             target="mcp_tool",
@@ -96,3 +96,114 @@ async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) 
     assert result == ""
     assert runtime.invocation is not None
     assert runtime.invocation["raw_args"] == '{"path":"README.md"}'
+
+
+def test_build_skill_command_prompt_requires_skill_and_request() -> None:
+    prompt = main.build_skill_command_prompt(
+        skill_name="reviewer",
+        skill_path="/workspace/skills/reviewer/SKILL.md",
+        raw_args="inspect this diff",
+    )
+
+    assert "Use the configured `reviewer` skill" in prompt
+    assert "Read `/workspace/skills/reviewer/SKILL.md` before taking any other action" in prompt
+    assert "Skill usage is mandatory" in prompt
+    assert "User request:\ninspect this diff" in prompt
+
+
+def test_build_skill_command_prompt_without_request_asks_for_task() -> None:
+    prompt = main.build_skill_command_prompt(
+        skill_name="reviewer",
+        skill_path="/workspace/skills/reviewer/SKILL.md",
+        raw_args="",
+    )
+
+    assert "briefly explain what it does and ask the user for the specific task" in prompt
+
+
+@pytest.mark.anyio
+async def test_handle_native_command_returns_forced_skill_prompt() -> None:
+    runtime = _DummyRuntime(
+        command=SimpleNamespace(
+            name="reviewer",
+            description="Review code for bugs",
+            target="skill",
+            value="/workspace/skills/reviewer/SKILL.md",
+            template=None,
+            mcp_server=None,
+        )
+    )
+    settings = SimpleNamespace(thread_id="thread-1")
+
+    result = await main.handle_native_command(
+        runtime=runtime,
+        settings=settings,
+        parsed=main.ParsedNativeCommand(
+            command_name="reviewer",
+            raw_args="inspect this diff",
+        ),
+    )
+
+    assert result is not None
+    assert "Use the configured `reviewer` skill" in result
+    assert "User request:\ninspect this diff" in result
+
+
+@pytest.mark.anyio
+async def test_handle_native_command_without_skill_args_requests_clarification() -> None:
+    runtime = _DummyRuntime(
+        command=SimpleNamespace(
+            name="reviewer",
+            description="Review code for bugs",
+            target="skill",
+            value="/workspace/skills/reviewer/SKILL.md",
+            template=None,
+            mcp_server=None,
+        )
+    )
+    settings = SimpleNamespace(thread_id="thread-1")
+
+    result = await main.handle_native_command(
+        runtime=runtime,
+        settings=settings,
+        parsed=main.ParsedNativeCommand(
+            command_name="reviewer",
+            raw_args="",
+        ),
+    )
+
+    assert result is not None
+    assert "briefly explain what it does and ask the user for the specific task" in result
+
+
+@pytest.mark.anyio
+async def test_handle_native_command_uses_selected_skill_command_input() -> None:
+    runtime = _DummyRuntime(
+        command=SimpleNamespace(
+            name="reviewer",
+            description="Review code for bugs",
+            target="skill",
+            value="/workspace/skills/reviewer/SKILL.md",
+            template=None,
+            mcp_server=None,
+        )
+    )
+    settings = SimpleNamespace(thread_id="thread-1")
+    parsed = main.resolve_native_command(
+        raw_text="inspect this diff",
+        selected_command="reviewer",
+    )
+
+    assert parsed == main.ParsedNativeCommand(
+        command_name="reviewer",
+        raw_args="inspect this diff",
+    )
+
+    result = await main.handle_native_command(
+        runtime=runtime,
+        settings=settings,
+        parsed=parsed,
+    )
+
+    assert result is not None
+    assert "User request:\ninspect this diff" in result

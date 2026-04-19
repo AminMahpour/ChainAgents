@@ -20,6 +20,7 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
+from deepagents.middleware.skills import _list_skills
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_ollama import ChatOllama
@@ -407,10 +408,37 @@ class AsyncSubagentConfig:
 class ChainlitCommandConfig:
     name: str
     description: str
-    target: Literal["prompt", "subagent", "mcp_tool"]
+    target: Literal["prompt", "subagent", "mcp_tool", "skill"]
     value: str
     template: str | None = None
     mcp_server: str | None = None
+    source: Literal["config", "agent_skill", "subagent_skill"] = "config"
+
+
+@dataclass(frozen=True)
+class SkillCommandMetadata:
+    name: str
+    description: str
+    path: str
+    source: Literal["agent_skill", "subagent_skill"]
+    owner: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.source == "agent_skill":
+            return f"main agent skill `{self.path}`"
+        if self.owner:
+            return f"subagent `{self.owner}` skill `{self.path}`"
+        return f"subagent skill `{self.path}`"
+
+    def to_chainlit_command(self) -> ChainlitCommandConfig:
+        return ChainlitCommandConfig(
+            name=self.name,
+            description=self.description,
+            target="skill",
+            value=self.path,
+            source=self.source,
+        )
 
 
 @dataclass(frozen=True)
@@ -898,23 +926,148 @@ def build_model(config: RuntimeConfig, reasoning_level: ReasoningLevel) -> Any:
     return ChatOpenAI(**kwargs)
 
 
-def build_deepagent_backend() -> CompositeBackend:
-    artifacts_root = deepagent_artifacts_root()
+def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:
+    resolved_project_root = project_root or PROJECT_ROOT
+    artifacts_root = deepagent_artifacts_root(resolved_project_root)
     return CompositeBackend(
         default=StateBackend(),
         routes={
-            deepagent_artifacts_route_prefix(): FilesystemBackend(
+            deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
                 root_dir=str(artifacts_root),
                 virtual_mode=True,
             ),
             "/workspace/": FilesystemBackend(
-                root_dir=str(PROJECT_ROOT),
+                root_dir=str(resolved_project_root),
                 virtual_mode=True,
             ),
             "/memories/": StoreBackend(),
         },
         artifacts_root=str(artifacts_root),
     )
+
+
+def normalize_chainlit_command_name(value: str) -> str:
+    return value.strip().lstrip("/").lower()
+
+
+def _load_skill_command_bucket(
+    *,
+    backend: CompositeBackend,
+    source_paths: tuple[str, ...],
+    source: Literal["agent_skill", "subagent_skill"],
+    owner: str | None = None,
+) -> tuple[SkillCommandMetadata, ...]:
+    commands_by_name: dict[str, SkillCommandMetadata] = {}
+    for source_path in source_paths:
+        try:
+            source_skills = _list_skills(backend, source_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load skills from '%s' for Chainlit command generation: %s",
+                source_path,
+                exc,
+            )
+            continue
+
+        for skill in source_skills:
+            command_name = normalize_chainlit_command_name(str(skill["name"]))
+            if not command_name or " " in command_name:
+                logger.warning(
+                    "Skipping skill '%s' from %s because it is not slash-command compatible.",
+                    skill["name"],
+                    skill["path"],
+                )
+                continue
+
+            metadata = SkillCommandMetadata(
+                name=command_name,
+                description=str(skill["description"]).strip(),
+                path=str(skill["path"]).strip(),
+                source=source,
+                owner=owner,
+            )
+            previous = commands_by_name.pop(command_name, None)
+            if previous is not None:
+                logger.warning(
+                    "Auto skill command '/%s' from %s overrides %s.",
+                    command_name,
+                    metadata.label,
+                    previous.label,
+                )
+            commands_by_name[command_name] = metadata
+    return tuple(commands_by_name.values())
+
+
+def build_chainlit_command_catalog(
+    extensions: ExtensionsConfig,
+    *,
+    backend: CompositeBackend | None = None,
+    project_root: Path | None = None,
+) -> tuple[tuple[ChainlitCommandConfig, ...], tuple[str, ...]]:
+    backend = backend or build_deepagent_backend(project_root=project_root)
+    notes: list[str] = []
+    merged_commands = list(extensions.chainlit_commands)
+    explicit_names = {command.name: command for command in extensions.chainlit_commands}
+
+    main_skill_commands = _load_skill_command_bucket(
+        backend=backend,
+        source_paths=extensions.skills,
+        source="agent_skill",
+    )
+    subagent_commands_by_name: dict[str, SkillCommandMetadata] = {}
+    for subagent in extensions.subagents:
+        for metadata in _load_skill_command_bucket(
+            backend=backend,
+            source_paths=subagent.skills,
+            source="subagent_skill",
+            owner=subagent.name,
+        ):
+            previous = subagent_commands_by_name.pop(metadata.name, None)
+            if previous is not None:
+                logger.warning(
+                    "Auto skill command '/%s' from %s overrides %s.",
+                    metadata.name,
+                    metadata.label,
+                    previous.label,
+                )
+            subagent_commands_by_name[metadata.name] = metadata
+    subagent_skill_commands = tuple(subagent_commands_by_name.values())
+
+    winner_by_name: dict[str, ChainlitCommandConfig | SkillCommandMetadata] = {
+        command.name: command for command in merged_commands
+    }
+
+    for metadata in main_skill_commands:
+        explicit = explicit_names.get(metadata.name)
+        if explicit is not None:
+            note = (
+                f"`/{metadata.name}` from {metadata.label} is hidden by explicit "
+                f"Chainlit command `/{explicit.name}`."
+            )
+            notes.append(note)
+            logger.warning(note)
+            continue
+        merged_commands.append(metadata.to_chainlit_command())
+        winner_by_name[metadata.name] = metadata
+
+    for metadata in subagent_skill_commands:
+        winner = winner_by_name.get(metadata.name)
+        if winner is None:
+            merged_commands.append(metadata.to_chainlit_command())
+            winner_by_name[metadata.name] = metadata
+            continue
+
+        if isinstance(winner, ChainlitCommandConfig):
+            note = (
+                f"`/{metadata.name}` from {metadata.label} is hidden by explicit "
+                f"Chainlit command `/{winner.name}`."
+            )
+        else:
+            note = f"`/{metadata.name}` from {metadata.label} is hidden by {winner.label}."
+        notes.append(note)
+        logger.warning(note)
+
+    return tuple(merged_commands), tuple(notes)
 
 
 def sanitize_tools_for_model(
@@ -1015,8 +1168,9 @@ class AgentRuntime:
     _instance: "AgentRuntime | None" = None
     _instance_lock = asyncio.Lock()
 
-    def __init__(self, config: RuntimeConfig) -> None:
+    def __init__(self, config: RuntimeConfig, *, project_root: Path | None = None) -> None:
         self.config = config
+        self.project_root = project_root or PROJECT_ROOT
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
         self._agents: dict[tuple[ReasoningLevel, str | None, str | None], object] = {}
@@ -1026,6 +1180,10 @@ class AgentRuntime:
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
+        self._chainlit_commands, self._chainlit_command_notes = build_chainlit_command_catalog(
+            config.extensions,
+            project_root=self.project_root,
+        )
 
     @classmethod
     async def get(cls) -> "AgentRuntime":
@@ -1055,6 +1213,14 @@ class AgentRuntime:
     @property
     def rag_enabled(self) -> bool:
         return self.config.rag_requested
+
+    @property
+    def chainlit_commands(self) -> tuple[ChainlitCommandConfig, ...]:
+        return self._chainlit_commands
+
+    @property
+    def chainlit_command_notes(self) -> tuple[str, ...]:
+        return self._chainlit_command_notes
 
     @property
     def rag_status(self) -> RagStatus:
@@ -1093,7 +1259,7 @@ class AgentRuntime:
         if self.config.rag is not None:
             self._rag_service = WorkspaceDocsRAG(
                 self.config.rag,
-                project_root=PROJECT_ROOT,
+                project_root=self.project_root,
             )
             rag_status = await asyncio.to_thread(self._rag_service.ensure_ready)
             if not rag_status.ready and rag_status.reason:
@@ -1191,10 +1357,10 @@ class AgentRuntime:
         )
 
     def resolve_chainlit_command(self, name: str) -> ChainlitCommandConfig | None:
-        normalized = name.strip().lstrip("/").lower()
+        normalized = normalize_chainlit_command_name(name)
         if not normalized:
             return None
-        for command in self.config.extensions.chainlit_commands:
+        for command in self.chainlit_commands:
             if command.name == normalized:
                 return command
         return None
@@ -1335,4 +1501,4 @@ class AgentRuntime:
             self._agents.clear()
 
     def _build_backend(self, runtime):
-        return build_deepagent_backend()
+        return build_deepagent_backend(project_root=self.project_root)
