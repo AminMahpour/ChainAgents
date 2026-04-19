@@ -14,9 +14,13 @@ import pytest
 import deepagent_runtime
 from deepagent_runtime import (
     AgentRuntime,
+    ChainlitCommandConfig,
     ExtensionsConfig,
     RuntimeConfig,
+    SubagentConfig,
     ToolExecutionResilienceMiddleware,
+    build_chainlit_command_catalog,
+    build_deepagent_backend,
     deepagent_artifacts_root,
     deepagent_artifacts_route_prefix,
 )
@@ -78,6 +82,27 @@ def make_extensions_config(
         mcp_stateful=mcp_stateful,
         mcp_servers={"repo": {"transport": "stdio", "command": "npx", "args": []}},
         agent_mcp_servers=agent_mcp_servers,
+    )
+
+
+def write_skill(
+    root: Path,
+    directory: str,
+    *,
+    name: str,
+    description: str,
+) -> None:
+    skill_path = root / directory / "SKILL.md"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    skill_path.write_text(
+        (
+            "---\n"
+            f"name: {name}\n"
+            f"description: {description}\n"
+            "---\n\n"
+            f"# {name}\n"
+        ),
+        encoding="utf-8",
     )
 
 
@@ -471,6 +496,155 @@ commands = [
 
     with pytest.raises(ValueError, match="unknown subagent"):
         deepagent_runtime.load_extensions_config()
+
+
+def test_build_chainlit_command_catalog_includes_main_and_subagent_skills(
+    tmp_path: Path,
+) -> None:
+    write_skill(
+        tmp_path,
+        "skills/reviewer",
+        name="reviewer",
+        description="Review code for bugs.",
+    )
+    write_skill(
+        tmp_path,
+        "subskills/repo-guide",
+        name="repo-guide",
+        description="Walk the repository.",
+    )
+    extensions = ExtensionsConfig(
+        config_path=None,
+        skills=("/workspace/skills/",),
+        subagents=(
+            SubagentConfig(
+                name="repo-researcher",
+                description="Researches the repo",
+                system_prompt="Do research",
+                skills=("/workspace/subskills/",),
+            ),
+        ),
+    )
+
+    commands, notes = build_chainlit_command_catalog(
+        extensions,
+        backend=build_deepagent_backend(project_root=tmp_path),
+        project_root=tmp_path,
+    )
+
+    assert [command.name for command in commands] == ["reviewer", "repo-guide"]
+    assert commands[0].target == "skill"
+    assert commands[0].value == "/workspace/skills/reviewer/SKILL.md"
+    assert commands[1].value == "/workspace/subskills/repo-guide/SKILL.md"
+    assert notes == ()
+
+
+def test_build_chainlit_command_catalog_prefers_explicit_command_over_skill(
+    tmp_path: Path,
+) -> None:
+    write_skill(
+        tmp_path,
+        "skills/reviewer",
+        name="reviewer",
+        description="Review code for bugs.",
+    )
+    extensions = ExtensionsConfig(
+        config_path=None,
+        skills=("/workspace/skills/",),
+        chainlit_commands=(
+            ChainlitCommandConfig(
+                name="reviewer",
+                description="Explicit reviewer command",
+                target="prompt",
+                value="Review this",
+            ),
+        ),
+    )
+
+    commands, notes = build_chainlit_command_catalog(
+        extensions,
+        backend=build_deepagent_backend(project_root=tmp_path),
+        project_root=tmp_path,
+    )
+
+    assert len(commands) == 1
+    assert commands[0].target == "prompt"
+    assert len(notes) == 1
+    assert "hidden by explicit Chainlit command" in notes[0]
+
+
+def test_build_chainlit_command_catalog_prefers_main_agent_skill_over_subagent_skill(
+    tmp_path: Path,
+) -> None:
+    write_skill(
+        tmp_path,
+        "skills/reviewer",
+        name="reviewer",
+        description="Main reviewer",
+    )
+    write_skill(
+        tmp_path,
+        "subskills/reviewer",
+        name="reviewer",
+        description="Subagent reviewer",
+    )
+    extensions = ExtensionsConfig(
+        config_path=None,
+        skills=("/workspace/skills/",),
+        subagents=(
+            SubagentConfig(
+                name="repo-researcher",
+                description="Researches the repo",
+                system_prompt="Do research",
+                skills=("/workspace/subskills/",),
+            ),
+        ),
+    )
+
+    commands, notes = build_chainlit_command_catalog(
+        extensions,
+        backend=build_deepagent_backend(project_root=tmp_path),
+        project_root=tmp_path,
+    )
+
+    assert len(commands) == 1
+    assert commands[0].target == "skill"
+    assert commands[0].description == "Main reviewer"
+    assert commands[0].value == "/workspace/skills/reviewer/SKILL.md"
+    assert len(notes) == 1
+    assert "main agent skill" in notes[0]
+
+
+def test_build_chainlit_command_catalog_uses_later_skill_source_in_same_bucket(
+    tmp_path: Path,
+) -> None:
+    write_skill(
+        tmp_path,
+        "skills-a/reviewer",
+        name="reviewer",
+        description="Earlier reviewer",
+    )
+    write_skill(
+        tmp_path,
+        "skills-b/reviewer",
+        name="reviewer",
+        description="Later reviewer",
+    )
+    extensions = ExtensionsConfig(
+        config_path=None,
+        skills=("/workspace/skills-a/", "/workspace/skills-b/"),
+    )
+
+    commands, notes = build_chainlit_command_catalog(
+        extensions,
+        backend=build_deepagent_backend(project_root=tmp_path),
+        project_root=tmp_path,
+    )
+
+    assert len(commands) == 1
+    assert commands[0].description == "Later reviewer"
+    assert commands[0].value == "/workspace/skills-b/reviewer/SKILL.md"
+    assert notes == ()
 
 
 def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:

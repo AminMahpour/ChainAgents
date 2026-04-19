@@ -243,6 +243,9 @@ Notes:
 - Relative skill paths are automatically mapped into the Deep Agents virtual filesystem as `/workspace/...`.
 - Each skill source directory should contain one or more skill folders, and each skill folder must contain `SKILL.md`.
 - You can also use explicit virtual paths such as `"/workspace/skills/"` if you prefer.
+- Every loaded skill is also exposed as a Chainlit slash command using the skill `name`, for example `reviewer` becomes `/reviewer`.
+- Running a skill-backed slash command forces the main agent to read that skill's `SKILL.md` and apply it for that request.
+- Skills loaded through `[agent].skills` and sync `[[subagents]].skills` are both considered for slash commands, but explicit `[chainlit].commands` take precedence on name collisions.
 
 Minimal `SKILL.md` example:
 
@@ -313,6 +316,7 @@ Supported subagent fields:
 ## Chainlit Native Commands
 
 You can configure slash-style commands that run from the Chainlit composer before the model call.
+Chainlit also auto-generates slash commands for loaded skills.
 
 Place this config in `deepagent.toml` or whatever file `DEEPAGENT_CONFIG` points to.
 Do not put it in the app UI file `chainlit.toml` or Chainlit's native [`.chainlit/config.toml`](.chainlit/config.toml).
@@ -340,6 +344,9 @@ Notes:
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.
 - For `mcp_tool`, user command arguments must be valid JSON, e.g. `/repo-readme {"path":"README.md"}`.
+- Each discovered skill also becomes `/<skill-name>` automatically. For example, a skill with `name: reviewer` is available as `/reviewer`.
+- Skill-backed commands always force the main agent to read the selected `SKILL.md` first and use it for that turn.
+- If a configured `[chainlit].commands` entry and a skill share the same slash name, the configured command wins.
 
 ## Add Async Subagents
 
