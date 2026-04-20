@@ -23,6 +23,7 @@ from deepagent_runtime import (
     build_deepagent_backend,
     deepagent_artifacts_root,
     deepagent_artifacts_route_prefix,
+    virtual_workspace_path_to_local,
 )
 from rag_runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
@@ -104,6 +105,26 @@ def write_skill(
         ),
         encoding="utf-8",
     )
+
+
+def test_virtual_workspace_path_to_local_maps_project_files(tmp_path: Path) -> None:
+    assert virtual_workspace_path_to_local(
+        "/workspace/skills/reviewer/SKILL.md",
+        tmp_path,
+    ) == str(tmp_path / "skills/reviewer/SKILL.md")
+
+
+def test_virtual_workspace_path_to_local_leaves_unknown_paths_unchanged(
+    tmp_path: Path,
+) -> None:
+    assert virtual_workspace_path_to_local(
+        "/memories/skills/reviewer/SKILL.md",
+        tmp_path,
+    ) == "/memories/skills/reviewer/SKILL.md"
+    assert virtual_workspace_path_to_local(
+        "/workspace/../outside/SKILL.md",
+        tmp_path,
+    ) == "/workspace/../outside/SKILL.md"
 
 
 def test_runtime_config_reports_rag_error_for_openai_auto_embeddings(
@@ -552,8 +573,32 @@ def test_build_chainlit_command_catalog_includes_main_and_subagent_skills(
 
     assert [command.name for command in commands] == ["reviewer", "repo-guide"]
     assert commands[0].target == "skill"
-    assert commands[0].value == "/workspace/skills/reviewer/SKILL.md"
-    assert commands[1].value == "/workspace/subskills/repo-guide/SKILL.md"
+    assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
+    assert commands[1].value == str(tmp_path / "subskills/repo-guide/SKILL.md")
+    assert notes == ()
+
+
+def test_build_chainlit_command_catalog_uses_backend_workspace_root_when_project_root_missing(
+    tmp_path: Path,
+) -> None:
+    write_skill(
+        tmp_path,
+        "skills/reviewer",
+        name="reviewer",
+        description="Review code for bugs.",
+    )
+    extensions = ExtensionsConfig(
+        config_path=None,
+        skills=("/workspace/skills/",),
+    )
+
+    commands, notes = build_chainlit_command_catalog(
+        extensions,
+        backend=build_deepagent_backend(project_root=tmp_path),
+    )
+
+    assert len(commands) == 1
+    assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
     assert notes == ()
 
 
@@ -628,7 +673,7 @@ def test_build_chainlit_command_catalog_prefers_main_agent_skill_over_subagent_s
     assert len(commands) == 1
     assert commands[0].target == "skill"
     assert commands[0].description == "Main reviewer"
-    assert commands[0].value == "/workspace/skills/reviewer/SKILL.md"
+    assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
     assert len(notes) == 1
     assert "main agent skill" in notes[0]
 
@@ -661,7 +706,7 @@ def test_build_chainlit_command_catalog_uses_later_skill_source_in_same_bucket(
 
     assert len(commands) == 1
     assert commands[0].description == "Later reviewer"
-    assert commands[0].value == "/workspace/skills-b/reviewer/SKILL.md"
+    assert commands[0].value == str(tmp_path / "skills-b/reviewer/SKILL.md")
     assert notes == ()
 
 
