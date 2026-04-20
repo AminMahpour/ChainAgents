@@ -322,11 +322,12 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
 
 
-def test_stateful_mcp_reuses_session_per_thread(
+def test_stateful_mcp_reuses_session_per_chainlit_session(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     created_sessions: list[tuple[str, object]] = []
+    closed_sessions: list[object] = []
     load_calls: list[tuple[object, str]] = []
 
     class FakeMCPClient:
@@ -337,7 +338,10 @@ def test_stateful_mcp_reuses_session_per_thread(
         async def session(self, server_name: str, *, auto_initialize: bool = True):
             session = object()
             created_sessions.append((server_name, session))
-            yield session
+            try:
+                yield session
+            finally:
+                closed_sessions.append(session)
 
         async def get_tools(self, *, server_name: str | None = None):
             raise AssertionError("stateful MCP mode should not call get_tools()")
@@ -366,29 +370,43 @@ def test_stateful_mcp_reuses_session_per_thread(
     runtime._mcp_client = FakeMCPClient()
 
     async def exercise_runtime():
-        thread_1_tools_first = await runtime._get_mcp_tools(
+        session_1_tools_first = await runtime._get_mcp_tools(
             ("repo",),
             thread_id="thread-1",
+            mcp_session_id="session-1",
         )
-        thread_1_tools_second = await runtime._get_mcp_tools(
-            ("repo",),
-            thread_id="thread-1",
-        )
-        thread_2_tools = await runtime._get_mcp_tools(
+        session_1_tools_second = await runtime._get_mcp_tools(
             ("repo",),
             thread_id="thread-2",
+            mcp_session_id="session-1",
         )
-        await runtime._exit_stack.aclose()
-        return thread_1_tools_first, thread_1_tools_second, thread_2_tools
+        session_2_tools = await runtime._get_mcp_tools(
+            ("repo",),
+            thread_id="thread-1",
+            mcp_session_id="session-2",
+        )
+        runtime._agents[("medium", "thread-1", None, "session-1")] = object()
+        runtime._agents[("medium", "thread-1", None, "session-2")] = object()
+        await runtime.close_mcp_session("session-1")
+        assert len(closed_sessions) == 1
+        assert ("session-1", "repo") not in runtime._mcp_sessions
+        assert ("session-1", ("repo",)) not in runtime._mcp_tools_cache
+        assert ("medium", "thread-1", None, "session-1") not in runtime._agents
+        assert ("medium", "thread-1", None, "session-2") in runtime._agents
+        await runtime.close_mcp_session("session-2")
+        return session_1_tools_first, session_1_tools_second, session_2_tools
 
-    thread_1_tools_first, thread_1_tools_second, thread_2_tools = asyncio.run(
+    session_1_tools_first, session_1_tools_second, session_2_tools = asyncio.run(
         exercise_runtime()
     )
 
     assert len(created_sessions) == 2
     assert len(load_calls) == 2
-    assert thread_1_tools_first[0].session is thread_1_tools_second[0].session
-    assert thread_1_tools_first[0].session is not thread_2_tools[0].session
+    assert len(closed_sessions) == 2
+    assert session_1_tools_first[0].session is session_1_tools_second[0].session
+    assert session_1_tools_first[0].session is not session_2_tools[0].session
+    assert closed_sessions[0] is session_1_tools_first[0].session
+    assert closed_sessions[1] is session_2_tools[0].session
 
 
 def test_rebuild_rag_index_clears_cached_agents(
@@ -664,9 +682,10 @@ def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:
         )
     )
 
-    async def fake_get_mcp_tools(server_names, *, thread_id=None):
+    async def fake_get_mcp_tools(server_names, *, thread_id=None, mcp_session_id=None):
         assert server_names == ("repo",)
         assert thread_id == "thread-1"
+        assert mcp_session_id is None
         return [FakeTool()]
 
     runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
