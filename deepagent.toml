@@ -39,7 +39,7 @@ url = "http://localhost:8090/mcp"
 
 [agent]
 skills = ["skills"]
-mcp_servers = ["repo"]
+mcp_servers = ["repo","tooluniverse"]
 # Keep ToolUniverse optional for slash-invoked skills in environments where the
 # MCP service is available by adding it to mcp_servers when needed:
 # mcp_servers = ["repo", "tooluniverse"]
