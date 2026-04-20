@@ -1,0 +1,4 @@
+interface:
+  display_name: "ToolUniverse Literature Search"
+  short_description: "Biomedical literature search and synthesis"
+  default_prompt: "Use ToolUniverse to search biomedical literature, collect article metadata and abstracts, and produce a cited evidence summary."

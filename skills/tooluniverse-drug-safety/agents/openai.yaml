@@ -1,0 +1,4 @@
+interface:
+  display_name: "ToolUniverse Drug Safety"
+  short_description: "FAERS, SIDER, openFDA, and label safety review"
+  default_prompt: "Use ToolUniverse safety tools to compare drug adverse events, retrieve FAERS reports, inspect SIDER label side effects, and summarize safety evidence with caveats."
