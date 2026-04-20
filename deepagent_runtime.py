@@ -1015,13 +1015,32 @@ def _load_skill_command_bucket(
     return tuple(commands_by_name.values())
 
 
+def _resolve_chainlit_project_root(
+    *,
+    backend: CompositeBackend | None,
+    project_root: Path | None,
+) -> Path:
+    if project_root is not None:
+        return project_root
+
+    if backend is not None:
+        workspace_backend = backend.routes.get("/workspace/")
+        if isinstance(workspace_backend, FilesystemBackend):
+            return workspace_backend.cwd
+
+    return PROJECT_ROOT
+
+
 def build_chainlit_command_catalog(
     extensions: ExtensionsConfig,
     *,
     backend: CompositeBackend | None = None,
     project_root: Path | None = None,
 ) -> tuple[tuple[ChainlitCommandConfig, ...], tuple[str, ...]]:
-    resolved_project_root = project_root or PROJECT_ROOT
+    resolved_project_root = _resolve_chainlit_project_root(
+        backend=backend,
+        project_root=project_root,
+    )
     backend = backend or build_deepagent_backend(project_root=resolved_project_root)
     notes: list[str] = []
     merged_commands = list(extensions.chainlit_commands)

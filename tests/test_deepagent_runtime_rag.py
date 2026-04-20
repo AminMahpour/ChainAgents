@@ -578,6 +578,30 @@ def test_build_chainlit_command_catalog_includes_main_and_subagent_skills(
     assert notes == ()
 
 
+def test_build_chainlit_command_catalog_uses_backend_workspace_root_when_project_root_missing(
+    tmp_path: Path,
+) -> None:
+    write_skill(
+        tmp_path,
+        "skills/reviewer",
+        name="reviewer",
+        description="Review code for bugs.",
+    )
+    extensions = ExtensionsConfig(
+        config_path=None,
+        skills=("/workspace/skills/",),
+    )
+
+    commands, notes = build_chainlit_command_catalog(
+        extensions,
+        backend=build_deepagent_backend(project_root=tmp_path),
+    )
+
+    assert len(commands) == 1
+    assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
+    assert notes == ()
+
+
 def test_build_chainlit_command_catalog_prefers_explicit_command_over_skill(
     tmp_path: Path,
 ) -> None:
