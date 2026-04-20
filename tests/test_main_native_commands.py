@@ -62,12 +62,14 @@ class _DummyRuntime:
         tool_name: str,
         raw_args: str,
         thread_id: str,
+        mcp_session_id: str | None = None,
         server_name: str | None = None,
     ):
         self.invocation = {
             "tool_name": tool_name,
             "raw_args": raw_args,
             "thread_id": thread_id,
+            "mcp_session_id": mcp_session_id,
             "server_name": server_name,
         }
         return {"ok": True}
@@ -96,6 +98,7 @@ async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) 
     assert result == ""
     assert runtime.invocation is not None
     assert runtime.invocation["raw_args"] == '{"path":"README.md"}'
+    assert runtime.invocation["mcp_session_id"] is None
 
 
 def test_build_skill_command_prompt_requires_skill_and_request() -> None:

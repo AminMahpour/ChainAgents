@@ -34,6 +34,7 @@ from response_exports import (
 SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
+SESSION_MCP_SESSION_ID_KEY = "mcp_session_id"
 REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
 UPLOAD_RAG_FILE_ACTION = "upload_rag_file"
 RAG_UPLOAD_ACCEPT = {
@@ -79,6 +80,27 @@ def current_chainlit_thread_id() -> str:
         return ""
     thread_id = getattr(session, "thread_id", None) or getattr(session, "id", None)
     return str(thread_id or "").strip()
+
+
+def current_chainlit_session_id() -> str:
+    try:
+        session = cl.context.session
+    except Exception:
+        return ""
+    return str(getattr(session, "id", None) or "").strip()
+
+
+def store_mcp_session_id() -> str:
+    session_id = current_chainlit_session_id() or current_chainlit_thread_id()
+    cl.user_session.set(SESSION_MCP_SESSION_ID_KEY, session_id)
+    return session_id
+
+
+def current_mcp_session_id() -> str:
+    session_id = str(cl.user_session.get(SESSION_MCP_SESSION_ID_KEY) or "").strip()
+    if session_id:
+        return session_id
+    return store_mcp_session_id()
 
 
 def settings_payload(settings: AppSettings) -> dict[str, str]:
@@ -266,6 +288,7 @@ async def handle_native_command(
     runtime: AgentRuntime,
     settings: AppSettings,
     parsed: ParsedNativeCommand,
+    mcp_session_id: str | None = None,
 ) -> str | None:
     command = runtime.resolve_chainlit_command(parsed.command_name)
     if command is None:
@@ -284,6 +307,7 @@ async def handle_native_command(
             tool_name=command.value,
             raw_args=tool_raw_args,
             thread_id=settings.thread_id,
+            mcp_session_id=mcp_session_id,
             server_name=command.mcp_server,
         )
         await cl.Message(
@@ -441,6 +465,7 @@ async def on_chat_start() -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    store_mcp_session_id()
     await publish_native_commands(runtime)
     run_task_list = await get_run_task_list()
     await run_task_list.show_ready()
@@ -466,7 +491,7 @@ async def on_chat_start() -> None:
         1 for command in runtime.chainlit_commands if command.target == "skill"
     )
     mcp_session_mode_line = (
-        "- MCP session mode: stateful per LangGraph thread while this app process stays alive\n"
+        "- MCP session mode: stateful for this Chainlit session; cleaned up when the session ends\n"
         if extensions.mcp_stateful
         else "- MCP session mode: stateless; a new MCP session is created for each tool call\n"
     )
@@ -516,6 +541,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    mcp_session_id = store_mcp_session_id()
     await publish_native_commands(runtime)
 
     run_task_list = await get_run_task_list()
@@ -533,6 +559,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         settings.reasoning_level,
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
+        mcp_session_id=mcp_session_id,
     )
     async_task_notifier = get_async_task_notifier(
         agent=agent,
@@ -615,6 +642,7 @@ async def on_message(message: cl.Message) -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    mcp_session_id = current_mcp_session_id()
     run_task_list = await get_run_task_list()
     uploaded_files = message_uploaded_rag_files(message)
     prompt_note = ""
@@ -646,6 +674,7 @@ async def on_message(message: cl.Message) -> None:
                 runtime=runtime,
                 settings=settings,
                 parsed=parsed_command,
+                mcp_session_id=mcp_session_id,
             )
         except Exception as exc:
             await cl.Message(
@@ -673,6 +702,7 @@ async def on_message(message: cl.Message) -> None:
         settings.reasoning_level,
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
+        mcp_session_id=mcp_session_id,
     )
     async_task_notifier = get_async_task_notifier(
         agent=agent,
@@ -732,3 +762,9 @@ async def on_chat_end() -> None:
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()
+    runtime = AgentRuntime.current()
+    if runtime is not None:
+        with suppress(Exception):
+            await runtime.close_mcp_session(
+                cl.user_session.get(SESSION_MCP_SESSION_ID_KEY)
+            )
