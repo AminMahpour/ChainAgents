@@ -441,6 +441,22 @@ class SkillCommandMetadata:
         )
 
 
+def virtual_workspace_path_to_local(path_value: str, project_root: Path | None = None) -> str:
+    normalized = path_value.strip().replace("\\", "/")
+    workspace_prefix = "/workspace"
+    if normalized != workspace_prefix and not normalized.startswith(f"{workspace_prefix}/"):
+        return path_value
+
+    root = (project_root or PROJECT_ROOT).resolve()
+    relative = PurePosixPath(normalized.removeprefix(workspace_prefix).lstrip("/"))
+    local_path = (root / Path(*relative.parts)).resolve()
+    try:
+        local_path.relative_to(root)
+    except ValueError:
+        return path_value
+    return str(local_path)
+
+
 @dataclass(frozen=True)
 class ExtensionsConfig:
     config_path: Path | None
@@ -955,6 +971,7 @@ def _load_skill_command_bucket(
     backend: CompositeBackend,
     source_paths: tuple[str, ...],
     source: Literal["agent_skill", "subagent_skill"],
+    project_root: Path | None = None,
     owner: str | None = None,
 ) -> tuple[SkillCommandMetadata, ...]:
     commands_by_name: dict[str, SkillCommandMetadata] = {}
@@ -982,7 +999,7 @@ def _load_skill_command_bucket(
             metadata = SkillCommandMetadata(
                 name=command_name,
                 description=str(skill["description"]).strip(),
-                path=str(skill["path"]).strip(),
+                path=virtual_workspace_path_to_local(str(skill["path"]), project_root),
                 source=source,
                 owner=owner,
             )
@@ -1004,7 +1021,8 @@ def build_chainlit_command_catalog(
     backend: CompositeBackend | None = None,
     project_root: Path | None = None,
 ) -> tuple[tuple[ChainlitCommandConfig, ...], tuple[str, ...]]:
-    backend = backend or build_deepagent_backend(project_root=project_root)
+    resolved_project_root = project_root or PROJECT_ROOT
+    backend = backend or build_deepagent_backend(project_root=resolved_project_root)
     notes: list[str] = []
     merged_commands = list(extensions.chainlit_commands)
     explicit_names = {command.name: command for command in extensions.chainlit_commands}
@@ -1013,6 +1031,7 @@ def build_chainlit_command_catalog(
         backend=backend,
         source_paths=extensions.skills,
         source="agent_skill",
+        project_root=resolved_project_root,
     )
     subagent_commands_by_name: dict[str, SkillCommandMetadata] = {}
     for subagent in extensions.subagents:
@@ -1020,6 +1039,7 @@ def build_chainlit_command_catalog(
             backend=backend,
             source_paths=subagent.skills,
             source="subagent_skill",
+            project_root=resolved_project_root,
             owner=subagent.name,
         ):
             previous = subagent_commands_by_name.pop(metadata.name, None)
