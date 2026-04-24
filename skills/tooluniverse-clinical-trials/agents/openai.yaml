@@ -1,0 +1,4 @@
+interface:
+  display_name: "ToolUniverse Clinical Trials"
+  short_description: "ClinicalTrials.gov searches and trial result extraction"
+  default_prompt: "Use ToolUniverse ClinicalTrials.gov tools to find trials, retrieve protocols, eligibility, outcomes, adverse events, locations, and references."
