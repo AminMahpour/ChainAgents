@@ -61,6 +61,7 @@ def make_runtime_config(
         database_url=None,
         model_provider="ollama",
         model_name="gpt-oss:20b",
+        model_choices=("gpt-oss:20b",),
         model_base_url="http://127.0.0.1:11434",
         model_api_key=None,
         model_temperature=0.0,
@@ -182,6 +183,29 @@ mcp_servers = ["repo"]
     config = deepagent_runtime.load_extensions_config()
 
     assert config.mcp_stateful is True
+
+
+def test_runtime_config_reads_model_choices_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "gpt-oss:20b"
+models = ["gpt-oss:20b", "gemma4:27b"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_name == "gpt-oss:20b"
+    assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
 def test_build_deepagent_backend_stores_large_tool_results_inside_project(

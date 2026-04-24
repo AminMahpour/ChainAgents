@@ -105,6 +105,7 @@ def current_mcp_session_id() -> str:
 
 def settings_payload(settings: AppSettings) -> dict[str, str]:
     return {
+        "model_name": settings.model_name,
         "reasoning_level": settings.reasoning_level,
         "thread_id": settings.thread_id,
     }
@@ -354,10 +355,33 @@ async def ask_for_rag_upload() -> list[UploadedRagFile]:
     ]
 
 
-def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
+def resolve_model_name(
+    value: Any | None,
+    *,
+    available_models: tuple[str, ...],
+    default: str,
+) -> str:
+    candidate = str(value or "").strip()
+    if candidate in available_models:
+        return candidate
+    return default
+
+
+def build_chat_settings(
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+) -> cl.ChatSettings:
     reasoning_levels = ["low", "medium", "high"]
     return cl.ChatSettings(
         [
+            Select(
+                id="model_name",
+                label="Model",
+                values=list(available_models),
+                initial_index=available_models.index(settings.model_name),
+                description="Select a configured model for this chat session.",
+            ),
             Select(
                 id="reasoning_level",
                 label="Reasoning Level",
@@ -381,9 +405,27 @@ def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
     )
 
 
-def build_modes(settings: AppSettings) -> list[cl.Mode]:
+def build_modes(
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+) -> list[cl.Mode]:
     reasoning_levels = ["low", "medium", "high"]
     return [
+        cl.Mode(
+            id="model_name",
+            name="Model",
+            options=[
+                cl.ModeOption(
+                    id=model_name,
+                    name=model_name,
+                    description="Use this model for the current message.",
+                    icon="bot",
+                    default=model_name == settings.model_name,
+                )
+                for model_name in available_models
+            ],
+        ),
         cl.Mode(
             id="reasoning_level",
             name="Reasoning",
@@ -409,19 +451,43 @@ def build_modes(settings: AppSettings) -> list[cl.Mode]:
                 )
                 for level in reasoning_levels
             ],
-        )
+        ),
     ]
 
 
-async def publish_modes(settings: AppSettings) -> None:
-    await cl.context.emitter.set_modes(build_modes(settings))
+async def publish_modes(
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+) -> None:
+    await cl.context.emitter.set_modes(
+        build_modes(settings, available_models=available_models)
+    )
 
 
-def coerce_settings(raw_settings: AppSettings | dict[str, Any] | None) -> AppSettings:
+def coerce_settings(
+    raw_settings: AppSettings | dict[str, Any] | None,
+    *,
+    default_model_name: str,
+    available_models: tuple[str, ...],
+) -> AppSettings:
     if raw_settings is None:
         raw_settings = {}
     if isinstance(raw_settings, AppSettings):
-        return raw_settings
+        return AppSettings(
+            model_name=resolve_model_name(
+                raw_settings.model_name,
+                available_models=available_models,
+                default=default_model_name,
+            ),
+            reasoning_level=normalize_reasoning_level(raw_settings.reasoning_level),
+            thread_id=raw_settings.thread_id,
+        )
+    model_name = resolve_model_name(
+        raw_settings.get("model_name"),
+        available_models=available_models,
+        default=default_model_name,
+    )
     reasoning_level = normalize_reasoning_level(
         raw_settings.get("reasoning_level", DEFAULT_REASONING_LEVEL)
     )
@@ -430,7 +496,11 @@ def coerce_settings(raw_settings: AppSettings | dict[str, Any] | None) -> AppSet
     ).strip()
     if not thread_id:
         thread_id = current_chainlit_thread_id()
-    return AppSettings(reasoning_level=reasoning_level, thread_id=thread_id.strip())
+    return AppSettings(
+        model_name=model_name,
+        reasoning_level=reasoning_level,
+        thread_id=thread_id.strip(),
+    )
 
 
 def resolve_reasoning_level_for_message(
@@ -440,7 +510,26 @@ def resolve_reasoning_level_for_message(
     raw_modes = getattr(message, "modes", None)
     if not isinstance(raw_modes, dict):
         return settings.reasoning_level
-    return normalize_reasoning_level(raw_modes.get("reasoning_level"))
+    return normalize_reasoning_level(
+        raw_modes.get("reasoning_level"),
+        default=settings.reasoning_level,
+    )
+
+
+def resolve_model_name_for_message(
+    message: cl.Message,
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+) -> str:
+    raw_modes = getattr(message, "modes", None)
+    if not isinstance(raw_modes, dict):
+        return settings.model_name
+    return resolve_model_name(
+        raw_modes.get("model_name"),
+        available_models=available_models,
+        default=settings.model_name,
+    )
 
 
 if AUTH_ENABLED:
@@ -516,12 +605,16 @@ async def on_chat_start() -> None:
     run_task_list = await get_run_task_list()
     await run_task_list.show_ready()
     settings = AppSettings(
+        model_name=runtime.config.model_name,
         reasoning_level=runtime.config.default_reasoning,
         thread_id=current_chainlit_thread_id(),
     )
     store_settings(settings)
-    await publish_modes(settings)
-    await build_chat_settings(settings).send()
+    await publish_modes(settings, available_models=runtime.config.model_choices)
+    await build_chat_settings(
+        settings,
+        available_models=runtime.config.model_choices,
+    ).send()
     persistence_line = (
         "- Persistence: Postgres-backed LangGraph checkpoints and `/memories/`\n"
         if runtime.persistence_enabled
@@ -598,13 +691,21 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     raw_settings = (
         metadata.get(SESSION_SETTINGS_KEY) if isinstance(metadata, dict) else None
     )
-    settings = coerce_settings(raw_settings)
+    settings = coerce_settings(
+        raw_settings,
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
     store_settings(settings)
-    await publish_modes(settings)
-    await build_chat_settings(settings).send()
+    await publish_modes(settings, available_models=runtime.config.model_choices)
+    await build_chat_settings(
+        settings,
+        available_models=runtime.config.model_choices,
+    ).send()
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
         settings.reasoning_level,
+        model_name=settings.model_name,
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,
@@ -621,9 +722,16 @@ async def on_chat_resume(thread: ThreadDict) -> None:
 
 @cl.on_settings_update
 async def on_settings_update(raw_settings: dict[str, Any]) -> None:
-    settings = coerce_settings(raw_settings)
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+    settings = coerce_settings(
+        raw_settings,
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
     store_settings(settings)
-    await publish_modes(settings)
+    await publish_modes(settings, available_models=runtime.config.model_choices)
 
 
 @cl.action_callback(DOWNLOAD_MARKDOWN_ACTION)
@@ -666,7 +774,11 @@ async def upload_rag_file(action: cl.Action) -> None:
     if runtime is None:
         return
 
-    settings = coerce_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
+    settings = coerce_settings(
+        cl.user_session.get(SESSION_SETTINGS_KEY),
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
     uploads = await ask_for_rag_upload()
     if not uploads:
         await cl.Message(content="No files were uploaded.", author="System").send()
@@ -687,17 +799,20 @@ async def upload_rag_file(action: cl.Action) -> None:
 
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
-    settings = coerce_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
-    effective_reasoning_level = resolve_reasoning_level_for_message(message, settings)
-    if effective_reasoning_level != settings.reasoning_level:
-        settings = AppSettings(
-            reasoning_level=effective_reasoning_level,
-            thread_id=settings.thread_id,
-        )
-        store_settings(settings)
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    settings = coerce_settings(
+        cl.user_session.get(SESSION_SETTINGS_KEY),
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
+    effective_reasoning_level = resolve_reasoning_level_for_message(message, settings)
+    effective_model_name = resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=runtime.config.model_choices,
+    )
     mcp_session_id = current_mcp_session_id()
     run_task_list = await get_run_task_list()
     uploaded_files = message_uploaded_rag_files(message)
@@ -755,7 +870,8 @@ async def on_message(message: cl.Message) -> None:
 
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
-        settings.reasoning_level,
+        effective_reasoning_level,
+        model_name=effective_model_name,
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,

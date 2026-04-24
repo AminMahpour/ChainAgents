@@ -486,6 +486,7 @@ class ModelDefaults:
     base_url: str = DEFAULT_OLLAMA_BASE_URL
     name: str = DEFAULT_MODEL
     api_key: str | None = None
+    models: tuple[str, ...] = ()
     name_is_explicit: bool = False
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
     temperature: float = DEFAULT_TEMPERATURE
@@ -505,9 +506,18 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
 
     provider = normalize_model_provider(raw_model.get("provider"))
     raw_name = str(raw_model.get("name", "")).strip()
-    if provider == "openai_compatible" and not raw_name:
+    raw_models = raw_model.get("models", [])
+    if raw_models and not isinstance(raw_models, list):
+        raise ValueError("The [model].models config must be an array of strings.")
+    parsed_models: list[str] = []
+    for raw_candidate in raw_models:
+        candidate = str(raw_candidate or "").strip()
+        if candidate and candidate not in parsed_models:
+            parsed_models.append(candidate)
+
+    if provider == "openai_compatible" and not raw_name and not parsed_models:
         raise ValueError(
-            "OpenAI-compatible model config must define a non-empty 'name'."
+            "OpenAI-compatible model config must define a non-empty 'name' or 'models'."
         )
 
     raw_base_url = str(raw_model.get("base_url", "")).strip()
@@ -533,9 +543,10 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
     return ModelDefaults(
         provider=provider,
         base_url=base_url,
-        name=raw_name or DEFAULT_MODEL,
+        name=raw_name or (parsed_models[0] if parsed_models else DEFAULT_MODEL),
         api_key=normalize_optional_string(raw_model.get("api_key")),
-        name_is_explicit=bool(raw_name),
+        models=tuple(parsed_models),
+        name_is_explicit=bool(raw_name or parsed_models),
         reasoning_effort=normalize_reasoning_level(
             raw_model.get("reasoning_effort"),
             default=DEFAULT_REASONING_LEVEL,
@@ -828,6 +839,7 @@ class RuntimeConfig:
     database_url: str | None
     model_provider: ModelProvider
     model_name: str
+    model_choices: tuple[str, ...]
     model_base_url: str
     model_api_key: str | None
     model_temperature: float
@@ -883,6 +895,14 @@ class RuntimeConfig:
             )
 
         model_name = generic_model_name or model_name_alias or model_defaults.name
+        model_choices = tuple(
+            dict.fromkeys(
+                [
+                    model_name,
+                    *model_defaults.models,
+                ]
+            )
+        )
         model_base_url = normalize_model_base_url(
             generic_model_base_url or model_base_url_alias or model_defaults.base_url,
             required_message="The model base URL cannot be empty.",
@@ -912,6 +932,7 @@ class RuntimeConfig:
             database_url=database_url,
             model_provider=model_provider,
             model_name=model_name,
+            model_choices=model_choices,
             model_base_url=model_base_url,
             model_api_key=model_api_key,
             model_temperature=model_defaults.temperature,
@@ -924,17 +945,23 @@ class RuntimeConfig:
         )
 
 
-def build_model(config: RuntimeConfig, reasoning_level: ReasoningLevel) -> Any:
+def build_model(
+    config: RuntimeConfig,
+    reasoning_level: ReasoningLevel,
+    *,
+    model_name: str | None = None,
+) -> Any:
+    selected_model = str(model_name or config.model_name).strip() or config.model_name
     if config.model_provider == "ollama":
         return ChatOllama(
-            model=config.model_name,
+            model=selected_model,
             base_url=config.model_base_url,
             reasoning=reasoning_level,
             temperature=config.model_temperature,
         )
 
     kwargs: dict[str, Any] = {
-        "model": config.model_name,
+        "model": selected_model,
         "base_url": config.model_base_url,
         "api_key": config.model_api_key or "deepagent",
         "temperature": config.model_temperature,
@@ -1201,6 +1228,7 @@ def create_configured_graph(
 class AppSettings:
     reasoning_level: ReasoningLevel
     thread_id: str
+    model_name: str
 
 
 class AgentRuntime:
@@ -1214,7 +1242,7 @@ class AgentRuntime:
         self._agent_lock = asyncio.Lock()
         self._mcp_lock = asyncio.Lock()
         self._agents: dict[
-            tuple[ReasoningLevel, str | None, str | None, str | None],
+            tuple[ReasoningLevel, str, str | None, str | None, str | None],
             object,
         ] = {}
         self._mcp_client: MultiServerMCPClient | None = None
@@ -1320,16 +1348,19 @@ class AgentRuntime:
         self,
         reasoning_level: ReasoningLevel,
         *,
+        model_name: str | None = None,
         thread_id: str | None = None,
         async_subagent_url_override: str | None = None,
         mcp_session_id: str | None = None,
     ):
+        selected_model = str(model_name or self.config.model_name).strip() or self.config.model_name
         mcp_scope = self._mcp_scope(
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
         cache_key = (
             reasoning_level,
+            selected_model,
             thread_id,
             async_subagent_url_override,
             mcp_scope,
@@ -1337,7 +1368,10 @@ class AgentRuntime:
         async with self._agent_lock:
             agent = self._agents.get(cache_key)
             if agent is None:
-                model = self._build_model(reasoning_level)
+                model = self._build_model(
+                    reasoning_level,
+                    model_name=selected_model,
+                )
                 rag_tool_enabled = self._rag_service is not None
                 main_tools = sanitize_tools_for_model(
                     self.config.model_provider,
@@ -1488,8 +1522,13 @@ class AgentRuntime:
     def _tool_supports_openai_compatible_schema(tool: Any) -> bool:
         return tool_supports_openai_compatible_schema(tool)
 
-    def _build_model(self, reasoning_level: ReasoningLevel) -> Any:
-        return build_model(self.config, reasoning_level)
+    def _build_model(
+        self,
+        reasoning_level: ReasoningLevel,
+        *,
+        model_name: str | None = None,
+    ) -> Any:
+        return build_model(self.config, reasoning_level, model_name=model_name)
 
     def _mcp_scope(
         self,

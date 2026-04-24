@@ -57,6 +57,41 @@ def test_resolve_reasoning_level_for_message_uses_mode_override() -> None:
     assert resolved == "high"
 
 
+def test_resolve_reasoning_level_for_message_falls_back_to_settings_default() -> None:
+    message = SimpleNamespace(content="hello", modes={})
+    settings = SimpleNamespace(reasoning_level="low")
+
+    resolved = main.resolve_reasoning_level_for_message(message, settings)
+
+    assert resolved == "low"
+
+
+def test_resolve_model_name_for_message_uses_mode_override() -> None:
+    message = SimpleNamespace(content="hello", modes={"model_name": "gemma4:27b"})
+    settings = SimpleNamespace(model_name="gpt-oss:20b")
+
+    resolved = main.resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=("gpt-oss:20b", "gemma4:27b"),
+    )
+
+    assert resolved == "gemma4:27b"
+
+
+def test_resolve_model_name_for_message_falls_back_to_settings() -> None:
+    message = SimpleNamespace(content="hello", modes={"model_name": "unknown"})
+    settings = SimpleNamespace(model_name="gpt-oss:20b")
+
+    resolved = main.resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=("gpt-oss:20b", "gemma4:27b"),
+    )
+
+    assert resolved == "gpt-oss:20b"
+
+
 class _DummyRuntime:
     def __init__(self, command=None) -> None:
         self.invocation: dict[str, str | None] | None = None

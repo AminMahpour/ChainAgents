@@ -144,6 +144,7 @@ provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
 name = "gpt-oss:20b"
+models = ["gpt-oss:20b", "gemma4:27b"]
 reasoning_effort = "medium"
 ```
 
@@ -163,6 +164,7 @@ Notes:
 
 - `provider` selects `ChatOllama` or `ChatOpenAI`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
+- `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `api_key` is optional and only used for `provider = "openai_compatible"`. When omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
