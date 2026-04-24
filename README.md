@@ -10,6 +10,7 @@ The app is wired for:
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
+- Chainlit Modes support for per-message reasoning selection (`Low`, `Medium`, `High`)
 
 ## Environment
 

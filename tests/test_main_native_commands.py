@@ -39,6 +39,24 @@ def test_resolve_native_command_returns_none_without_command() -> None:
     assert parsed is None
 
 
+def test_resolve_reasoning_level_for_message_defaults_to_settings() -> None:
+    message = SimpleNamespace(content="hello")
+    settings = SimpleNamespace(reasoning_level="medium")
+
+    resolved = main.resolve_reasoning_level_for_message(message, settings)
+
+    assert resolved == "medium"
+
+
+def test_resolve_reasoning_level_for_message_uses_mode_override() -> None:
+    message = SimpleNamespace(content="hello", modes={"reasoning_level": "high"})
+    settings = SimpleNamespace(reasoning_level="medium")
+
+    resolved = main.resolve_reasoning_level_for_message(message, settings)
+
+    assert resolved == "high"
+
+
 class _DummyRuntime:
     def __init__(self, command=None) -> None:
         self.invocation: dict[str, str | None] | None = None

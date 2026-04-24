@@ -381,6 +381,42 @@ def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
     )
 
 
+def build_modes(settings: AppSettings) -> list[cl.Mode]:
+    reasoning_levels = ["low", "medium", "high"]
+    return [
+        cl.Mode(
+            id="reasoning_level",
+            name="Reasoning",
+            options=[
+                cl.ModeOption(
+                    id=level,
+                    name=level.capitalize(),
+                    description=(
+                        "Deeper reasoning with higher latency"
+                        if level == "high"
+                        else (
+                            "Balanced quality and speed"
+                            if level == "medium"
+                            else "Fastest responses with lighter reasoning"
+                        )
+                    ),
+                    icon=(
+                        "brain"
+                        if level == "high"
+                        else ("sparkles" if level == "medium" else "zap")
+                    ),
+                    default=level == settings.reasoning_level,
+                )
+                for level in reasoning_levels
+            ],
+        )
+    ]
+
+
+async def publish_modes(settings: AppSettings) -> None:
+    await cl.context.emitter.set_modes(build_modes(settings))
+
+
 def coerce_settings(raw_settings: AppSettings | dict[str, Any] | None) -> AppSettings:
     if raw_settings is None:
         raw_settings = {}
@@ -395,6 +431,16 @@ def coerce_settings(raw_settings: AppSettings | dict[str, Any] | None) -> AppSet
     if not thread_id:
         thread_id = current_chainlit_thread_id()
     return AppSettings(reasoning_level=reasoning_level, thread_id=thread_id.strip())
+
+
+def resolve_reasoning_level_for_message(
+    message: cl.Message,
+    settings: AppSettings,
+) -> str:
+    raw_modes = getattr(message, "modes", None)
+    if not isinstance(raw_modes, dict):
+        return settings.reasoning_level
+    return normalize_reasoning_level(raw_modes.get("reasoning_level"))
 
 
 if AUTH_ENABLED:
@@ -474,6 +520,7 @@ async def on_chat_start() -> None:
         thread_id=current_chainlit_thread_id(),
     )
     store_settings(settings)
+    await publish_modes(settings)
     await build_chat_settings(settings).send()
     persistence_line = (
         "- Persistence: Postgres-backed LangGraph checkpoints and `/memories/`\n"
@@ -553,6 +600,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     )
     settings = coerce_settings(raw_settings)
     store_settings(settings)
+    await publish_modes(settings)
     await build_chat_settings(settings).send()
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
@@ -575,6 +623,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
 async def on_settings_update(raw_settings: dict[str, Any]) -> None:
     settings = coerce_settings(raw_settings)
     store_settings(settings)
+    await publish_modes(settings)
 
 
 @cl.action_callback(DOWNLOAD_MARKDOWN_ACTION)
@@ -639,6 +688,13 @@ async def upload_rag_file(action: cl.Action) -> None:
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     settings = coerce_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
+    effective_reasoning_level = resolve_reasoning_level_for_message(message, settings)
+    if effective_reasoning_level != settings.reasoning_level:
+        settings = AppSettings(
+            reasoning_level=effective_reasoning_level,
+            thread_id=settings.thread_id,
+        )
+        store_settings(settings)
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
