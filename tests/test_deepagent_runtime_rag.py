@@ -61,6 +61,7 @@ def make_runtime_config(
         database_url=None,
         model_provider="ollama",
         model_name="gpt-oss:20b",
+        model_choices=("gpt-oss:20b",),
         model_base_url="http://127.0.0.1:11434",
         model_api_key=None,
         model_temperature=0.0,
@@ -182,6 +183,29 @@ mcp_servers = ["repo"]
     config = deepagent_runtime.load_extensions_config()
 
     assert config.mcp_stateful is True
+
+
+def test_runtime_config_reads_model_choices_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "gpt-oss:20b"
+models = ["gpt-oss:20b", "gemma4:27b"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_name == "gpt-oss:20b"
+    assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
 def test_build_deepagent_backend_stores_large_tool_results_inside_project(
@@ -499,6 +523,8 @@ description = "Researches the repo"
 system_prompt = "Do research"
 
 [chainlit]
+model_mode_enabled = false
+reasoning_mode_enabled = false
 commands = [
   { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "repo-researcher" },
   { name = "run-tool", description = "Call MCP tool", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo" },
@@ -515,6 +541,44 @@ commands = [
     assert extensions.chainlit_commands[0].name == "ask-researcher"
     assert extensions.chainlit_commands[1].target == "mcp_tool"
     assert extensions.chainlit_commands[2].template == "Rewrite: {input}"
+    assert extensions.chainlit_model_mode_enabled is False
+    assert extensions.chainlit_reasoning_mode_enabled is False
+
+
+def test_load_extensions_config_rejects_non_boolean_reasoning_mode_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+reasoning_mode_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="reasoning_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_model_mode_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+model_mode_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="model_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
 
 
 def test_load_extensions_config_rejects_unknown_chainlit_subagent(
