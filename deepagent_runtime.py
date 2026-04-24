@@ -476,10 +476,10 @@ class ExtensionsConfig:
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
-    chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
-    chainlit_show_startup_message: bool = True
     chainlit_model_mode_enabled: bool = True
     chainlit_reasoning_mode_enabled: bool = True
+    chainlit_show_startup_message: bool = True
+    chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -863,10 +863,10 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
         chainlit_commands=tuple(chainlit_commands),
-        chainlit_starters=tuple(chainlit_starters),
-        chainlit_show_startup_message=raw_chainlit_show_startup_message,
         chainlit_model_mode_enabled=raw_model_mode_enabled,
         chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
+        chainlit_show_startup_message=raw_chainlit_show_startup_message,
+        chainlit_starters=tuple(chainlit_starters),
     )
 
 

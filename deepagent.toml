@@ -74,6 +74,10 @@ skills = ["skills"]
 mcp_servers = ["repo"]
 
 [chainlit]
+# Set false to hide model selection in chat settings and Modes.
+model_mode_enabled = true
+# Set false to disable per-message reasoning overrides from the Modes picker.
+reasoning_mode_enabled = true
 # Set false to hide the startup status/welcome message in the UI.
 show_startup_message = true
 commands = [
@@ -82,7 +86,7 @@ commands = [
   { name = "summarize", description = "Apply a prompt template.", target = "prompt", value = "Summarize the input", template = "Summarize this:\n{input}" }
 ]
 starters = [
-  { label = "Morning routine ideation", message = "Can you help me create a personalized morning routine that would help increase my productivity throughout the day?", icon = "/public/idea.svg" },
+  { label = "Morning routine ideation", message = "Can you help me create a personalized morning routine that improves my productivity?", icon = "/public/idea.svg" },
   { label = "Explain superconductors", message = "Explain superconductors like I'm five years old.", icon = "/public/learn.svg" },
-  { label = "Python script for daily email reports", message = "Write a script to automate sending daily email reports in Python, and walk me through how I would set it up.", icon = "/public/terminal.svg", command = "code" }
+  { label = "Python email report script", message = "Write a script to automate sending daily email reports in Python and explain setup.", icon = "/public/terminal.svg", command = "code" }
 ]

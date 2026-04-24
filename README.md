@@ -328,11 +328,12 @@ Example:
 
 ```toml
 [chainlit]
-show_startup_message = true
 # Set false to hide model selection in chat settings and Modes.
 model_mode_enabled = true
 # Set false to disable per-message reasoning overrides from the Modes picker.
 reasoning_mode_enabled = true
+# Set false to hide the startup status/welcome message in the UI.
+show_startup_message = true
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
