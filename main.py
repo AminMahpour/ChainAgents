@@ -699,24 +699,25 @@ async def on_chat_start() -> None:
         extensions_line += f"Command notes:\n{note_lines}\n"
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
-    startup_message = cl.Message(
-        content=(
-            "Workspace agent ready.\n\n"
-            f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
-            f"- Model: `{runtime.config.model_name}`\n"
-            f"- Thread ID: `{settings.thread_id}`\n"
-            f"{persistence_line}"
-            f"{history_line}"
-            f"{rag_status_line(runtime)}"
-            f"{extensions_line}"
-            "- Real repo files live under `/workspace/`\n"
-            "- Agent memory is available under `/memories/`"
-        ),
-        author="System",
-    )
-    if runtime.rag_enabled:
-        startup_message.actions = rag_actions()
-    await startup_message.send()
+    if runtime.config.extensions.chainlit_startup_status_enabled:
+        startup_message = cl.Message(
+            content=(
+                "Workspace agent ready.\n\n"
+                f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
+                f"- Model: `{runtime.config.model_name}`\n"
+                f"- Thread ID: `{settings.thread_id}`\n"
+                f"{persistence_line}"
+                f"{history_line}"
+                f"{rag_status_line(runtime)}"
+                f"{extensions_line}"
+                "- Real repo files live under `/workspace/`\n"
+                "- Agent memory is available under `/memories/`"
+            ),
+            author="System",
+        )
+        if runtime.rag_enabled:
+            startup_message.actions = rag_actions()
+        await startup_message.send()
 
 
 @cl.on_chat_resume
