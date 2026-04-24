@@ -416,6 +416,14 @@ class ChainlitCommandConfig:
 
 
 @dataclass(frozen=True)
+class ChainlitStarterConfig:
+    label: str
+    message: str
+    icon: str | None = None
+    command: str | None = None
+
+
+@dataclass(frozen=True)
 class SkillCommandMetadata:
     name: str
     description: str
@@ -468,6 +476,7 @@ class ExtensionsConfig:
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
+    chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -477,6 +486,7 @@ class ExtensionsConfig:
             or self.subagents
             or self.async_subagents
             or self.chainlit_commands
+            or self.chainlit_starters
         )
 
 
@@ -785,6 +795,37 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         )
         seen_commands.add(name)
 
+    raw_chainlit_starters = chainlit_section.get("starters", [])
+    if not isinstance(raw_chainlit_starters, list):
+        raise ValueError("The top-level 'chainlit.starters' config must be an array of tables.")
+
+    chainlit_starters: list[ChainlitStarterConfig] = []
+    for index, raw_chainlit_starter in enumerate(raw_chainlit_starters, start=1):
+        if not isinstance(raw_chainlit_starter, dict):
+            raise ValueError(
+                f"Chainlit starter entry #{index} must be a table/object."
+            )
+        label = str(raw_chainlit_starter.get("label", "")).strip()
+        message = str(raw_chainlit_starter.get("message", "")).strip()
+        icon = normalize_optional_string(raw_chainlit_starter.get("icon"))
+        command = normalize_optional_string(raw_chainlit_starter.get("command"))
+        if not label:
+            raise ValueError(
+                f"Chainlit starter entry #{index} must include a non-empty 'label'."
+            )
+        if not message:
+            raise ValueError(
+                f"Chainlit starter '{label}' must include a non-empty 'message'."
+            )
+        chainlit_starters.append(
+            ChainlitStarterConfig(
+                label=label,
+                message=message,
+                icon=icon,
+                command=command,
+            )
+        )
+
     return ExtensionsConfig(
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
@@ -795,6 +836,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
         chainlit_commands=tuple(chainlit_commands),
+        chainlit_starters=tuple(chainlit_starters),
     )
 
 

@@ -16,6 +16,7 @@ from chainlit.types import ThreadDict
 from async_task_notifications import AsyncTaskNotifier, async_subagent_url_override
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
 from deepagent_runtime import (
+    ChainlitStarterConfig,
     DEFAULT_REASONING_LEVEL,
     AgentRuntime,
     AppSettings,
@@ -136,6 +137,20 @@ def build_upload_rag_action() -> cl.Action:
 
 def rag_actions() -> list[cl.Action]:
     return [build_rag_action(), build_upload_rag_action()]
+
+
+def build_chainlit_starters(
+    starter_configs: tuple[ChainlitStarterConfig, ...],
+) -> list[cl.Starter]:
+    return [
+        cl.Starter(
+            label=starter.label,
+            message=starter.message,
+            icon=starter.icon,
+            command=starter.command,
+        )
+        for starter in starter_configs
+    ]
 
 
 def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
@@ -420,6 +435,14 @@ async def get_runtime_or_notify() -> AgentRuntime | None:
     except Exception as exc:
         await cl.Message(content=f"Startup error: {exc}", author="System").send()
         return None
+
+
+@cl.set_starters
+async def set_starters() -> list[cl.Starter]:
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return []
+    return build_chainlit_starters(runtime.config.extensions.chainlit_starters)
 
 
 async def get_run_task_list() -> RunTaskList:

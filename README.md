@@ -330,6 +330,11 @@ commands = [
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
   { name = "summarize", description = "Apply a prompt template.", target = "prompt", value = "Summarize the input", template = "Summarize this:\n{input}" }
 ]
+starters = [
+  { label = "Morning routine ideation", message = "Can you help me create a personalized morning routine that improves my productivity?", icon = "/public/idea.svg" },
+  { label = "Explain superconductors", message = "Explain superconductors like I'm five years old.", icon = "/public/learn.svg" },
+  { label = "Python email report script", message = "Write a script to automate sending daily email reports in Python and explain setup.", icon = "/public/terminal.svg", command = "code" },
+]
 ```
 
 `target` modes:
@@ -347,6 +352,7 @@ Notes:
 - Each discovered skill also becomes `/<skill-name>` automatically. For example, a skill with `name: reviewer` is available as `/reviewer`.
 - Skill-backed commands always force the main agent to read the selected `SKILL.md` first and use it for that turn.
 - If a configured `[chainlit].commands` entry and a skill share the same slash name, the configured command wins.
+- `starters` are optional and map directly to Chainlit `Starter` items (`label`, `message`, optional `icon`, optional `command`).
 
 ## Add Async Subagents
 

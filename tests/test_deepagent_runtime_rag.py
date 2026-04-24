@@ -517,6 +517,51 @@ commands = [
     assert extensions.chainlit_commands[2].template == "Rewrite: {input}"
 
 
+def test_load_extensions_config_parses_chainlit_starters(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+starters = [
+  { label = "Explain superconductors", message = "Explain superconductors like I'm five years old.", icon = "/public/learn.svg" },
+  { label = "Write script", message = "Write a Python script for daily email reports.", command = "code" }
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert len(extensions.chainlit_starters) == 2
+    assert extensions.chainlit_starters[0].label == "Explain superconductors"
+    assert extensions.chainlit_starters[0].icon == "/public/learn.svg"
+    assert extensions.chainlit_starters[1].command == "code"
+
+
+def test_load_extensions_config_rejects_invalid_chainlit_starter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+starters = [
+  { label = "", message = "hello" }
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="non-empty 'label'"):
+        deepagent_runtime.load_extensions_config()
+
+
 def test_load_extensions_config_rejects_unknown_chainlit_subagent(
     tmp_path: Path,
     monkeypatch,

@@ -37,6 +37,11 @@ commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher subagent.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Call MCP filesystem read_file on README.md.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\": \"README.md\"}" },
 ]
+starters = [
+  { label = "Morning routine ideation", message = "Can you help me create a personalized morning routine that improves my productivity?", icon = "/public/idea.svg" },
+  { label = "Explain superconductors", message = "Explain superconductors like I'm five years old.", icon = "/public/learn.svg" },
+  { label = "Python email report script", message = "Write a script to automate sending daily email reports in Python and explain setup.", icon = "/public/terminal.svg", command = "code" },
+]
 
 [rag]
 enabled = true
