@@ -105,6 +105,35 @@ def test_resolve_model_name_for_message_falls_back_to_settings() -> None:
     assert resolved == "gpt-oss:20b"
 
 
+@pytest.mark.anyio
+async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> None:
+    class _Emitter:
+        async def set_modes(self, _modes):
+            raise RuntimeError('column "modes" does not exist')
+
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(emitter=_Emitter()))
+
+    await main.publish_modes(
+        SimpleNamespace(model_name="gpt-oss:20b", reasoning_level="medium"),
+        available_models=("gpt-oss:20b",),
+    )
+
+
+@pytest.mark.anyio
+async def test_publish_modes_raises_for_unrelated_errors(monkeypatch) -> None:
+    class _Emitter:
+        async def set_modes(self, _modes):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(emitter=_Emitter()))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await main.publish_modes(
+            SimpleNamespace(model_name="gpt-oss:20b", reasoning_level="medium"),
+            available_models=("gpt-oss:20b",),
+        )
+
+
 class _DummyRuntime:
     def __init__(self, command=None) -> None:
         self.invocation: dict[str, str | None] | None = None

@@ -466,13 +466,22 @@ async def publish_modes(
     available_models: tuple[str, ...],
     reasoning_mode_enabled: bool = True,
 ) -> None:
-    await cl.context.emitter.set_modes(
-        build_modes(
-            settings,
-            available_models=available_models,
-            reasoning_mode_enabled=reasoning_mode_enabled,
+    try:
+        await cl.context.emitter.set_modes(
+            build_modes(
+                settings,
+                available_models=available_models,
+                reasoning_mode_enabled=reasoning_mode_enabled,
+            )
         )
-    )
+    except Exception as exc:
+        message = str(exc).lower()
+        missing_modes_column = "modes" in message and (
+            ("column" in message and "does not exist" in message)
+            or "no such column" in message
+        )
+        if not missing_modes_column:
+            raise
 
 
 def coerce_settings(
