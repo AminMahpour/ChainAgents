@@ -1,9 +1,11 @@
 [model]
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
-temperature = 0
+temperature = 0.3
+
 name = "gemma4:26b"
-#name = "gpt-oss:20b"
+#models = ["gpt-oss:20b", "gemma4:26b", "qwen3.6:27b"]
+
 reasoning_effort = "medium"
 
 # For LM Studio or another OpenAI-compatible server, switch to:

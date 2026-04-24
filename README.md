@@ -10,6 +10,7 @@ The app is wired for:
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
+- Chainlit Modes support for per-message reasoning selection (`Low`, `Medium`, `High`)
 
 ## Environment
 
@@ -143,6 +144,7 @@ provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
 name = "gpt-oss:20b"
+models = ["gpt-oss:20b", "gemma4:27b"]
 reasoning_effort = "medium"
 ```
 
@@ -162,6 +164,7 @@ Notes:
 
 - `provider` selects `ChatOllama` or `ChatOpenAI`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
+- `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `api_key` is optional and only used for `provider = "openai_compatible"`. When omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
@@ -326,6 +329,10 @@ Example:
 ```toml
 [chainlit]
 show_startup_message = true
+# Set false to hide model selection in chat settings and Modes.
+model_mode_enabled = true
+# Set false to disable per-message reasoning overrides from the Modes picker.
+reasoning_mode_enabled = true
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
@@ -347,6 +354,8 @@ starters = [
 Notes:
 
 - The `[chainlit]` table for native commands belongs in `deepagent.toml`, alongside `[model]`, `[agent]`, `[mcp]`, `[[subagents]]`, and `[[async_subagents]]`.
+- `[chainlit].model_mode_enabled = false` hides the Model selector in chat settings and the Model mode group, and ignores per-message model overrides from UI modes.
+- `[chainlit].reasoning_mode_enabled = false` hides the Reasoning mode group and ignores per-message reasoning overrides from UI modes.
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.
 - For `mcp_tool`, user command arguments must be valid JSON, e.g. `/repo-readme {"path":"README.md"}`.

@@ -3,6 +3,7 @@ provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
 name = "gpt-oss:20b"
+models = ["gpt-oss:20b", "gemma4:27b"]
 reasoning_effort = "medium"
 # For LM Studio or another OpenAI-compatible server, switch to:
 # provider = "openai_compatible"
@@ -33,6 +34,10 @@ mcp_servers = ["repo"]
 [chainlit]
 # Set false to hide the startup status/welcome message in the UI.
 show_startup_message = true
+# Set false to hide model selection in chat settings and Modes.
+model_mode_enabled = true
+# Set false to disable per-message reasoning overrides from the Modes picker.
+reasoning_mode_enabled = true
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },
