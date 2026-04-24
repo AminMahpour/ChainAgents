@@ -477,6 +477,7 @@ class ExtensionsConfig:
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
+    chainlit_show_startup_message: bool = True
 
     @property
     def enabled(self) -> bool:
@@ -825,6 +826,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
                 command=command,
             )
         )
+    raw_chainlit_show_startup_message = chainlit_section.get("show_startup_message", True)
+    if not isinstance(raw_chainlit_show_startup_message, bool):
+        raise ValueError("The top-level 'chainlit.show_startup_message' config must be a boolean.")
 
     return ExtensionsConfig(
         config_path=config_path,
@@ -837,6 +841,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         async_subagents=tuple(async_subagents),
         chainlit_commands=tuple(chainlit_commands),
         chainlit_starters=tuple(chainlit_starters),
+        chainlit_show_startup_message=raw_chainlit_show_startup_message,
     )
 
 

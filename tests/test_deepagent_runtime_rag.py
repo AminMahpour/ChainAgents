@@ -542,6 +542,62 @@ starters = [
     assert extensions.chainlit_starters[1].command == "code"
 
 
+def test_load_extensions_config_parses_chainlit_show_startup_message_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+show_startup_message = false
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.chainlit_show_startup_message is False
+
+
+def test_load_extensions_config_defaults_chainlit_show_startup_message_to_true(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+commands = []
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.chainlit_show_startup_message is True
+
+
+def test_load_extensions_config_rejects_non_boolean_chainlit_show_startup_message(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+show_startup_message = "sometimes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="chainlit.show_startup_message"):
+        deepagent_runtime.load_extensions_config()
+
+
 def test_load_extensions_config_rejects_invalid_chainlit_starter(
     tmp_path: Path,
     monkeypatch,

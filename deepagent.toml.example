@@ -31,6 +31,8 @@ skills = ["skills"]
 mcp_servers = ["repo"]
 
 [chainlit]
+# Set false to hide the startup status/welcome message in the UI.
+show_startup_message = true
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },

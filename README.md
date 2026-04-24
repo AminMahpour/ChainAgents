@@ -325,6 +325,7 @@ Example:
 
 ```toml
 [chainlit]
+show_startup_message = true
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
@@ -353,6 +354,7 @@ Notes:
 - Skill-backed commands always force the main agent to read the selected `SKILL.md` first and use it for that turn.
 - If a configured `[chainlit].commands` entry and a skill share the same slash name, the configured command wins.
 - `starters` are optional and map directly to Chainlit `Starter` items (`label`, `message`, optional `icon`, optional `command`).
+- `show_startup_message` is optional (default `true`); set it to `false` to hide the startup status/welcome wall of text in the Chainlit UI.
 
 ## Add Async Subagents
 
