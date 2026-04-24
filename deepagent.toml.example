@@ -32,6 +32,8 @@ skills = ["skills"]
 mcp_servers = ["repo"]
 
 [chainlit]
+# Set false to disable per-message reasoning overrides from the Modes picker.
+reasoning_mode_enabled = true
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },

@@ -409,9 +409,10 @@ def build_modes(
     settings: AppSettings,
     *,
     available_models: tuple[str, ...],
+    reasoning_mode_enabled: bool = True,
 ) -> list[cl.Mode]:
     reasoning_levels = ["low", "medium", "high"]
-    return [
+    modes = [
         cl.Mode(
             id="model_name",
             name="Model",
@@ -426,42 +427,51 @@ def build_modes(
                 for model_name in available_models
             ],
         ),
-        cl.Mode(
-            id="reasoning_level",
-            name="Reasoning",
-            options=[
-                cl.ModeOption(
-                    id=level,
-                    name=level.capitalize(),
-                    description=(
-                        "Deeper reasoning with higher latency"
-                        if level == "high"
-                        else (
-                            "Balanced quality and speed"
-                            if level == "medium"
-                            else "Fastest responses with lighter reasoning"
-                        )
-                    ),
-                    icon=(
-                        "brain"
-                        if level == "high"
-                        else ("sparkles" if level == "medium" else "zap")
-                    ),
-                    default=level == settings.reasoning_level,
-                )
-                for level in reasoning_levels
-            ],
-        ),
     ]
+    if reasoning_mode_enabled:
+        modes.append(
+            cl.Mode(
+                id="reasoning_level",
+                name="Reasoning",
+                options=[
+                    cl.ModeOption(
+                        id=level,
+                        name=level.capitalize(),
+                        description=(
+                            "Deeper reasoning with higher latency"
+                            if level == "high"
+                            else (
+                                "Balanced quality and speed"
+                                if level == "medium"
+                                else "Fastest responses with lighter reasoning"
+                            )
+                        ),
+                        icon=(
+                            "brain"
+                            if level == "high"
+                            else ("sparkles" if level == "medium" else "zap")
+                        ),
+                        default=level == settings.reasoning_level,
+                    )
+                    for level in reasoning_levels
+                ],
+            )
+        )
+    return modes
 
 
 async def publish_modes(
     settings: AppSettings,
     *,
     available_models: tuple[str, ...],
+    reasoning_mode_enabled: bool = True,
 ) -> None:
     await cl.context.emitter.set_modes(
-        build_modes(settings, available_models=available_models)
+        build_modes(
+            settings,
+            available_models=available_models,
+            reasoning_mode_enabled=reasoning_mode_enabled,
+        )
     )
 
 
@@ -506,7 +516,11 @@ def coerce_settings(
 def resolve_reasoning_level_for_message(
     message: cl.Message,
     settings: AppSettings,
+    *,
+    reasoning_mode_enabled: bool = True,
 ) -> str:
+    if not reasoning_mode_enabled:
+        return settings.reasoning_level
     raw_modes = getattr(message, "modes", None)
     if not isinstance(raw_modes, dict):
         return settings.reasoning_level
@@ -610,7 +624,11 @@ async def on_chat_start() -> None:
         thread_id=current_chainlit_thread_id(),
     )
     store_settings(settings)
-    await publish_modes(settings, available_models=runtime.config.model_choices)
+    await publish_modes(
+        settings,
+        available_models=runtime.config.model_choices,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
     await build_chat_settings(
         settings,
         available_models=runtime.config.model_choices,
@@ -697,7 +715,11 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         available_models=runtime.config.model_choices,
     )
     store_settings(settings)
-    await publish_modes(settings, available_models=runtime.config.model_choices)
+    await publish_modes(
+        settings,
+        available_models=runtime.config.model_choices,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
     await build_chat_settings(
         settings,
         available_models=runtime.config.model_choices,
@@ -731,7 +753,11 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         available_models=runtime.config.model_choices,
     )
     store_settings(settings)
-    await publish_modes(settings, available_models=runtime.config.model_choices)
+    await publish_modes(
+        settings,
+        available_models=runtime.config.model_choices,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
 
 
 @cl.action_callback(DOWNLOAD_MARKDOWN_ACTION)
@@ -807,7 +833,11 @@ async def on_message(message: cl.Message) -> None:
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
     )
-    effective_reasoning_level = resolve_reasoning_level_for_message(message, settings)
+    effective_reasoning_level = resolve_reasoning_level_for_message(
+        message,
+        settings,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
     effective_model_name = resolve_model_name_for_message(
         message,
         settings,

@@ -468,6 +468,7 @@ class ExtensionsConfig:
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
+    chainlit_reasoning_mode_enabled: bool = True
 
     @property
     def enabled(self) -> bool:
@@ -744,6 +745,11 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_chainlit_commands = chainlit_section.get("commands", [])
     if not isinstance(raw_chainlit_commands, list):
         raise ValueError("The top-level 'chainlit.commands' config must be an array of tables.")
+    raw_reasoning_mode_enabled = chainlit_section.get("reasoning_mode_enabled", True)
+    if not isinstance(raw_reasoning_mode_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.reasoning_mode_enabled' config must be a boolean."
+        )
 
     chainlit_commands: list[ChainlitCommandConfig] = []
     seen_commands: set[str] = set()
@@ -806,6 +812,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
         chainlit_commands=tuple(chainlit_commands),
+        chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
     )
 
 

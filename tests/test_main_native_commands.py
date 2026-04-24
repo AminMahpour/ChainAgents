@@ -66,6 +66,19 @@ def test_resolve_reasoning_level_for_message_falls_back_to_settings_default() ->
     assert resolved == "low"
 
 
+def test_resolve_reasoning_level_for_message_ignores_override_when_disabled() -> None:
+    message = SimpleNamespace(content="hello", modes={"reasoning_level": "high"})
+    settings = SimpleNamespace(reasoning_level="low")
+
+    resolved = main.resolve_reasoning_level_for_message(
+        message,
+        settings,
+        reasoning_mode_enabled=False,
+    )
+
+    assert resolved == "low"
+
+
 def test_resolve_model_name_for_message_uses_mode_override() -> None:
     message = SimpleNamespace(content="hello", modes={"model_name": "gemma4:27b"})
     settings = SimpleNamespace(model_name="gpt-oss:20b")
