@@ -105,6 +105,20 @@ def test_resolve_model_name_for_message_falls_back_to_settings() -> None:
     assert resolved == "gpt-oss:20b"
 
 
+def test_resolve_model_name_for_message_ignores_override_when_disabled() -> None:
+    message = SimpleNamespace(content="hello", modes={"model_name": "gemma4:27b"})
+    settings = SimpleNamespace(model_name="gpt-oss:20b")
+
+    resolved = main.resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=("gpt-oss:20b", "gemma4:27b"),
+        model_mode_enabled=False,
+    )
+
+    assert resolved == "gpt-oss:20b"
+
+
 @pytest.mark.anyio
 async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> None:
     class _Emitter:

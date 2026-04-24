@@ -523,6 +523,7 @@ description = "Researches the repo"
 system_prompt = "Do research"
 
 [chainlit]
+model_mode_enabled = false
 reasoning_mode_enabled = false
 commands = [
   { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "repo-researcher" },
@@ -540,6 +541,7 @@ commands = [
     assert extensions.chainlit_commands[0].name == "ask-researcher"
     assert extensions.chainlit_commands[1].target == "mcp_tool"
     assert extensions.chainlit_commands[2].template == "Rewrite: {input}"
+    assert extensions.chainlit_model_mode_enabled is False
     assert extensions.chainlit_reasoning_mode_enabled is False
 
 
@@ -558,6 +560,24 @@ reasoning_mode_enabled = "no"
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
     with pytest.raises(ValueError, match="reasoning_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_model_mode_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+model_mode_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="model_mode_enabled"):
         deepagent_runtime.load_extensions_config()
 
 

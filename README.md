@@ -328,6 +328,8 @@ Example:
 
 ```toml
 [chainlit]
+# Set false to hide model selection in chat settings and Modes.
+model_mode_enabled = true
 # Set false to disable per-message reasoning overrides from the Modes picker.
 reasoning_mode_enabled = true
 commands = [
@@ -346,6 +348,7 @@ commands = [
 Notes:
 
 - The `[chainlit]` table for native commands belongs in `deepagent.toml`, alongside `[model]`, `[agent]`, `[mcp]`, `[[subagents]]`, and `[[async_subagents]]`.
+- `[chainlit].model_mode_enabled = false` hides the Model selector in chat settings and the Model mode group, and ignores per-message model overrides from UI modes.
 - `[chainlit].reasoning_mode_enabled = false` hides the Reasoning mode group and ignores per-message reasoning overrides from UI modes.
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.

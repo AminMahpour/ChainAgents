@@ -371,17 +371,22 @@ def build_chat_settings(
     settings: AppSettings,
     *,
     available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
 ) -> cl.ChatSettings:
     reasoning_levels = ["low", "medium", "high"]
-    return cl.ChatSettings(
-        [
+    inputs: list[Any] = []
+    if model_mode_enabled:
+        inputs.append(
             Select(
                 id="model_name",
                 label="Model",
                 values=list(available_models),
                 initial_index=available_models.index(settings.model_name),
                 description="Select a configured model for this chat session.",
-            ),
+            )
+        )
+    inputs.extend(
+        [
             Select(
                 id="reasoning_level",
                 label="Reasoning Level",
@@ -403,31 +408,35 @@ def build_chat_settings(
             ),
         ]
     )
+    return cl.ChatSettings(inputs)
 
 
 def build_modes(
     settings: AppSettings,
     *,
     available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
     reasoning_mode_enabled: bool = True,
 ) -> list[cl.Mode]:
     reasoning_levels = ["low", "medium", "high"]
-    modes = [
-        cl.Mode(
-            id="model_name",
-            name="Model",
-            options=[
-                cl.ModeOption(
-                    id=model_name,
-                    name=model_name,
-                    description="Use this model for the current message.",
-                    icon="bot",
-                    default=model_name == settings.model_name,
-                )
-                for model_name in available_models
-            ],
-        ),
-    ]
+    modes: list[cl.Mode] = []
+    if model_mode_enabled:
+        modes.append(
+            cl.Mode(
+                id="model_name",
+                name="Model",
+                options=[
+                    cl.ModeOption(
+                        id=model_name,
+                        name=model_name,
+                        description="Use this model for the current message.",
+                        icon="bot",
+                        default=model_name == settings.model_name,
+                    )
+                    for model_name in available_models
+                ],
+            )
+        )
     if reasoning_mode_enabled:
         modes.append(
             cl.Mode(
@@ -464,6 +473,7 @@ async def publish_modes(
     settings: AppSettings,
     *,
     available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
     reasoning_mode_enabled: bool = True,
 ) -> None:
     try:
@@ -471,6 +481,7 @@ async def publish_modes(
             build_modes(
                 settings,
                 available_models=available_models,
+                model_mode_enabled=model_mode_enabled,
                 reasoning_mode_enabled=reasoning_mode_enabled,
             )
         )
@@ -544,7 +555,10 @@ def resolve_model_name_for_message(
     settings: AppSettings,
     *,
     available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
 ) -> str:
+    if not model_mode_enabled:
+        return settings.model_name
     raw_modes = getattr(message, "modes", None)
     if not isinstance(raw_modes, dict):
         return settings.model_name
@@ -636,11 +650,13 @@ async def on_chat_start() -> None:
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
         reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
     )
     await build_chat_settings(
         settings,
         available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     ).send()
     persistence_line = (
         "- Persistence: Postgres-backed LangGraph checkpoints and `/memories/`\n"
@@ -727,11 +743,13 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
         reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
     )
     await build_chat_settings(
         settings,
         available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     ).send()
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
@@ -765,6 +783,7 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
         reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
     )
 
@@ -851,6 +870,7 @@ async def on_message(message: cl.Message) -> None:
         message,
         settings,
         available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     )
     mcp_session_id = current_mcp_session_id()
     run_task_list = await get_run_task_list()
