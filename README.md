@@ -1,5 +1,7 @@
 # Workspace Deep Agent
 
+![Workspace Deep Agent logo](logo.png)
+
 This project runs a local-first LangChain Deep Agent behind a Chainlit UI.
 
 The app is wired for:
