@@ -342,6 +342,46 @@ def test_get_agent_includes_rag_tool_when_ready(
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
 
 
+def test_get_agent_includes_summarization_middleware_when_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        captured["tools"] = tools or []
+        captured["kwargs"] = kwargs
+        return object()
+
+    class FakeSummarizationMiddleware:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        "langchain.agents.middleware.SummarizationMiddleware",
+        FakeSummarizationMiddleware,
+    )
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                summarization_middleware_enabled=True,
+            ),
+        )
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    middleware = captured["kwargs"]["middleware"]
+    assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+    assert any(isinstance(item, FakeSummarizationMiddleware) for item in middleware)
+
+
 def test_get_agent_omits_rag_tool_when_service_is_missing(
     tmp_path: Path,
     monkeypatch,
@@ -545,6 +585,43 @@ commands = [
     assert extensions.chainlit_model_mode_enabled is False
     assert extensions.chainlit_reasoning_mode_enabled is False
     assert extensions.chainlit_startup_status_enabled is False
+
+
+def test_load_extensions_config_parses_summarization_middleware_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+summarization_middleware_enabled = true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.summarization_middleware_enabled is True
+
+
+def test_load_extensions_config_rejects_non_boolean_summarization_middleware_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+summarization_middleware_enabled = "yes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="summarization_middleware_enabled"):
+        deepagent_runtime.load_extensions_config()
 
 
 def test_load_extensions_config_rejects_non_boolean_startup_status_flag(

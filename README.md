@@ -286,6 +286,7 @@ cwd = "."
 [agent]
 skills = ["skills"]
 mcp_servers = ["repo"]
+summarization_middleware_enabled = false
 
 [[subagents]]
 name = "repo-researcher"
@@ -315,6 +316,10 @@ Supported subagent fields:
 - `skills`: optional list of skill source paths for that subagent
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional model override
+
+Main `[agent]` additions:
+
+- `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
 
 ## Chainlit Native Commands
 

@@ -30,6 +30,8 @@ url = "http://localhost:8000/mcp"
 # This directory should contain one or more skill folders, each with its own SKILL.md.
 skills = ["skills"]
 mcp_servers = ["repo"]
+# Set true to add LangChain's SummarizationMiddleware to the main agent and sync subagents.
+summarization_middleware_enabled = false
 
 [chainlit]
 # Set false to hide model selection in chat settings and Modes.
