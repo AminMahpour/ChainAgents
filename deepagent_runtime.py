@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -271,8 +272,69 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             return self._error_tool_message(request, exc)
 
 
-def build_agent_middleware() -> list[AgentMiddleware[Any, Any, Any]]:
-    return [ToolExecutionResilienceMiddleware()]
+def _build_summarization_middleware(
+    *,
+    config: RuntimeConfig,
+    reasoning_level: ReasoningLevel,
+    model_name: str | None = None,
+) -> AgentMiddleware[Any, Any, Any] | None:
+    try:
+        from langchain.agents.middleware import SummarizationMiddleware
+    except Exception:
+        logger.warning(
+            "Summarization middleware is enabled but unavailable in the installed LangChain version."
+        )
+        return None
+
+    kwargs: dict[str, Any] = {}
+    signature = inspect.signature(SummarizationMiddleware)
+    if "model" in signature.parameters:
+        kwargs["model"] = build_model(
+            config,
+            reasoning_level,
+            model_name=model_name,
+        )
+    if config.extensions.summarization_trigger_tokens is not None:
+        if "max_tokens_before_summary" in signature.parameters:
+            kwargs["max_tokens_before_summary"] = (
+                config.extensions.summarization_trigger_tokens
+            )
+        elif "trigger" in signature.parameters:
+            kwargs["trigger"] = ("tokens", config.extensions.summarization_trigger_tokens)
+    if config.extensions.summarization_keep_tokens is not None and "keep" in signature.parameters:
+        kwargs["keep"] = ("tokens", config.extensions.summarization_keep_tokens)
+
+    try:
+        middleware = SummarizationMiddleware(**kwargs)
+    except Exception as exc:
+        logger.warning(
+            "Failed to initialize summarization middleware; continuing without it: %s",
+            exc,
+        )
+        return None
+    return middleware
+
+
+def build_agent_middleware(
+    *,
+    config: RuntimeConfig | None = None,
+    reasoning_level: ReasoningLevel | None = None,
+    model_name: str | None = None,
+) -> list[AgentMiddleware[Any, Any, Any]]:
+    middleware: list[AgentMiddleware[Any, Any, Any]] = [ToolExecutionResilienceMiddleware()]
+    if (
+        config
+        and config.extensions.summarization_middleware_enabled
+        and reasoning_level is not None
+    ):
+        summarization_middleware = _build_summarization_middleware(
+            config=config,
+            reasoning_level=reasoning_level,
+            model_name=model_name,
+        )
+        if summarization_middleware is not None:
+            middleware.append(summarization_middleware)
+    return middleware
 
 
 def resolve_local_path(path_value: str, base_dir: Path) -> Path:
@@ -471,6 +533,9 @@ class ExtensionsConfig:
     chainlit_model_mode_enabled: bool = True
     chainlit_reasoning_mode_enabled: bool = True
     chainlit_startup_status_enabled: bool = True
+    summarization_middleware_enabled: bool = False
+    summarization_trigger_tokens: int | None = None
+    summarization_keep_tokens: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -682,6 +747,30 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         mcp_servers[str(name)] = normalize_mcp_server_config(raw_server, base_dir)
 
     raw_skill_paths = agent_section.get("skills", [])
+    raw_summarization_middleware_enabled = agent_section.get(
+        "summarization_middleware_enabled",
+        False,
+    )
+    raw_summarization_trigger_tokens = agent_section.get("summarization_trigger_tokens")
+    raw_summarization_keep_tokens = agent_section.get("summarization_keep_tokens")
+    if not isinstance(raw_summarization_middleware_enabled, bool):
+        raise ValueError(
+            "The top-level 'agent.summarization_middleware_enabled' config must be a boolean."
+        )
+    if raw_summarization_trigger_tokens is not None and (
+        not isinstance(raw_summarization_trigger_tokens, int)
+        or raw_summarization_trigger_tokens <= 0
+    ):
+        raise ValueError(
+            "The top-level 'agent.summarization_trigger_tokens' config must be a positive integer."
+        )
+    if raw_summarization_keep_tokens is not None and (
+        not isinstance(raw_summarization_keep_tokens, int)
+        or raw_summarization_keep_tokens <= 0
+    ):
+        raise ValueError(
+            "The top-level 'agent.summarization_keep_tokens' config must be a positive integer."
+        )
     skill_paths = tuple(
         normalize_skill_source_path(str(path_value), base_dir)
         for path_value in raw_skill_paths
@@ -827,6 +916,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         chainlit_model_mode_enabled=raw_model_mode_enabled,
         chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
         chainlit_startup_status_enabled=raw_startup_status_enabled,
+        summarization_middleware_enabled=raw_summarization_middleware_enabled,
+        summarization_trigger_tokens=raw_summarization_trigger_tokens,
+        summarization_keep_tokens=raw_summarization_keep_tokens,
     )
 
 
@@ -1198,9 +1290,14 @@ def build_graph_subagent_specs(
     *,
     include_async_subagents: bool,
 ) -> list[Any]:
-    middleware = build_agent_middleware()
     subagent_specs: list[Any] = [
-        subagent.to_deepagents_spec(middleware=middleware)
+        subagent.to_deepagents_spec(
+            middleware=build_agent_middleware(
+                config=config,
+                reasoning_level=config.default_reasoning,
+                model_name=subagent.model,
+            )
+        )
         for subagent in config.extensions.subagents
     ]
     if include_async_subagents:
@@ -1238,7 +1335,10 @@ def create_configured_graph(
             system_prompt,
             rag_enabled=config.rag is not None,
         ),
-        middleware=build_agent_middleware(),
+        middleware=build_agent_middleware(
+            config=config,
+            reasoning_level=config.default_reasoning,
+        ),
         backend=build_deepagent_backend(),
         skills=list(config.extensions.skills) or None,
         subagents=subagent_specs or None,
@@ -1401,7 +1501,11 @@ class AgentRuntime:
                         mcp_session_id=mcp_session_id,
                     ),
                 )
-                middleware = build_agent_middleware()
+                middleware = build_agent_middleware(
+                    config=self.config,
+                    reasoning_level=reasoning_level,
+                    model_name=selected_model,
+                )
                 subagent_specs: list[Any] = [
                     subagent.to_deepagents_spec(
                         tools=sanitize_tools_for_model(
@@ -1412,7 +1516,11 @@ class AgentRuntime:
                                 mcp_session_id=mcp_session_id,
                             ),
                         ),
-                        middleware=middleware,
+                        middleware=build_agent_middleware(
+                            config=self.config,
+                            reasoning_level=reasoning_level,
+                            model_name=subagent.model or selected_model,
+                        ),
                     )
                     for subagent in self.config.extensions.subagents
                 ]
