@@ -287,6 +287,8 @@ cwd = "."
 skills = ["skills"]
 mcp_servers = ["repo"]
 summarization_middleware_enabled = false
+summarization_trigger_tokens = 6000
+summarization_keep_tokens = 2400
 
 [[subagents]]
 name = "repo-researcher"
@@ -320,6 +322,8 @@ Supported subagent fields:
 Main `[agent]` additions:
 
 - `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
+- `summarization_trigger_tokens`: optional positive integer token threshold that triggers summarization when reached.
+- `summarization_keep_tokens`: optional positive integer token budget to keep in conversation history after summarization.
 
 ## Chainlit Native Commands
 

@@ -32,6 +32,9 @@ skills = ["skills"]
 mcp_servers = ["repo"]
 # Set true to add LangChain's SummarizationMiddleware to the main agent and sync subagents.
 summarization_middleware_enabled = false
+# Optional token thresholds used when the installed LangChain middleware supports them.
+summarization_trigger_tokens = 6000
+summarization_keep_tokens = 2400
 
 [chainlit]
 # Set false to hide model selection in chat settings and Modes.

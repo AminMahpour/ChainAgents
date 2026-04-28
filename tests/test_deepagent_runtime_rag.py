@@ -354,13 +354,21 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
         return object()
 
     class FakeSummarizationMiddleware:
-        def __init__(self, **kwargs) -> None:
+        def __init__(self, model=None, trigger=None, keep=None, **kwargs) -> None:
+            self.model = model
+            self.trigger = trigger
+            self.keep = keep
             self.kwargs = kwargs
 
     monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
     monkeypatch.setattr(
         "langchain.agents.middleware.SummarizationMiddleware",
         FakeSummarizationMiddleware,
+    )
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "build_model",
+        lambda *_args, model_name=None, **_kwargs: f"model::{model_name or 'default'}",
     )
 
     runtime = AgentRuntime(
@@ -369,6 +377,16 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
             extensions=ExtensionsConfig(
                 config_path=None,
                 summarization_middleware_enabled=True,
+                summarization_trigger_tokens=5000,
+                summarization_keep_tokens=2000,
+                subagents=(
+                    SubagentConfig(
+                        name="repo-researcher",
+                        description="Researches the repo",
+                        system_prompt="Do research",
+                        model="gpt-oss:120b",
+                    ),
+                ),
             ),
         )
     )
@@ -379,7 +397,22 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
 
     middleware = captured["kwargs"]["middleware"]
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
-    assert any(isinstance(item, FakeSummarizationMiddleware) for item in middleware)
+    summarizers = [
+        item for item in middleware if isinstance(item, FakeSummarizationMiddleware)
+    ]
+    assert len(summarizers) == 1
+    assert summarizers[0].model == "model::gpt-oss:20b"
+    assert summarizers[0].trigger == ("tokens", 5000)
+    assert summarizers[0].keep == ("tokens", 2000)
+    subagent_specs = captured["kwargs"]["subagents"]
+    subagent_middleware = subagent_specs[0]["middleware"]
+    subagent_summarizers = [
+        item
+        for item in subagent_middleware
+        if isinstance(item, FakeSummarizationMiddleware)
+    ]
+    assert len(subagent_summarizers) == 1
+    assert subagent_summarizers[0].model == "model::gpt-oss:120b"
 
 
 def test_get_agent_omits_rag_tool_when_service_is_missing(
@@ -596,6 +629,8 @@ def test_load_extensions_config_parses_summarization_middleware_flag(
         """
 [agent]
 summarization_middleware_enabled = true
+summarization_trigger_tokens = 6000
+summarization_keep_tokens = 2400
 """.strip(),
         encoding="utf-8",
     )
@@ -604,6 +639,8 @@ summarization_middleware_enabled = true
     extensions = deepagent_runtime.load_extensions_config()
 
     assert extensions.summarization_middleware_enabled is True
+    assert extensions.summarization_trigger_tokens == 6000
+    assert extensions.summarization_keep_tokens == 2400
 
 
 def test_load_extensions_config_rejects_non_boolean_summarization_middleware_flag(
@@ -621,6 +658,25 @@ summarization_middleware_enabled = "yes"
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
     with pytest.raises(ValueError, match="summarization_middleware_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_invalid_summarization_token_thresholds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+summarization_trigger_tokens = 0
+summarization_keep_tokens = "many"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="summarization_trigger_tokens"):
         deepagent_runtime.load_extensions_config()
 
 
