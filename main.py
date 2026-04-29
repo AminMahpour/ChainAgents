@@ -994,9 +994,3 @@ async def on_chat_end() -> None:
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()
-    runtime = AgentRuntime.current()
-    if runtime is not None:
-        with suppress(Exception):
-            await runtime.close_mcp_session(
-                cl.user_session.get(SESSION_MCP_SESSION_ID_KEY)
-            )
