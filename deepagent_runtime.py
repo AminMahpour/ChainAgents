@@ -1642,7 +1642,36 @@ class AgentRuntime:
                 raise ValueError(
                     f"Command arguments for MCP tool '{tool_name}' must be valid JSON."
                 ) from None
-        return await selected_tool.ainvoke(parsed_args)
+        try:
+            return await selected_tool.ainvoke(parsed_args)
+        except Exception as exc:
+            if not self._is_closed_mcp_resource_error(exc):
+                raise
+            logger.info(
+                "MCP tool '%s' failed with closed resource; refreshing session and retrying once.",
+                tool_name,
+            )
+            await self._refresh_mcp_scope(
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+            )
+            refreshed_tools = await self._get_mcp_tools(
+                candidate_servers,
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+                refresh=True,
+            )
+            refreshed_tool = next(
+                (
+                    tool
+                    for tool in refreshed_tools
+                    if str(getattr(tool, "name", "")).strip() == tool_name
+                ),
+                None,
+            )
+            if refreshed_tool is None:
+                raise
+            return await refreshed_tool.ainvoke(parsed_args)
 
     def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
         return sanitize_tools_for_model(self.config.model_provider, tools)
@@ -1709,6 +1738,7 @@ class AgentRuntime:
         *,
         thread_id: str | None = None,
         mcp_session_id: str | None = None,
+        refresh: bool = False,
     ) -> list[Any]:
         if not server_names or self._mcp_client is None:
             return []
@@ -1720,6 +1750,8 @@ class AgentRuntime:
         cache_key = (tool_scope, tuple(server_names))
 
         async with self._mcp_lock:
+            if refresh:
+                self._mcp_tools_cache.pop(cache_key, None)
             cached = self._mcp_tools_cache.get(cache_key)
             if cached is not None:
                 return list(cached)
@@ -1747,6 +1779,25 @@ class AgentRuntime:
 
             self._mcp_tools_cache[cache_key] = tools
             return list(tools)
+
+    async def _refresh_mcp_scope(
+        self,
+        *,
+        thread_id: str | None,
+        mcp_session_id: str | None,
+    ) -> None:
+        mcp_scope = self._mcp_scope(
+            mcp_session_id=mcp_session_id,
+            thread_id=thread_id,
+        )
+        if mcp_scope is None:
+            return
+        await self.close_mcp_session(mcp_scope)
+
+    @staticmethod
+    def _is_closed_mcp_resource_error(exc: Exception) -> bool:
+        message = str(exc).strip().lower()
+        return "closedresourceerror" in message or "resource is closed" in message
 
     async def _build_main_tools(
         self,
