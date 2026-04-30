@@ -323,6 +323,7 @@ Supported subagent fields:
 
 Main `[agent]` additions:
 
+- `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
 - `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
 - `summarization_trigger_tokens`: optional positive integer token threshold that triggers summarization when reached.
 - `summarization_keep_tokens`: optional positive integer token budget to keep in conversation history after summarization.
