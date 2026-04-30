@@ -67,7 +67,8 @@ SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
-- Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
+- Use `/workspace/` for real project files. Treat this as the project root.
+- Save all generated output files under `/workspace/output/` (project-relative `output/`) unless the user explicitly asks for a different location.
 - Use `/memories/` for agent memory. Persistence depends on runtime configuration.
 - Use any other absolute path only for ephemeral scratch work.
 
