@@ -61,6 +61,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+OUTPUT_DIRECTORY_NAME = "output"
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = f"""
@@ -273,6 +274,89 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             return self._error_tool_message(request, exc)
 
 
+class OutputPathRestrictionMiddleware(AgentMiddleware[Any, Any, Any]):
+    PATH_KEYS = (
+        "path",
+        "file_path",
+        "new_path",
+        "old_path",
+        "target_file",
+    )
+
+    def __init__(self, *, project_root: Path | None = None) -> None:
+        self.project_root = (project_root or PROJECT_ROOT).resolve()
+        self.allowed_root = (self.project_root / OUTPUT_DIRECTORY_NAME).resolve()
+
+    def _coerce_tool_args(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return {}
+            try:
+                loaded = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(loaded, dict):
+                return loaded
+        return {}
+
+    def _resolve_candidate(self, raw_path: str) -> Path | None:
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        else:
+            resolved = (self.project_root / candidate).resolve()
+        try:
+            resolved.relative_to(self.allowed_root)
+        except ValueError:
+            return None
+        return resolved
+
+    def _validate_tool_paths(self, request: ToolCallRequest) -> ToolMessage | None:
+        tool_name = str(request.tool_call.get("name") or getattr(request.tool, "name", "tool"))
+        args = self._coerce_tool_args(request.tool_call.get("args"))
+        for key in self.PATH_KEYS:
+            value = args.get(key)
+            if value is None:
+                continue
+            raw_path = str(value).strip()
+            if not raw_path:
+                continue
+            if self._resolve_candidate(raw_path) is None:
+                tool_call_id = str(request.tool_call.get("id") or tool_name)
+                return ToolMessage(
+                    content=(
+                        f"Blocked tool write path `{raw_path}`. "
+                        f"Writes are restricted to `{self.allowed_root.as_posix()}/`."
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+        return None
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        blocked = self._validate_tool_paths(request)
+        if blocked is not None:
+            return blocked
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        blocked = self._validate_tool_paths(request)
+        if blocked is not None:
+            return blocked
+        return await handler(request)
+
 def _build_summarization_middleware(
     *,
     config: RuntimeConfig,
@@ -322,7 +406,10 @@ def build_agent_middleware(
     reasoning_level: ReasoningLevel | None = None,
     model_name: str | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
-    middleware: list[AgentMiddleware[Any, Any, Any]] = [ToolExecutionResilienceMiddleware()]
+    middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        OutputPathRestrictionMiddleware(),
+        ToolExecutionResilienceMiddleware(),
+    ]
     if (
         config
         and config.extensions.summarization_middleware_enabled
