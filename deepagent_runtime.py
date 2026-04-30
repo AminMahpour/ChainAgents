@@ -1326,6 +1326,7 @@ def create_configured_graph(
     *,
     include_async_subagents: bool,
     system_prompt: str = SYSTEM_PROMPT,
+    apply_custom_instruction: bool = False,
 ) -> Any:
     config = RuntimeConfig.from_env()
     subagent_specs = build_graph_subagent_specs(
@@ -1348,7 +1349,11 @@ def create_configured_graph(
         system_prompt=compose_rag_system_prompt(
             compose_agent_system_prompt(
                 system_prompt,
-                config.extensions.custom_instruction,
+                (
+                    config.extensions.custom_instruction
+                    if apply_custom_instruction
+                    else None
+                ),
             ),
             rag_enabled=config.rag is not None,
         ),

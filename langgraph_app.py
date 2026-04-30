@@ -18,6 +18,7 @@ findings with concrete file paths or sources when relevant.
 supervisor = create_configured_graph(
     include_async_subagents=True,
     system_prompt=SYSTEM_PROMPT,
+    apply_custom_instruction=True,
 )
 
 async_researcher = create_configured_graph(
