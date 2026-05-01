@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 import chainlit_bridge
@@ -92,3 +94,74 @@ async def test_response_stream_batches_fast_chunks_until_finish(monkeypatch) -> 
 
     assert response_message.tokens == ["A", "BC"]
     assert response_message.update_count == 1
+
+
+@pytest.mark.anyio
+async def test_astream_events_chain_stream_tuple_chunk_is_normalized() -> None:
+    bridge = ChainlitEventBridge(prompt="hello")
+    handled_parts: list[dict[str, Any]] = []
+
+    async def handle_part(part: dict[str, Any]) -> None:
+        handled_parts.append(part)
+
+    bridge.handle_part = handle_part  # type: ignore[method-assign]
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    ("tools:abc",),
+                    "updates",
+                    {"tools": {"messages": []}},
+                ),
+            },
+        }
+    )
+
+    assert handled_parts == [
+        {
+            "type": "updates",
+            "ns": ("tools:abc",),
+            "data": {"tools": {"messages": []}},
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_astream_events_ignores_non_langgraph_stream_chunks() -> None:
+    bridge = ChainlitEventBridge(prompt="hello")
+    handled_parts: list[dict[str, Any]] = []
+
+    async def handle_part(part: dict[str, Any]) -> None:
+        handled_parts.append(part)
+
+    bridge.handle_part = handle_part  # type: ignore[method-assign]
+
+    await bridge.handle_event(
+        {
+            "event": "on_chat_model_stream",
+            "data": {"chunk": "hello"},
+        }
+    )
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {"chunk": {"output": "not a LangGraph stream part"}},
+        }
+    )
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "parent_ids": ["root-run-id"],
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    ("duplicate nested token", {}),
+                ),
+            },
+        }
+    )
+
+    assert handled_parts == []

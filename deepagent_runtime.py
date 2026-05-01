@@ -59,6 +59,7 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
+DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 logger = logging.getLogger(__name__)
@@ -153,6 +154,25 @@ def normalize_model_temperature(value: Any | None) -> float:
     if not math.isfinite(temperature):
         return DEFAULT_TEMPERATURE
     return temperature
+
+
+def normalize_recursion_limit(
+    value: Any | None,
+    *,
+    default: int = DEFAULT_RECURSION_LIMIT,
+    field_name: str = "recursion_limit",
+) -> int:
+    if value is None or str(value).strip() == "":
+        return default
+
+    try:
+        recursion_limit = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer.") from exc
+
+    if recursion_limit <= 0:
+        raise ValueError(f"{field_name} must be a positive integer.")
+    return recursion_limit
 
 
 def normalize_model_base_url(
@@ -524,6 +544,7 @@ class ExtensionsConfig:
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
     mcp_stateful: bool = False
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
     agent_mcp_servers: tuple[str, ...] = ()
@@ -740,6 +761,10 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     if agent_section and not isinstance(agent_section, dict):
         raise ValueError("The top-level 'agent' config must be a table/object.")
 
+    recursion_limit = normalize_recursion_limit(
+        agent_section.get("recursion_limit"),
+        field_name="The top-level 'agent.recursion_limit' config",
+    )
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -909,6 +934,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
         mcp_stateful=bool(mcp_section.get("stateful", False)),
+        recursion_limit=recursion_limit,
         mcp_servers=mcp_servers or None,
         skills=skill_paths,
         agent_mcp_servers=raw_agent_mcp_servers,
@@ -973,6 +999,7 @@ class RuntimeConfig:
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT
     rag_requested: bool = False
     rag: ResolvedRagConfig | None = None
     rag_error: str | None = None
@@ -1042,6 +1069,11 @@ class RuntimeConfig:
             generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
         )
+        recursion_limit = normalize_recursion_limit(
+            os.getenv("DEEPAGENT_RECURSION_LIMIT"),
+            default=file_config.extensions.recursion_limit,
+            field_name="DEEPAGENT_RECURSION_LIMIT",
+        )
         rag_requested = file_config.rag.enabled
         rag = None
         rag_error = None
@@ -1066,6 +1098,7 @@ class RuntimeConfig:
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
             extensions=file_config.extensions,
+            recursion_limit=recursion_limit,
             rag_requested=rag_requested,
             rag=rag,
             rag_error=rag_error,

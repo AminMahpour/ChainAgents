@@ -18,6 +18,15 @@ DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
 RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
 RESPONSE_STREAM_FLUSH_CHARS = 1024
 CHAINLIT_APP_CONFIG_PATH = Path(__file__).resolve().parent / "chainlit.toml"
+LANGGRAPH_STREAM_MODES = {
+    "values",
+    "updates",
+    "custom",
+    "messages",
+    "checkpoints",
+    "tasks",
+    "debug",
+}
 
 
 def load_auto_collapse_delay_seconds() -> float:
@@ -97,6 +106,42 @@ def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
             continue
         labels.append(segment.split(":", 1)[0])
     return " / ".join(labels)
+
+
+def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
+    if isinstance(chunk, dict):
+        mode = chunk.get("type")
+        if isinstance(mode, str) and mode in LANGGRAPH_STREAM_MODES and "data" in chunk:
+            return chunk
+        return None
+
+    if not isinstance(chunk, tuple):
+        return None
+
+    if len(chunk) == 3:
+        ns, mode, data = chunk
+    elif len(chunk) == 2:
+        first, data = chunk
+        if isinstance(first, tuple):
+            ns = first
+            mode = "values"
+        else:
+            ns = ()
+            mode = first
+    else:
+        return None
+
+    if not isinstance(mode, str) or mode not in LANGGRAPH_STREAM_MODES:
+        return None
+
+    if isinstance(ns, tuple):
+        namespace = ns
+    elif ns in (None, ""):
+        namespace = ()
+    else:
+        return None
+
+    return {"type": mode, "ns": namespace, "data": data}
 
 
 def reasoning_text_from_token(token: Any) -> str:
@@ -571,6 +616,22 @@ class ChainlitEventBridge:
             return
         if kind == "updates":
             await self._handle_update_chunk(part)
+
+    async def handle_event(self, event: dict[str, Any]) -> None:
+        if event.get("event") != "on_chain_stream":
+            return
+        if event.get("parent_ids"):
+            return
+
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return
+
+        part = langgraph_part_from_event_chunk(data.get("chunk"))
+        if part is None:
+            return
+
+        await self.handle_part(part)
 
     async def finish(self) -> None:
         await self._flush_response_stream()

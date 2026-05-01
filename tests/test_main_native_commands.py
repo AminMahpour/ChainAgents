@@ -119,6 +119,17 @@ def test_resolve_model_name_for_message_ignores_override_when_disabled() -> None
     assert resolved == "gpt-oss:20b"
 
 
+def test_build_langgraph_config_includes_recursion_limit() -> None:
+    settings = SimpleNamespace(thread_id="thread-1")
+
+    config = main.build_langgraph_config(settings, recursion_limit=100)
+
+    assert config == {
+        "configurable": {"thread_id": "thread-1"},
+        "recursion_limit": 100,
+    }
+
+
 @pytest.mark.anyio
 async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> None:
     class _Emitter:

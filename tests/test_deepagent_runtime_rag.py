@@ -208,6 +208,47 @@ models = ["gpt-oss:20b", "gemma4:27b"]
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
+def test_runtime_config_reads_recursion_limit_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+recursion_limit = 64
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.delenv("DEEPAGENT_RECURSION_LIMIT", raising=False)
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.recursion_limit == 64
+    assert config.extensions.recursion_limit == 64
+
+
+def test_runtime_config_env_overrides_recursion_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+recursion_limit = 64
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_RECURSION_LIMIT", "88")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.recursion_limit == 88
+
+
 def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
