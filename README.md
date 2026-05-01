@@ -144,6 +144,27 @@ Start the Chainlit app:
 chainlit run main.py -w
 ```
 
+Run the same underlying agent from a terminal without the Chainlit UI:
+
+```bash
+uv run chainagents --prompt "Summarize this repository" --thread-id cli
+```
+
+Useful CLI examples:
+
+```bash
+uv run chainagents --status --no-rag
+uv run chainagents --list-commands
+uv run chainagents --command ask-researcher --prompt "Find the config entrypoints"
+uv run chainagents --stdin --model gemma4:26b --reasoning high < prompt.txt
+uv run chainagents --rebuild-rag
+uv run chainagents --upload-rag notes.md --prompt "Use my uploaded notes"
+```
+
+Run `uv run chainagents --help` for all runtime flags, including model provider,
+base URL, API key, temperature, persistence, MCP session scope, async subagent
+URL, RAG controls, streaming, reasoning traces, tool traces, and JSON output.
+
 ## Model Config
 
 You can keep the model defaults in `deepagent.toml`:

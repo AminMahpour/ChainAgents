@@ -2,36 +2,37 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import agent_commands
 import main
 import pytest
 
 
 def test_resolve_native_command_prefers_explicit_slash_text() -> None:
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="/summarize hello world",
         selected_command="ask-researcher",
     )
 
-    assert parsed == main.ParsedNativeCommand(
+    assert parsed == agent_commands.ParsedNativeCommand(
         command_name="summarize",
         raw_args="hello world",
     )
 
 
 def test_resolve_native_command_uses_selected_command_input() -> None:
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="hello world",
         selected_command="summarize",
     )
 
-    assert parsed == main.ParsedNativeCommand(
+    assert parsed == agent_commands.ParsedNativeCommand(
         command_name="summarize",
         raw_args="hello world",
     )
 
 
 def test_resolve_native_command_returns_none_without_command() -> None:
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="hello world",
         selected_command=None,
     )
@@ -212,7 +213,7 @@ async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) 
     result = await main.handle_native_command(
         runtime=runtime,
         settings=settings,
-        parsed=main.ParsedNativeCommand(command_name="repo-readme", raw_args=""),
+        parsed=agent_commands.ParsedNativeCommand(command_name="repo-readme", raw_args=""),
     )
 
     assert result == ""
@@ -222,7 +223,7 @@ async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) 
 
 
 def test_build_skill_command_prompt_requires_skill_and_request() -> None:
-    prompt = main.build_skill_command_prompt(
+    prompt = agent_commands.build_skill_command_prompt(
         skill_name="reviewer",
         skill_path="/workspace/skills/reviewer/SKILL.md",
         raw_args="inspect this diff",
@@ -235,7 +236,7 @@ def test_build_skill_command_prompt_requires_skill_and_request() -> None:
 
 
 def test_build_skill_command_prompt_without_request_asks_for_task() -> None:
-    prompt = main.build_skill_command_prompt(
+    prompt = agent_commands.build_skill_command_prompt(
         skill_name="reviewer",
         skill_path="/workspace/skills/reviewer/SKILL.md",
         raw_args="",
@@ -261,7 +262,7 @@ async def test_handle_native_command_returns_forced_skill_prompt() -> None:
     result = await main.handle_native_command(
         runtime=runtime,
         settings=settings,
-        parsed=main.ParsedNativeCommand(
+        parsed=agent_commands.ParsedNativeCommand(
             command_name="reviewer",
             raw_args="inspect this diff",
         ),
@@ -289,7 +290,7 @@ async def test_handle_native_command_without_skill_args_requests_clarification()
     result = await main.handle_native_command(
         runtime=runtime,
         settings=settings,
-        parsed=main.ParsedNativeCommand(
+        parsed=agent_commands.ParsedNativeCommand(
             command_name="reviewer",
             raw_args="",
         ),
@@ -312,12 +313,12 @@ async def test_handle_native_command_uses_selected_skill_command_input() -> None
         )
     )
     settings = SimpleNamespace(thread_id="thread-1")
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="inspect this diff",
         selected_command="reviewer",
     )
 
-    assert parsed == main.ParsedNativeCommand(
+    assert parsed == agent_commands.ParsedNativeCommand(
         command_name="reviewer",
         raw_args="inspect this diff",
     )
