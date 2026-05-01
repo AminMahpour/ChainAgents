@@ -24,6 +24,7 @@ export DEEPAGENT_MODEL_PROVIDER="ollama"
 export DEEPAGENT_MODEL_BASE_URL="http://127.0.0.1:11434"
 export DEEPAGENT_MODEL_NAME="gpt-oss:20b"
 export DEEPAGENT_MODEL_REASONING="medium"
+export DEEPAGENT_RECURSION_LIMIT="200"
 # export DEEPAGENT_MODEL_API_KEY="optional-for-secured-openai-compatible-servers"
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
@@ -46,6 +47,12 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 - they override the matching `[model]` values in `deepagent.toml`
 - `DEEPAGENT_MODEL_API_KEY` is only needed for secured OpenAI-compatible servers
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
+
+`DEEPAGENT_RECURSION_LIMIT` is optional:
+
+- it overrides `[agent].recursion_limit` in `deepagent.toml`
+- it controls the maximum LangGraph steps for a single agent run
+- raise it when long tool-heavy Deep Agent runs hit `GraphRecursionError`
 
 `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
 
@@ -122,6 +129,7 @@ ollama pull nomic-embed-text
 This repo now includes a live [deepagent.toml](deepagent.toml) with:
 
 - model defaults for provider, base URL, model name, and reasoning effort
+- a higher LangGraph recursion limit for longer tool-heavy Deep Agent runs
 - a real `repo` MCP server pinned to `npx @modelcontextprotocol/server-filesystem@2025.8.21`
 - a `repo-researcher` subagent using [prompts/repo-researcher.md](prompts/repo-researcher.md)
 - the repo-local `skills/` source for both the main agent and the subagent
@@ -172,6 +180,24 @@ Notes:
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, and `DEEPAGENT_MODEL_REASONING` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
+
+## Agent Runtime Config
+
+The `[agent]` table configures main-agent runtime behavior:
+
+```toml
+[agent]
+recursion_limit = 200
+skills = ["skills"]
+mcp_servers = ["repo"]
+```
+
+Notes:
+
+- `recursion_limit` is the LangGraph step limit for one agent run.
+- The built-in default is `100`; this repo's `deepagent.toml` sets it to `200`.
+- `DEEPAGENT_RECURSION_LIMIT` overrides this value when set.
+- Increase it for long tool-heavy runs that hit `GraphRecursionError`; lower it if you want runaway loops to stop sooner.
 
 ## Optional: Enable Workspace Docs RAG
 
@@ -286,6 +312,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
 [agent]
+recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
 summarization_middleware_enabled = false
@@ -323,6 +350,7 @@ Supported subagent fields:
 
 Main `[agent]` additions:
 
+- `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
 - `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
 - `summarization_trigger_tokens`: optional positive integer token threshold that triggers summarization when reached.

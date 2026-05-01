@@ -115,6 +115,13 @@ def store_settings(settings: AppSettings) -> None:
     cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
 
 
+def build_langgraph_config(settings: AppSettings, *, recursion_limit: int) -> dict[str, Any]:
+    return {
+        "configurable": {"thread_id": settings.thread_id},
+        "recursion_limit": recursion_limit,
+    }
+
+
 def build_rag_action() -> cl.Action:
     return cl.Action(
         name=REBUILD_RAG_INDEX_ACTION,
@@ -944,7 +951,10 @@ async def on_message(message: cl.Message) -> None:
     bridge = ChainlitEventBridge(prompt=message.content, run_task_list=run_task_list)
     await bridge.start()
 
-    config = {"configurable": {"thread_id": settings.thread_id}}
+    config = build_langgraph_config(
+        settings,
+        recursion_limit=runtime.config.recursion_limit,
+    )
     payload = {
         "messages": [
             {
@@ -953,12 +963,12 @@ async def on_message(message: cl.Message) -> None:
             }
         ]
     }
-    stream = agent.astream(
+    stream = agent.astream_events(
         payload,
         config=config,
+        version="v2",
         stream_mode=["messages", "updates"],
         subgraphs=True,
-        version="v2",
     )
 
     try:
@@ -967,7 +977,7 @@ async def on_message(message: cl.Message) -> None:
                 part = await anext(stream)
             except StopAsyncIteration:
                 break
-            await bridge.handle_part(part)
+            await bridge.handle_event(part)
     except asyncio.CancelledError:
         with suppress(Exception):
             await stream.aclose()
