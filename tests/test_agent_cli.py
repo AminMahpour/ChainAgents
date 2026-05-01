@@ -261,7 +261,11 @@ async def test_cli_json_combines_multiple_actions(tmp_path: Path) -> None:
             async_subagents=[],
         ),
     )
-    runtime.rag_status = RagStatus.ready_status(1, 2, persist_directory=Path(".rag"))  # type: ignore[attr-defined]
+    runtime.rag_status = RagStatus.ready_status(  # type: ignore[attr-defined]
+        file_count=1,
+        chunk_count=2,
+        persist_directory=Path(".rag"),
+    )
     runtime.chainlit_commands = []  # type: ignore[attr-defined]
     runtime.chainlit_command_notes = []  # type: ignore[attr-defined]
     stdout = io.StringIO()

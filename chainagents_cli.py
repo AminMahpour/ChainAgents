@@ -736,6 +736,7 @@ async def ingest_uploads(
     stdout: TextIO,
     stderr: TextIO,
     json_output: bool,
+    emit_output: bool = True,
 ) -> RagUploadResult | None:
     if not paths:
         return None
@@ -753,7 +754,8 @@ async def ingest_uploads(
         uploads.append(UploadedRagFile(path=path, name=path.name))
 
     result = await runtime.ingest_rag_uploads(thread_id=thread_id, uploads=uploads)
-    print_upload_result(result, stdout=stdout, json_output=json_output)
+    if emit_output:
+        print_upload_result(result, stdout=stdout, json_output=json_output)
     return result
 
 
@@ -960,7 +962,8 @@ async def run_cli(
         thread_id=args.thread_id,
         stdout=stdout,
         stderr=stderr,
-        json_output=not args.json_output,
+        json_output=False,
+        emit_output=not args.json_output,
     )
     if args.upload_rag and args.json_output and upload_result is not None:
         json_actions["upload_rag"] = upload_result_payload(upload_result)
