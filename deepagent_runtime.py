@@ -536,6 +536,7 @@ class ExtensionsConfig:
     summarization_middleware_enabled: bool = False
     summarization_trigger_tokens: int | None = None
     summarization_keep_tokens: int | None = None
+    custom_instruction: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -747,6 +748,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         mcp_servers[str(name)] = normalize_mcp_server_config(raw_server, base_dir)
 
     raw_skill_paths = agent_section.get("skills", [])
+    custom_instruction = normalize_optional_string(agent_section.get("custom_instruction"))
     raw_summarization_middleware_enabled = agent_section.get(
         "summarization_middleware_enabled",
         False,
@@ -919,6 +921,18 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         summarization_middleware_enabled=raw_summarization_middleware_enabled,
         summarization_trigger_tokens=raw_summarization_trigger_tokens,
         summarization_keep_tokens=raw_summarization_keep_tokens,
+        custom_instruction=custom_instruction,
+    )
+
+
+def compose_agent_system_prompt(base_prompt: str, custom_instruction: str | None) -> str:
+    instruction = (custom_instruction or "").strip()
+    if not instruction:
+        return base_prompt
+    return (
+        f"{base_prompt}\n\n"
+        "Custom user instruction from [agent].custom_instruction in deepagent.toml:\n"
+        f"{instruction}"
     )
 
 
@@ -1312,6 +1326,7 @@ def create_configured_graph(
     *,
     include_async_subagents: bool,
     system_prompt: str = SYSTEM_PROMPT,
+    apply_custom_instruction: bool = False,
 ) -> Any:
     config = RuntimeConfig.from_env()
     subagent_specs = build_graph_subagent_specs(
@@ -1332,7 +1347,14 @@ def create_configured_graph(
         model=build_model(config, config.default_reasoning),
         tools=sanitize_tools_for_model(config.model_provider, tools) or None,
         system_prompt=compose_rag_system_prompt(
-            system_prompt,
+            compose_agent_system_prompt(
+                system_prompt,
+                (
+                    config.extensions.custom_instruction
+                    if apply_custom_instruction
+                    else None
+                ),
+            ),
             rag_enabled=config.rag is not None,
         ),
         middleware=build_agent_middleware(
@@ -1534,7 +1556,10 @@ class AgentRuntime:
                     model=model,
                     tools=main_tools or None,
                     system_prompt=compose_rag_system_prompt(
-                        SYSTEM_PROMPT,
+                        compose_agent_system_prompt(
+                            SYSTEM_PROMPT,
+                            self.config.extensions.custom_instruction,
+                        ),
                         rag_enabled=rag_tool_enabled,
                     ),
                     middleware=middleware,
