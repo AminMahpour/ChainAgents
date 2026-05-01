@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import secrets
 import traceback
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import chainlit as cl
 from chainlit.input_widget import Select, TextInput
 from chainlit.types import ThreadDict
 
+from agent_commands import (
+    ParsedNativeCommand,
+    build_skill_command_prompt,
+    dumps_tool_result,
+    parse_native_command,
+    resolve_native_command,
+    resolve_runtime_command,
+)
 from async_task_notifications import AsyncTaskNotifier, async_subagent_url_override
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
 from deepagent_runtime import (
@@ -229,68 +236,6 @@ def upload_result_message(upload_result) -> str:
 
     return upload_result.reason or "No files were added to RAG."
 
-class ParsedNativeCommand(NamedTuple):
-    command_name: str
-    raw_args: str
-
-
-def parse_native_command(raw_text: str) -> ParsedNativeCommand | None:
-    text = raw_text.strip()
-    if not text.startswith("/"):
-        return None
-    tokens = text[1:].split(None, 1)
-    if not tokens:
-        return None
-    return ParsedNativeCommand(
-        command_name=tokens[0].strip().lower(),
-        raw_args=tokens[1].strip() if len(tokens) > 1 else "",
-    )
-
-
-def resolve_native_command(
-    *,
-    raw_text: str,
-    selected_command: str | None = None,
-) -> ParsedNativeCommand | None:
-    parsed = parse_native_command(raw_text)
-    if parsed is not None:
-        return parsed
-
-    command_name = str(selected_command or "").strip().lstrip("/").lower()
-    if not command_name:
-        return None
-
-    return ParsedNativeCommand(
-        command_name=command_name,
-        raw_args=raw_text.strip(),
-    )
-
-
-def apply_native_template(template: str | None, raw_args: str) -> str:
-    if template is None:
-        return raw_args.strip()
-    return template.replace("{input}", raw_args.strip()).strip()
-
-
-def build_skill_command_prompt(*, skill_name: str, skill_path: str, raw_args: str) -> str:
-    prelude = (
-        f"Use the configured `{skill_name}` skill for this request.\n"
-        f"Read `{skill_path}` before taking any other action and follow it for this entire turn.\n"
-        "Skill usage is mandatory for this request.\n"
-    )
-    request = raw_args.strip()
-    if request:
-        return (
-            f"{prelude}\n"
-            "After reading the skill, complete the user's request below.\n\n"
-            f"User request:\n{request}"
-        ).strip()
-    return (
-        f"{prelude}\n"
-        "After reading the skill, briefly explain what it does and ask the user for the specific task."
-    ).strip()
-
-
 async def handle_native_command(
     *,
     runtime: AgentRuntime,
@@ -298,47 +243,28 @@ async def handle_native_command(
     parsed: ParsedNativeCommand,
     mcp_session_id: str | None = None,
 ) -> str | None:
-    command = runtime.resolve_chainlit_command(parsed.command_name)
-    if command is None:
+    result = await resolve_runtime_command(
+        runtime=runtime,
+        parsed=parsed,
+        thread_id=settings.thread_id,
+        mcp_session_id=mcp_session_id,
+    )
+    if result.target == "unknown":
         return None
 
-    if command.target == "skill":
-        return build_skill_command_prompt(
-            skill_name=command.name,
-            skill_path=command.value,
-            raw_args=parsed.raw_args,
-        )
-
-    if command.target == "mcp_tool":
-        tool_raw_args = apply_native_template(command.template, parsed.raw_args)
-        result = await runtime.invoke_mcp_tool_command(
-            tool_name=command.value,
-            raw_args=tool_raw_args,
-            thread_id=settings.thread_id,
-            mcp_session_id=mcp_session_id,
-            server_name=command.mcp_server,
-        )
+    if result.target == "mcp_tool":
         await cl.Message(
             author="System",
             content=(
-                f"Ran `/{command.name}` ({command.description}).\n\n"
+                f"Ran `/{result.command_name}` ({result.description}).\n\n"
                 "Tool result:\n```json\n"
-                f"{json.dumps(result, indent=2, sort_keys=True, ensure_ascii=True, default=str)}\n"
+                f"{dumps_tool_result(result.tool_result)}\n"
                 "```"
             ),
         ).send()
         return ""
 
-    transformed = apply_native_template(command.template, parsed.raw_args)
-    if command.target == "prompt":
-        return transformed or command.value
-
-    return (
-        f"Delegate this request to the configured `{command.value}` subagent.\n\n"
-        f"Command: `/{command.name}`\n"
-        f"Description: {command.description}\n\n"
-        f"User request:\n{transformed or parsed.raw_args or command.value}"
-    ).strip()
+    return result.prompt
 
 
 async def ask_for_rag_upload() -> list[UploadedRagFile]:

@@ -962,29 +962,51 @@ def compose_agent_system_prompt(base_prompt: str, custom_instruction: str | None
     )
 
 
-def load_file_config() -> FileConfig:
-    config_name = os.getenv("DEEPAGENT_CONFIG", DEFAULT_EXTENSIONS_CONFIG).strip()
-    config_path = resolve_local_path(config_name or DEFAULT_EXTENSIONS_CONFIG, PROJECT_ROOT)
-    if not config_path.exists():
+def load_file_config(config_path: str | Path | None = None) -> FileConfig:
+    config_name = (
+        str(config_path).strip()
+        if config_path is not None
+        else os.getenv("DEEPAGENT_CONFIG", DEFAULT_EXTENSIONS_CONFIG).strip()
+    )
+    resolved_config_path = resolve_local_path(
+        config_name or DEFAULT_EXTENSIONS_CONFIG,
+        PROJECT_ROOT,
+    )
+    if not resolved_config_path.exists():
         return FileConfig(
             model=ModelDefaults(),
             extensions=ExtensionsConfig(config_path=None),
             rag=RagConfig(),
         )
 
-    with config_path.open("rb") as fh:
+    with resolved_config_path.open("rb") as fh:
         raw_config = tomllib.load(fh)
 
     return FileConfig(
         model=parse_model_defaults(raw_config),
-        extensions=parse_extensions_config(raw_config, config_path),
-        rag=parse_rag_config(raw_config, config_path),
+        extensions=parse_extensions_config(raw_config, resolved_config_path),
+        rag=parse_rag_config(raw_config, resolved_config_path),
     )
 
 
-def load_extensions_config() -> ExtensionsConfig:
+def load_extensions_config(config_path: str | Path | None = None) -> ExtensionsConfig:
     # Keep the previous public helper for existing imports and tests.
-    return load_file_config().extensions
+    return load_file_config(config_path).extensions
+
+
+@dataclass(frozen=True)
+class RuntimeConfigOverrides:
+    config_path: str | Path | None = None
+    database_url: str | None = None
+    disable_database: bool = False
+    model_provider: str | None = None
+    model_name: str | None = None
+    model_base_url: str | None = None
+    model_api_key: str | None = None
+    model_temperature: float | None = None
+    reasoning_level: str | None = None
+    recursion_limit: int | None = None
+    disable_rag: bool = False
 
 
 @dataclass(frozen=True)
@@ -1005,20 +1027,42 @@ class RuntimeConfig:
     rag_error: str | None = None
 
     @classmethod
-    def from_env(cls) -> "RuntimeConfig":
-        file_config = load_file_config()
+    def from_env(
+        cls,
+        overrides: RuntimeConfigOverrides | None = None,
+    ) -> "RuntimeConfig":
+        overrides = overrides or RuntimeConfigOverrides()
+        file_config = load_file_config(overrides.config_path)
         model_defaults = file_config.model
-        database_url = os.getenv("DATABASE_URL", "").strip() or None
+        if overrides.disable_database:
+            database_url = None
+        elif overrides.database_url is not None:
+            database_url = normalize_optional_string(overrides.database_url)
+        else:
+            database_url = os.getenv("DATABASE_URL", "").strip() or None
         model_provider_override = normalize_optional_string(
-            os.getenv("DEEPAGENT_MODEL_PROVIDER")
+            overrides.model_provider
         )
+        if model_provider_override is None:
+            model_provider_override = normalize_optional_string(
+                os.getenv("DEEPAGENT_MODEL_PROVIDER")
+            )
         model_provider = normalize_model_provider(
             model_provider_override,
             default=model_defaults.provider,
         )
-        generic_model_name = os.getenv("DEEPAGENT_MODEL_NAME", "").strip()
-        generic_model_base_url = os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
-        generic_model_reasoning = os.getenv("DEEPAGENT_MODEL_REASONING", "").strip()
+        generic_model_name = (
+            normalize_optional_string(overrides.model_name)
+            or os.getenv("DEEPAGENT_MODEL_NAME", "").strip()
+        )
+        generic_model_base_url = (
+            normalize_optional_string(overrides.model_base_url)
+            or os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
+        )
+        generic_model_reasoning = (
+            normalize_optional_string(overrides.reasoning_level)
+            or os.getenv("DEEPAGENT_MODEL_REASONING", "").strip()
+        )
         model_name_alias = os.getenv("OLLAMA_MODEL", "").strip() if model_provider == "ollama" else ""
         model_base_url_alias = (
             os.getenv("OLLAMA_BASE_URL", "").strip() if model_provider == "ollama" else ""
@@ -1061,20 +1105,32 @@ class RuntimeConfig:
             generic_model_base_url or model_base_url_alias or model_defaults.base_url,
             required_message="The model base URL cannot be empty.",
         )
-        model_api_key = (
-            normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
-            or model_defaults.api_key
+        if overrides.model_api_key is not None:
+            model_api_key = normalize_optional_string(overrides.model_api_key)
+        else:
+            model_api_key = (
+                normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+                or model_defaults.api_key
+            )
+        model_temperature = (
+            normalize_model_temperature(overrides.model_temperature)
+            if overrides.model_temperature is not None
+            else model_defaults.temperature
         )
         default_reasoning = normalize_reasoning_level(
             generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
         )
         recursion_limit = normalize_recursion_limit(
-            os.getenv("DEEPAGENT_RECURSION_LIMIT"),
+            (
+                overrides.recursion_limit
+                if overrides.recursion_limit is not None
+                else os.getenv("DEEPAGENT_RECURSION_LIMIT")
+            ),
             default=file_config.extensions.recursion_limit,
             field_name="DEEPAGENT_RECURSION_LIMIT",
         )
-        rag_requested = file_config.rag.enabled
+        rag_requested = file_config.rag.enabled and not overrides.disable_rag
         rag = None
         rag_error = None
         if rag_requested:
@@ -1094,7 +1150,7 @@ class RuntimeConfig:
             model_choices=model_choices,
             model_base_url=model_base_url,
             model_api_key=model_api_key,
-            model_temperature=model_defaults.temperature,
+            model_temperature=model_temperature,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
             extensions=file_config.extensions,
@@ -1442,6 +1498,17 @@ class AgentRuntime:
                 await instance._initialize()
                 cls._instance = instance
             return cls._instance
+
+    @classmethod
+    async def create(
+        cls,
+        config: RuntimeConfig | None = None,
+        *,
+        project_root: Path | None = None,
+    ) -> "AgentRuntime":
+        instance = cls(config or RuntimeConfig.from_env(), project_root=project_root)
+        await instance._initialize()
+        return instance
 
     @classmethod
     def current(cls) -> "AgentRuntime | None":
@@ -1869,6 +1936,12 @@ class AgentRuntime:
 
         for stack in stacks:
             await stack.aclose()
+
+    async def close(self) -> None:
+        await self._exit_stack.aclose()
+        self._checkpointer = None
+        self._store = None
+        self._mcp_client = None
 
     def _build_backend(self, runtime):
         return build_deepagent_backend(project_root=self.project_root)
