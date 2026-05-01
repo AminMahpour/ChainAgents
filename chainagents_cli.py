@@ -736,21 +736,25 @@ async def ingest_uploads(
     stdout: TextIO,
     stderr: TextIO,
     json_output: bool,
-) -> bool:
+) -> RagUploadResult | None:
     if not paths:
-        return True
+        return None
 
     uploads: list[UploadedRagFile] = []
     for raw_path in paths:
         path = Path(raw_path).expanduser().resolve()
         if not path.exists() or not path.is_file():
             print(f"upload-rag: file does not exist: {path}", file=stderr)
-            return False
+            return RagUploadResult(
+                thread_id=thread_id,
+                success=False,
+                reason=f"file does not exist: {path}",
+            )
         uploads.append(UploadedRagFile(path=path, name=path.name))
 
     result = await runtime.ingest_rag_uploads(thread_id=thread_id, uploads=uploads)
     print_upload_result(result, stdout=stdout, json_output=json_output)
-    return result.reason is None
+    return result
 
 
 async def run_agent_prompt(
@@ -760,7 +764,8 @@ async def run_agent_prompt(
     prompt: str,
     stdout: TextIO,
     stderr: TextIO,
-) -> int:
+    emit_json: bool = True,
+) -> int | dict[str, Any]:
     thread_id = str(args.thread_id or DEFAULT_CLI_THREAD_ID).strip() or DEFAULT_CLI_THREAD_ID
     reasoning_level: ReasoningLevel = normalize_reasoning_level(
         args.reasoning,
@@ -860,19 +865,16 @@ async def run_agent_prompt(
 
     response = renderer.finish()
     if args.json_output:
-        print(
-            json.dumps(
-                {
-                    "response": response,
-                    "thread_id": settings.thread_id,
-                    "model": settings.model_name,
-                    "reasoning": settings.reasoning_level,
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-            file=stdout,
-        )
+        payload = {
+            "response": response,
+            "thread_id": settings.thread_id,
+            "model": settings.model_name,
+            "reasoning": settings.reasoning_level,
+        }
+        if emit_json:
+            print(json.dumps(payload, indent=2, sort_keys=True), file=stdout)
+            return 0
+        return {"prompt": payload}
     return 0
 
 
@@ -918,40 +920,74 @@ async def run_cli(
     prompt = prompt_from_args(args, stdin=stdin, parser=parser)
     has_prompt = bool(prompt and prompt.strip())
 
+    json_actions: dict[str, Any] = {}
+
     if args.status:
-        print_runtime_status(runtime, stdout=stdout, json_output=args.json_output)
+        if args.json_output:
+            json_actions["status"] = runtime_status_payload(runtime)
+        else:
+            print_runtime_status(runtime, stdout=stdout, json_output=False)
     if args.list_commands:
-        print_command_list(runtime, stdout=stdout, json_output=args.json_output)
+        if args.json_output:
+            json_actions["commands"] = [
+                {
+                    "name": command.name,
+                    "description": command.description,
+                    "target": command.target,
+                    "value": command.value,
+                    "source": command.source,
+                }
+                for command in runtime.chainlit_commands
+            ]
+            json_actions["notes"] = list(runtime.chainlit_command_notes)
+        else:
+            print_command_list(runtime, stdout=stdout, json_output=False)
     if args.rebuild_rag:
         status = await runtime.rebuild_rag_index()
-        print_rag_status(
-            status=status,
-            action="rebuild_rag",
-            stdout=stdout,
-            json_output=args.json_output,
-        )
+        if args.json_output:
+            json_actions["rebuild_rag"] = rag_status_payload(status)
+        else:
+            print_rag_status(
+                status=status,
+                action="rebuild_rag",
+                stdout=stdout,
+                json_output=False,
+            )
 
-    uploads_ok = await ingest_uploads(
+    upload_result = await ingest_uploads(
         runtime,
         paths=args.upload_rag,
         thread_id=args.thread_id,
         stdout=stdout,
         stderr=stderr,
-        json_output=args.json_output,
+        json_output=not args.json_output,
     )
-    if not uploads_ok:
+    if args.upload_rag and args.json_output and upload_result is not None:
+        json_actions["upload_rag"] = upload_result_payload(upload_result)
+
+    if upload_result is not None and upload_result.reason is not None:
         return 1
 
     if has_prompt:
-        return await run_agent_prompt(
+        prompt_result = await run_agent_prompt(
             runtime,
             args,
             prompt=prompt or "",
             stdout=stdout,
             stderr=stderr,
+            emit_json=not args.json_output,
         )
+        if args.json_output:
+            if isinstance(prompt_result, dict):
+                json_actions.update(prompt_result)
+                print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
+                return 0
+            return int(prompt_result)
+        return int(prompt_result)
 
     if args.status or args.list_commands or args.rebuild_rag or args.upload_rag:
+        if args.json_output:
+            print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
         return 0
 
     return await interactive_repl(

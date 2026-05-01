@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -224,6 +225,58 @@ async def test_cli_runs_rag_actions_without_prompt(tmp_path: Path) -> None:
     assert runtime.uploaded == ["notes.md"]
     assert "rebuild_rag: ready" in stdout.getvalue()
     assert "upload-rag: added notes.md" in stdout.getvalue()
+
+
+@pytest.mark.anyio
+async def test_cli_json_combines_multiple_actions(tmp_path: Path) -> None:
+    upload = tmp_path / "notes.md"
+    upload.write_text("# Notes\n", encoding="utf-8")
+    args = chainagents_cli.parse_args(
+        [
+            "--json",
+            "--status",
+            "--list-commands",
+            "--rebuild-rag",
+            "--upload-rag",
+            str(upload),
+            "--thread-id",
+            "thread-1",
+        ]
+    )
+    runtime = _FakeRagRuntime()
+    runtime.config = SimpleNamespace(  # type: ignore[attr-defined]
+        model_provider="ollama",
+        model_name="fake-model",
+        model_choices=["fake-model"],
+        model_base_url=None,
+        default_reasoning="medium",
+        recursion_limit=50,
+        persistence_mode="memory",
+        extensions=SimpleNamespace(
+            config_path=None,
+            skills=[],
+            mcp_servers={},
+            agent_mcp_servers=[],
+            subagents=[],
+            async_subagents=[],
+        ),
+    )
+    runtime.rag_status = RagStatus.ready_status(1, 2, persist_directory=Path(".rag"))  # type: ignore[attr-defined]
+    runtime.chainlit_commands = []  # type: ignore[attr-defined]
+    runtime.chainlit_command_notes = []  # type: ignore[attr-defined]
+    stdout = io.StringIO()
+
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=runtime,  # type: ignore[arg-type]
+        stdout=stdout,
+        stderr=io.StringIO(),
+        stdin=io.StringIO(""),
+    )
+
+    assert code == 0
+    payload = json.loads(stdout.getvalue())
+    assert set(payload.keys()) == {"status", "commands", "notes", "rebuild_rag", "upload_rag"}
 
 
 class _Token:
