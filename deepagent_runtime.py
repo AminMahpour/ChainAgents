@@ -23,7 +23,7 @@ from deepagents.backends import (
 )
 from deepagents.middleware.skills import _list_skills
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessageChunk, ToolMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -63,6 +63,13 @@ DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 logger = logging.getLogger(__name__)
+
+OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+    "reasoning_details",
+)
 
 SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
@@ -117,6 +124,61 @@ def format_model_provider(provider: ModelProvider) -> str:
     if provider == "openai_compatible":
         return "OpenAI-compatible"
     return "Ollama"
+
+
+def _first_openai_compatible_delta(chunk: dict[str, Any]) -> dict[str, Any]:
+    choices = chunk.get("choices", [])
+    if not choices:
+        nested_chunk = chunk.get("chunk")
+        if isinstance(nested_chunk, dict):
+            choices = nested_chunk.get("choices", [])
+
+    if not isinstance(choices, list) or not choices:
+        return {}
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return {}
+
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        return delta
+    return {}
+
+
+def _openai_compatible_reasoning_delta(chunk: dict[str, Any]) -> Any:
+    delta = _first_openai_compatible_delta(chunk)
+    for key in OPENAI_COMPATIBLE_REASONING_DELTA_KEYS:
+        value = delta.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+class OpenAICompatibleChatOpenAI(ChatOpenAI):
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict[str, Any],
+        default_chunk_class: type,
+        base_generation_info: dict | None,
+    ):
+        generation_chunk = super()._convert_chunk_to_generation_chunk(
+            chunk,
+            default_chunk_class,
+            base_generation_info,
+        )
+        if generation_chunk is None:
+            return None
+
+        reasoning_delta = _openai_compatible_reasoning_delta(chunk)
+        if reasoning_delta is None or not isinstance(
+            generation_chunk.message,
+            AIMessageChunk,
+        ):
+            return generation_chunk
+
+        generation_chunk.message.additional_kwargs["reasoning_content"] = reasoning_delta
+        return generation_chunk
 
 
 def normalize_model_endpoint(value: str | None) -> str:
@@ -1182,7 +1244,7 @@ def build_model(
         "api_key": config.model_api_key or "deepagent",
         "temperature": config.model_temperature,
     }
-    return ChatOpenAI(**kwargs)
+    return OpenAICompatibleChatOpenAI(**kwargs)
 
 
 def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:

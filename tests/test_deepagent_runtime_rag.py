@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from langchain.agents.middleware.types import ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 import pytest
@@ -84,6 +84,47 @@ def make_extensions_config(
         mcp_stateful=mcp_stateful,
         mcp_servers={"repo": {"transport": "stdio", "command": "npx", "args": []}},
         agent_mcp_servers=agent_mcp_servers,
+    )
+
+
+def test_openai_compatible_model_preserves_vllm_reasoning_delta() -> None:
+    config = RuntimeConfig(
+        database_url=None,
+        model_provider="openai_compatible",
+        model_name="reasoning-model",
+        model_choices=("reasoning-model",),
+        model_base_url="http://127.0.0.1:8000/v1",
+        model_api_key=None,
+        model_temperature=0.0,
+        default_reasoning="medium",
+        persistence_mode="memory",
+        extensions=ExtensionsConfig(config_path=None),
+    )
+    model = deepagent_runtime.build_model(config, "medium")
+
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "thinking through the answer",
+                },
+                "finish_reason": None,
+                "index": 0,
+            }
+        ]
+    }
+
+    generation_chunk = model._convert_chunk_to_generation_chunk(
+        chunk,
+        AIMessageChunk,
+        {},
+    )
+
+    assert generation_chunk is not None
+    assert generation_chunk.message.additional_kwargs["reasoning_content"] == (
+        "thinking through the answer"
     )
 
 
