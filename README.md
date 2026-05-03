@@ -159,11 +159,13 @@ uv run chainagents --command ask-researcher --prompt "Find the config entrypoint
 uv run chainagents --stdin --model gemma4:26b --reasoning high < prompt.txt
 uv run chainagents --rebuild-rag
 uv run chainagents --upload-rag notes.md --prompt "Use my uploaded notes"
+uv run chainagents --photo scene.jpg --prompt "Describe this photo"
 ```
 
 Run `uv run chainagents --help` for all runtime flags, including model provider,
 base URL, API key, temperature, persistence, MCP session scope, async subagent
-URL, RAG controls, streaming, reasoning traces, tool traces, and JSON output.
+URL, RAG controls, photo attachments, streaming, reasoning traces, tool traces,
+and JSON output.
 
 ## Model Config
 
