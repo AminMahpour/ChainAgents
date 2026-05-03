@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 from pathlib import Path
@@ -17,6 +18,8 @@ def test_cli_parses_prompt_and_runtime_flags() -> None:
         [
             "--prompt",
             "hello",
+            "--photo",
+            "image.png",
             "--model",
             "gemma4:26b",
             "--reasoning",
@@ -29,6 +32,7 @@ def test_cli_parses_prompt_and_runtime_flags() -> None:
     )
 
     assert chainagents_cli.prompt_from_args(args, stdin=io.StringIO("")) == "hello"
+    assert args.photo == ["image.png"]
     assert args.model == "gemma4:26b"
     assert args.reasoning == "high"
     assert args.thread_id == "thread-1"
@@ -196,6 +200,35 @@ class _FakeRagRuntime:
         )
 
 
+class _CaptureAgent:
+    def __init__(self) -> None:
+        self.payload = None
+        self.config = None
+
+    def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+        self.payload = payload
+        self.config = config
+
+        async def events():
+            if False:
+                yield None
+
+        return events()
+
+
+class _FakePromptRuntime:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            default_reasoning="medium",
+            model_name="fake-model",
+            recursion_limit=100,
+        )
+        self.agent = _CaptureAgent()
+
+    async def get_agent(self, *args, **kwargs):
+        return self.agent
+
+
 @pytest.mark.anyio
 async def test_cli_runs_rag_actions_without_prompt(tmp_path: Path) -> None:
     upload = tmp_path / "notes.md"
@@ -225,6 +258,60 @@ async def test_cli_runs_rag_actions_without_prompt(tmp_path: Path) -> None:
     assert runtime.uploaded == ["notes.md"]
     assert "rebuild_rag: ready" in stdout.getvalue()
     assert "upload-rag: added notes.md" in stdout.getvalue()
+
+
+@pytest.mark.anyio
+async def test_cli_photo_attaches_image_content_to_agent_payload(tmp_path: Path) -> None:
+    photo = tmp_path / "scene.png"
+    photo.write_bytes(b"\x89PNG\r\n")
+    args = chainagents_cli.parse_args(
+        [
+            "--prompt",
+            "Describe this scene",
+            "--photo",
+            str(photo),
+            "--no-stream",
+        ]
+    )
+    runtime = _FakePromptRuntime()
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        args,
+        prompt="Describe this scene",
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    content = runtime.agent.payload["messages"][0]["content"]
+    expected_image_url = (
+        "data:image/png;base64,"
+        + base64.b64encode(photo.read_bytes()).decode("ascii")
+    )
+    assert content == [
+        {"type": "text", "text": "Describe this scene"},
+        {"type": "image_url", "image_url": {"url": expected_image_url}},
+    ]
+
+
+@pytest.mark.anyio
+async def test_cli_photo_requires_prompt(tmp_path: Path) -> None:
+    photo = tmp_path / "scene.png"
+    photo.write_bytes(b"\x89PNG\r\n")
+    args = chainagents_cli.parse_args(["--photo", str(photo)])
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=_FakePromptRuntime(),  # type: ignore[arg-type]
+        stdout=io.StringIO(),
+        stderr=stderr,
+        stdin=io.StringIO(""),
+    )
+
+    assert code == 2
+    assert "provide a prompt with --photo" in stderr.getvalue()
 
 
 @pytest.mark.anyio

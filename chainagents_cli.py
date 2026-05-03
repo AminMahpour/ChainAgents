@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
+import mimetypes
 import sys
 import traceback
 from contextlib import suppress
@@ -57,6 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--stdin",
         action="store_true",
         help="Read the prompt from stdin.",
+    )
+    parser.add_argument(
+        "--photo",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Attach an image file to the prompt for vision-capable models. May be repeated.",
     )
 
     parser.add_argument("--config", help="Path to deepagent.toml.")
@@ -192,6 +201,35 @@ def prompt_from_args(
     if args.prompt_parts:
         return " ".join(args.prompt_parts)
     return None
+
+
+def photo_content_parts(paths: list[str], *, stderr: TextIO) -> list[dict[str, Any]] | None:
+    parts: list[dict[str, Any]] = []
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve()
+        if not path.exists() or not path.is_file():
+            print(f"photo: file does not exist: {path}", file=stderr)
+            return None
+
+        mime_type, _ = mimetypes.guess_type(path.name)
+        if not mime_type or not mime_type.startswith("image/"):
+            print(f"photo: unsupported image type: {path}", file=stderr)
+            return None
+
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+            }
+        )
+    return parts
+
+
+def user_message_content(prompt: str, photos: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    if not photos:
+        return prompt
+    return [{"type": "text", "text": prompt}, *photos]
 
 
 def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
@@ -814,6 +852,10 @@ async def run_agent_prompt(
             if not prompt.strip():
                 return 0
 
+    photos = photo_content_parts(args.photo, stderr=stderr)
+    if photos is None:
+        return 1
+
     agent = await runtime.get_agent(
         settings.reasoning_level,
         model_name=settings.model_name,
@@ -821,7 +863,9 @@ async def run_agent_prompt(
         async_subagent_url_override=args.async_subagent_url,
         mcp_session_id=args.mcp_session_id,
     )
-    payload = {"messages": [{"role": "user", "content": prompt}]}
+    payload = {
+        "messages": [{"role": "user", "content": user_message_content(prompt, photos)}]
+    }
     config = {
         "configurable": {"thread_id": settings.thread_id},
         "recursion_limit": runtime.config.recursion_limit,
@@ -923,6 +967,10 @@ async def run_cli(
     has_prompt = bool(prompt and prompt.strip())
 
     json_actions: dict[str, Any] = {}
+
+    if args.photo and not has_prompt:
+        print("photo: provide a prompt with --photo.", file=stderr)
+        return 2
 
     if args.status:
         if args.json_output:
