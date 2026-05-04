@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import tomllib
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -1271,6 +1272,35 @@ def normalize_chainlit_command_name(value: str) -> str:
     return value.strip().lstrip("/").lower()
 
 
+
+def _list_skills_with_retry(
+    backend: CompositeBackend,
+    source_path: str,
+    *,
+    retries: int = 2,
+    delay_seconds: float = 0.15,
+) -> list[dict[str, Any]]:
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return _list_skills(backend, source_path)
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(delay_seconds * (attempt + 1))
+                continue
+            raise
+        except OSError as exc:
+            if exc.errno in {13, 2}:
+                last_exc = exc
+                if attempt < retries:
+                    time.sleep(delay_seconds * (attempt + 1))
+                    continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return []
+
 def _load_skill_command_bucket(
     *,
     backend: CompositeBackend,
@@ -1282,10 +1312,10 @@ def _load_skill_command_bucket(
     commands_by_name: dict[str, SkillCommandMetadata] = {}
     for source_path in source_paths:
         try:
-            source_skills = _list_skills(backend, source_path)
+            source_skills = _list_skills_with_retry(backend, source_path)
         except Exception as exc:
             logger.warning(
-                "Failed to load skills from '%s' for Chainlit command generation: %s",
+                "Failed to load skills from '%s' (check path mapping/read permissions) for Chainlit command generation: %s",
                 source_path,
                 exc,
             )

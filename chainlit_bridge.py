@@ -17,6 +17,7 @@ from response_exports import attach_response_export_actions
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
 RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
 RESPONSE_STREAM_FLUSH_CHARS = 1024
+MAX_TOOL_OUTPUT_CHARS = 20_000
 CHAINLIT_APP_CONFIG_PATH = Path(__file__).resolve().parent / "chainlit.toml"
 LANGGRAPH_STREAM_MODES = {
     "values",
@@ -835,7 +836,9 @@ class ChainlitEventBridge:
 
         if not state.step.input:
             state.step.input = state.rendered_input
-        state.step.output = pretty_data(getattr(tool_message, "content", ""))
+        state.step.output = truncate_tool_output(
+            pretty_data(getattr(tool_message, "content", ""))
+        )
         state.step.end = utc_now()
         await state.step.update()
         self._schedule_step_auto_collapse(state.step)
@@ -918,3 +921,12 @@ class ChainlitEventBridge:
         task = asyncio.create_task(collapse_later())
         self.pending_collapse_tasks.add(task)
         task.add_done_callback(self.pending_collapse_tasks.discard)
+
+def truncate_tool_output(text: str, *, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return (
+        f"{text[:limit]}\n\n[output truncated: omitted {omitted} characters to keep Chainlit step updates stable]"
+    )
+
