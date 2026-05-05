@@ -300,7 +300,49 @@ def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
     return summary
 
 
+WORKSPACE_PATH_TOOL_ARG_KEYS = {
+    "destination",
+    "dest",
+    "dst",
+    "path",
+    "paths",
+    "source",
+    "src",
+}
+
+
+def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
+    if isinstance(value, str):
+        return virtual_workspace_path_to_local(value, project_root)
+    if isinstance(value, list):
+        return [_map_workspace_tool_path_value(item, project_root) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_map_workspace_tool_path_value(item, project_root) for item in value)
+    return value
+
+
+def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None) -> Any:
+    if not isinstance(args, dict):
+        return args
+
+    root = (project_root or PROJECT_ROOT).resolve()
+    mapped = dict(args)
+    for key, value in args.items():
+        if str(key).lower() in WORKSPACE_PATH_TOOL_ARG_KEYS:
+            mapped[key] = _map_workspace_tool_path_value(value, root)
+    return mapped
+
+
 class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
+    def __init__(self, *, project_root: Path | None = None) -> None:
+        self.project_root = (project_root or PROJECT_ROOT).resolve()
+
+    def _map_workspace_path_args(self, request: ToolCallRequest) -> None:
+        args = request.tool_call.get("args")
+        mapped_args = map_workspace_paths_in_tool_args(args, self.project_root)
+        if mapped_args is not args:
+            request.tool_call["args"] = mapped_args
+
     def _error_tool_message(
         self,
         request: ToolCallRequest,
@@ -335,6 +377,7 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
         try:
+            self._map_workspace_path_args(request)
             return handler(request)
         except asyncio.CancelledError:
             raise
@@ -347,6 +390,7 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
         try:
+            self._map_workspace_path_args(request)
             return await handler(request)
         except asyncio.CancelledError:
             raise
@@ -402,8 +446,11 @@ def build_agent_middleware(
     config: RuntimeConfig | None = None,
     reasoning_level: ReasoningLevel | None = None,
     model_name: str | None = None,
+    project_root: Path | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
-    middleware: list[AgentMiddleware[Any, Any, Any]] = [ToolExecutionResilienceMiddleware()]
+    middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        ToolExecutionResilienceMiddleware(project_root=project_root)
+    ]
     if (
         config
         and config.extensions.summarization_middleware_enabled
@@ -1511,6 +1558,7 @@ def create_configured_graph(
         middleware=build_agent_middleware(
             config=config,
             reasoning_level=config.default_reasoning,
+            project_root=PROJECT_ROOT,
         ),
         backend=build_deepagent_backend(),
         skills=list(config.extensions.skills) or None,
@@ -1689,6 +1737,7 @@ class AgentRuntime:
                     config=self.config,
                     reasoning_level=reasoning_level,
                     model_name=selected_model,
+                    project_root=self.project_root,
                 )
                 subagent_specs: list[Any] = [
                     subagent.to_deepagents_spec(
@@ -1704,6 +1753,7 @@ class AgentRuntime:
                             config=self.config,
                             reasoning_level=reasoning_level,
                             model_name=subagent.model or selected_model,
+                            project_root=self.project_root,
                         ),
                     )
                     for subagent in self.config.extensions.subagents
