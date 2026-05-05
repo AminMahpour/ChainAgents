@@ -413,6 +413,8 @@ class CliEventRenderer:
         self.reasoning_buffers: dict[str, str] = {}
         self.reasoning_line_source: str | None = None
         self.tool_names: dict[str, str] = {}
+        self.tool_args_buffers: dict[str, str] = {}
+        self.tool_call_started: set[str] = set()
         self.completed_tool_results: set[tuple[str, str, str]] = set()
         self.stdout_console = Console(
             file=stdout,
@@ -539,29 +541,41 @@ class CliEventRenderer:
         call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
         tool_name = str(chunk.get("name") or self.tool_names.get(call_id) or "tool")
         self.tool_names[call_id] = tool_name
-        if self.show_tools and chunk.get("name"):
-            self._close_reasoning_line()
-            body = Text.assemble(
-                ("status: ", "dim"),
-                ("start", "bold yellow"),
-                ("\nsource: ", "dim"),
-                (source, "cyan"),
-                ("\ntool: ", "dim"),
-                (tool_name, "bold white"),
+        args_delta = chunk.get("args")
+        if args_delta:
+            self.tool_args_buffers[call_id] = self.tool_args_buffers.get(call_id, "") + str(
+                args_delta
             )
-            args = pretty_tool_call_args(chunk.get("args"))
-            if args:
-                body.append("\nargs: ", style="dim yellow")
-                body.append(args, style="yellow")
-            self.stderr_console.print(
-                Panel(
-                    body,
-                    title="Tool Call",
-                    title_align="left",
-                    border_style="yellow",
-                    box=box.ASCII,
-                )
+
+        if not self.show_tools:
+            return
+        if not chunk.get("name") and call_id not in self.tool_call_started:
+            return
+
+        self._close_reasoning_line()
+        status = "start" if call_id not in self.tool_call_started else "update"
+        self.tool_call_started.add(call_id)
+        body = Text.assemble(
+            ("status: ", "dim"),
+            (status, "bold yellow"),
+            ("\nsource: ", "dim"),
+            (source, "cyan"),
+            ("\ntool: ", "dim"),
+            (tool_name, "bold white"),
+        )
+        args = pretty_tool_call_args(self.tool_args_buffers.get(call_id))
+        if args:
+            body.append("\nargs: ", style="dim yellow")
+            body.append(args, style="yellow")
+        self.stderr_console.print(
+            Panel(
+                body,
+                title="Tool Call",
+                title_align="left",
+                border_style="yellow",
+                box=box.ASCII,
             )
+        )
 
     def _complete_tool(self, source: str, tool_message: Any) -> None:
         if not self.show_tools:
