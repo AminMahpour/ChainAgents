@@ -548,6 +548,8 @@ async def test_cli_event_renderer_boxes_tool_call_start() -> None:
     assert "status: start" in output
     assert "source: main-agent" in output
     assert "tool: read_file" in output
+    assert "args: " in output
+    assert '"path": "README.md"' in output
     assert "+" in output
     assert "|" in output
 

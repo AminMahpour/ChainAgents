@@ -291,6 +291,17 @@ def truncate_tool_result_content(value: Any) -> str:
     return content[:TOOL_RESULT_PREVIEW_CHARS]
 
 
+def pretty_tool_call_args(value: Any) -> str:
+    content = stringify_content(value).strip()
+    if not content:
+        return ""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    return json.dumps(parsed, indent=2, sort_keys=True, ensure_ascii=True)
+
+
 def reasoning_text_from_token(token: Any) -> str:
     if hasattr(token, "additional_kwargs"):
         text = stringify_content(token.additional_kwargs.get("reasoning_content"))
@@ -530,16 +541,21 @@ class CliEventRenderer:
         self.tool_names[call_id] = tool_name
         if self.show_tools and chunk.get("name"):
             self._close_reasoning_line()
+            body = Text.assemble(
+                ("status: ", "dim"),
+                ("start", "bold yellow"),
+                ("\nsource: ", "dim"),
+                (source, "cyan"),
+                ("\ntool: ", "dim"),
+                (tool_name, "bold white"),
+            )
+            args = pretty_tool_call_args(chunk.get("args"))
+            if args:
+                body.append("\nargs: ", style="dim yellow")
+                body.append(args, style="yellow")
             self.stderr_console.print(
                 Panel(
-                    Text.assemble(
-                        ("status: ", "dim"),
-                        ("start", "bold yellow"),
-                        ("\nsource: ", "dim"),
-                        (source, "cyan"),
-                        ("\ntool: ", "dim"),
-                        (tool_name, "bold white"),
-                    ),
+                    body,
                     title="Tool Call",
                     title_align="left",
                     border_style="yellow",
