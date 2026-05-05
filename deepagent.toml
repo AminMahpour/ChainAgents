@@ -3,7 +3,7 @@ provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0.3
 
-name = "gemma4:26b"
+name = "qwen3.6:27b"
 #models = ["gpt-oss:20b", "gemma4:26b", "qwen3.6:27b"]
 
 reasoning_effort = "medium"
@@ -35,10 +35,14 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
+[mcp.servers.tooluniverse]
+transport = "http"
+url = "http://localhost:8090/mcp"
+
 [agent]
 recursion_limit = 200
 skills = ["skills"]
-mcp_servers = ["repo"]
+mcp_servers = ["repo", "tooluniverse"]
 
 [rag]
 enabled = true
