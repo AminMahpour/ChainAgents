@@ -343,6 +343,37 @@ def test_tool_execution_resilience_middleware_returns_error_tool_message() -> No
     assert "without aborting the run" in str(result.content)
 
 
+def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path) -> None:
+    middleware = ToolExecutionResilienceMiddleware(project_root=tmp_path)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "read_file",
+            "args": {"path": "/workspace/skills/reviewer/SKILL.md"},
+            "type": "tool_call",
+        },
+        tool=SimpleNamespace(name="read_file"),
+        state={},
+        runtime=SimpleNamespace(),
+    )
+
+    def handler(updated_request: ToolCallRequest) -> ToolMessage:
+        assert updated_request.tool_call["args"] == {
+            "path": str(tmp_path / "skills/reviewer/SKILL.md")
+        }
+        return ToolMessage(
+            content="ok",
+            name="read_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    result = middleware.wrap_tool_call(request, handler)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "success"
+
+
 def test_agent_runtime_initialize_runs_rag_startup_check(
     tmp_path: Path,
     monkeypatch,
