@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from langchain.agents.middleware.types import ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 import pytest
@@ -61,6 +61,7 @@ def make_runtime_config(
         database_url=None,
         model_provider="ollama",
         model_name="gpt-oss:20b",
+        model_choices=("gpt-oss:20b",),
         model_base_url="http://127.0.0.1:11434",
         model_api_key=None,
         model_temperature=0.0,
@@ -83,6 +84,47 @@ def make_extensions_config(
         mcp_stateful=mcp_stateful,
         mcp_servers={"repo": {"transport": "stdio", "command": "npx", "args": []}},
         agent_mcp_servers=agent_mcp_servers,
+    )
+
+
+def test_openai_compatible_model_preserves_vllm_reasoning_delta() -> None:
+    config = RuntimeConfig(
+        database_url=None,
+        model_provider="openai_compatible",
+        model_name="reasoning-model",
+        model_choices=("reasoning-model",),
+        model_base_url="http://127.0.0.1:8000/v1",
+        model_api_key=None,
+        model_temperature=0.0,
+        default_reasoning="medium",
+        persistence_mode="memory",
+        extensions=ExtensionsConfig(config_path=None),
+    )
+    model = deepagent_runtime.build_model(config, "medium")
+
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "thinking through the answer",
+                },
+                "finish_reason": None,
+                "index": 0,
+            }
+        ]
+    }
+
+    generation_chunk = model._convert_chunk_to_generation_chunk(
+        chunk,
+        AIMessageChunk,
+        {},
+    )
+
+    assert generation_chunk is not None
+    assert generation_chunk.message.additional_kwargs["reasoning_content"] == (
+        "thinking through the answer"
     )
 
 
@@ -182,6 +224,70 @@ mcp_servers = ["repo"]
     config = deepagent_runtime.load_extensions_config()
 
     assert config.mcp_stateful is True
+
+
+def test_runtime_config_reads_model_choices_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "gpt-oss:20b"
+models = ["gpt-oss:20b", "gemma4:27b"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_name == "gpt-oss:20b"
+    assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
+
+
+def test_runtime_config_reads_recursion_limit_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+recursion_limit = 64
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.delenv("DEEPAGENT_RECURSION_LIMIT", raising=False)
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.recursion_limit == 64
+    assert config.extensions.recursion_limit == 64
+
+
+def test_runtime_config_env_overrides_recursion_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+recursion_limit = 64
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_RECURSION_LIMIT", "88")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.recursion_limit == 88
 
 
 def test_build_deepagent_backend_stores_large_tool_results_inside_project(
@@ -316,6 +422,79 @@ def test_get_agent_includes_rag_tool_when_ready(
     assert "search_workspace_knowledge" in tool_names
     middleware = captured["kwargs"]["middleware"]
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+
+
+def test_get_agent_includes_summarization_middleware_when_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        captured["tools"] = tools or []
+        captured["kwargs"] = kwargs
+        return object()
+
+    class FakeSummarizationMiddleware:
+        def __init__(self, model=None, trigger=None, keep=None, **kwargs) -> None:
+            self.model = model
+            self.trigger = trigger
+            self.keep = keep
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        "langchain.agents.middleware.SummarizationMiddleware",
+        FakeSummarizationMiddleware,
+    )
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "build_model",
+        lambda *_args, model_name=None, **_kwargs: f"model::{model_name or 'default'}",
+    )
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                summarization_middleware_enabled=True,
+                summarization_trigger_tokens=5000,
+                summarization_keep_tokens=2000,
+                subagents=(
+                    SubagentConfig(
+                        name="repo-researcher",
+                        description="Researches the repo",
+                        system_prompt="Do research",
+                        model="gpt-oss:120b",
+                    ),
+                ),
+            ),
+        )
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    middleware = captured["kwargs"]["middleware"]
+    assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+    summarizers = [
+        item for item in middleware if isinstance(item, FakeSummarizationMiddleware)
+    ]
+    assert len(summarizers) == 1
+    assert summarizers[0].model == "model::gpt-oss:20b"
+    assert summarizers[0].trigger == ("tokens", 5000)
+    assert summarizers[0].keep == ("tokens", 2000)
+    subagent_specs = captured["kwargs"]["subagents"]
+    subagent_middleware = subagent_specs[0]["middleware"]
+    subagent_summarizers = [
+        item
+        for item in subagent_middleware
+        if isinstance(item, FakeSummarizationMiddleware)
+    ]
+    assert len(subagent_summarizers) == 1
+    assert subagent_summarizers[0].model == "model::gpt-oss:120b"
 
 
 def test_get_agent_omits_rag_tool_when_service_is_missing(
@@ -499,6 +678,9 @@ description = "Researches the repo"
 system_prompt = "Do research"
 
 [chainlit]
+model_mode_enabled = false
+reasoning_mode_enabled = false
+startup_status_enabled = false
 commands = [
   { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "repo-researcher" },
   { name = "run-tool", description = "Call MCP tool", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo" },
@@ -515,6 +697,123 @@ commands = [
     assert extensions.chainlit_commands[0].name == "ask-researcher"
     assert extensions.chainlit_commands[1].target == "mcp_tool"
     assert extensions.chainlit_commands[2].template == "Rewrite: {input}"
+    assert extensions.chainlit_model_mode_enabled is False
+    assert extensions.chainlit_reasoning_mode_enabled is False
+    assert extensions.chainlit_startup_status_enabled is False
+
+
+def test_load_extensions_config_parses_summarization_middleware_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+summarization_middleware_enabled = true
+summarization_trigger_tokens = 6000
+summarization_keep_tokens = 2400
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.summarization_middleware_enabled is True
+    assert extensions.summarization_trigger_tokens == 6000
+    assert extensions.summarization_keep_tokens == 2400
+
+
+def test_load_extensions_config_rejects_non_boolean_summarization_middleware_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+summarization_middleware_enabled = "yes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="summarization_middleware_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_invalid_summarization_token_thresholds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+summarization_trigger_tokens = 0
+summarization_keep_tokens = "many"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="summarization_trigger_tokens"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_startup_status_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+startup_status_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="startup_status_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_reasoning_mode_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+reasoning_mode_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="reasoning_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_model_mode_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+model_mode_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="model_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
 
 
 def test_load_extensions_config_rejects_unknown_chainlit_subagent(

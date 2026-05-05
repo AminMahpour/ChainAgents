@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import secrets
 import traceback
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import chainlit as cl
 from chainlit.input_widget import Select, TextInput
 from chainlit.types import ThreadDict
 
+from agent_commands import (
+    ParsedNativeCommand,
+    build_skill_command_prompt,
+    dumps_tool_result,
+    parse_native_command,
+    resolve_native_command,
+    resolve_runtime_command,
+)
 from async_task_notifications import AsyncTaskNotifier, async_subagent_url_override
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
 from deepagent_runtime import (
@@ -105,6 +112,7 @@ def current_mcp_session_id() -> str:
 
 def settings_payload(settings: AppSettings) -> dict[str, str]:
     return {
+        "model_name": settings.model_name,
         "reasoning_level": settings.reasoning_level,
         "thread_id": settings.thread_id,
     }
@@ -112,6 +120,13 @@ def settings_payload(settings: AppSettings) -> dict[str, str]:
 
 def store_settings(settings: AppSettings) -> None:
     cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
+
+
+def build_langgraph_config(settings: AppSettings, *, recursion_limit: int) -> dict[str, Any]:
+    return {
+        "configurable": {"thread_id": settings.thread_id},
+        "recursion_limit": recursion_limit,
+    }
 
 
 def build_rag_action() -> cl.Action:
@@ -221,68 +236,6 @@ def upload_result_message(upload_result) -> str:
 
     return upload_result.reason or "No files were added to RAG."
 
-class ParsedNativeCommand(NamedTuple):
-    command_name: str
-    raw_args: str
-
-
-def parse_native_command(raw_text: str) -> ParsedNativeCommand | None:
-    text = raw_text.strip()
-    if not text.startswith("/"):
-        return None
-    tokens = text[1:].split(None, 1)
-    if not tokens:
-        return None
-    return ParsedNativeCommand(
-        command_name=tokens[0].strip().lower(),
-        raw_args=tokens[1].strip() if len(tokens) > 1 else "",
-    )
-
-
-def resolve_native_command(
-    *,
-    raw_text: str,
-    selected_command: str | None = None,
-) -> ParsedNativeCommand | None:
-    parsed = parse_native_command(raw_text)
-    if parsed is not None:
-        return parsed
-
-    command_name = str(selected_command or "").strip().lstrip("/").lower()
-    if not command_name:
-        return None
-
-    return ParsedNativeCommand(
-        command_name=command_name,
-        raw_args=raw_text.strip(),
-    )
-
-
-def apply_native_template(template: str | None, raw_args: str) -> str:
-    if template is None:
-        return raw_args.strip()
-    return template.replace("{input}", raw_args.strip()).strip()
-
-
-def build_skill_command_prompt(*, skill_name: str, skill_path: str, raw_args: str) -> str:
-    prelude = (
-        f"Use the configured `{skill_name}` skill for this request.\n"
-        f"Read `{skill_path}` before taking any other action and follow it for this entire turn.\n"
-        "Skill usage is mandatory for this request.\n"
-    )
-    request = raw_args.strip()
-    if request:
-        return (
-            f"{prelude}\n"
-            "After reading the skill, complete the user's request below.\n\n"
-            f"User request:\n{request}"
-        ).strip()
-    return (
-        f"{prelude}\n"
-        "After reading the skill, briefly explain what it does and ask the user for the specific task."
-    ).strip()
-
-
 async def handle_native_command(
     *,
     runtime: AgentRuntime,
@@ -290,47 +243,28 @@ async def handle_native_command(
     parsed: ParsedNativeCommand,
     mcp_session_id: str | None = None,
 ) -> str | None:
-    command = runtime.resolve_chainlit_command(parsed.command_name)
-    if command is None:
+    result = await resolve_runtime_command(
+        runtime=runtime,
+        parsed=parsed,
+        thread_id=settings.thread_id,
+        mcp_session_id=mcp_session_id,
+    )
+    if result.target == "unknown":
         return None
 
-    if command.target == "skill":
-        return build_skill_command_prompt(
-            skill_name=command.name,
-            skill_path=command.value,
-            raw_args=parsed.raw_args,
-        )
-
-    if command.target == "mcp_tool":
-        tool_raw_args = apply_native_template(command.template, parsed.raw_args)
-        result = await runtime.invoke_mcp_tool_command(
-            tool_name=command.value,
-            raw_args=tool_raw_args,
-            thread_id=settings.thread_id,
-            mcp_session_id=mcp_session_id,
-            server_name=command.mcp_server,
-        )
+    if result.target == "mcp_tool":
         await cl.Message(
             author="System",
             content=(
-                f"Ran `/{command.name}` ({command.description}).\n\n"
+                f"Ran `/{result.command_name}` ({result.description}).\n\n"
                 "Tool result:\n```json\n"
-                f"{json.dumps(result, indent=2, sort_keys=True, ensure_ascii=True, default=str)}\n"
+                f"{dumps_tool_result(result.tool_result)}\n"
                 "```"
             ),
         ).send()
         return ""
 
-    transformed = apply_native_template(command.template, parsed.raw_args)
-    if command.target == "prompt":
-        return transformed or command.value
-
-    return (
-        f"Delegate this request to the configured `{command.value}` subagent.\n\n"
-        f"Command: `/{command.name}`\n"
-        f"Description: {command.description}\n\n"
-        f"User request:\n{transformed or parsed.raw_args or command.value}"
-    ).strip()
+    return result.prompt
 
 
 async def ask_for_rag_upload() -> list[UploadedRagFile]:
@@ -354,9 +288,37 @@ async def ask_for_rag_upload() -> list[UploadedRagFile]:
     ]
 
 
-def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
+def resolve_model_name(
+    value: Any | None,
+    *,
+    available_models: tuple[str, ...],
+    default: str,
+) -> str:
+    candidate = str(value or "").strip()
+    if candidate in available_models:
+        return candidate
+    return default
+
+
+def build_chat_settings(
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
+) -> cl.ChatSettings:
     reasoning_levels = ["low", "medium", "high"]
-    return cl.ChatSettings(
+    inputs: list[Any] = []
+    if model_mode_enabled:
+        inputs.append(
+            Select(
+                id="model_name",
+                label="Model",
+                values=list(available_models),
+                initial_index=available_models.index(settings.model_name),
+                description="Select a configured model for this chat session.",
+            )
+        )
+    inputs.extend(
         [
             Select(
                 id="reasoning_level",
@@ -379,13 +341,116 @@ def build_chat_settings(settings: AppSettings) -> cl.ChatSettings:
             ),
         ]
     )
+    return cl.ChatSettings(inputs)
 
 
-def coerce_settings(raw_settings: AppSettings | dict[str, Any] | None) -> AppSettings:
+def build_modes(
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
+    reasoning_mode_enabled: bool = True,
+) -> list[cl.Mode]:
+    reasoning_levels = ["low", "medium", "high"]
+    modes: list[cl.Mode] = []
+    if model_mode_enabled:
+        modes.append(
+            cl.Mode(
+                id="model_name",
+                name="Model",
+                options=[
+                    cl.ModeOption(
+                        id=model_name,
+                        name=model_name,
+                        description="Use this model for the current message.",
+                        icon="bot",
+                        default=model_name == settings.model_name,
+                    )
+                    for model_name in available_models
+                ],
+            )
+        )
+    if reasoning_mode_enabled:
+        modes.append(
+            cl.Mode(
+                id="reasoning_level",
+                name="Reasoning",
+                options=[
+                    cl.ModeOption(
+                        id=level,
+                        name=level.capitalize(),
+                        description=(
+                            "Deeper reasoning with higher latency"
+                            if level == "high"
+                            else (
+                                "Balanced quality and speed"
+                                if level == "medium"
+                                else "Fastest responses with lighter reasoning"
+                            )
+                        ),
+                        icon=(
+                            "brain"
+                            if level == "high"
+                            else ("sparkles" if level == "medium" else "zap")
+                        ),
+                        default=level == settings.reasoning_level,
+                    )
+                    for level in reasoning_levels
+                ],
+            )
+        )
+    return modes
+
+
+async def publish_modes(
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
+    reasoning_mode_enabled: bool = True,
+) -> None:
+    try:
+        await cl.context.emitter.set_modes(
+            build_modes(
+                settings,
+                available_models=available_models,
+                model_mode_enabled=model_mode_enabled,
+                reasoning_mode_enabled=reasoning_mode_enabled,
+            )
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        missing_modes_column = "modes" in message and (
+            ("column" in message and "does not exist" in message)
+            or "no such column" in message
+        )
+        if not missing_modes_column:
+            raise
+
+
+def coerce_settings(
+    raw_settings: AppSettings | dict[str, Any] | None,
+    *,
+    default_model_name: str,
+    available_models: tuple[str, ...],
+) -> AppSettings:
     if raw_settings is None:
         raw_settings = {}
     if isinstance(raw_settings, AppSettings):
-        return raw_settings
+        return AppSettings(
+            model_name=resolve_model_name(
+                raw_settings.model_name,
+                available_models=available_models,
+                default=default_model_name,
+            ),
+            reasoning_level=normalize_reasoning_level(raw_settings.reasoning_level),
+            thread_id=raw_settings.thread_id,
+        )
+    model_name = resolve_model_name(
+        raw_settings.get("model_name"),
+        available_models=available_models,
+        default=default_model_name,
+    )
     reasoning_level = normalize_reasoning_level(
         raw_settings.get("reasoning_level", DEFAULT_REASONING_LEVEL)
     )
@@ -394,7 +459,47 @@ def coerce_settings(raw_settings: AppSettings | dict[str, Any] | None) -> AppSet
     ).strip()
     if not thread_id:
         thread_id = current_chainlit_thread_id()
-    return AppSettings(reasoning_level=reasoning_level, thread_id=thread_id.strip())
+    return AppSettings(
+        model_name=model_name,
+        reasoning_level=reasoning_level,
+        thread_id=thread_id.strip(),
+    )
+
+
+def resolve_reasoning_level_for_message(
+    message: cl.Message,
+    settings: AppSettings,
+    *,
+    reasoning_mode_enabled: bool = True,
+) -> str:
+    if not reasoning_mode_enabled:
+        return settings.reasoning_level
+    raw_modes = getattr(message, "modes", None)
+    if not isinstance(raw_modes, dict):
+        return settings.reasoning_level
+    return normalize_reasoning_level(
+        raw_modes.get("reasoning_level"),
+        default=settings.reasoning_level,
+    )
+
+
+def resolve_model_name_for_message(
+    message: cl.Message,
+    settings: AppSettings,
+    *,
+    available_models: tuple[str, ...],
+    model_mode_enabled: bool = True,
+) -> str:
+    if not model_mode_enabled:
+        return settings.model_name
+    raw_modes = getattr(message, "modes", None)
+    if not isinstance(raw_modes, dict):
+        return settings.model_name
+    return resolve_model_name(
+        raw_modes.get("model_name"),
+        available_models=available_models,
+        default=settings.model_name,
+    )
 
 
 if AUTH_ENABLED:
@@ -470,11 +575,22 @@ async def on_chat_start() -> None:
     run_task_list = await get_run_task_list()
     await run_task_list.show_ready()
     settings = AppSettings(
+        model_name=runtime.config.model_name,
         reasoning_level=runtime.config.default_reasoning,
         thread_id=current_chainlit_thread_id(),
     )
     store_settings(settings)
-    await build_chat_settings(settings).send()
+    await publish_modes(
+        settings,
+        available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
+    await build_chat_settings(
+        settings,
+        available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
+    ).send()
     persistence_line = (
         "- Persistence: Postgres-backed LangGraph checkpoints and `/memories/`\n"
         if runtime.persistence_enabled
@@ -516,24 +632,25 @@ async def on_chat_start() -> None:
         extensions_line += f"Command notes:\n{note_lines}\n"
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
-    startup_message = cl.Message(
-        content=(
-            "Workspace agent ready.\n\n"
-            f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
-            f"- Model: `{runtime.config.model_name}`\n"
-            f"- Thread ID: `{settings.thread_id}`\n"
-            f"{persistence_line}"
-            f"{history_line}"
-            f"{rag_status_line(runtime)}"
-            f"{extensions_line}"
-            "- Real repo files live under `/workspace/`\n"
-            "- Agent memory is available under `/memories/`"
-        ),
-        author="System",
-    )
-    if runtime.rag_enabled:
-        startup_message.actions = rag_actions()
-    await startup_message.send()
+    if runtime.config.extensions.chainlit_startup_status_enabled:
+        startup_message = cl.Message(
+            content=(
+                "Workspace agent ready.\n\n"
+                f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
+                f"- Model: `{runtime.config.model_name}`\n"
+                f"- Thread ID: `{settings.thread_id}`\n"
+                f"{persistence_line}"
+                f"{history_line}"
+                f"{rag_status_line(runtime)}"
+                f"{extensions_line}"
+                "- Real repo files live under `/workspace/`\n"
+                "- Agent memory is available under `/memories/`"
+            ),
+            author="System",
+        )
+        if runtime.rag_enabled:
+            startup_message.actions = rag_actions()
+        await startup_message.send()
 
 
 @cl.on_chat_resume
@@ -551,12 +668,27 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     raw_settings = (
         metadata.get(SESSION_SETTINGS_KEY) if isinstance(metadata, dict) else None
     )
-    settings = coerce_settings(raw_settings)
+    settings = coerce_settings(
+        raw_settings,
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
     store_settings(settings)
-    await build_chat_settings(settings).send()
+    await publish_modes(
+        settings,
+        available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
+    await build_chat_settings(
+        settings,
+        available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
+    ).send()
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
         settings.reasoning_level,
+        model_name=settings.model_name,
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,
@@ -573,8 +705,21 @@ async def on_chat_resume(thread: ThreadDict) -> None:
 
 @cl.on_settings_update
 async def on_settings_update(raw_settings: dict[str, Any]) -> None:
-    settings = coerce_settings(raw_settings)
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+    settings = coerce_settings(
+        raw_settings,
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
     store_settings(settings)
+    await publish_modes(
+        settings,
+        available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
 
 
 @cl.action_callback(DOWNLOAD_MARKDOWN_ACTION)
@@ -617,7 +762,11 @@ async def upload_rag_file(action: cl.Action) -> None:
     if runtime is None:
         return
 
-    settings = coerce_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
+    settings = coerce_settings(
+        cl.user_session.get(SESSION_SETTINGS_KEY),
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
     uploads = await ask_for_rag_upload()
     if not uploads:
         await cl.Message(content="No files were uploaded.", author="System").send()
@@ -638,10 +787,25 @@ async def upload_rag_file(action: cl.Action) -> None:
 
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
-    settings = coerce_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
+    settings = coerce_settings(
+        cl.user_session.get(SESSION_SETTINGS_KEY),
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
+    effective_reasoning_level = resolve_reasoning_level_for_message(
+        message,
+        settings,
+        reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+    )
+    effective_model_name = resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=runtime.config.model_choices,
+        model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
+    )
     mcp_session_id = current_mcp_session_id()
     run_task_list = await get_run_task_list()
     uploaded_files = message_uploaded_rag_files(message)
@@ -699,7 +863,8 @@ async def on_message(message: cl.Message) -> None:
 
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
-        settings.reasoning_level,
+        effective_reasoning_level,
+        model_name=effective_model_name,
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,
@@ -712,7 +877,10 @@ async def on_message(message: cl.Message) -> None:
     bridge = ChainlitEventBridge(prompt=message.content, run_task_list=run_task_list)
     await bridge.start()
 
-    config = {"configurable": {"thread_id": settings.thread_id}}
+    config = build_langgraph_config(
+        settings,
+        recursion_limit=runtime.config.recursion_limit,
+    )
     payload = {
         "messages": [
             {
@@ -721,12 +889,12 @@ async def on_message(message: cl.Message) -> None:
             }
         ]
     }
-    stream = agent.astream(
+    stream = agent.astream_events(
         payload,
         config=config,
+        version="v2",
         stream_mode=["messages", "updates"],
         subgraphs=True,
-        version="v2",
     )
 
     try:
@@ -735,7 +903,7 @@ async def on_message(message: cl.Message) -> None:
                 part = await anext(stream)
             except StopAsyncIteration:
                 break
-            await bridge.handle_part(part)
+            await bridge.handle_event(part)
     except asyncio.CancelledError:
         with suppress(Exception):
             await stream.aclose()
@@ -762,9 +930,3 @@ async def on_chat_end() -> None:
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()
-    runtime = AgentRuntime.current()
-    if runtime is not None:
-        with suppress(Exception):
-            await runtime.close_mcp_session(
-                cl.user_session.get(SESSION_MCP_SESSION_ID_KEY)
-            )

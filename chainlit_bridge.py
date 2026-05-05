@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,7 +15,18 @@ from chainlit.utils import utc_now
 from response_exports import attach_response_export_actions
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
+RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
+RESPONSE_STREAM_FLUSH_CHARS = 1024
 CHAINLIT_APP_CONFIG_PATH = Path(__file__).resolve().parent / "chainlit.toml"
+LANGGRAPH_STREAM_MODES = {
+    "values",
+    "updates",
+    "custom",
+    "messages",
+    "checkpoints",
+    "tasks",
+    "debug",
+}
 
 
 def load_auto_collapse_delay_seconds() -> float:
@@ -94,6 +106,42 @@ def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
             continue
         labels.append(segment.split(":", 1)[0])
     return " / ".join(labels)
+
+
+def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
+    if isinstance(chunk, dict):
+        mode = chunk.get("type")
+        if isinstance(mode, str) and mode in LANGGRAPH_STREAM_MODES and "data" in chunk:
+            return chunk
+        return None
+
+    if not isinstance(chunk, tuple):
+        return None
+
+    if len(chunk) == 3:
+        ns, mode, data = chunk
+    elif len(chunk) == 2:
+        first, data = chunk
+        if isinstance(first, tuple):
+            ns = first
+            mode = "values"
+        else:
+            ns = ()
+            mode = first
+    else:
+        return None
+
+    if not isinstance(mode, str) or mode not in LANGGRAPH_STREAM_MODES:
+        return None
+
+    if isinstance(ns, tuple):
+        namespace = ns
+    elif ns in (None, ""):
+        namespace = ()
+    else:
+        return None
+
+    return {"type": mode, "ns": namespace, "data": data}
 
 
 def reasoning_text_from_token(token: Any) -> str:
@@ -417,6 +465,11 @@ class RunTaskList:
             return
         self._finish_running_reasoning()
         response_for_id = for_id or self.response_for_id
+        response_task = self.tasks_by_key.get(self.RESPONSE_KEY)
+        if response_task is not None and response_task.status == cl.TaskStatus.RUNNING:
+            if response_for_id is not None:
+                response_task.forId = response_for_id
+            return
         self._ensure_task(
             self.RESPONSE_KEY,
             "final response",
@@ -541,6 +594,9 @@ class ChainlitEventBridge:
         self.run_task_list = run_task_list
         self.response_message: cl.Message | None = None
         self.response_buffer = ""
+        self.pending_response_stream = ""
+        self.response_task_started = False
+        self.last_response_flush_at = 0.0
         self.response_streamed_from_messages = False
         self.reasoning_steps: dict[str, cl.Step] = {}
         self.reasoning_buffers: dict[str, str] = {}
@@ -561,7 +617,24 @@ class ChainlitEventBridge:
         if kind == "updates":
             await self._handle_update_chunk(part)
 
+    async def handle_event(self, event: dict[str, Any]) -> None:
+        if event.get("event") != "on_chain_stream":
+            return
+        if event.get("parent_ids"):
+            return
+
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return
+
+        part = langgraph_part_from_event_chunk(data.get("chunk"))
+        if part is None:
+            return
+
+        await self.handle_part(part)
+
     async def finish(self) -> None:
+        await self._flush_response_stream()
         await self._close_all_open_steps()
         if self.response_message is not None:
             attach_response_export_actions(
@@ -666,13 +739,38 @@ class ChainlitEventBridge:
         delta = text[len(self.response_buffer) :] if text.startswith(self.response_buffer) else text
         if not delta:
             return
-        if self.run_task_list is not None and self.response_message is not None:
+        if (
+            not self.response_task_started
+            and self.run_task_list is not None
+            and self.response_message is not None
+        ):
             await self.run_task_list.mark_response_started(
                 for_id=getattr(self.response_message, "id", None)
             )
-        if self.response_message is not None:
-            await self.response_message.stream_token(delta)
+            self.response_task_started = True
         self.response_buffer += delta
+        self.pending_response_stream += delta
+        if self._should_flush_response_stream():
+            await self._flush_response_stream()
+
+    def _should_flush_response_stream(self) -> bool:
+        if len(self.pending_response_stream) >= RESPONSE_STREAM_FLUSH_CHARS:
+            return True
+        if not self.last_response_flush_at:
+            return True
+        return (
+            time.monotonic() - self.last_response_flush_at
+            >= RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS
+        )
+
+    async def _flush_response_stream(self) -> None:
+        if not self.pending_response_stream:
+            return
+        pending = self.pending_response_stream
+        if self.response_message is not None:
+            await self.response_message.stream_token(pending)
+        self.pending_response_stream = ""
+        self.last_response_flush_at = time.monotonic()
 
     async def _stream_tool_call(self, source: str, chunk: dict[str, Any]) -> None:
         call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")

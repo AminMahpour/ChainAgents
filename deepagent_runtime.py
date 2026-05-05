@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -22,7 +23,7 @@ from deepagents.backends import (
 )
 from deepagents.middleware.skills import _list_skills
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessageChunk, ToolMessage
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -58,9 +59,17 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
+DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 logger = logging.getLogger(__name__)
+
+OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+    "reasoning_details",
+)
 
 SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
@@ -117,6 +126,61 @@ def format_model_provider(provider: ModelProvider) -> str:
     return "Ollama"
 
 
+def _first_openai_compatible_delta(chunk: dict[str, Any]) -> dict[str, Any]:
+    choices = chunk.get("choices", [])
+    if not choices:
+        nested_chunk = chunk.get("chunk")
+        if isinstance(nested_chunk, dict):
+            choices = nested_chunk.get("choices", [])
+
+    if not isinstance(choices, list) or not choices:
+        return {}
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return {}
+
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        return delta
+    return {}
+
+
+def _openai_compatible_reasoning_delta(chunk: dict[str, Any]) -> Any:
+    delta = _first_openai_compatible_delta(chunk)
+    for key in OPENAI_COMPATIBLE_REASONING_DELTA_KEYS:
+        value = delta.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+class OpenAICompatibleChatOpenAI(ChatOpenAI):
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict[str, Any],
+        default_chunk_class: type,
+        base_generation_info: dict | None,
+    ):
+        generation_chunk = super()._convert_chunk_to_generation_chunk(
+            chunk,
+            default_chunk_class,
+            base_generation_info,
+        )
+        if generation_chunk is None:
+            return None
+
+        reasoning_delta = _openai_compatible_reasoning_delta(chunk)
+        if reasoning_delta is None or not isinstance(
+            generation_chunk.message,
+            AIMessageChunk,
+        ):
+            return generation_chunk
+
+        generation_chunk.message.additional_kwargs["reasoning_content"] = reasoning_delta
+        return generation_chunk
+
+
 def normalize_model_endpoint(value: str | None) -> str:
     candidate = (value or DEFAULT_OLLAMA_ENDPOINT).strip()
     if not candidate:
@@ -152,6 +216,25 @@ def normalize_model_temperature(value: Any | None) -> float:
     if not math.isfinite(temperature):
         return DEFAULT_TEMPERATURE
     return temperature
+
+
+def normalize_recursion_limit(
+    value: Any | None,
+    *,
+    default: int = DEFAULT_RECURSION_LIMIT,
+    field_name: str = "recursion_limit",
+) -> int:
+    if value is None or str(value).strip() == "":
+        return default
+
+    try:
+        recursion_limit = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer.") from exc
+
+    if recursion_limit <= 0:
+        raise ValueError(f"{field_name} must be a positive integer.")
+    return recursion_limit
 
 
 def normalize_model_base_url(
@@ -271,8 +354,69 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             return self._error_tool_message(request, exc)
 
 
-def build_agent_middleware() -> list[AgentMiddleware[Any, Any, Any]]:
-    return [ToolExecutionResilienceMiddleware()]
+def _build_summarization_middleware(
+    *,
+    config: RuntimeConfig,
+    reasoning_level: ReasoningLevel,
+    model_name: str | None = None,
+) -> AgentMiddleware[Any, Any, Any] | None:
+    try:
+        from langchain.agents.middleware import SummarizationMiddleware
+    except Exception:
+        logger.warning(
+            "Summarization middleware is enabled but unavailable in the installed LangChain version."
+        )
+        return None
+
+    kwargs: dict[str, Any] = {}
+    signature = inspect.signature(SummarizationMiddleware)
+    if "model" in signature.parameters:
+        kwargs["model"] = build_model(
+            config,
+            reasoning_level,
+            model_name=model_name,
+        )
+    if config.extensions.summarization_trigger_tokens is not None:
+        if "max_tokens_before_summary" in signature.parameters:
+            kwargs["max_tokens_before_summary"] = (
+                config.extensions.summarization_trigger_tokens
+            )
+        elif "trigger" in signature.parameters:
+            kwargs["trigger"] = ("tokens", config.extensions.summarization_trigger_tokens)
+    if config.extensions.summarization_keep_tokens is not None and "keep" in signature.parameters:
+        kwargs["keep"] = ("tokens", config.extensions.summarization_keep_tokens)
+
+    try:
+        middleware = SummarizationMiddleware(**kwargs)
+    except Exception as exc:
+        logger.warning(
+            "Failed to initialize summarization middleware; continuing without it: %s",
+            exc,
+        )
+        return None
+    return middleware
+
+
+def build_agent_middleware(
+    *,
+    config: RuntimeConfig | None = None,
+    reasoning_level: ReasoningLevel | None = None,
+    model_name: str | None = None,
+) -> list[AgentMiddleware[Any, Any, Any]]:
+    middleware: list[AgentMiddleware[Any, Any, Any]] = [ToolExecutionResilienceMiddleware()]
+    if (
+        config
+        and config.extensions.summarization_middleware_enabled
+        and reasoning_level is not None
+    ):
+        summarization_middleware = _build_summarization_middleware(
+            config=config,
+            reasoning_level=reasoning_level,
+            model_name=model_name,
+        )
+        if summarization_middleware is not None:
+            middleware.append(summarization_middleware)
+    return middleware
 
 
 def resolve_local_path(path_value: str, base_dir: Path) -> Path:
@@ -462,12 +606,20 @@ class ExtensionsConfig:
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
     mcp_stateful: bool = False
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
     agent_mcp_servers: tuple[str, ...] = ()
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
+    chainlit_model_mode_enabled: bool = True
+    chainlit_reasoning_mode_enabled: bool = True
+    chainlit_startup_status_enabled: bool = True
+    summarization_middleware_enabled: bool = False
+    summarization_trigger_tokens: int | None = None
+    summarization_keep_tokens: int | None = None
+    custom_instruction: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -486,6 +638,7 @@ class ModelDefaults:
     base_url: str = DEFAULT_OLLAMA_BASE_URL
     name: str = DEFAULT_MODEL
     api_key: str | None = None
+    models: tuple[str, ...] = ()
     name_is_explicit: bool = False
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
     temperature: float = DEFAULT_TEMPERATURE
@@ -505,9 +658,18 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
 
     provider = normalize_model_provider(raw_model.get("provider"))
     raw_name = str(raw_model.get("name", "")).strip()
-    if provider == "openai_compatible" and not raw_name:
+    raw_models = raw_model.get("models", [])
+    if raw_models and not isinstance(raw_models, list):
+        raise ValueError("The [model].models config must be an array of strings.")
+    parsed_models: list[str] = []
+    for raw_candidate in raw_models:
+        candidate = str(raw_candidate or "").strip()
+        if candidate and candidate not in parsed_models:
+            parsed_models.append(candidate)
+
+    if provider == "openai_compatible" and not raw_name and not parsed_models:
         raise ValueError(
-            "OpenAI-compatible model config must define a non-empty 'name'."
+            "OpenAI-compatible model config must define a non-empty 'name' or 'models'."
         )
 
     raw_base_url = str(raw_model.get("base_url", "")).strip()
@@ -533,9 +695,10 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
     return ModelDefaults(
         provider=provider,
         base_url=base_url,
-        name=raw_name or DEFAULT_MODEL,
+        name=raw_name or (parsed_models[0] if parsed_models else DEFAULT_MODEL),
         api_key=normalize_optional_string(raw_model.get("api_key")),
-        name_is_explicit=bool(raw_name),
+        models=tuple(parsed_models),
+        name_is_explicit=bool(raw_name or parsed_models),
         reasoning_effort=normalize_reasoning_level(
             raw_model.get("reasoning_effort"),
             default=DEFAULT_REASONING_LEVEL,
@@ -660,6 +823,10 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     if agent_section and not isinstance(agent_section, dict):
         raise ValueError("The top-level 'agent' config must be a table/object.")
 
+    recursion_limit = normalize_recursion_limit(
+        agent_section.get("recursion_limit"),
+        field_name="The top-level 'agent.recursion_limit' config",
+    )
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -668,6 +835,31 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         mcp_servers[str(name)] = normalize_mcp_server_config(raw_server, base_dir)
 
     raw_skill_paths = agent_section.get("skills", [])
+    custom_instruction = normalize_optional_string(agent_section.get("custom_instruction"))
+    raw_summarization_middleware_enabled = agent_section.get(
+        "summarization_middleware_enabled",
+        False,
+    )
+    raw_summarization_trigger_tokens = agent_section.get("summarization_trigger_tokens")
+    raw_summarization_keep_tokens = agent_section.get("summarization_keep_tokens")
+    if not isinstance(raw_summarization_middleware_enabled, bool):
+        raise ValueError(
+            "The top-level 'agent.summarization_middleware_enabled' config must be a boolean."
+        )
+    if raw_summarization_trigger_tokens is not None and (
+        not isinstance(raw_summarization_trigger_tokens, int)
+        or raw_summarization_trigger_tokens <= 0
+    ):
+        raise ValueError(
+            "The top-level 'agent.summarization_trigger_tokens' config must be a positive integer."
+        )
+    if raw_summarization_keep_tokens is not None and (
+        not isinstance(raw_summarization_keep_tokens, int)
+        or raw_summarization_keep_tokens <= 0
+    ):
+        raise ValueError(
+            "The top-level 'agent.summarization_keep_tokens' config must be a positive integer."
+        )
     skill_paths = tuple(
         normalize_skill_source_path(str(path_value), base_dir)
         for path_value in raw_skill_paths
@@ -733,6 +925,21 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_chainlit_commands = chainlit_section.get("commands", [])
     if not isinstance(raw_chainlit_commands, list):
         raise ValueError("The top-level 'chainlit.commands' config must be an array of tables.")
+    raw_reasoning_mode_enabled = chainlit_section.get("reasoning_mode_enabled", True)
+    raw_model_mode_enabled = chainlit_section.get("model_mode_enabled", True)
+    raw_startup_status_enabled = chainlit_section.get("startup_status_enabled", True)
+    if not isinstance(raw_reasoning_mode_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.reasoning_mode_enabled' config must be a boolean."
+        )
+    if not isinstance(raw_model_mode_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.model_mode_enabled' config must be a boolean."
+        )
+    if not isinstance(raw_startup_status_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.startup_status_enabled' config must be a boolean."
+        )
 
     chainlit_commands: list[ChainlitCommandConfig] = []
     seen_commands: set[str] = set()
@@ -789,38 +996,79 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
         mcp_stateful=bool(mcp_section.get("stateful", False)),
+        recursion_limit=recursion_limit,
         mcp_servers=mcp_servers or None,
         skills=skill_paths,
         agent_mcp_servers=raw_agent_mcp_servers,
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
         chainlit_commands=tuple(chainlit_commands),
+        chainlit_model_mode_enabled=raw_model_mode_enabled,
+        chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
+        chainlit_startup_status_enabled=raw_startup_status_enabled,
+        summarization_middleware_enabled=raw_summarization_middleware_enabled,
+        summarization_trigger_tokens=raw_summarization_trigger_tokens,
+        summarization_keep_tokens=raw_summarization_keep_tokens,
+        custom_instruction=custom_instruction,
     )
 
 
-def load_file_config() -> FileConfig:
-    config_name = os.getenv("DEEPAGENT_CONFIG", DEFAULT_EXTENSIONS_CONFIG).strip()
-    config_path = resolve_local_path(config_name or DEFAULT_EXTENSIONS_CONFIG, PROJECT_ROOT)
-    if not config_path.exists():
+def compose_agent_system_prompt(base_prompt: str, custom_instruction: str | None) -> str:
+    instruction = (custom_instruction or "").strip()
+    if not instruction:
+        return base_prompt
+    return (
+        f"{base_prompt}\n\n"
+        "Custom user instruction from [agent].custom_instruction in deepagent.toml:\n"
+        f"{instruction}"
+    )
+
+
+def load_file_config(config_path: str | Path | None = None) -> FileConfig:
+    config_name = (
+        str(config_path).strip()
+        if config_path is not None
+        else os.getenv("DEEPAGENT_CONFIG", DEFAULT_EXTENSIONS_CONFIG).strip()
+    )
+    resolved_config_path = resolve_local_path(
+        config_name or DEFAULT_EXTENSIONS_CONFIG,
+        PROJECT_ROOT,
+    )
+    if not resolved_config_path.exists():
         return FileConfig(
             model=ModelDefaults(),
             extensions=ExtensionsConfig(config_path=None),
             rag=RagConfig(),
         )
 
-    with config_path.open("rb") as fh:
+    with resolved_config_path.open("rb") as fh:
         raw_config = tomllib.load(fh)
 
     return FileConfig(
         model=parse_model_defaults(raw_config),
-        extensions=parse_extensions_config(raw_config, config_path),
-        rag=parse_rag_config(raw_config, config_path),
+        extensions=parse_extensions_config(raw_config, resolved_config_path),
+        rag=parse_rag_config(raw_config, resolved_config_path),
     )
 
 
-def load_extensions_config() -> ExtensionsConfig:
+def load_extensions_config(config_path: str | Path | None = None) -> ExtensionsConfig:
     # Keep the previous public helper for existing imports and tests.
-    return load_file_config().extensions
+    return load_file_config(config_path).extensions
+
+
+@dataclass(frozen=True)
+class RuntimeConfigOverrides:
+    config_path: str | Path | None = None
+    database_url: str | None = None
+    disable_database: bool = False
+    model_provider: str | None = None
+    model_name: str | None = None
+    model_base_url: str | None = None
+    model_api_key: str | None = None
+    model_temperature: float | None = None
+    reasoning_level: str | None = None
+    recursion_limit: int | None = None
+    disable_rag: bool = False
 
 
 @dataclass(frozen=True)
@@ -828,31 +1076,55 @@ class RuntimeConfig:
     database_url: str | None
     model_provider: ModelProvider
     model_name: str
+    model_choices: tuple[str, ...]
     model_base_url: str
     model_api_key: str | None
     model_temperature: float
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT
     rag_requested: bool = False
     rag: ResolvedRagConfig | None = None
     rag_error: str | None = None
 
     @classmethod
-    def from_env(cls) -> "RuntimeConfig":
-        file_config = load_file_config()
+    def from_env(
+        cls,
+        overrides: RuntimeConfigOverrides | None = None,
+    ) -> "RuntimeConfig":
+        overrides = overrides or RuntimeConfigOverrides()
+        file_config = load_file_config(overrides.config_path)
         model_defaults = file_config.model
-        database_url = os.getenv("DATABASE_URL", "").strip() or None
+        if overrides.disable_database:
+            database_url = None
+        elif overrides.database_url is not None:
+            database_url = normalize_optional_string(overrides.database_url)
+        else:
+            database_url = os.getenv("DATABASE_URL", "").strip() or None
         model_provider_override = normalize_optional_string(
-            os.getenv("DEEPAGENT_MODEL_PROVIDER")
+            overrides.model_provider
         )
+        if model_provider_override is None:
+            model_provider_override = normalize_optional_string(
+                os.getenv("DEEPAGENT_MODEL_PROVIDER")
+            )
         model_provider = normalize_model_provider(
             model_provider_override,
             default=model_defaults.provider,
         )
-        generic_model_name = os.getenv("DEEPAGENT_MODEL_NAME", "").strip()
-        generic_model_base_url = os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
-        generic_model_reasoning = os.getenv("DEEPAGENT_MODEL_REASONING", "").strip()
+        generic_model_name = (
+            normalize_optional_string(overrides.model_name)
+            or os.getenv("DEEPAGENT_MODEL_NAME", "").strip()
+        )
+        generic_model_base_url = (
+            normalize_optional_string(overrides.model_base_url)
+            or os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
+        )
+        generic_model_reasoning = (
+            normalize_optional_string(overrides.reasoning_level)
+            or os.getenv("DEEPAGENT_MODEL_REASONING", "").strip()
+        )
         model_name_alias = os.getenv("OLLAMA_MODEL", "").strip() if model_provider == "ollama" else ""
         model_base_url_alias = (
             os.getenv("OLLAMA_BASE_URL", "").strip() if model_provider == "ollama" else ""
@@ -883,19 +1155,44 @@ class RuntimeConfig:
             )
 
         model_name = generic_model_name or model_name_alias or model_defaults.name
+        model_choices = tuple(
+            dict.fromkeys(
+                [
+                    model_name,
+                    *model_defaults.models,
+                ]
+            )
+        )
         model_base_url = normalize_model_base_url(
             generic_model_base_url or model_base_url_alias or model_defaults.base_url,
             required_message="The model base URL cannot be empty.",
         )
-        model_api_key = (
-            normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
-            or model_defaults.api_key
+        if overrides.model_api_key is not None:
+            model_api_key = normalize_optional_string(overrides.model_api_key)
+        else:
+            model_api_key = (
+                normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+                or model_defaults.api_key
+            )
+        model_temperature = (
+            normalize_model_temperature(overrides.model_temperature)
+            if overrides.model_temperature is not None
+            else model_defaults.temperature
         )
         default_reasoning = normalize_reasoning_level(
             generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
         )
-        rag_requested = file_config.rag.enabled
+        recursion_limit = normalize_recursion_limit(
+            (
+                overrides.recursion_limit
+                if overrides.recursion_limit is not None
+                else os.getenv("DEEPAGENT_RECURSION_LIMIT")
+            ),
+            default=file_config.extensions.recursion_limit,
+            field_name="DEEPAGENT_RECURSION_LIMIT",
+        )
+        rag_requested = file_config.rag.enabled and not overrides.disable_rag
         rag = None
         rag_error = None
         if rag_requested:
@@ -912,34 +1209,42 @@ class RuntimeConfig:
             database_url=database_url,
             model_provider=model_provider,
             model_name=model_name,
+            model_choices=model_choices,
             model_base_url=model_base_url,
             model_api_key=model_api_key,
-            model_temperature=model_defaults.temperature,
+            model_temperature=model_temperature,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
             extensions=file_config.extensions,
+            recursion_limit=recursion_limit,
             rag_requested=rag_requested,
             rag=rag,
             rag_error=rag_error,
         )
 
 
-def build_model(config: RuntimeConfig, reasoning_level: ReasoningLevel) -> Any:
+def build_model(
+    config: RuntimeConfig,
+    reasoning_level: ReasoningLevel,
+    *,
+    model_name: str | None = None,
+) -> Any:
+    selected_model = str(model_name or config.model_name).strip() or config.model_name
     if config.model_provider == "ollama":
         return ChatOllama(
-            model=config.model_name,
+            model=selected_model,
             base_url=config.model_base_url,
             reasoning=reasoning_level,
             temperature=config.model_temperature,
         )
 
     kwargs: dict[str, Any] = {
-        "model": config.model_name,
+        "model": selected_model,
         "base_url": config.model_base_url,
         "api_key": config.model_api_key or "deepagent",
         "temperature": config.model_temperature,
     }
-    return ChatOpenAI(**kwargs)
+    return OpenAICompatibleChatOpenAI(**kwargs)
 
 
 def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:
@@ -1150,9 +1455,14 @@ def build_graph_subagent_specs(
     *,
     include_async_subagents: bool,
 ) -> list[Any]:
-    middleware = build_agent_middleware()
     subagent_specs: list[Any] = [
-        subagent.to_deepagents_spec(middleware=middleware)
+        subagent.to_deepagents_spec(
+            middleware=build_agent_middleware(
+                config=config,
+                reasoning_level=config.default_reasoning,
+                model_name=subagent.model,
+            )
+        )
         for subagent in config.extensions.subagents
     ]
     if include_async_subagents:
@@ -1167,6 +1477,7 @@ def create_configured_graph(
     *,
     include_async_subagents: bool,
     system_prompt: str = SYSTEM_PROMPT,
+    apply_custom_instruction: bool = False,
 ) -> Any:
     config = RuntimeConfig.from_env()
     subagent_specs = build_graph_subagent_specs(
@@ -1187,10 +1498,20 @@ def create_configured_graph(
         model=build_model(config, config.default_reasoning),
         tools=sanitize_tools_for_model(config.model_provider, tools) or None,
         system_prompt=compose_rag_system_prompt(
-            system_prompt,
+            compose_agent_system_prompt(
+                system_prompt,
+                (
+                    config.extensions.custom_instruction
+                    if apply_custom_instruction
+                    else None
+                ),
+            ),
             rag_enabled=config.rag is not None,
         ),
-        middleware=build_agent_middleware(),
+        middleware=build_agent_middleware(
+            config=config,
+            reasoning_level=config.default_reasoning,
+        ),
         backend=build_deepagent_backend(),
         skills=list(config.extensions.skills) or None,
         subagents=subagent_specs or None,
@@ -1201,6 +1522,7 @@ def create_configured_graph(
 class AppSettings:
     reasoning_level: ReasoningLevel
     thread_id: str
+    model_name: str
 
 
 class AgentRuntime:
@@ -1214,7 +1536,7 @@ class AgentRuntime:
         self._agent_lock = asyncio.Lock()
         self._mcp_lock = asyncio.Lock()
         self._agents: dict[
-            tuple[ReasoningLevel, str | None, str | None, str | None],
+            tuple[ReasoningLevel, str, str | None, str | None, str | None],
             object,
         ] = {}
         self._mcp_client: MultiServerMCPClient | None = None
@@ -1238,6 +1560,17 @@ class AgentRuntime:
                 await instance._initialize()
                 cls._instance = instance
             return cls._instance
+
+    @classmethod
+    async def create(
+        cls,
+        config: RuntimeConfig | None = None,
+        *,
+        project_root: Path | None = None,
+    ) -> "AgentRuntime":
+        instance = cls(config or RuntimeConfig.from_env(), project_root=project_root)
+        await instance._initialize()
+        return instance
 
     @classmethod
     def current(cls) -> "AgentRuntime | None":
@@ -1320,16 +1653,19 @@ class AgentRuntime:
         self,
         reasoning_level: ReasoningLevel,
         *,
+        model_name: str | None = None,
         thread_id: str | None = None,
         async_subagent_url_override: str | None = None,
         mcp_session_id: str | None = None,
     ):
+        selected_model = str(model_name or self.config.model_name).strip() or self.config.model_name
         mcp_scope = self._mcp_scope(
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
         cache_key = (
             reasoning_level,
+            selected_model,
             thread_id,
             async_subagent_url_override,
             mcp_scope,
@@ -1337,7 +1673,10 @@ class AgentRuntime:
         async with self._agent_lock:
             agent = self._agents.get(cache_key)
             if agent is None:
-                model = self._build_model(reasoning_level)
+                model = self._build_model(
+                    reasoning_level,
+                    model_name=selected_model,
+                )
                 rag_tool_enabled = self._rag_service is not None
                 main_tools = sanitize_tools_for_model(
                     self.config.model_provider,
@@ -1346,7 +1685,11 @@ class AgentRuntime:
                         mcp_session_id=mcp_session_id,
                     ),
                 )
-                middleware = build_agent_middleware()
+                middleware = build_agent_middleware(
+                    config=self.config,
+                    reasoning_level=reasoning_level,
+                    model_name=selected_model,
+                )
                 subagent_specs: list[Any] = [
                     subagent.to_deepagents_spec(
                         tools=sanitize_tools_for_model(
@@ -1357,7 +1700,11 @@ class AgentRuntime:
                                 mcp_session_id=mcp_session_id,
                             ),
                         ),
-                        middleware=middleware,
+                        middleware=build_agent_middleware(
+                            config=self.config,
+                            reasoning_level=reasoning_level,
+                            model_name=subagent.model or selected_model,
+                        ),
                     )
                     for subagent in self.config.extensions.subagents
                 ]
@@ -1371,7 +1718,10 @@ class AgentRuntime:
                     model=model,
                     tools=main_tools or None,
                     system_prompt=compose_rag_system_prompt(
-                        SYSTEM_PROMPT,
+                        compose_agent_system_prompt(
+                            SYSTEM_PROMPT,
+                            self.config.extensions.custom_instruction,
+                        ),
                         rag_enabled=rag_tool_enabled,
                     ),
                     middleware=middleware,
@@ -1488,8 +1838,13 @@ class AgentRuntime:
     def _tool_supports_openai_compatible_schema(tool: Any) -> bool:
         return tool_supports_openai_compatible_schema(tool)
 
-    def _build_model(self, reasoning_level: ReasoningLevel) -> Any:
-        return build_model(self.config, reasoning_level)
+    def _build_model(
+        self,
+        reasoning_level: ReasoningLevel,
+        *,
+        model_name: str | None = None,
+    ) -> Any:
+        return build_model(self.config, reasoning_level, model_name=model_name)
 
     def _mcp_scope(
         self,
@@ -1643,6 +1998,12 @@ class AgentRuntime:
 
         for stack in stacks:
             await stack.aclose()
+
+    async def close(self) -> None:
+        await self._exit_stack.aclose()
+        self._checkpointer = None
+        self._store = None
+        self._mcp_client = None
 
     def _build_backend(self, runtime):
         return build_deepagent_backend(project_root=self.project_root)

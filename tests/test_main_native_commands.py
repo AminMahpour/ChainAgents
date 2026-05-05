@@ -2,41 +2,162 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import agent_commands
 import main
 import pytest
 
 
 def test_resolve_native_command_prefers_explicit_slash_text() -> None:
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="/summarize hello world",
         selected_command="ask-researcher",
     )
 
-    assert parsed == main.ParsedNativeCommand(
+    assert parsed == agent_commands.ParsedNativeCommand(
         command_name="summarize",
         raw_args="hello world",
     )
 
 
 def test_resolve_native_command_uses_selected_command_input() -> None:
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="hello world",
         selected_command="summarize",
     )
 
-    assert parsed == main.ParsedNativeCommand(
+    assert parsed == agent_commands.ParsedNativeCommand(
         command_name="summarize",
         raw_args="hello world",
     )
 
 
 def test_resolve_native_command_returns_none_without_command() -> None:
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="hello world",
         selected_command=None,
     )
 
     assert parsed is None
+
+
+def test_resolve_reasoning_level_for_message_defaults_to_settings() -> None:
+    message = SimpleNamespace(content="hello")
+    settings = SimpleNamespace(reasoning_level="medium")
+
+    resolved = main.resolve_reasoning_level_for_message(message, settings)
+
+    assert resolved == "medium"
+
+
+def test_resolve_reasoning_level_for_message_uses_mode_override() -> None:
+    message = SimpleNamespace(content="hello", modes={"reasoning_level": "high"})
+    settings = SimpleNamespace(reasoning_level="medium")
+
+    resolved = main.resolve_reasoning_level_for_message(message, settings)
+
+    assert resolved == "high"
+
+
+def test_resolve_reasoning_level_for_message_falls_back_to_settings_default() -> None:
+    message = SimpleNamespace(content="hello", modes={})
+    settings = SimpleNamespace(reasoning_level="low")
+
+    resolved = main.resolve_reasoning_level_for_message(message, settings)
+
+    assert resolved == "low"
+
+
+def test_resolve_reasoning_level_for_message_ignores_override_when_disabled() -> None:
+    message = SimpleNamespace(content="hello", modes={"reasoning_level": "high"})
+    settings = SimpleNamespace(reasoning_level="low")
+
+    resolved = main.resolve_reasoning_level_for_message(
+        message,
+        settings,
+        reasoning_mode_enabled=False,
+    )
+
+    assert resolved == "low"
+
+
+def test_resolve_model_name_for_message_uses_mode_override() -> None:
+    message = SimpleNamespace(content="hello", modes={"model_name": "gemma4:27b"})
+    settings = SimpleNamespace(model_name="gpt-oss:20b")
+
+    resolved = main.resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=("gpt-oss:20b", "gemma4:27b"),
+    )
+
+    assert resolved == "gemma4:27b"
+
+
+def test_resolve_model_name_for_message_falls_back_to_settings() -> None:
+    message = SimpleNamespace(content="hello", modes={"model_name": "unknown"})
+    settings = SimpleNamespace(model_name="gpt-oss:20b")
+
+    resolved = main.resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=("gpt-oss:20b", "gemma4:27b"),
+    )
+
+    assert resolved == "gpt-oss:20b"
+
+
+def test_resolve_model_name_for_message_ignores_override_when_disabled() -> None:
+    message = SimpleNamespace(content="hello", modes={"model_name": "gemma4:27b"})
+    settings = SimpleNamespace(model_name="gpt-oss:20b")
+
+    resolved = main.resolve_model_name_for_message(
+        message,
+        settings,
+        available_models=("gpt-oss:20b", "gemma4:27b"),
+        model_mode_enabled=False,
+    )
+
+    assert resolved == "gpt-oss:20b"
+
+
+def test_build_langgraph_config_includes_recursion_limit() -> None:
+    settings = SimpleNamespace(thread_id="thread-1")
+
+    config = main.build_langgraph_config(settings, recursion_limit=100)
+
+    assert config == {
+        "configurable": {"thread_id": "thread-1"},
+        "recursion_limit": 100,
+    }
+
+
+@pytest.mark.anyio
+async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> None:
+    class _Emitter:
+        async def set_modes(self, _modes):
+            raise RuntimeError('column "modes" does not exist')
+
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(emitter=_Emitter()))
+
+    await main.publish_modes(
+        SimpleNamespace(model_name="gpt-oss:20b", reasoning_level="medium"),
+        available_models=("gpt-oss:20b",),
+    )
+
+
+@pytest.mark.anyio
+async def test_publish_modes_raises_for_unrelated_errors(monkeypatch) -> None:
+    class _Emitter:
+        async def set_modes(self, _modes):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(emitter=_Emitter()))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await main.publish_modes(
+            SimpleNamespace(model_name="gpt-oss:20b", reasoning_level="medium"),
+            available_models=("gpt-oss:20b",),
+        )
 
 
 class _DummyRuntime:
@@ -92,7 +213,7 @@ async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) 
     result = await main.handle_native_command(
         runtime=runtime,
         settings=settings,
-        parsed=main.ParsedNativeCommand(command_name="repo-readme", raw_args=""),
+        parsed=agent_commands.ParsedNativeCommand(command_name="repo-readme", raw_args=""),
     )
 
     assert result == ""
@@ -102,7 +223,7 @@ async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) 
 
 
 def test_build_skill_command_prompt_requires_skill_and_request() -> None:
-    prompt = main.build_skill_command_prompt(
+    prompt = agent_commands.build_skill_command_prompt(
         skill_name="reviewer",
         skill_path="/workspace/skills/reviewer/SKILL.md",
         raw_args="inspect this diff",
@@ -115,7 +236,7 @@ def test_build_skill_command_prompt_requires_skill_and_request() -> None:
 
 
 def test_build_skill_command_prompt_without_request_asks_for_task() -> None:
-    prompt = main.build_skill_command_prompt(
+    prompt = agent_commands.build_skill_command_prompt(
         skill_name="reviewer",
         skill_path="/workspace/skills/reviewer/SKILL.md",
         raw_args="",
@@ -141,7 +262,7 @@ async def test_handle_native_command_returns_forced_skill_prompt() -> None:
     result = await main.handle_native_command(
         runtime=runtime,
         settings=settings,
-        parsed=main.ParsedNativeCommand(
+        parsed=agent_commands.ParsedNativeCommand(
             command_name="reviewer",
             raw_args="inspect this diff",
         ),
@@ -169,7 +290,7 @@ async def test_handle_native_command_without_skill_args_requests_clarification()
     result = await main.handle_native_command(
         runtime=runtime,
         settings=settings,
-        parsed=main.ParsedNativeCommand(
+        parsed=agent_commands.ParsedNativeCommand(
             command_name="reviewer",
             raw_args="",
         ),
@@ -192,12 +313,12 @@ async def test_handle_native_command_uses_selected_skill_command_input() -> None
         )
     )
     settings = SimpleNamespace(thread_id="thread-1")
-    parsed = main.resolve_native_command(
+    parsed = agent_commands.resolve_native_command(
         raw_text="inspect this diff",
         selected_command="reviewer",
     )
 
-    assert parsed == main.ParsedNativeCommand(
+    assert parsed == agent_commands.ParsedNativeCommand(
         command_name="reviewer",
         raw_args="inspect this diff",
     )

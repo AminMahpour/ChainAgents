@@ -1,6 +1,8 @@
-# Workspace Deep Agent
+# ChainAgents
 
-This project runs a local-first LangChain Deep Agent behind a Chainlit UI.
+![Workspace Deep Agent logo](logo.png)
+
+This project runs a local-first LangChain DeepAgent behind a Chainlit UI.
 
 The app is wired for:
 
@@ -10,6 +12,7 @@ The app is wired for:
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
+- Chainlit Modes support for per-message reasoning selection (`Low`, `Medium`, `High`)
 
 ## Environment
 
@@ -21,6 +24,7 @@ export DEEPAGENT_MODEL_PROVIDER="ollama"
 export DEEPAGENT_MODEL_BASE_URL="http://127.0.0.1:11434"
 export DEEPAGENT_MODEL_NAME="gpt-oss:20b"
 export DEEPAGENT_MODEL_REASONING="medium"
+export DEEPAGENT_RECURSION_LIMIT="200"
 # export DEEPAGENT_MODEL_API_KEY="optional-for-secured-openai-compatible-servers"
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
@@ -43,6 +47,12 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 - they override the matching `[model]` values in `deepagent.toml`
 - `DEEPAGENT_MODEL_API_KEY` is only needed for secured OpenAI-compatible servers
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
+
+`DEEPAGENT_RECURSION_LIMIT` is optional:
+
+- it overrides `[agent].recursion_limit` in `deepagent.toml`
+- it controls the maximum LangGraph steps for a single agent run
+- raise it when long tool-heavy Deep Agent runs hit `GraphRecursionError`
 
 `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
 
@@ -119,6 +129,7 @@ ollama pull nomic-embed-text
 This repo now includes a live [deepagent.toml](deepagent.toml) with:
 
 - model defaults for provider, base URL, model name, and reasoning effort
+- a higher LangGraph recursion limit for longer tool-heavy Deep Agent runs
 - a real `repo` MCP server pinned to `npx @modelcontextprotocol/server-filesystem@2025.8.21`
 - a `repo-researcher` subagent using [prompts/repo-researcher.md](prompts/repo-researcher.md)
 - the repo-local `skills/` source for both the main agent and the subagent
@@ -133,6 +144,29 @@ Start the Chainlit app:
 chainlit run main.py -w
 ```
 
+Run the same underlying agent from a terminal without the Chainlit UI:
+
+```bash
+uv run chainagents --prompt "Summarize this repository" --thread-id cli
+```
+
+Useful CLI examples:
+
+```bash
+uv run chainagents --status --no-rag
+uv run chainagents --list-commands
+uv run chainagents --command ask-researcher --prompt "Find the config entrypoints"
+uv run chainagents --stdin --model gemma4:26b --reasoning high < prompt.txt
+uv run chainagents --rebuild-rag
+uv run chainagents --upload-rag notes.md --prompt "Use my uploaded notes"
+uv run chainagents --photo scene.jpg --prompt "Describe this photo"
+```
+
+Run `uv run chainagents --help` for all runtime flags, including model provider,
+base URL, API key, temperature, persistence, MCP session scope, async subagent
+URL, RAG controls, photo attachments, streaming, reasoning traces, tool traces,
+and JSON output.
+
 ## Model Config
 
 You can keep the model defaults in `deepagent.toml`:
@@ -143,6 +177,7 @@ provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
 name = "gpt-oss:20b"
+models = ["gpt-oss:20b", "gemma4:27b"]
 reasoning_effort = "medium"
 ```
 
@@ -162,11 +197,30 @@ Notes:
 
 - `provider` selects `ChatOllama` or `ChatOpenAI`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
+- `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `api_key` is optional and only used for `provider = "openai_compatible"`. When omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, and `DEEPAGENT_MODEL_REASONING` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
+
+## Agent Runtime Config
+
+The `[agent]` table configures main-agent runtime behavior:
+
+```toml
+[agent]
+recursion_limit = 200
+skills = ["skills"]
+mcp_servers = ["repo"]
+```
+
+Notes:
+
+- `recursion_limit` is the LangGraph step limit for one agent run.
+- The built-in default is `100`; this repo's `deepagent.toml` sets it to `200`.
+- `DEEPAGENT_RECURSION_LIMIT` overrides this value when set.
+- Increase it for long tool-heavy runs that hit `GraphRecursionError`; lower it if you want runaway loops to stop sooner.
 
 ## Optional: Enable Workspace Docs RAG
 
@@ -281,8 +335,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
 [agent]
+recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
+summarization_middleware_enabled = false
+summarization_trigger_tokens = 6000
+summarization_keep_tokens = 2400
 
 [[subagents]]
 name = "repo-researcher"
@@ -313,6 +371,14 @@ Supported subagent fields:
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional model override
 
+Main `[agent]` additions:
+
+- `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
+- `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
+- `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
+- `summarization_trigger_tokens`: optional positive integer token threshold that triggers summarization when reached.
+- `summarization_keep_tokens`: optional positive integer token budget to keep in conversation history after summarization.
+
 ## Chainlit Native Commands
 
 You can configure slash-style commands that run from the Chainlit composer before the model call.
@@ -325,6 +391,12 @@ Example:
 
 ```toml
 [chainlit]
+# Set false to hide model selection in chat settings and Modes.
+model_mode_enabled = true
+# Set false to disable per-message reasoning overrides from the Modes picker.
+reasoning_mode_enabled = true
+# Set false to hide the initial startup status message ("Workspace agent ready...").
+startup_status_enabled = true
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
@@ -341,6 +413,9 @@ commands = [
 Notes:
 
 - The `[chainlit]` table for native commands belongs in `deepagent.toml`, alongside `[model]`, `[agent]`, `[mcp]`, `[[subagents]]`, and `[[async_subagents]]`.
+- `[chainlit].model_mode_enabled = false` hides the Model selector in chat settings and the Model mode group, and ignores per-message model overrides from UI modes.
+- `[chainlit].reasoning_mode_enabled = false` hides the Reasoning mode group and ignores per-message reasoning overrides from UI modes.
+- `[chainlit].startup_status_enabled = false` disables the initial startup status message that summarizes runtime configuration.
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.
 - For `mcp_tool`, user command arguments must be valid JSON, e.g. `/repo-readme {"path":"README.md"}`.

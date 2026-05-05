@@ -1,9 +1,11 @@
 [model]
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
-temperature = 0
+temperature = 0.3
+
 name = "gemma4:26b"
-#name = "gpt-oss:20b"
+#models = ["gpt-oss:20b", "gemma4:26b", "qwen3.6:27b"]
+
 reasoning_effort = "medium"
 
 # For LM Studio or another OpenAI-compatible server, switch to:
@@ -33,16 +35,10 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
-[mcp.servers.tooluniverse]
-transport = "http"
-url = "http://localhost:8090/mcp"
-
 [agent]
+recursion_limit = 200
 skills = ["skills"]
-mcp_servers = ["repo","tooluniverse"]
-# Keep ToolUniverse optional for slash-invoked skills in environments where the
-# MCP service is available by adding it to mcp_servers when needed:
-# mcp_servers = ["repo", "tooluniverse"]
+mcp_servers = ["repo"]
 
 [rag]
 enabled = true
