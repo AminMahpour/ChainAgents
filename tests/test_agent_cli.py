@@ -401,6 +401,15 @@ class _ToolCallToken:
     ]
 
 
+class _ToolCallChunkToken:
+    type = "AIMessageChunk"
+    content = ""
+    additional_kwargs: dict[str, str] = {}
+
+    def __init__(self, chunk: dict[str, str]) -> None:
+        self.tool_call_chunks = [chunk]
+
+
 class _ToolMessage:
     type = "tool"
     name = "read_file"
@@ -548,8 +557,43 @@ async def test_cli_event_renderer_boxes_tool_call_start() -> None:
     assert "status: start" in output
     assert "source: main-agent" in output
     assert "tool: read_file" in output
+    assert "args: " in output
+    assert '"path": "README.md"' in output
     assert "+" in output
     assert "|" in output
+
+
+@pytest.mark.anyio
+async def test_cli_event_renderer_accumulates_tool_args_across_chunks() -> None:
+    stderr = io.StringIO()
+    renderer = chainagents_cli.CliEventRenderer(
+        prompt="hello",
+        stdout=io.StringIO(),
+        stderr=stderr,
+        stream=True,
+        json_output=False,
+        show_reasoning=False,
+        show_tools=True,
+    )
+
+    await renderer.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {"chunk": ((), "messages", (_ToolCallChunkToken({"id": "call-9", "name": "read_file", "args": '{"path":"REA'}), {}))},
+        }
+    )
+    await renderer.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {"chunk": ((), "messages", (_ToolCallChunkToken({"id": "call-9", "args": 'DME.md"}'}), {}))},
+        }
+    )
+
+    output = stderr.getvalue()
+    assert "Tool Call" in output
+    assert "status: start" in output
+    assert "status: update" in output
+    assert '"path": "README.md"' in output
 
 
 @pytest.mark.anyio
