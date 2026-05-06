@@ -1,6 +1,9 @@
 [model]
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
+# Optional Ollama session pool. Each active Chainlit session is pinned to one URL.
+# base_urls = ["http://127.0.0.1:11434", "http://127.0.0.1:11435"]
+# load_balance = "session_round_robin"
 temperature = 0
 name = "gpt-oss:20b"
 models = ["gpt-oss:20b", "gemma4:27b"]

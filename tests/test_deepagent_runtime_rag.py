@@ -249,6 +249,94 @@ models = ["gpt-oss:20b", "gemma4:27b"]
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
+def test_runtime_config_reads_ollama_base_urls_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+base_urls = ["http://127.0.0.1:11434/", "127.0.0.1:11435"]
+load_balance = "session_round_robin"
+name = "gpt-oss:20b"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_base_url == "http://127.0.0.1:11434"
+    assert config.model_base_urls == (
+        "http://127.0.0.1:11434",
+        "http://127.0.0.1:11435",
+    )
+    assert config.model_load_balance == "session_round_robin"
+
+
+def test_agent_runtime_assigns_ollama_base_urls_per_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+base_urls = ["http://127.0.0.1:11434", "http://127.0.0.1:11435"]
+load_balance = "session_round_robin"
+name = "gpt-oss:20b"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    built_base_urls: list[str] = []
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs) -> None:
+            self.base_url = kwargs["base_url"]
+
+    def fake_create_deep_agent(**kwargs):
+        built_base_urls.append(kwargs["model"].base_url)
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "ChatOllama", FakeChatOllama)
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(deepagent_runtime.RuntimeConfig.from_env())
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    async def exercise_runtime() -> None:
+        await runtime.get_agent(
+            "medium",
+            thread_id="thread-1",
+            mcp_session_id="session-1",
+        )
+        await runtime.get_agent(
+            "medium",
+            thread_id="thread-2",
+            mcp_session_id="session-2",
+        )
+        await runtime.get_agent(
+            "medium",
+            thread_id="thread-3",
+            mcp_session_id="session-1",
+        )
+
+    asyncio.run(exercise_runtime())
+
+    assert built_base_urls == [
+        "http://127.0.0.1:11434",
+        "http://127.0.0.1:11435",
+        "http://127.0.0.1:11434",
+    ]
+
+
 def test_runtime_config_reads_openai_endpoint_url_from_toml(
     tmp_path: Path,
     monkeypatch,

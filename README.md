@@ -176,6 +176,9 @@ You can keep the model defaults in `deepagent.toml`:
 [model]
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
+# Optional: pin each active Chainlit session to one Ollama URL in round-robin order.
+# base_urls = ["http://127.0.0.1:11434", "http://127.0.0.1:11435"]
+# load_balance = "session_round_robin"
 temperature = 0
 name = "gpt-oss:20b"
 models = ["gpt-oss:20b", "gemma4:27b"]
@@ -208,12 +211,13 @@ Notes:
 
 - `provider` selects `ChatOllama` or `ChatOpenAI`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
+- `base_urls` is an Ollama-only pool. With `load_balance = "session_round_robin"`, each active Chainlit session is pinned to one URL in round-robin order; `base_url` remains the default and RAG embedding endpoint.
 - `endpoint_url` is an OpenAI-compatible override for full non-standard chat-completions URLs; query parameters are forwarded as OpenAI client default query parameters.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `api_key` is optional and only used for `provider = "openai_compatible"`. When omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
-- `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, and `DEEPAGENT_MODEL_REASONING` override the TOML defaults when set.
+- `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, and `DEEPAGENT_MODEL_REASONING` override the TOML defaults when set. `DEEPAGENT_MODEL_BASE_URL` selects a single endpoint and disables the `base_urls` pool for that runtime.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
 
 ## Agent Runtime Config

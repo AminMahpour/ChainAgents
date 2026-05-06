@@ -49,6 +49,7 @@ from rag_runtime import (
 
 
 ModelProvider = Literal["ollama", "openai_compatible"]
+ModelLoadBalanceMode = Literal["none", "session_round_robin"]
 ReasoningLevel = Literal["low", "medium", "high"]
 PersistenceMode = Literal["memory", "postgres"]
 DEFAULT_MODEL = "gpt-oss:20b"
@@ -58,6 +59,7 @@ DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_TEMPERATURE = 0.0
+DEFAULT_MODEL_LOAD_BALANCE: ModelLoadBalanceMode = "none"
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -119,6 +121,22 @@ def normalize_model_provider(
     if candidate not in {"ollama", "openai_compatible"}:
         raise ValueError(
             "The model provider must be 'ollama' or 'openai_compatible'."
+        )
+    return candidate  # type: ignore[return-value]
+
+
+def normalize_model_load_balance(
+    value: Any | None,
+    *,
+    default: ModelLoadBalanceMode = DEFAULT_MODEL_LOAD_BALANCE,
+) -> ModelLoadBalanceMode:
+    candidate = str(value or default).strip().lower().replace("-", "_")
+    if not candidate:
+        return default
+    if candidate not in {"none", "session_round_robin"}:
+        raise ValueError(
+            "The [model].load_balance config must be 'none' or "
+            "'session_round_robin'."
         )
     return candidate  # type: ignore[return-value]
 
@@ -254,6 +272,25 @@ def normalize_model_base_url(
     if "://" not in candidate:
         candidate = f"http://{candidate}"
     return candidate.rstrip("/")
+
+
+def normalize_model_base_urls(value: Any | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("The [model].base_urls config must be an array of strings.")
+
+    urls: list[str] = []
+    for raw_url in value:
+        url = normalize_model_base_url(raw_url)
+        if not url:
+            raise ValueError("The [model].base_urls config cannot include empty URLs.")
+        if url not in urls:
+            urls.append(url)
+
+    if not urls:
+        raise ValueError("The [model].base_urls config must include at least one URL.")
+    return tuple(urls)
 
 
 def normalize_openai_endpoint_url(
@@ -444,6 +481,7 @@ def _build_summarization_middleware(
     config: RuntimeConfig,
     reasoning_level: ReasoningLevel,
     model_name: str | None = None,
+    model_base_url: str | None = None,
 ) -> AgentMiddleware[Any, Any, Any] | None:
     try:
         from langchain.agents.middleware import SummarizationMiddleware
@@ -460,6 +498,7 @@ def _build_summarization_middleware(
             config,
             reasoning_level,
             model_name=model_name,
+            model_base_url=model_base_url,
         )
     if config.extensions.summarization_trigger_tokens is not None:
         if "max_tokens_before_summary" in signature.parameters:
@@ -487,6 +526,7 @@ def build_agent_middleware(
     config: RuntimeConfig | None = None,
     reasoning_level: ReasoningLevel | None = None,
     model_name: str | None = None,
+    model_base_url: str | None = None,
     project_root: Path | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
     middleware: list[AgentMiddleware[Any, Any, Any]] = [
@@ -501,6 +541,7 @@ def build_agent_middleware(
             config=config,
             reasoning_level=reasoning_level,
             model_name=model_name,
+            model_base_url=model_base_url,
         )
         if summarization_middleware is not None:
             middleware.append(summarization_middleware)
@@ -724,6 +765,8 @@ class ExtensionsConfig:
 class ModelDefaults:
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
     base_url: str = DEFAULT_OLLAMA_BASE_URL
+    base_urls: tuple[str, ...] = (DEFAULT_OLLAMA_BASE_URL,)
+    load_balance: ModelLoadBalanceMode = DEFAULT_MODEL_LOAD_BALANCE
     endpoint_query: tuple[tuple[str, str], ...] = ()
     name: str = DEFAULT_MODEL
     api_key: str | None = None
@@ -762,10 +805,25 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
         )
 
     raw_base_url = str(raw_model.get("base_url", "")).strip()
+    raw_base_urls = raw_model.get("base_urls")
     raw_endpoint_url = raw_model.get("endpoint_url")
+    raw_load_balance = raw_model.get("load_balance")
+    base_urls: tuple[str, ...] = ()
+    load_balance: ModelLoadBalanceMode = DEFAULT_MODEL_LOAD_BALANCE
     endpoint_query: tuple[tuple[str, str], ...] = ()
     if provider == "ollama":
-        if raw_base_url:
+        base_urls = normalize_model_base_urls(raw_base_urls)
+        load_balance = normalize_model_load_balance(
+            raw_load_balance,
+            default=(
+                "session_round_robin"
+                if len(base_urls) > 1
+                else DEFAULT_MODEL_LOAD_BALANCE
+            ),
+        )
+        if base_urls:
+            base_url = base_urls[0]
+        elif raw_base_url:
             base_url = normalize_model_base_url(
                 raw_base_url,
                 default=DEFAULT_OLLAMA_BASE_URL,
@@ -775,6 +833,8 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
                 raw_model.get("endpoint"),
                 normalize_model_port(raw_model.get("port")),
             )
+        if not base_urls:
+            base_urls = (base_url,)
     else:
         required_message = (
             "OpenAI-compatible model config must define a non-empty "
@@ -794,6 +854,8 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
     return ModelDefaults(
         provider=provider,
         base_url=base_url,
+        base_urls=base_urls or (base_url,),
+        load_balance=load_balance,
         endpoint_query=endpoint_query,
         name=raw_name or (parsed_models[0] if parsed_models else DEFAULT_MODEL),
         api_key=normalize_optional_string(raw_model.get("api_key")),
@@ -1213,6 +1275,8 @@ class RuntimeConfig:
     rag_requested: bool = False
     rag: ResolvedRagConfig | None = None
     rag_error: str | None = None
+    model_base_urls: tuple[str, ...] = ()
+    model_load_balance: ModelLoadBalanceMode = DEFAULT_MODEL_LOAD_BALANCE
     model_endpoint_query: tuple[tuple[str, str], ...] = ()
 
     @classmethod
@@ -1317,6 +1381,8 @@ class RuntimeConfig:
                 generic_model_endpoint_url,
                 required_message="The model endpoint URL cannot be empty.",
             )
+            model_base_urls = (model_base_url,)
+            model_load_balance = DEFAULT_MODEL_LOAD_BALANCE
         else:
             model_base_url = normalize_model_base_url(
                 generic_model_base_url
@@ -1326,6 +1392,18 @@ class RuntimeConfig:
             )
             if generic_model_base_url or model_base_url_alias:
                 model_endpoint_query = ()
+                model_base_urls = (model_base_url,)
+                model_load_balance = DEFAULT_MODEL_LOAD_BALANCE
+            elif model_provider == "ollama":
+                model_base_urls = model_defaults.base_urls or (model_base_url,)
+                model_load_balance = (
+                    model_defaults.load_balance
+                    if len(model_base_urls) > 1
+                    else DEFAULT_MODEL_LOAD_BALANCE
+                )
+            else:
+                model_base_urls = (model_base_url,)
+                model_load_balance = DEFAULT_MODEL_LOAD_BALANCE
         if overrides.model_api_key is not None:
             model_api_key = normalize_optional_string(overrides.model_api_key)
         else:
@@ -1379,6 +1457,8 @@ class RuntimeConfig:
             rag_requested=rag_requested,
             rag=rag,
             rag_error=rag_error,
+            model_base_urls=model_base_urls,
+            model_load_balance=model_load_balance,
             model_endpoint_query=model_endpoint_query,
         )
 
@@ -1388,19 +1468,23 @@ def build_model(
     reasoning_level: ReasoningLevel,
     *,
     model_name: str | None = None,
+    model_base_url: str | None = None,
 ) -> Any:
     selected_model = str(model_name or config.model_name).strip() or config.model_name
+    selected_base_url = str(model_base_url or config.model_base_url).strip()
+    if not selected_base_url:
+        selected_base_url = config.model_base_url
     if config.model_provider == "ollama":
         return ChatOllama(
             model=selected_model,
-            base_url=config.model_base_url,
+            base_url=selected_base_url,
             reasoning=reasoning_level,
             temperature=config.model_temperature,
         )
 
     kwargs: dict[str, Any] = {
         "model": selected_model,
-        "base_url": config.model_base_url,
+        "base_url": selected_base_url,
         "api_key": config.model_api_key or "deepagent",
         "temperature": config.model_temperature,
     }
@@ -1700,10 +1784,9 @@ class AgentRuntime:
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
         self._mcp_lock = asyncio.Lock()
-        self._agents: dict[
-            tuple[ReasoningLevel, str, str | None, str | None, str | None],
-            object,
-        ] = {}
+        self._agents: dict[tuple[Any, ...], object] = {}
+        self._model_base_url_assignments: dict[str, str] = {}
+        self._next_model_base_url_index = 0
         self._mcp_client: MultiServerMCPClient | None = None
         self._mcp_tools_cache: dict[tuple[str | None, tuple[str, ...]], list[Any]] = {}
         self._mcp_sessions: dict[tuple[str | None, str], Any] = {}
@@ -1828,19 +1911,25 @@ class AgentRuntime:
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
-        cache_key = (
-            reasoning_level,
-            selected_model,
-            thread_id,
-            async_subagent_url_override,
-            mcp_scope,
-        )
         async with self._agent_lock:
+            selected_model_base_url = self._select_model_base_url(
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+            )
+            cache_key = (
+                reasoning_level,
+                selected_model,
+                thread_id,
+                async_subagent_url_override,
+                mcp_scope,
+                selected_model_base_url,
+            )
             agent = self._agents.get(cache_key)
             if agent is None:
                 model = self._build_model(
                     reasoning_level,
                     model_name=selected_model,
+                    model_base_url=selected_model_base_url,
                 )
                 rag_tool_enabled = self._rag_service is not None
                 main_tools = sanitize_tools_for_model(
@@ -1854,6 +1943,7 @@ class AgentRuntime:
                     config=self.config,
                     reasoning_level=reasoning_level,
                     model_name=selected_model,
+                    model_base_url=selected_model_base_url,
                     project_root=self.project_root,
                 )
                 subagent_specs: list[Any] = [
@@ -1870,6 +1960,7 @@ class AgentRuntime:
                             config=self.config,
                             reasoning_level=reasoning_level,
                             model_name=subagent.model or selected_model,
+                            model_base_url=selected_model_base_url,
                             project_root=self.project_root,
                         ),
                     )
@@ -1999,6 +2090,33 @@ class AgentRuntime:
                 ) from None
         return await selected_tool.ainvoke(parsed_args)
 
+    def _select_model_base_url(
+        self,
+        *,
+        thread_id: str | None,
+        mcp_session_id: str | None,
+    ) -> str:
+        urls = self.config.model_base_urls or (self.config.model_base_url,)
+        if (
+            self.config.model_provider != "ollama"
+            or self.config.model_load_balance != "session_round_robin"
+            or len(urls) <= 1
+        ):
+            return self.config.model_base_url
+
+        assignment_key = str(mcp_session_id or thread_id or "").strip()
+        if not assignment_key:
+            return urls[0]
+
+        assigned_url = self._model_base_url_assignments.get(assignment_key)
+        if assigned_url is not None:
+            return assigned_url
+
+        assigned_url = urls[self._next_model_base_url_index % len(urls)]
+        self._next_model_base_url_index += 1
+        self._model_base_url_assignments[assignment_key] = assigned_url
+        return assigned_url
+
     def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
         return sanitize_tools_for_model(self.config.model_provider, tools)
 
@@ -2011,8 +2129,14 @@ class AgentRuntime:
         reasoning_level: ReasoningLevel,
         *,
         model_name: str | None = None,
+        model_base_url: str | None = None,
     ) -> Any:
-        return build_model(self.config, reasoning_level, model_name=model_name)
+        return build_model(
+            self.config,
+            reasoning_level,
+            model_name=model_name,
+            model_base_url=model_base_url,
+        )
 
     def _mcp_scope(
         self,
@@ -2029,6 +2153,16 @@ class AgentRuntime:
 
         fallback = str(thread_id or "").strip()
         return fallback or None
+
+    @staticmethod
+    def _agent_cache_key_mcp_scope(key: tuple[Any, ...]) -> str | None:
+        if len(key) >= 5:
+            value = key[4]
+        elif len(key) >= 4:
+            value = key[3]
+        else:
+            return None
+        return value if isinstance(value, str) else None
 
     async def _get_stateful_mcp_session(
         self,
@@ -2137,7 +2271,7 @@ class AgentRuntime:
             self._agents = {
                 key: agent
                 for key, agent in self._agents.items()
-                if len(key) < 4 or key[3] != mcp_scope
+                if self._agent_cache_key_mcp_scope(key) != mcp_scope
             }
             async with self._mcp_lock:
                 stack = self._mcp_session_stacks.pop(mcp_scope, None)

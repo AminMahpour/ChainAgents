@@ -19,7 +19,7 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 
 ## Model Defaults
 
-- `deepagent.toml` can define `[model]` with `provider`, `base_url` or OpenAI-compatible `endpoint_url`, `temperature`, `name`, optional `api_key`, and `reasoning_effort`
+- `deepagent.toml` can define `[model]` with `provider`, `base_url`, Ollama `base_urls` and `load_balance`, OpenAI-compatible `endpoint_url`, `temperature`, `name`, optional `api_key`, and `reasoning_effort`
 - if `deepagent.toml` is missing, the runtime defaults to `http://127.0.0.1:11434`, `gpt-oss:20b`, and `medium`
 - `DEEPAGENT_MODEL_*` env vars override the TOML defaults, and `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain available as Ollama-only compatibility aliases
 
