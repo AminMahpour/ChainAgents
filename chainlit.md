@@ -14,11 +14,12 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 
 - Real repo files are available under `/workspace/`.
 - Memory is available under `/memories/`.
+- A repo-root `AGENTS.md` file is automatically included in the main agent system prompt when present.
 - Reuse the `LangGraph Thread ID` setting to continue a persisted thread.
 
 ## Model Defaults
 
-- `deepagent.toml` can define `[model]` with `provider`, `base_url`, `temperature`, `name`, optional `api_key`, and `reasoning_effort`
+- `deepagent.toml` can define `[model]` with `provider`, `base_url` or OpenAI-compatible `endpoint_url`, `temperature`, `name`, optional `api_key`, and `reasoning_effort`
 - if `deepagent.toml` is missing, the runtime defaults to `http://127.0.0.1:11434`, `gpt-oss:20b`, and `medium`
 - `DEEPAGENT_MODEL_*` env vars override the TOML defaults, and `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain available as Ollama-only compatibility aliases
 

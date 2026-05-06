@@ -249,6 +249,57 @@ models = ["gpt-oss:20b", "gemma4:27b"]
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
+def test_runtime_config_reads_openai_endpoint_url_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "openai_compatible"
+endpoint_url = "https://api.example.test/openai/deployments/local/chat/completions?api-version=2026-01-01"
+name = "local-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_base_url == "https://api.example.test/openai/deployments/local"
+    assert config.model_endpoint_query == (("api-version", "2026-01-01"),)
+    assert model.default_query == {"api-version": "2026-01-01"}
+
+
+def test_runtime_config_rejects_ollama_provider_switch_with_only_endpoint_url(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "openai_compatible"
+base_url = "https://api.example.test/openai/v1"
+name = "remote-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "ollama")
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_ENDPOINT_URL",
+        "http://127.0.0.1:11434/v1/chat/completions",
+    )
+    monkeypatch.delenv("DEEPAGENT_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+
+    with pytest.raises(ValueError, match="DEEPAGENT_MODEL_BASE_URL"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
 def test_runtime_config_reads_recursion_limit_from_toml(
     tmp_path: Path,
     monkeypatch,
@@ -906,6 +957,39 @@ def test_build_chainlit_command_catalog_includes_main_and_subagent_skills(
     assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
     assert commands[1].value == str(tmp_path / "subskills/repo-guide/SKILL.md")
     assert notes == ()
+
+
+def test_compose_agent_system_prompt_includes_agents_md(
+    tmp_path: Path,
+) -> None:
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text(
+        "# Agent Notes\n\nPrefer focused changes.",
+        encoding="utf-8",
+    )
+
+    prompt = deepagent_runtime.compose_agent_system_prompt(
+        "Base prompt.",
+        "Use direct answers.",
+        project_root=tmp_path,
+    )
+
+    assert "Base prompt." in prompt
+    assert "Repository instructions from AGENTS.md:" in prompt
+    assert "Prefer focused changes." in prompt
+    assert prompt.index("Prefer focused changes.") < prompt.index("Use direct answers.")
+
+
+def test_compose_agent_system_prompt_ignores_missing_agents_md(
+    tmp_path: Path,
+) -> None:
+    prompt = deepagent_runtime.compose_agent_system_prompt(
+        "Base prompt.",
+        None,
+        project_root=tmp_path,
+    )
+
+    assert prompt == "Base prompt."
 
 
 def test_build_chainlit_command_catalog_uses_backend_workspace_root_when_project_root_missing(

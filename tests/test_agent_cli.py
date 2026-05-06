@@ -101,6 +101,40 @@ recursion_limit = 20
     assert config.rag_requested is False
 
 
+def test_cli_endpoint_url_override_supplies_openai_default_query(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://config.example:11434"
+name = "config-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    args = chainagents_cli.parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--provider",
+            "openai_compatible",
+            "--endpoint-url",
+            "https://api.example.test/proxy/chat/completions?api-version=2026-01-01",
+            "--model",
+            "cli-model",
+            "--status",
+        ]
+    )
+
+    config = RuntimeConfig.from_env(chainagents_cli.runtime_overrides_from_args(args))
+
+    assert config.model_provider == "openai_compatible"
+    assert config.model_base_url == "https://api.example.test/proxy"
+    assert config.model_endpoint_query == (("api-version", "2026-01-01"),)
+
+
 class _FakeMcpRuntime:
     def __init__(self) -> None:
         self.config = SimpleNamespace(
