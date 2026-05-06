@@ -249,6 +249,30 @@ models = ["gpt-oss:20b", "gemma4:27b"]
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
+def test_runtime_config_reads_openai_endpoint_url_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "openai_compatible"
+endpoint_url = "https://api.example.test/openai/deployments/local/chat/completions?api-version=2026-01-01"
+name = "local-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_base_url == "https://api.example.test/openai/deployments/local"
+    assert config.model_endpoint_query == (("api-version", "2026-01-01"),)
+    assert model.default_query == {"api-version": "2026-01-01"}
+
+
 def test_runtime_config_reads_recursion_limit_from_toml(
     tmp_path: Path,
     monkeypatch,

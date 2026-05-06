@@ -12,7 +12,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.backends import (
@@ -63,6 +63,8 @@ DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 logger = logging.getLogger(__name__)
+OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
+OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
 
 OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
     "reasoning_content",
@@ -251,6 +253,44 @@ def normalize_model_base_url(
     if "://" not in candidate:
         candidate = f"http://{candidate}"
     return candidate.rstrip("/")
+
+
+def normalize_openai_endpoint_url(
+    value: Any | None,
+    *,
+    required_message: str | None = None,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    candidate = normalize_model_base_url(
+        value,
+        required_message=required_message,
+    )
+    parsed = urlsplit(candidate)
+    path = parsed.path.rstrip("/")
+    for suffix in (
+        OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX,
+        OPENAI_RESPONSES_PATH_SUFFIX,
+    ):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            break
+
+    base_url = urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+    return base_url, tuple(parse_qsl(parsed.query, keep_blank_values=True))
+
+
+def model_endpoint_query_to_dict(
+    query: tuple[tuple[str, str], ...],
+) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, value in query:
+        existing = values.get(key)
+        if existing is None:
+            values[key] = value
+        elif isinstance(existing, list):
+            existing.append(value)
+        else:
+            values[key] = [existing, value]
+    return values
 
 
 def normalize_optional_string(value: Any | None) -> str | None:
@@ -683,6 +723,7 @@ class ExtensionsConfig:
 class ModelDefaults:
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
     base_url: str = DEFAULT_OLLAMA_BASE_URL
+    endpoint_query: tuple[tuple[str, str], ...] = ()
     name: str = DEFAULT_MODEL
     api_key: str | None = None
     models: tuple[str, ...] = ()
@@ -720,6 +761,8 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
         )
 
     raw_base_url = str(raw_model.get("base_url", "")).strip()
+    raw_endpoint_url = raw_model.get("endpoint_url")
+    endpoint_query: tuple[tuple[str, str], ...] = ()
     if provider == "ollama":
         if raw_base_url:
             base_url = normalize_model_base_url(
@@ -732,16 +775,25 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
                 normalize_model_port(raw_model.get("port")),
             )
     else:
-        base_url = normalize_model_base_url(
-            raw_model.get("base_url"),
-            required_message=(
-                "OpenAI-compatible model config must define a non-empty 'base_url'."
-            ),
+        required_message = (
+            "OpenAI-compatible model config must define a non-empty "
+            "'base_url' or 'endpoint_url'."
         )
+        if normalize_optional_string(raw_endpoint_url):
+            base_url, endpoint_query = normalize_openai_endpoint_url(
+                raw_endpoint_url,
+                required_message=required_message,
+            )
+        else:
+            base_url = normalize_model_base_url(
+                raw_model.get("base_url"),
+                required_message=required_message,
+            )
 
     return ModelDefaults(
         provider=provider,
         base_url=base_url,
+        endpoint_query=endpoint_query,
         name=raw_name or (parsed_models[0] if parsed_models else DEFAULT_MODEL),
         api_key=normalize_optional_string(raw_model.get("api_key")),
         models=tuple(parsed_models),
@@ -1111,6 +1163,7 @@ class RuntimeConfigOverrides:
     model_provider: str | None = None
     model_name: str | None = None
     model_base_url: str | None = None
+    model_endpoint_url: str | None = None
     model_api_key: str | None = None
     model_temperature: float | None = None
     reasoning_level: str | None = None
@@ -1134,6 +1187,7 @@ class RuntimeConfig:
     rag_requested: bool = False
     rag: ResolvedRagConfig | None = None
     rag_error: str | None = None
+    model_endpoint_query: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def from_env(
@@ -1168,27 +1222,40 @@ class RuntimeConfig:
             normalize_optional_string(overrides.model_base_url)
             or os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
         )
+        generic_model_endpoint_url = (
+            normalize_optional_string(overrides.model_endpoint_url)
+            or os.getenv("DEEPAGENT_MODEL_ENDPOINT_URL", "").strip()
+        )
         generic_model_reasoning = (
             normalize_optional_string(overrides.reasoning_level)
             or os.getenv("DEEPAGENT_MODEL_REASONING", "").strip()
         )
-        model_name_alias = os.getenv("OLLAMA_MODEL", "").strip() if model_provider == "ollama" else ""
+        model_name_alias = (
+            os.getenv("OLLAMA_MODEL", "").strip()
+            if model_provider == "ollama"
+            else ""
+        )
         model_base_url_alias = (
-            os.getenv("OLLAMA_BASE_URL", "").strip() if model_provider == "ollama" else ""
+            os.getenv("OLLAMA_BASE_URL", "").strip()
+            if model_provider == "ollama"
+            else ""
         )
         model_reasoning_alias = (
-            os.getenv("OLLAMA_REASONING", "").strip() if model_provider == "ollama" else ""
+            os.getenv("OLLAMA_REASONING", "").strip()
+            if model_provider == "ollama"
+            else ""
         )
 
         if (
             model_provider_override
             and model_provider != model_defaults.provider
             and not generic_model_base_url
+            and not generic_model_endpoint_url
         ):
             raise ValueError(
                 "Switching model providers via DEEPAGENT_MODEL_PROVIDER also requires "
-                "DEEPAGENT_MODEL_BASE_URL so the new provider does not inherit an "
-                "incompatible endpoint."
+                "DEEPAGENT_MODEL_BASE_URL or DEEPAGENT_MODEL_ENDPOINT_URL so the "
+                "new provider does not inherit an incompatible endpoint."
             )
 
         if (
@@ -1210,10 +1277,21 @@ class RuntimeConfig:
                 ]
             )
         )
-        model_base_url = normalize_model_base_url(
-            generic_model_base_url or model_base_url_alias or model_defaults.base_url,
-            required_message="The model base URL cannot be empty.",
-        )
+        model_endpoint_query = model_defaults.endpoint_query
+        if model_provider == "openai_compatible" and generic_model_endpoint_url:
+            model_base_url, model_endpoint_query = normalize_openai_endpoint_url(
+                generic_model_endpoint_url,
+                required_message="The model endpoint URL cannot be empty.",
+            )
+        else:
+            model_base_url = normalize_model_base_url(
+                generic_model_base_url
+                or model_base_url_alias
+                or model_defaults.base_url,
+                required_message="The model base URL cannot be empty.",
+            )
+            if generic_model_base_url or model_base_url_alias:
+                model_endpoint_query = ()
         if overrides.model_api_key is not None:
             model_api_key = normalize_optional_string(overrides.model_api_key)
         else:
@@ -1267,6 +1345,7 @@ class RuntimeConfig:
             rag_requested=rag_requested,
             rag=rag,
             rag_error=rag_error,
+            model_endpoint_query=model_endpoint_query,
         )
 
 
@@ -1291,6 +1370,9 @@ def build_model(
         "api_key": config.model_api_key or "deepagent",
         "temperature": config.model_temperature,
     }
+    default_query = model_endpoint_query_to_dict(config.model_endpoint_query)
+    if default_query:
+        kwargs["default_query"] = default_query
     return OpenAICompatibleChatOpenAI(**kwargs)
 
 

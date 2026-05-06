@@ -81,6 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--provider", help="Model provider: ollama or openai_compatible.")
     parser.add_argument("--base-url", help="Model server base URL.")
+    parser.add_argument(
+        "--endpoint-url",
+        help=(
+            "OpenAI-compatible full endpoint URL. "
+            "Use this for non-standard /chat/completions paths."
+        ),
+    )
     parser.add_argument("--model", help="Model name to run.")
     parser.add_argument("--api-key", help="API key for OpenAI-compatible model servers.")
     parser.add_argument("--temperature", type=float, help="Model temperature.")
@@ -169,6 +176,7 @@ def runtime_overrides_from_args(args: argparse.Namespace) -> RuntimeConfigOverri
         model_provider=args.provider,
         model_name=args.model,
         model_base_url=args.base_url,
+        model_endpoint_url=args.endpoint_url,
         model_api_key=args.api_key,
         model_temperature=args.temperature,
         reasoning_level=args.reasoning,
