@@ -62,6 +62,7 @@ DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+AGENTS_MD_FILENAME = "AGENTS.md"
 logger = logging.getLogger(__name__)
 OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
 OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
@@ -1112,15 +1113,40 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     )
 
 
-def compose_agent_system_prompt(base_prompt: str, custom_instruction: str | None) -> str:
+def load_agents_md_instruction(project_root: Path | None = None) -> str | None:
+    agents_md_path = (project_root or PROJECT_ROOT).resolve() / AGENTS_MD_FILENAME
+    try:
+        instruction = agents_md_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", agents_md_path, exc)
+        return None
+    return instruction or None
+
+
+def compose_agent_system_prompt(
+    base_prompt: str,
+    custom_instruction: str | None,
+    *,
+    project_root: Path | None = None,
+) -> str:
+    sections = [base_prompt]
+    agents_md_instruction = load_agents_md_instruction(project_root)
+    if agents_md_instruction:
+        sections.append(
+            f"Repository instructions from {AGENTS_MD_FILENAME}:\n"
+            f"{agents_md_instruction}"
+        )
+
     instruction = (custom_instruction or "").strip()
     if not instruction:
-        return base_prompt
-    return (
-        f"{base_prompt}\n\n"
+        return "\n\n".join(sections)
+    sections.append(
         "Custom user instruction from [agent].custom_instruction in deepagent.toml:\n"
         f"{instruction}"
     )
+    return "\n\n".join(sections)
 
 
 def load_file_config(config_path: str | Path | None = None) -> FileConfig:
@@ -1246,16 +1272,24 @@ class RuntimeConfig:
             else ""
         )
 
+        endpoint_url_satisfies_provider_switch = (
+            model_provider == "openai_compatible" and bool(generic_model_endpoint_url)
+        )
         if (
             model_provider_override
             and model_provider != model_defaults.provider
             and not generic_model_base_url
-            and not generic_model_endpoint_url
+            and not endpoint_url_satisfies_provider_switch
         ):
+            required_url_env = "DEEPAGENT_MODEL_BASE_URL"
+            if model_provider == "openai_compatible":
+                required_url_env = (
+                    "DEEPAGENT_MODEL_BASE_URL or DEEPAGENT_MODEL_ENDPOINT_URL"
+                )
             raise ValueError(
                 "Switching model providers via DEEPAGENT_MODEL_PROVIDER also requires "
-                "DEEPAGENT_MODEL_BASE_URL or DEEPAGENT_MODEL_ENDPOINT_URL so the "
-                "new provider does not inherit an incompatible endpoint."
+                f"{required_url_env} so the new provider does not inherit an "
+                "incompatible endpoint."
             )
 
         if (
@@ -1634,6 +1668,7 @@ def create_configured_graph(
                     if apply_custom_instruction
                     else None
                 ),
+                project_root=PROJECT_ROOT,
             ),
             rag_enabled=config.rag is not None,
         ),
@@ -1853,6 +1888,7 @@ class AgentRuntime:
                         compose_agent_system_prompt(
                             SYSTEM_PROMPT,
                             self.config.extensions.custom_instruction,
+                            project_root=self.project_root,
                         ),
                         rag_enabled=rag_tool_enabled,
                     ),

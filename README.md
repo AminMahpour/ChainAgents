@@ -257,6 +257,7 @@ provider = "auto"
 Notes:
 
 - The default corpus is docs-only: `README.md`, `chainlit.md`, `prompts/**/*.md`, and `skills/**/*.md`.
+- `AGENTS.md` and `AGENT.md` stay out of RAG because `AGENTS.md` is loaded directly into the main agent prompt when present.
 - The persisted local index lives under [`.rag/`](.rag/) and is safe to delete and rebuild.
 - With `provider = "auto"`, the embedding backend follows the active chat-model provider.
 - For Ollama, the default embedding model is `nomic-embed-text`.
@@ -386,6 +387,7 @@ Supported subagent fields:
 Main `[agent]` additions:
 
 - `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
+- `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
 - `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
 - `summarization_trigger_tokens`: optional positive integer token threshold that triggers summarization when reached.
