@@ -527,7 +527,7 @@ async def test_cli_event_renderer_appends_reasoning_chunks_inline() -> None:
 
 
 @pytest.mark.anyio
-async def test_cli_event_renderer_boxes_tool_call_start() -> None:
+async def test_cli_event_renderer_uses_block_panel_for_tool_call_start() -> None:
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -559,8 +559,10 @@ async def test_cli_event_renderer_boxes_tool_call_start() -> None:
     assert "tool: read_file" in output
     assert "args: " in output
     assert '"path": "README.md"' in output
-    assert "+" in output
-    assert "|" in output
+    assert "+" not in output
+    assert "|" not in output
+    assert "━" in output
+    assert "┃" in output
 
 
 @pytest.mark.anyio
@@ -632,8 +634,10 @@ async def test_cli_event_renderer_truncates_tool_results_to_200_characters() -> 
     assert "tool: read_file" in output
     assert "result: " in output
     assert "TAIL" not in output
-    assert "+" in output
-    assert "|" in output
+    assert "+" not in output
+    assert "|" not in output
+    assert "━" in output
+    assert "┃" in output
 
 
 @pytest.mark.anyio

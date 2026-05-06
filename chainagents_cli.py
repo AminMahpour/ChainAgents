@@ -15,6 +15,7 @@ from typing import Any, TextIO
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from agent_commands import (
@@ -46,6 +47,9 @@ LANGGRAPH_STREAM_MODES = {
     "tasks",
     "debug",
 }
+CLI_PANEL_BOX = box.HEAVY
+CLI_TABLE_BOX = box.SIMPLE_HEAVY
+CLI_PANEL_PADDING = (0, 1)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -302,6 +306,32 @@ def pretty_tool_call_args(value: Any) -> str:
     return json.dumps(parsed, indent=2, sort_keys=True, ensure_ascii=True)
 
 
+def cli_console(file: TextIO) -> Console:
+    return Console(
+        file=file,
+        highlight=False,
+        soft_wrap=True,
+    )
+
+
+def cli_panel(renderable: Any, *, title: str, border_style: str) -> Panel:
+    return Panel(
+        renderable,
+        title=title,
+        title_align="left",
+        border_style=border_style,
+        box=CLI_PANEL_BOX,
+        padding=CLI_PANEL_PADDING,
+    )
+
+
+def cli_kv_table() -> Table:
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim", no_wrap=True)
+    table.add_column()
+    return table
+
+
 def reasoning_text_from_token(token: Any) -> str:
     if hasattr(token, "additional_kwargs"):
         text = stringify_content(token.additional_kwargs.get("reasoning_content"))
@@ -416,16 +446,8 @@ class CliEventRenderer:
         self.tool_args_buffers: dict[str, str] = {}
         self.tool_call_started: set[str] = set()
         self.completed_tool_results: set[tuple[str, str, str]] = set()
-        self.stdout_console = Console(
-            file=stdout,
-            highlight=False,
-            soft_wrap=True,
-        )
-        self.stderr_console = Console(
-            file=stderr,
-            highlight=False,
-            soft_wrap=True,
-        )
+        self.stdout_console = cli_console(stdout)
+        self.stderr_console = cli_console(stderr)
 
     async def handle_event(self, event: dict[str, Any]) -> None:
         if event.get("event") != "on_chain_stream":
@@ -568,12 +590,10 @@ class CliEventRenderer:
             body.append("\nargs: ", style="dim yellow")
             body.append(args, style="yellow")
         self.stderr_console.print(
-            Panel(
+            cli_panel(
                 body,
                 title="Tool Call",
-                title_align="left",
                 border_style="yellow",
-                box=box.ASCII,
             )
         )
 
@@ -607,12 +627,10 @@ class CliEventRenderer:
             body.append("\nresult: ", style="dim yellow")
             body.append(content, style="yellow")
         self.stderr_console.print(
-            Panel(
+            cli_panel(
                 body,
                 title="Tool Result",
-                title_align="left",
                 border_style="red" if status.lower() == "error" else "green",
-                box=box.ASCII,
             )
         )
 
@@ -679,6 +697,18 @@ def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
     }
 
 
+def rag_status_text(rag: dict[str, Any]) -> Text:
+    if rag["enabled"] and rag["ready"]:
+        text = Text("ready", style="bold green")
+        text.append(f" ({rag['file_count']} files, {rag['chunk_count']} chunks)")
+        return text
+    if rag["enabled"]:
+        text = Text("unavailable", style="bold yellow")
+        text.append(f" ({rag['reason'] or 'unknown error'})", style="yellow")
+        return text
+    return Text("disabled", style="dim")
+
+
 def print_runtime_status(
     runtime: AgentRuntime,
     *,
@@ -690,23 +720,28 @@ def print_runtime_status(
         print(json.dumps({"status": payload}, indent=2, sort_keys=True), file=stdout)
         return
 
-    print("ChainAgents runtime", file=stdout)
-    print(f"- Model provider: {payload['model_provider_label']}", file=stdout)
-    print(f"- Model: {payload['model']}", file=stdout)
-    print(f"- Reasoning: {payload['reasoning']}", file=stdout)
-    print(f"- Recursion limit: {payload['recursion_limit']}", file=stdout)
-    print(f"- Persistence: {payload['persistence']}", file=stdout)
-    rag = payload["rag"]
-    if rag["enabled"] and rag["ready"]:
-        print(
-            f"- RAG: ready ({rag['file_count']} files, {rag['chunk_count']} chunks)",
-            file=stdout,
+    table = cli_kv_table()
+    table.add_row(
+        "Model provider",
+        Text(str(payload["model_provider_label"]), "bright_white"),
+    )
+    table.add_row("Model", Text(str(payload["model"]), "bright_white"))
+    table.add_row(
+        "Base URL",
+        Text(str(payload["model_base_url"] or "not set"), "white"),
+    )
+    table.add_row("Reasoning", Text(str(payload["reasoning"]), "cyan"))
+    table.add_row("Recursion limit", Text(str(payload["recursion_limit"]), "white"))
+    table.add_row("Persistence", Text(str(payload["persistence"]), "white"))
+    table.add_row("RAG", rag_status_text(payload["rag"]))
+    table.add_row("Commands", Text(str(len(payload["commands"])), "bold cyan"))
+    cli_console(stdout).print(
+        cli_panel(
+            table,
+            title="ChainAgents Runtime",
+            border_style="bright_cyan",
         )
-    elif rag["enabled"]:
-        print(f"- RAG: unavailable ({rag['reason'] or 'unknown error'})", file=stdout)
-    else:
-        print("- RAG: disabled", file=stdout)
-    print(f"- Commands: {len(payload['commands'])}", file=stdout)
+    )
 
 
 def print_command_list(
@@ -739,16 +774,55 @@ def print_command_list(
         )
         return
 
+    console = cli_console(stdout)
     if not commands:
-        print("No configured commands.", file=stdout)
-    else:
-        for command in commands:
-            print(
-                f"/{command['name']} ({command['target']}): {command['description']}",
-                file=stdout,
+        console.print(
+            cli_panel(
+                Text("No configured commands.", style="dim"),
+                title="Commands",
+                border_style="bright_black",
             )
-    for note in runtime.chainlit_command_notes:
-        print(f"note: {note}", file=stdout)
+        )
+    else:
+        table = Table(
+            box=CLI_TABLE_BOX,
+            border_style="bright_black",
+            header_style="bold cyan",
+            expand=True,
+            show_lines=False,
+        )
+        table.add_column("Command", style="bold bright_white", no_wrap=True)
+        table.add_column("Target", style="cyan", no_wrap=True)
+        table.add_column("Description", style="white")
+        table.add_column("Source", style="dim", no_wrap=True)
+        for command in commands:
+            table.add_row(
+                f"/{command['name']}",
+                str(command["target"]),
+                str(command["description"] or "-"),
+                str(command["source"] or "-"),
+            )
+        console.print(
+            cli_panel(
+                table,
+                title=f"Commands ({len(commands)})",
+                border_style="cyan",
+            )
+        )
+    if runtime.chainlit_command_notes:
+        notes = Text()
+        for index, note in enumerate(runtime.chainlit_command_notes):
+            if index:
+                notes.append("\n")
+            notes.append("note: ", style="dim yellow")
+            notes.append(str(note), style="yellow")
+        console.print(
+            cli_panel(
+                notes,
+                title="Command Notes",
+                border_style="yellow",
+            )
+        )
 
 
 def print_rag_status(
@@ -763,14 +837,23 @@ def print_rag_status(
         print(json.dumps({action: payload}, indent=2, sort_keys=True), file=stdout)
         return
     if status.ready:
-        print(
-            f"{action}: ready ({status.file_count} files, {status.chunk_count} chunks)",
-            file=stdout,
-        )
+        body = Text(f"{action}: ready", style="bold green")
+        body.append(f" ({status.file_count} files, {status.chunk_count} chunks)")
+        border_style = "green"
     elif status.enabled:
-        print(f"{action}: unavailable ({status.reason or 'unknown error'})", file=stdout)
+        body = Text(f"{action}: unavailable", style="bold yellow")
+        body.append(f" ({status.reason or 'unknown error'})", style="yellow")
+        border_style = "yellow"
     else:
-        print(f"{action}: disabled", file=stdout)
+        body = Text(f"{action}: disabled", style="dim")
+        border_style = "bright_black"
+    cli_console(stdout).print(
+        cli_panel(
+            body,
+            title="RAG",
+            border_style=border_style,
+        )
+    )
 
 
 def print_upload_result(
@@ -783,17 +866,26 @@ def print_upload_result(
     if json_output:
         print(json.dumps({"upload_rag": payload}, indent=2, sort_keys=True), file=stdout)
         return
+    body = Text()
     if result.added_files:
-        print(
-            "upload-rag: added "
-            f"{', '.join(result.added_files)} "
-            f"({result.indexed_files} files, {result.chunk_count} chunks)",
-            file=stdout,
-        )
+        body.append("upload-rag: added ", style="bold green")
+        body.append(", ".join(result.added_files), style="bright_white")
+        body.append(f" ({result.indexed_files} files, {result.chunk_count} chunks)")
     elif result.reason:
-        print(f"upload-rag: {result.reason}", file=stdout)
+        body.append(f"upload-rag: {result.reason}", style="yellow")
     if result.rejected_files:
-        print(f"upload-rag: rejected {', '.join(result.rejected_files)}", file=stdout)
+        if body.plain:
+            body.append("\n")
+        body.append("upload-rag: rejected ", style="bold yellow")
+        body.append(", ".join(result.rejected_files), style="yellow")
+    if body.plain:
+        cli_console(stdout).print(
+            cli_panel(
+                body,
+                title="Upload RAG",
+                border_style="green" if result.added_files else "yellow",
+            )
+        )
 
 
 async def ingest_uploads(
