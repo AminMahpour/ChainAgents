@@ -39,6 +39,10 @@ cwd = "."
 recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
+summarization_middleware_enabled = true
+# Optional token thresholds used when the installed LangChain middleware supports them.
+summarization_trigger_tokens = 1000
+summarization_keep_tokens = 500
 
 [rag]
 enabled = true

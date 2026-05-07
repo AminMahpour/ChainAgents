@@ -73,6 +73,7 @@ OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
     "reasoning_text",
     "reasoning_details",
 )
+SUMMARIZATION_STATUS_EVENT_KIND = "summarization_status"
 
 SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
@@ -439,11 +440,88 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             return self._error_tool_message(request, exc)
 
 
+class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
+    def __init__(self, inner: AgentMiddleware[Any, Any, Any], *, source: str = "main-agent") -> None:
+        super().__init__()
+        self.inner = inner
+        self.source = source
+
+    @property
+    def name(self) -> str:
+        return str(getattr(self.inner, "name", "SummarizationMiddleware"))
+
+    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        will_summarize = self._will_summarize(state)
+        if will_summarize:
+            self._emit(runtime, "started", "Conversation summarization triggered.")
+        try:
+            result = self.inner.before_model(state, runtime)
+        except Exception:
+            if will_summarize:
+                self._emit(runtime, "failed", "Conversation summarization failed.")
+            raise
+        if result is not None:
+            if not will_summarize:
+                self._emit(runtime, "started", "Conversation summarization triggered.")
+            self._emit(runtime, "completed", "Conversation summarization completed.")
+        return result
+
+    async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        will_summarize = self._will_summarize(state)
+        if will_summarize:
+            self._emit(runtime, "started", "Conversation summarization triggered.")
+        try:
+            result = await self.inner.abefore_model(state, runtime)
+        except Exception:
+            if will_summarize:
+                self._emit(runtime, "failed", "Conversation summarization failed.")
+            raise
+        if result is not None:
+            if not will_summarize:
+                self._emit(runtime, "started", "Conversation summarization triggered.")
+            self._emit(runtime, "completed", "Conversation summarization completed.")
+        return result
+
+    def _will_summarize(self, state: Any) -> bool:
+        try:
+            messages = state["messages"]
+            ensure_ids = getattr(self.inner, "_ensure_message_ids", None)
+            if callable(ensure_ids):
+                ensure_ids(messages)
+            token_counter = getattr(self.inner, "token_counter")
+            should_summarize = getattr(self.inner, "_should_summarize")
+            determine_cutoff = getattr(self.inner, "_determine_cutoff_index")
+            total_tokens = token_counter(messages)
+            return bool(
+                should_summarize(messages, total_tokens)
+                and determine_cutoff(messages) > 0
+            )
+        except Exception:
+            return False
+
+    def _emit(self, runtime: Any, status: str, message: str) -> None:
+        stream_writer = getattr(runtime, "stream_writer", None)
+        if not callable(stream_writer):
+            return
+        try:
+            stream_writer(
+                {
+                    "kind": SUMMARIZATION_STATUS_EVENT_KIND,
+                    "status": status,
+                    "source": self.source,
+                    "message": message,
+                }
+            )
+        except Exception as exc:
+            logger.debug("Failed to emit summarization status event: %s", exc)
+
+
 def _build_summarization_middleware(
     *,
     config: RuntimeConfig,
     reasoning_level: ReasoningLevel,
     model_name: str | None = None,
+    source: str = "main-agent",
 ) -> AgentMiddleware[Any, Any, Any] | None:
     try:
         from langchain.agents.middleware import SummarizationMiddleware
@@ -479,7 +557,7 @@ def _build_summarization_middleware(
             exc,
         )
         return None
-    return middleware
+    return SummarizationStatusMiddleware(middleware, source=source)
 
 
 def build_agent_middleware(
@@ -487,6 +565,7 @@ def build_agent_middleware(
     config: RuntimeConfig | None = None,
     reasoning_level: ReasoningLevel | None = None,
     model_name: str | None = None,
+    source: str = "main-agent",
     project_root: Path | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
     middleware: list[AgentMiddleware[Any, Any, Any]] = [
@@ -501,6 +580,7 @@ def build_agent_middleware(
             config=config,
             reasoning_level=reasoning_level,
             model_name=model_name,
+            source=source,
         )
         if summarization_middleware is not None:
             middleware.append(summarization_middleware)
@@ -1624,6 +1704,7 @@ def build_graph_subagent_specs(
                 config=config,
                 reasoning_level=config.default_reasoning,
                 model_name=subagent.model,
+                source=subagent.name,
             )
         )
         for subagent in config.extensions.subagents
@@ -1675,6 +1756,7 @@ def create_configured_graph(
         middleware=build_agent_middleware(
             config=config,
             reasoning_level=config.default_reasoning,
+            source="main-agent",
             project_root=PROJECT_ROOT,
         ),
         backend=build_deepagent_backend(),
@@ -1854,6 +1936,7 @@ class AgentRuntime:
                     config=self.config,
                     reasoning_level=reasoning_level,
                     model_name=selected_model,
+                    source="main-agent",
                     project_root=self.project_root,
                 )
                 subagent_specs: list[Any] = [
@@ -1870,6 +1953,7 @@ class AgentRuntime:
                             config=self.config,
                             reasoning_level=reasoning_level,
                             model_name=subagent.model or selected_model,
+                            source=subagent.name,
                             project_root=self.project_root,
                         ),
                     )

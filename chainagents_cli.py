@@ -38,6 +38,7 @@ from rag_runtime import RagStatus, RagUploadResult, UploadedRagFile
 
 DEFAULT_CLI_THREAD_ID = "cli"
 TOOL_RESULT_PREVIEW_CHARS = 200
+SUMMARIZATION_STATUS_KIND = "summarization_status"
 LANGGRAPH_STREAM_MODES = {
     "values",
     "updates",
@@ -476,6 +477,8 @@ class CliEventRenderer:
             self._handle_message_chunk(part)
         elif kind == "updates":
             self._handle_update_chunk(part)
+        elif kind == "custom":
+            self._handle_custom_chunk(part)
 
     def finish(self) -> str:
         self._close_reasoning_line()
@@ -536,6 +539,36 @@ class CliEventRenderer:
             for message in messages_from_node_data(data):
                 if getattr(message, "type", None) == "tool":
                     self._complete_tool(source, message)
+
+    def _handle_custom_chunk(self, part: dict[str, Any]) -> None:
+        data = part.get("data")
+        if not isinstance(data, dict):
+            return
+        if data.get("kind") != SUMMARIZATION_STATUS_KIND:
+            return
+        if self.json_output:
+            return
+
+        status = str(data.get("status") or "triggered").strip() or "triggered"
+        source = str(data.get("source") or "main-agent").strip() or "main-agent"
+        message = str(data.get("message") or "Conversation summarization triggered.").strip()
+        self._close_reasoning_line()
+        body = Text.assemble(
+            ("status: ", "dim"),
+            (status, "bold cyan"),
+            ("\nsource: ", "dim"),
+            (source, "cyan"),
+        )
+        if message:
+            body.append("\nmessage: ", style="dim")
+            body.append(message, style="white")
+        self.stderr_console.print(
+            cli_panel(
+                body,
+                title="Summarization",
+                border_style="cyan",
+            )
+        )
 
     def _stream_response(self, text: str) -> None:
         delta = text[len(self.response_buffer) :] if text.startswith(self.response_buffer) else text
@@ -1013,7 +1046,7 @@ async def run_agent_prompt(
         payload,
         config=config,
         version="v2",
-        stream_mode=["messages", "updates"],
+        stream_mode=["messages", "updates", "custom"],
         subgraphs=True,
     )
 

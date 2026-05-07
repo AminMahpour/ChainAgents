@@ -46,10 +46,41 @@ class _ResponseMessage:
         self.update_count += 1
 
 
+class _Step:
+    instances: list["_Step"] = []
+
+    def __init__(
+        self,
+        name: str,
+        type: str,
+        default_open: bool = False,
+        **_kwargs: Any,
+    ) -> None:
+        self.name = name
+        self.type = type
+        self.default_open = default_open
+        self.input: Any = None
+        self.output: Any = None
+        self.start: Any = None
+        self.end: Any = None
+        self.send_count = 0
+        self.update_count = 0
+        self.id = f"step-{len(self.instances) + 1}"
+        self.instances.append(self)
+
+    async def send(self) -> None:
+        self.send_count += 1
+
+    async def update(self) -> None:
+        self.update_count += 1
+
+
 @pytest.fixture(autouse=True)
 def _patch_chainlit_tasks(monkeypatch) -> None:
+    _Step.instances.clear()
     monkeypatch.setattr(chainlit_bridge.cl, "TaskStatus", _TaskStatus)
     monkeypatch.setattr(chainlit_bridge.cl, "Task", _Task)
+    monkeypatch.setattr(chainlit_bridge.cl, "Step", _Step)
 
 
 @pytest.mark.anyio
@@ -165,3 +196,34 @@ async def test_astream_events_ignores_non_langgraph_stream_chunks() -> None:
     )
 
     assert handled_parts == []
+
+
+@pytest.mark.anyio
+async def test_chainlit_bridge_shows_summarization_status() -> None:
+    bridge = ChainlitEventBridge(prompt="hello")
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "kind": "summarization_status",
+                        "status": "started",
+                        "source": "main-agent",
+                        "message": "Conversation summarization triggered.",
+                    },
+                ),
+            },
+        }
+    )
+
+    assert len(_Step.instances) == 1
+    step = _Step.instances[0]
+    assert step.name == "main-agent summarization"
+    assert step.type == "llm"
+    assert step.default_open is True
+    assert step.output == "Conversation summarization triggered."
+    assert step.send_count == 1
+    assert step.update_count == 1

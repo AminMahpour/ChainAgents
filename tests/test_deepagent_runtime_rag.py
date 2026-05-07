@@ -562,21 +562,72 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
     middleware = captured["kwargs"]["middleware"]
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
     summarizers = [
-        item for item in middleware if isinstance(item, FakeSummarizationMiddleware)
+        item.inner
+        for item in middleware
+        if isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
     ]
     assert len(summarizers) == 1
+    assert isinstance(summarizers[0], FakeSummarizationMiddleware)
     assert summarizers[0].model == "model::gpt-oss:20b"
     assert summarizers[0].trigger == ("tokens", 5000)
     assert summarizers[0].keep == ("tokens", 2000)
     subagent_specs = captured["kwargs"]["subagents"]
     subagent_middleware = subagent_specs[0]["middleware"]
     subagent_summarizers = [
-        item
+        item.inner
         for item in subagent_middleware
-        if isinstance(item, FakeSummarizationMiddleware)
+        if isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
     ]
     assert len(subagent_summarizers) == 1
+    assert isinstance(subagent_summarizers[0], FakeSummarizationMiddleware)
     assert subagent_summarizers[0].model == "model::gpt-oss:120b"
+
+
+def test_summarization_status_middleware_emits_stream_events() -> None:
+    events: list[dict[str, str]] = []
+
+    class FakeRuntime:
+        def stream_writer(self, event: dict[str, str]) -> None:
+            events.append(event)
+
+    class FakeSummarizationMiddleware:
+        def token_counter(self, messages) -> int:
+            return 12
+
+        def _should_summarize(self, messages, total_tokens: int) -> bool:
+            return total_tokens >= 10
+
+        def _determine_cutoff_index(self, messages) -> int:
+            return 1
+
+        def before_model(self, state, runtime):
+            return {"messages": ["summary"]}
+
+    middleware = deepagent_runtime.SummarizationStatusMiddleware(
+        FakeSummarizationMiddleware(),
+        source="main-agent",
+    )
+
+    result = middleware.before_model(
+        {"messages": ["one", "two"]},
+        FakeRuntime(),
+    )
+
+    assert result == {"messages": ["summary"]}
+    assert events == [
+        {
+            "kind": "summarization_status",
+            "status": "started",
+            "source": "main-agent",
+            "message": "Conversation summarization triggered.",
+        },
+        {
+            "kind": "summarization_status",
+            "status": "completed",
+            "source": "main-agent",
+            "message": "Conversation summarization completed.",
+        },
+    ]
 
 
 def test_get_agent_omits_rag_tool_when_service_is_missing(

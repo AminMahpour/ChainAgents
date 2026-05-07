@@ -600,6 +600,43 @@ async def test_cli_event_renderer_uses_block_panel_for_tool_call_start() -> None
 
 
 @pytest.mark.anyio
+async def test_cli_event_renderer_shows_summarization_status() -> None:
+    stderr = io.StringIO()
+    renderer = chainagents_cli.CliEventRenderer(
+        prompt="hello",
+        stdout=io.StringIO(),
+        stderr=stderr,
+        stream=True,
+        json_output=False,
+        show_reasoning=False,
+        show_tools=False,
+    )
+
+    await renderer.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "kind": "summarization_status",
+                        "status": "started",
+                        "source": "main-agent",
+                        "message": "Conversation summarization triggered.",
+                    },
+                ),
+            },
+        }
+    )
+
+    output = stderr.getvalue()
+    assert "Summarization" in output
+    assert "status: started" in output
+    assert "source: main-agent" in output
+    assert "Conversation summarization triggered." in output
+
+
+@pytest.mark.anyio
 async def test_cli_event_renderer_accumulates_tool_args_across_chunks() -> None:
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(

@@ -18,6 +18,7 @@ DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
 RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
 RESPONSE_STREAM_FLUSH_CHARS = 1024
 CHAINLIT_APP_CONFIG_PATH = Path(__file__).resolve().parent / "chainlit.toml"
+SUMMARIZATION_STATUS_KIND = "summarization_status"
 LANGGRAPH_STREAM_MODES = {
     "values",
     "updates",
@@ -601,6 +602,7 @@ class ChainlitEventBridge:
         self.reasoning_steps: dict[str, cl.Step] = {}
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
+        self.summarization_steps: dict[str, cl.Step] = {}
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
 
@@ -616,6 +618,9 @@ class ChainlitEventBridge:
             return
         if kind == "updates":
             await self._handle_update_chunk(part)
+            return
+        if kind == "custom":
+            await self._handle_custom_chunk(part)
 
     async def handle_event(self, event: dict[str, Any]) -> None:
         if event.get("event") != "on_chain_stream":
@@ -708,6 +713,34 @@ class ChainlitEventBridge:
             for message in messages_from_node_data(data):
                 if getattr(message, "type", None) == "tool":
                     await self._complete_tool_step(source, message)
+
+    async def _handle_custom_chunk(self, part: dict[str, Any]) -> None:
+        data = part.get("data")
+        if not isinstance(data, dict):
+            return
+        if data.get("kind") != SUMMARIZATION_STATUS_KIND:
+            return
+
+        source = str(data.get("source") or "main-agent").strip() or "main-agent"
+        status = str(data.get("status") or "triggered").strip().lower() or "triggered"
+        message = str(data.get("message") or "Conversation summarization triggered.").strip()
+        step = self.summarization_steps.get(source)
+        if step is None:
+            step = cl.Step(
+                name=f"{source} summarization",
+                type="llm",
+                default_open=True,
+            )
+            step.input = self.prompt if source == "main-agent" else ""
+            step.start = utc_now()
+            await step.send()
+            self.summarization_steps[source] = step
+
+        step.output = message
+        if status in {"completed", "skipped", "failed"}:
+            step.end = utc_now()
+            self._schedule_step_auto_collapse(step)
+        await step.update()
 
     async def _stream_reasoning(self, source: str, text: str) -> None:
         previous = self.reasoning_buffers.get(source, "")
@@ -900,6 +933,13 @@ class ChainlitEventBridge:
             await step.update()
             self._schedule_step_auto_collapse(step)
         self.reasoning_steps.clear()
+
+        for step in self.summarization_steps.values():
+            if not step.end:
+                step.end = utc_now()
+            await step.update()
+            self._schedule_step_auto_collapse(step)
+        self.summarization_steps.clear()
 
     def _schedule_step_auto_collapse(self, step: cl.Step) -> None:
         if step.id in self.collapse_scheduled_step_ids:
