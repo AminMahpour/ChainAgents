@@ -241,6 +241,24 @@ def normalize_recursion_limit(
     return recursion_limit
 
 
+def normalize_repeat_penalty(value: Any | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        repeat_penalty = float(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Model repeat_penalty must be a finite number.") from exc
+    if not math.isfinite(repeat_penalty):
+        raise ValueError("Model repeat_penalty must be a finite number.")
+    if repeat_penalty < 0:
+        raise ValueError("Model repeat_penalty must be greater than or equal to 0.")
+    return repeat_penalty
+
+
 def normalize_model_base_url(
     value: Any | None,
     *,
@@ -811,6 +829,7 @@ class ModelDefaults:
     name_is_explicit: bool = False
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
     temperature: float = DEFAULT_TEMPERATURE
+    repeat_penalty: float | None = None
 
 
 @dataclass(frozen=True)
@@ -886,6 +905,7 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
         temperature=normalize_model_temperature(
             raw_model.get("temperature", raw_model.get("tempreature"))
         ),
+        repeat_penalty=normalize_repeat_penalty(raw_model.get("repeat_penalty")),
     )
 
 
@@ -1289,6 +1309,7 @@ class RuntimeConfig:
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    model_repeat_penalty: float | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     rag_requested: bool = False
     rag: ResolvedRagConfig | None = None
@@ -1418,6 +1439,7 @@ class RuntimeConfig:
             if overrides.model_temperature is not None
             else model_defaults.temperature
         )
+        model_repeat_penalty = model_defaults.repeat_penalty
         default_reasoning = normalize_reasoning_level(
             generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
@@ -1452,6 +1474,7 @@ class RuntimeConfig:
             model_base_url=model_base_url,
             model_api_key=model_api_key,
             model_temperature=model_temperature,
+            model_repeat_penalty=model_repeat_penalty,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
             extensions=file_config.extensions,
@@ -1471,12 +1494,15 @@ def build_model(
 ) -> Any:
     selected_model = str(model_name or config.model_name).strip() or config.model_name
     if config.model_provider == "ollama":
-        return ChatOllama(
-            model=selected_model,
-            base_url=config.model_base_url,
-            reasoning=reasoning_level,
-            temperature=config.model_temperature,
-        )
+        kwargs: dict[str, Any] = {
+            "model": selected_model,
+            "base_url": config.model_base_url,
+            "reasoning": reasoning_level,
+            "temperature": config.model_temperature,
+        }
+        if config.model_repeat_penalty is not None:
+            kwargs["repeat_penalty"] = config.model_repeat_penalty
+        return ChatOllama(**kwargs)
 
     kwargs: dict[str, Any] = {
         "model": selected_model,
