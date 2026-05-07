@@ -1306,10 +1306,10 @@ class RuntimeConfig:
     model_base_url: str
     model_api_key: str | None
     model_temperature: float
-    model_repeat_penalty: float | None
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    model_repeat_penalty: float | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     rag_requested: bool = False
     rag: ResolvedRagConfig | None = None
