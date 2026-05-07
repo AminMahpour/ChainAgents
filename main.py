@@ -893,7 +893,7 @@ async def on_message(message: cl.Message) -> None:
         payload,
         config=config,
         version="v2",
-        stream_mode=["messages", "updates"],
+        stream_mode=["messages", "updates", "custom"],
         subgraphs=True,
     )
 

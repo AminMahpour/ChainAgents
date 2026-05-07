@@ -392,6 +392,7 @@ Main `[agent]` additions:
 - `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
 - `summarization_trigger_tokens`: optional positive integer token threshold that triggers summarization when reached.
 - `summarization_keep_tokens`: optional positive integer token budget to keep in conversation history after summarization.
+- When summarization runs, the CLI prints a summarization status panel and Chainlit shows a summarization step in the UI.
 
 ## Chainlit Native Commands
 
