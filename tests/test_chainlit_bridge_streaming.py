@@ -223,6 +223,35 @@ async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> 
 
 
 @pytest.mark.anyio
+async def test_non_chronological_mode_streams_response_immediately() -> None:
+    bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
+
+    await bridge._stream_response("A")
+    await bridge._stream_response("AB")
+
+    assert len(_Message.instances) == 1
+    assert _Message.instances[0].tokens == ["A", "B"]
+
+
+@pytest.mark.anyio
+async def test_non_chronological_mode_keeps_reasoning_step_open_across_tool_call() -> None:
+    bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
+
+    await bridge._stream_reasoning("main-agent", "first thought")
+    await bridge._stream_tool_call(
+        "main-agent",
+        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    )
+    await bridge._stream_reasoning("main-agent", "first thought second thought")
+
+    assert [step.name for step in _Step.instances] == [
+        "main-agent reasoning",
+        "main-agent · read_file",
+    ]
+    assert _Step.instances[0].tokens == ["first thought", " second thought"]
+
+
+@pytest.mark.anyio
 async def test_astream_events_chain_stream_tuple_chunk_is_normalized() -> None:
     bridge = ChainlitEventBridge(prompt="hello")
     handled_parts: list[dict[str, Any]] = []

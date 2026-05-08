@@ -590,7 +590,13 @@ class RunTaskList:
 
 
 class ChainlitEventBridge:
-    def __init__(self, prompt: str, run_task_list: RunTaskList | None = None) -> None:
+    def __init__(
+        self,
+        prompt: str,
+        run_task_list: RunTaskList | None = None,
+        *,
+        chronological_ui_enabled: bool = True,
+    ) -> None:
         self.prompt = prompt
         self.run_task_list = run_task_list
         self.response_message: cl.Message | None = None
@@ -605,6 +611,7 @@ class ChainlitEventBridge:
         self.summarization_steps: dict[str, cl.Step] = {}
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
+        self.chronological_ui_enabled = chronological_ui_enabled
 
     async def start(self) -> None:
         if self.run_task_list is not None:
@@ -773,6 +780,10 @@ class ChainlitEventBridge:
             self.response_task_started = True
         self.response_buffer += delta
         self.pending_response_stream += delta
+        if not self.chronological_ui_enabled:
+            if self.response_message is None:
+                self.response_message = await cl.Message(content="").send()
+            await self._flush_response_stream()
 
     async def _send_final_response_message(self) -> None:
         if not self.response_buffer:
@@ -817,7 +828,8 @@ class ChainlitEventBridge:
         self.last_response_flush_at = time.monotonic()
 
     async def _stream_tool_call(self, source: str, chunk: dict[str, Any]) -> None:
-        await self._close_reasoning_step(source)
+        if self.chronological_ui_enabled:
+            await self._close_reasoning_step(source)
         call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
         state = self.tool_steps.get(call_id)
         if state is None:

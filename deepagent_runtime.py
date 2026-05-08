@@ -802,6 +802,7 @@ class ExtensionsConfig:
     chainlit_model_mode_enabled: bool = True
     chainlit_reasoning_mode_enabled: bool = True
     chainlit_startup_status_enabled: bool = True
+    chainlit_chronological_ui_enabled: bool = True
     summarization_middleware_enabled: bool = False
     summarization_trigger_tokens: int | None = None
     summarization_keep_tokens: int | None = None
@@ -1128,6 +1129,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_reasoning_mode_enabled = chainlit_section.get("reasoning_mode_enabled", True)
     raw_model_mode_enabled = chainlit_section.get("model_mode_enabled", True)
     raw_startup_status_enabled = chainlit_section.get("startup_status_enabled", True)
+    raw_chronological_ui_enabled = chainlit_section.get("chronological_ui_enabled", True)
     if not isinstance(raw_reasoning_mode_enabled, bool):
         raise ValueError(
             "The top-level 'chainlit.reasoning_mode_enabled' config must be a boolean."
@@ -1139,6 +1141,10 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     if not isinstance(raw_startup_status_enabled, bool):
         raise ValueError(
             "The top-level 'chainlit.startup_status_enabled' config must be a boolean."
+        )
+    if not isinstance(raw_chronological_ui_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.chronological_ui_enabled' config must be a boolean."
         )
 
     chainlit_commands: list[ChainlitCommandConfig] = []
@@ -1206,6 +1212,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         chainlit_model_mode_enabled=raw_model_mode_enabled,
         chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
         chainlit_startup_status_enabled=raw_startup_status_enabled,
+        chainlit_chronological_ui_enabled=raw_chronological_ui_enabled,
         summarization_middleware_enabled=raw_summarization_middleware_enabled,
         summarization_trigger_tokens=raw_summarization_trigger_tokens,
         summarization_keep_tokens=raw_summarization_keep_tokens,
