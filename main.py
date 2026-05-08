@@ -874,7 +874,11 @@ async def on_message(message: cl.Message) -> None:
         runtime=runtime,
         url_override=async_url_override,
     )
-    bridge = ChainlitEventBridge(prompt=message.content, run_task_list=run_task_list)
+    bridge = ChainlitEventBridge(
+        prompt=message.content,
+        run_task_list=run_task_list,
+        chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
+    )
     await bridge.start()
 
     config = build_langgraph_config(

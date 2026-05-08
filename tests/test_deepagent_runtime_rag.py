@@ -814,6 +814,7 @@ system_prompt = "Do research"
 model_mode_enabled = false
 reasoning_mode_enabled = false
 startup_status_enabled = false
+chronological_ui_enabled = false
 commands = [
   { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "repo-researcher" },
   { name = "run-tool", description = "Call MCP tool", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo" },
@@ -833,6 +834,7 @@ commands = [
     assert extensions.chainlit_model_mode_enabled is False
     assert extensions.chainlit_reasoning_mode_enabled is False
     assert extensions.chainlit_startup_status_enabled is False
+    assert extensions.chainlit_chronological_ui_enabled is False
 
 
 def test_load_extensions_config_parses_summarization_middleware_flag(
@@ -928,6 +930,24 @@ reasoning_mode_enabled = "no"
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
     with pytest.raises(ValueError, match="reasoning_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_chronological_ui_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+chronological_ui_enabled = "sometimes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="chronological_ui_enabled"):
         deepagent_runtime.load_extensions_config()
 
 

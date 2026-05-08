@@ -42,8 +42,8 @@ skills = ["skills"]
 mcp_servers = ["repo"]
 summarization_middleware_enabled = true
 # Optional token thresholds used when the installed LangChain middleware supports them.
-summarization_trigger_tokens = 1000
-summarization_keep_tokens = 500
+summarization_trigger_tokens = 150000
+summarization_keep_tokens = 10000
 
 [rag]
 enabled = true
@@ -80,6 +80,13 @@ skills = ["skills"]
 mcp_servers = ["repo"]
 
 [chainlit]
+# Set false to hide model selection in chat settings and Modes.
+model_mode_enabled = false
+# Set false to disable per-message reasoning overrides from the Modes picker.
+reasoning_mode_enabled = true
+# Set false to hide the initial startup status message ("Workspace agent ready...").
+startup_status_enabled = false
+
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
