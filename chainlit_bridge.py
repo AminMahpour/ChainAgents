@@ -607,9 +607,8 @@ class ChainlitEventBridge:
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
 
     async def start(self) -> None:
-        self.response_message = await cl.Message(content="").send()
         if self.run_task_list is not None:
-            await self.run_task_list.start(response_for_id=self.response_message.id)
+            await self.run_task_list.start()
 
     async def handle_part(self, part: dict[str, Any]) -> None:
         kind = part["type"]
@@ -639,15 +638,8 @@ class ChainlitEventBridge:
         await self.handle_part(part)
 
     async def finish(self) -> None:
-        await self._flush_response_stream()
         await self._close_all_open_steps()
-        if self.response_message is not None:
-            attach_response_export_actions(
-                self.response_message,
-                prompt=self.prompt,
-                response_text=self.response_buffer,
-            )
-            await self.response_message.update()
+        await self._send_final_response_message()
         if self.run_task_list is not None:
             await self.run_task_list.finish()
 
@@ -772,19 +764,38 @@ class ChainlitEventBridge:
         delta = text[len(self.response_buffer) :] if text.startswith(self.response_buffer) else text
         if not delta:
             return
+        await self._close_active_reasoning_steps()
         if (
             not self.response_task_started
             and self.run_task_list is not None
-            and self.response_message is not None
         ):
+            await self.run_task_list.mark_response_started()
+            self.response_task_started = True
+        self.response_buffer += delta
+        self.pending_response_stream += delta
+
+    async def _send_final_response_message(self) -> None:
+        if not self.response_buffer:
+            return
+
+        if self.response_message is None:
+            self.response_message = await cl.Message(content=self.response_buffer).send()
+            self.pending_response_stream = ""
+        else:
+            await self._flush_response_stream()
+
+        if self.run_task_list is not None:
             await self.run_task_list.mark_response_started(
                 for_id=getattr(self.response_message, "id", None)
             )
             self.response_task_started = True
-        self.response_buffer += delta
-        self.pending_response_stream += delta
-        if self._should_flush_response_stream():
-            await self._flush_response_stream()
+
+        attach_response_export_actions(
+            self.response_message,
+            prompt=self.prompt,
+            response_text=self.response_buffer,
+        )
+        await self.response_message.update()
 
     def _should_flush_response_stream(self) -> bool:
         if len(self.pending_response_stream) >= RESPONSE_STREAM_FLUSH_CHARS:
@@ -806,6 +817,7 @@ class ChainlitEventBridge:
         self.last_response_flush_at = time.monotonic()
 
     async def _stream_tool_call(self, source: str, chunk: dict[str, Any]) -> None:
+        await self._close_reasoning_step(source)
         call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
         state = self.tool_steps.get(call_id)
         if state is None:
@@ -884,6 +896,19 @@ class ChainlitEventBridge:
             if todos:
                 await self.run_task_list.update_todos(todos)
         self.tool_steps.pop(state.call_id, None)
+
+    async def _close_reasoning_step(self, source: str) -> None:
+        step = self.reasoning_steps.pop(source, None)
+        if step is None:
+            return
+        if not step.end:
+            step.end = utc_now()
+        await step.update()
+        self._schedule_step_auto_collapse(step)
+
+    async def _close_active_reasoning_steps(self) -> None:
+        for source in list(self.reasoning_steps):
+            await self._close_reasoning_step(source)
 
     def _resolve_tool_step(self, source: str, tool_message: Any) -> ToolStepState | None:
         tool_call_id = getattr(tool_message, "tool_call_id", None)

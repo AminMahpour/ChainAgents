@@ -46,6 +46,30 @@ class _ResponseMessage:
         self.update_count += 1
 
 
+class _Message:
+    instances: list["_Message"] = []
+
+    def __init__(self, content: str = "", author: str | None = None, **_kwargs: Any) -> None:
+        self.content = content
+        self.author = author
+        self.id = f"message-{len(self.instances) + 1}"
+        self.tokens: list[str] = []
+        self.actions: list[Any] = []
+        self.send_count = 0
+        self.update_count = 0
+        self.instances.append(self)
+
+    async def send(self) -> "_Message":
+        self.send_count += 1
+        return self
+
+    async def stream_token(self, token: str) -> None:
+        self.tokens.append(token)
+
+    async def update(self) -> None:
+        self.update_count += 1
+
+
 class _Step:
     instances: list["_Step"] = []
 
@@ -63,6 +87,7 @@ class _Step:
         self.output: Any = None
         self.start: Any = None
         self.end: Any = None
+        self.tokens: list[str] = []
         self.send_count = 0
         self.update_count = 0
         self.id = f"step-{len(self.instances) + 1}"
@@ -71,16 +96,21 @@ class _Step:
     async def send(self) -> None:
         self.send_count += 1
 
+    async def stream_token(self, token: str) -> None:
+        self.tokens.append(token)
+
     async def update(self) -> None:
         self.update_count += 1
 
 
 @pytest.fixture(autouse=True)
 def _patch_chainlit_tasks(monkeypatch) -> None:
+    _Message.instances.clear()
     _Step.instances.clear()
     monkeypatch.setattr(chainlit_bridge.cl, "TaskStatus", _TaskStatus)
     monkeypatch.setattr(chainlit_bridge.cl, "Task", _Task)
     monkeypatch.setattr(chainlit_bridge.cl, "Step", _Step)
+    monkeypatch.setattr(chainlit_bridge.cl, "Message", _Message)
 
 
 @pytest.mark.anyio
@@ -102,7 +132,72 @@ async def test_response_task_starts_once_for_rapid_response_tokens() -> None:
 
 
 @pytest.mark.anyio
-async def test_response_stream_batches_fast_chunks_until_finish(monkeypatch) -> None:
+async def test_response_message_is_created_on_finish_after_reasoning_steps(monkeypatch) -> None:
+    task_list = _TaskList()
+    run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
+    bridge = ChainlitEventBridge(prompt="hello", run_task_list=run_task_list)
+    monkeypatch.setattr(
+        chainlit_bridge,
+        "attach_response_export_actions",
+        lambda *args, **kwargs: None,
+    )
+
+    await bridge.start()
+
+    assert _Message.instances == []
+    assert [task.title for task in task_list.tasks] == ["main-agent reasoning"]
+    assert task_list.tasks[0].forId is None
+
+    await bridge._stream_reasoning("main-agent", "thinking")
+
+    assert _Message.instances == []
+    assert len(_Step.instances) == 1
+    assert _Step.instances[0].name == "main-agent reasoning"
+
+    await bridge._stream_response("Final answer")
+
+    assert _Message.instances == []
+    assert bridge.response_buffer == "Final answer"
+
+    await bridge.finish()
+
+    assert len(_Message.instances) == 1
+    assert _Message.instances[0].send_count == 1
+    assert _Message.instances[0].content == "Final answer"
+    assert _Message.instances[0].tokens == []
+    assert _Message.instances[0].update_count == 1
+    assert _Step.instances[0].end is not None
+    assert [task.title for task in task_list.tasks] == [
+        "main-agent reasoning",
+        "final response",
+    ]
+    assert task_list.tasks[-1].status == _TaskStatus.DONE
+    assert task_list.tasks[-1].forId == _Message.instances[0].id
+
+
+@pytest.mark.anyio
+async def test_reasoning_after_tool_call_starts_a_new_chronological_step() -> None:
+    bridge = ChainlitEventBridge(prompt="hello")
+
+    await bridge._stream_reasoning("main-agent", "first thought")
+    await bridge._stream_tool_call(
+        "main-agent",
+        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    )
+    await bridge._stream_reasoning("main-agent", "first thought second thought")
+
+    assert [step.name for step in _Step.instances] == [
+        "main-agent reasoning",
+        "main-agent · read_file",
+        "main-agent reasoning",
+    ]
+    assert _Step.instances[0].tokens == ["first thought"]
+    assert _Step.instances[0].end is not None
+    assert _Step.instances[2].tokens == [" second thought"]
+
+
+@pytest.mark.anyio
+async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> None:
     response_message = _ResponseMessage()
     bridge = ChainlitEventBridge(prompt="hello")
     bridge.response_message = response_message  # type: ignore[assignment]
@@ -118,12 +213,12 @@ async def test_response_stream_batches_fast_chunks_until_finish(monkeypatch) -> 
     await bridge._stream_response("B")
     await bridge._stream_response("C")
 
-    assert response_message.tokens == ["A"]
     assert bridge.response_buffer == "ABC"
+    assert response_message.tokens == []
 
     await bridge.finish()
 
-    assert response_message.tokens == ["A", "BC"]
+    assert response_message.tokens == ["ABC"]
     assert response_message.update_count == 1
 
 
