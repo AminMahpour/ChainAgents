@@ -1,3 +1,5 @@
+"""Test the ChainAgents CLI argument parsing, commands, and streaming renderer."""
+
 from __future__ import annotations
 
 import base64
@@ -14,6 +16,7 @@ from rag_runtime import RagStatus, RagUploadResult
 
 
 def test_cli_parses_prompt_and_runtime_flags() -> None:
+    """Verify that CLI parses prompt and runtime flags."""
     args = chainagents_cli.parse_args(
         [
             "--prompt",
@@ -44,6 +47,12 @@ def test_runtime_overrides_from_cli_args_take_precedence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that runtime overrides from CLI args take precedence.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -104,6 +113,11 @@ recursion_limit = 20
 def test_cli_endpoint_url_override_supplies_openai_default_query(
     tmp_path: Path,
 ) -> None:
+    """Verify that CLI endpoint URL override supplies openai default query.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -136,7 +150,10 @@ name = "config-model"
 
 
 class _FakeMcpRuntime:
+    """Provide a test double for fake MCP runtime."""
+
     def __init__(self) -> None:
+        """Initialize the fake MCP runtime instance."""
         self.config = SimpleNamespace(
             default_reasoning="medium",
             model_name="fake-model",
@@ -145,6 +162,14 @@ class _FakeMcpRuntime:
         self.invocation: dict[str, str | None] | None = None
 
     def resolve_chainlit_command(self, name: str):
+        """Resolve chainlit command.
+
+        Args:
+            name: The name value.
+
+        Returns:
+            The resolved chainlit command.
+        """
         if name != "repo-readme":
             return None
         return SimpleNamespace(
@@ -165,6 +190,18 @@ class _FakeMcpRuntime:
         mcp_session_id: str | None,
         server_name: str | None,
     ):
+        """Invoke a configured MCP tool command with parsed arguments.
+
+        Args:
+            tool_name: Name of the tool to invoke.
+            raw_args: Raw argument text supplied with the command.
+            thread_id: Conversation thread identifier.
+            mcp_session_id: MCP session identifier.
+            server_name: The server name value.
+
+        Returns:
+            The invoke MCP tool command result.
+        """
         self.invocation = {
             "tool_name": tool_name,
             "raw_args": raw_args,
@@ -177,6 +214,7 @@ class _FakeMcpRuntime:
 
 @pytest.mark.anyio
 async def test_cli_command_invokes_configured_mcp_tool() -> None:
+    """Verify that CLI command invokes configured MCP tool."""
     args = chainagents_cli.parse_args(
         [
             "--prompt",
@@ -212,11 +250,19 @@ async def test_cli_command_invokes_configured_mcp_tool() -> None:
 
 
 class _FakeRagRuntime:
+    """Provide a test double for fake RAG runtime."""
+
     def __init__(self) -> None:
+        """Initialize the fake RAG runtime instance."""
         self.rebuilt = False
         self.uploaded: list[str] = []
 
     async def rebuild_rag_index(self) -> RagStatus:
+        """Rebuild RAG index.
+
+        Returns:
+            The rebuilt object or status.
+        """
         self.rebuilt = True
         return RagStatus.ready_status(
             file_count=1,
@@ -225,6 +271,15 @@ class _FakeRagRuntime:
         )
 
     async def ingest_rag_uploads(self, *, thread_id: str, uploads):
+        """Ingest RAG uploads.
+
+        Args:
+            thread_id: Conversation thread identifier.
+            uploads: Uploaded files supplied by the user.
+
+        Returns:
+            The ingest RAG uploads result.
+        """
         self.uploaded = [upload.name for upload in uploads]
         return RagUploadResult(
             thread_id=thread_id,
@@ -235,15 +290,35 @@ class _FakeRagRuntime:
 
 
 class _CaptureAgent:
+    """Provide a test double for capture agent."""
+
     def __init__(self) -> None:
+        """Initialize the capture agent instance."""
         self.payload = None
         self.config = None
 
     def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+        """Yield fake stream events for CLI renderer tests.
+
+        Args:
+            payload: The payload value.
+            config: Configuration object used by the operation.
+            version: The version value.
+            stream_mode: The stream mode value.
+            subgraphs: The subgraphs value.
+
+        Returns:
+            The astream events result.
+        """
         self.payload = payload
         self.config = config
 
         async def events():
+            """Provide events behavior.
+
+            Yields:
+                Values produced by events.
+            """
             if False:
                 yield None
 
@@ -251,7 +326,10 @@ class _CaptureAgent:
 
 
 class _FakePromptRuntime:
+    """Provide a test double for fake prompt runtime."""
+
     def __init__(self) -> None:
+        """Initialize the fake prompt runtime instance."""
         self.config = SimpleNamespace(
             default_reasoning="medium",
             model_name="fake-model",
@@ -260,11 +338,25 @@ class _FakePromptRuntime:
         self.agent = _CaptureAgent()
 
     async def get_agent(self, *args, **kwargs):
+        """Return the fake prompt agent used by CLI tests.
+
+        Args:
+            args: Parsed command-line arguments.
+            kwargs: The kwargs value.
+
+        Returns:
+            The fake prompt agent.
+        """
         return self.agent
 
 
 @pytest.mark.anyio
 async def test_cli_runs_rag_actions_without_prompt(tmp_path: Path) -> None:
+    """Verify that CLI runs RAG actions without prompt.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     upload = tmp_path / "notes.md"
     upload.write_text("# Notes\n", encoding="utf-8")
     args = chainagents_cli.parse_args(
@@ -296,6 +388,11 @@ async def test_cli_runs_rag_actions_without_prompt(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_cli_photo_attaches_image_content_to_agent_payload(tmp_path: Path) -> None:
+    """Verify that CLI photo attaches image content to agent payload.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     photo = tmp_path / "scene.png"
     photo.write_bytes(b"\x89PNG\r\n")
     args = chainagents_cli.parse_args(
@@ -331,6 +428,11 @@ async def test_cli_photo_attaches_image_content_to_agent_payload(tmp_path: Path)
 
 @pytest.mark.anyio
 async def test_cli_photo_requires_prompt(tmp_path: Path) -> None:
+    """Verify that CLI photo requires prompt.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     photo = tmp_path / "scene.png"
     photo.write_bytes(b"\x89PNG\r\n")
     args = chainagents_cli.parse_args(["--photo", str(photo)])
@@ -350,6 +452,11 @@ async def test_cli_photo_requires_prompt(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_cli_json_combines_multiple_actions(tmp_path: Path) -> None:
+    """Verify that CLI JSON combines multiple actions.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     upload = tmp_path / "notes.md"
     upload.write_text("# Notes\n", encoding="utf-8")
     args = chainagents_cli.parse_args(
@@ -405,24 +512,59 @@ async def test_cli_json_combines_multiple_actions(tmp_path: Path) -> None:
 
 
 class _Token:
+    """Provide an internal helper for token.
+
+    Attributes:
+        type: The type value.
+        additional_kwargs: The additional kwargs value.
+        tool_call_chunks: The tool call chunks value.
+    """
+
     type = "AIMessageChunk"
     additional_kwargs: dict[str, str] = {}
     tool_call_chunks: list[dict[str, str]] = []
 
     def __init__(self, content: str) -> None:
+        """Initialize the token instance.
+
+        Args:
+            content: Message or document content to process.
+        """
         self.content = content
 
 
 class _ReasoningToken:
+    """Provide an internal helper for reasoning token.
+
+    Attributes:
+        type: The type value.
+        content: Message or document content to process.
+        tool_call_chunks: The tool call chunks value.
+    """
+
     type = "AIMessageChunk"
     content = ""
     tool_call_chunks: list[dict[str, str]] = []
 
     def __init__(self, reasoning: str = "thinking") -> None:
+        """Initialize the reasoning token instance.
+
+        Args:
+            reasoning: The reasoning value.
+        """
         self.additional_kwargs = {"reasoning_content": reasoning}
 
 
 class _ToolCallToken:
+    """Provide an internal helper for tool call token.
+
+    Attributes:
+        type: The type value.
+        content: Message or document content to process.
+        additional_kwargs: The additional kwargs value.
+        tool_call_chunks: The tool call chunks value.
+    """
+
     type = "AIMessageChunk"
     content = ""
     additional_kwargs: dict[str, str] = {}
@@ -436,26 +578,54 @@ class _ToolCallToken:
 
 
 class _ToolCallChunkToken:
+    """Provide an internal helper for tool call chunk token.
+
+    Attributes:
+        type: The type value.
+        content: Message or document content to process.
+        additional_kwargs: The additional kwargs value.
+    """
+
     type = "AIMessageChunk"
     content = ""
     additional_kwargs: dict[str, str] = {}
 
     def __init__(self, chunk: dict[str, str]) -> None:
+        """Initialize the tool call chunk token instance.
+
+        Args:
+            chunk: Streamed event chunk to normalize.
+        """
         self.tool_call_chunks = [chunk]
 
 
 class _ToolMessage:
+    """Provide an internal helper for tool message.
+
+    Attributes:
+        type: The type value.
+        name: The name value.
+        status: The status value.
+        tool_call_id: Tool call identifier.
+    """
+
     type = "tool"
     name = "read_file"
     status = "success"
     tool_call_id = "call-1"
 
     def __init__(self, content: str) -> None:
+        """Initialize the tool message instance.
+
+        Args:
+            content: Message or document content to process.
+        """
         self.content = content
 
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_streams_final_response() -> None:
+    """Verify that CLI event renderer streams final response."""
     stdout = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -500,6 +670,7 @@ async def test_cli_event_renderer_streams_final_response() -> None:
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_formats_reasoning_trace() -> None:
+    """Verify that CLI event renderer formats reasoning trace."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -529,6 +700,7 @@ async def test_cli_event_renderer_formats_reasoning_trace() -> None:
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_appends_reasoning_chunks_inline() -> None:
+    """Verify that CLI event renderer appends reasoning chunks inline."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -562,6 +734,7 @@ async def test_cli_event_renderer_appends_reasoning_chunks_inline() -> None:
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_uses_block_panel_for_tool_call_start() -> None:
+    """Verify that CLI event renderer uses block panel for tool call start."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -601,6 +774,7 @@ async def test_cli_event_renderer_uses_block_panel_for_tool_call_start() -> None
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_shows_summarization_status() -> None:
+    """Verify that CLI event renderer shows summarization status."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -638,6 +812,7 @@ async def test_cli_event_renderer_shows_summarization_status() -> None:
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_accumulates_tool_args_across_chunks() -> None:
+    """Verify that CLI event renderer accumulates tool args across chunks."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -671,6 +846,7 @@ async def test_cli_event_renderer_accumulates_tool_args_across_chunks() -> None:
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_truncates_tool_results_to_200_characters() -> None:
+    """Verify that CLI event renderer truncates tool results to 200 characters."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",
@@ -713,6 +889,7 @@ async def test_cli_event_renderer_truncates_tool_results_to_200_characters() -> 
 
 @pytest.mark.anyio
 async def test_cli_event_renderer_deduplicates_tool_results_from_stream_modes() -> None:
+    """Verify that CLI event renderer deduplicates tool results from stream modes."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
         prompt="hello",

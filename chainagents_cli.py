@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Provide the terminal CLI for ChainAgents prompts and runtime commands."""
+
 from __future__ import annotations
 
 import argparse
@@ -54,6 +56,11 @@ CLI_PANEL_PADDING = (0, 1)
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build parser.
+
+    Returns:
+        The constructed parser.
+    """
     parser = argparse.ArgumentParser(
         prog="chainagents",
         description="Run the ChainAgents DeepAgent runtime without the Chainlit UI.",
@@ -166,10 +173,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse args.
+
+    Args:
+        argv: The argv value.
+
+    Returns:
+        The parsed args.
+    """
     return build_parser().parse_args(argv)
 
 
 def runtime_overrides_from_args(args: argparse.Namespace) -> RuntimeConfigOverrides:
+    """Build runtime override values from parsed CLI arguments.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        The constructed runtime override values from parsed cli arguments.
+    """
     return RuntimeConfigOverrides(
         config_path=args.config,
         database_url=args.database_url,
@@ -192,6 +215,19 @@ def prompt_from_args(
     stdin: TextIO,
     parser: argparse.ArgumentParser | None = None,
 ) -> str | None:
+    """Resolve the prompt text supplied through CLI arguments.
+
+    Args:
+        args: Parsed command-line arguments.
+        stdin: The stdin value.
+        parser: The parser value.
+
+    Returns:
+        The resolved the prompt text supplied through cli arguments.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     prompt_sources = sum(
         1
         for enabled in (
@@ -217,6 +253,15 @@ def prompt_from_args(
 
 
 def photo_content_parts(paths: list[str], *, stderr: TextIO) -> list[dict[str, Any]] | None:
+    """Build multimodal content parts for uploaded CLI photos.
+
+    Args:
+        paths: Filesystem paths to inspect.
+        stderr: The stderr value.
+
+    Returns:
+        The constructed multimodal content parts for uploaded cli photos.
+    """
     parts: list[dict[str, Any]] = []
     for raw_path in paths:
         path = Path(raw_path).expanduser().resolve()
@@ -240,12 +285,29 @@ def photo_content_parts(paths: list[str], *, stderr: TextIO) -> list[dict[str, A
 
 
 def user_message_content(prompt: str, photos: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    """Build the user message payload sent from the CLI.
+
+    Args:
+        prompt: The prompt value.
+        photos: The photos value.
+
+    Returns:
+        The constructed the user message payload sent from the cli.
+    """
     if not photos:
         return prompt
     return [{"type": "text", "text": prompt}, *photos]
 
 
 def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
+    """Normalize stream event chunks into LangGraph part metadata.
+
+    Args:
+        chunk: Streamed event chunk to normalize.
+
+    Returns:
+        The langgraph part from event chunk result.
+    """
     if isinstance(chunk, dict):
         mode = chunk.get("type")
         if isinstance(mode, str) and mode in LANGGRAPH_STREAM_MODES and "data" in chunk:
@@ -282,6 +344,14 @@ def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
 
 
 def stringify_content(value: Any) -> str:
+    """Convert content.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The string representation.
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -298,6 +368,14 @@ def stringify_content(value: Any) -> str:
 
 
 def truncate_tool_result_content(value: Any) -> str:
+    """Truncate tool result content.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The truncated value.
+    """
     content = stringify_content(value).strip()
     if len(content) <= TOOL_RESULT_PREVIEW_CHARS:
         return content
@@ -305,6 +383,14 @@ def truncate_tool_result_content(value: Any) -> str:
 
 
 def pretty_tool_call_args(value: Any) -> str:
+    """Format tool call args.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The formatted display value.
+    """
     content = stringify_content(value).strip()
     if not content:
         return ""
@@ -316,6 +402,14 @@ def pretty_tool_call_args(value: Any) -> str:
 
 
 def cli_console(file: TextIO) -> Console:
+    """Create the Rich console used by the CLI renderer.
+
+    Args:
+        file: The file value.
+
+    Returns:
+        The created the rich console used by the cli renderer.
+    """
     return Console(
         file=file,
         highlight=False,
@@ -324,6 +418,16 @@ def cli_console(file: TextIO) -> Console:
 
 
 def cli_panel(renderable: Any, *, title: str, border_style: str) -> Panel:
+    """Create a Rich panel with ChainAgents CLI styling.
+
+    Args:
+        renderable: The renderable value.
+        title: The title value.
+        border_style: The border style value.
+
+    Returns:
+        The created a rich panel with chainagents cli styling.
+    """
     return Panel(
         renderable,
         title=title,
@@ -335,6 +439,11 @@ def cli_panel(renderable: Any, *, title: str, border_style: str) -> Panel:
 
 
 def cli_kv_table() -> Table:
+    """Create a two-column Rich table for CLI key-value output.
+
+    Returns:
+        The created a two-column rich table for cli key-value output.
+    """
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim", no_wrap=True)
     table.add_column()
@@ -342,6 +451,14 @@ def cli_kv_table() -> Table:
 
 
 def reasoning_text_from_token(token: Any) -> str:
+    """Extract reasoning text from a streamed model token.
+
+    Args:
+        token: Streamed model token to inspect.
+
+    Returns:
+        The extracted reasoning text from a streamed model token.
+    """
     if hasattr(token, "additional_kwargs"):
         text = stringify_content(token.additional_kwargs.get("reasoning_content"))
         if text:
@@ -352,6 +469,15 @@ def reasoning_text_from_token(token: Any) -> str:
 
 
 def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
+    """Return a display label for a tool namespace.
+
+    Args:
+        ns: The ns value.
+        metadata: The metadata value.
+
+    Returns:
+        A display label for a tool namespace.
+    """
     agent_name = metadata.get("lc_agent_name")
     if agent_name:
         return str(agent_name)
@@ -368,6 +494,14 @@ def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
 
 
 def iter_messages(value: Any) -> list[Any]:
+    """Iterate over messages.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        An iterator over the matching values.
+    """
     if value is None:
         return []
     if isinstance(value, (list, tuple)):
@@ -394,6 +528,14 @@ def iter_messages(value: Any) -> list[Any]:
 
 
 def messages_from_node_data(data: Any) -> list[Any]:
+    """Extract message objects from LangGraph node update payloads.
+
+    Args:
+        data: Payload data to inspect.
+
+    Returns:
+        The extracted message objects from langgraph node update payloads.
+    """
     if data is None:
         return []
     if isinstance(data, dict):
@@ -402,14 +544,39 @@ def messages_from_node_data(data: Any) -> list[Any]:
 
 
 def is_assistant_message(message: Any) -> bool:
+    """Return whether assistant message.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+
+    Returns:
+        Whether assistant message.
+    """
     return getattr(message, "type", None) in {"ai", "AIMessageChunk"}
 
 
 def message_text(message: Any) -> str:
+    """Build the message for text.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+
+    Returns:
+        The constructed the message for text.
+    """
     return stringify_content(getattr(message, "content", "")).strip()
 
 
 def assistant_messages_for_current_prompt(messages: list[Any], prompt: str) -> list[Any]:
+    """Return assistant messages produced after the current prompt began.
+
+    Args:
+        messages: The messages value.
+        prompt: The prompt value.
+
+    Returns:
+        Assistant messages produced after the current prompt began.
+    """
     prompt_text = prompt.strip()
     current_prompt_index = -1
     for index, message in enumerate(messages):
@@ -429,6 +596,8 @@ def assistant_messages_for_current_prompt(messages: list[Any], prompt: str) -> l
 
 
 class CliEventRenderer:
+    """Represent CLI event renderer."""
+
     def __init__(
         self,
         *,
@@ -440,6 +609,17 @@ class CliEventRenderer:
         show_reasoning: bool,
         show_tools: bool,
     ) -> None:
+        """Initialize the CLI event renderer instance.
+
+        Args:
+            prompt: The prompt value.
+            stdout: The stdout value.
+            stderr: The stderr value.
+            stream: The stream value.
+            json_output: The JSON output value.
+            show_reasoning: The show reasoning value.
+            show_tools: The show tools value.
+        """
         self.prompt = prompt
         self.stdout = stdout
         self.stderr = stderr
@@ -459,6 +639,11 @@ class CliEventRenderer:
         self.stderr_console = cli_console(stderr)
 
     async def handle_event(self, event: dict[str, Any]) -> None:
+        """Handle one raw LangGraph stream event.
+
+        Args:
+            event: LangGraph stream event to process.
+        """
         if event.get("event") != "on_chain_stream":
             return
         if event.get("parent_ids"):
@@ -481,6 +666,11 @@ class CliEventRenderer:
             self._handle_custom_chunk(part)
 
     def finish(self) -> str:
+        """Finish the CLI event renderer.
+
+        Returns:
+            The finish result.
+        """
         self._close_reasoning_line()
         if self.json_output:
             return self.response_buffer
@@ -493,6 +683,11 @@ class CliEventRenderer:
         return self.response_buffer
 
     def _handle_message_chunk(self, part: dict[str, Any]) -> None:
+        """Handle message chunk.
+
+        Args:
+            part: The part value.
+        """
         token, metadata = part["data"]
         metadata = metadata if isinstance(metadata, dict) else {}
         ns = tuple(part.get("ns", ()))
@@ -518,6 +713,11 @@ class CliEventRenderer:
             self._stream_response(content_text)
 
     def _handle_update_chunk(self, part: dict[str, Any]) -> None:
+        """Handle update chunk.
+
+        Args:
+            part: The part value.
+        """
         ns = tuple(part.get("ns", ()))
         source = namespace_label(ns, {"lc_agent_name": None})
 
@@ -541,6 +741,11 @@ class CliEventRenderer:
                     self._complete_tool(source, message)
 
     def _handle_custom_chunk(self, part: dict[str, Any]) -> None:
+        """Handle custom chunk.
+
+        Args:
+            part: The part value.
+        """
         data = part.get("data")
         if not isinstance(data, dict):
             return
@@ -571,6 +776,11 @@ class CliEventRenderer:
         )
 
     def _stream_response(self, text: str) -> None:
+        """Stream final response text into the active output target.
+
+        Args:
+            text: Text content to process.
+        """
         delta = text[len(self.response_buffer) :] if text.startswith(self.response_buffer) else text
         if not delta:
             return
@@ -579,6 +789,12 @@ class CliEventRenderer:
             self.stdout_console.print(Text(delta, style="bright_white"), end="")
 
     def _stream_reasoning(self, source: str, text: str) -> None:
+        """Stream reasoning text into the active output target.
+
+        Args:
+            source: The source value.
+            text: Text content to process.
+        """
         previous = self.reasoning_buffers.get(source, "")
         delta = text[len(previous) :] if text.startswith(previous) else text
         if not delta:
@@ -595,12 +811,19 @@ class CliEventRenderer:
             self.stderr_console.print(Text(delta, style="magenta"), end="")
 
     def _close_reasoning_line(self) -> None:
+        """Close the active reasoning line before rendering other output."""
         if self.reasoning_line_source is None:
             return
         self.stderr_console.print()
         self.reasoning_line_source = None
 
     def _stream_tool_call(self, source: str, chunk: dict[str, Any]) -> None:
+        """Render a streamed tool call and its accumulated arguments.
+
+        Args:
+            source: The source value.
+            chunk: Streamed event chunk to normalize.
+        """
         call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
         tool_name = str(chunk.get("name") or self.tool_names.get(call_id) or "tool")
         self.tool_names[call_id] = tool_name
@@ -639,6 +862,12 @@ class CliEventRenderer:
         )
 
     def _complete_tool(self, source: str, tool_message: Any) -> None:
+        """Render the final status and output for a completed tool call.
+
+        Args:
+            source: The source value.
+            tool_message: The tool message value.
+        """
         if not self.show_tools:
             return
         name = str(getattr(tool_message, "name", "") or "tool")
@@ -683,6 +912,17 @@ class CliEventRenderer:
         tool_message: Any,
         content: str,
     ) -> tuple[str, str, str]:
+        """Build a stable key for deduplicating streamed tool results.
+
+        Args:
+            source: The source value.
+            name: The name value.
+            tool_message: The tool message value.
+            content: Message or document content to process.
+
+        Returns:
+            The constructed a stable key for deduplicating streamed tool results.
+        """
         stable_id = str(
             getattr(tool_message, "tool_call_id", None)
             or getattr(tool_message, "id", None)
@@ -694,6 +934,14 @@ class CliEventRenderer:
 
 
 def rag_status_payload(status: RagStatus) -> dict[str, Any]:
+    """Build the JSON payload for CLI RAG status output.
+
+    Args:
+        status: The status value.
+
+    Returns:
+        The constructed the json payload for cli rag status output.
+    """
     return {
         "enabled": status.enabled,
         "ready": status.ready,
@@ -705,6 +953,14 @@ def rag_status_payload(status: RagStatus) -> dict[str, Any]:
 
 
 def upload_result_payload(result: RagUploadResult) -> dict[str, Any]:
+    """Build the JSON payload for CLI upload results.
+
+    Args:
+        result: Result payload to format or inspect.
+
+    Returns:
+        The constructed the json payload for cli upload results.
+    """
     return {
         "thread_id": result.thread_id,
         "success": result.success,
@@ -717,6 +973,14 @@ def upload_result_payload(result: RagUploadResult) -> dict[str, Any]:
 
 
 def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
+    """Build the JSON payload for CLI runtime status output.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+
+    Returns:
+        The constructed the json payload for cli runtime status output.
+    """
     extensions = runtime.config.extensions
     return {
         "model_provider": runtime.config.model_provider,
@@ -739,6 +1003,14 @@ def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
 
 
 def rag_status_text(rag: dict[str, Any]) -> Text:
+    """Render RAG status as human-readable CLI text.
+
+    Args:
+        rag: The RAG value.
+
+    Returns:
+        The RAG status text result.
+    """
     if rag["enabled"] and rag["ready"]:
         text = Text("ready", style="bold green")
         text.append(f" ({rag['file_count']} files, {rag['chunk_count']} chunks)")
@@ -756,6 +1028,13 @@ def print_runtime_status(
     stdout: TextIO,
     json_output: bool,
 ) -> None:
+    """Print runtime status.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+        stdout: The stdout value.
+        json_output: The JSON output value.
+    """
     payload = runtime_status_payload(runtime)
     if json_output:
         print(json.dumps({"status": payload}, indent=2, sort_keys=True), file=stdout)
@@ -791,6 +1070,13 @@ def print_command_list(
     stdout: TextIO,
     json_output: bool,
 ) -> None:
+    """Print command list.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+        stdout: The stdout value.
+        json_output: The JSON output value.
+    """
     commands = [
         {
             "name": command.name,
@@ -873,6 +1159,14 @@ def print_rag_status(
     stdout: TextIO,
     json_output: bool,
 ) -> None:
+    """Print RAG status.
+
+    Args:
+        status: The status value.
+        action: The action value.
+        stdout: The stdout value.
+        json_output: The JSON output value.
+    """
     payload = rag_status_payload(status)
     if json_output:
         print(json.dumps({action: payload}, indent=2, sort_keys=True), file=stdout)
@@ -903,6 +1197,13 @@ def print_upload_result(
     stdout: TextIO,
     json_output: bool,
 ) -> None:
+    """Print upload result.
+
+    Args:
+        result: Result payload to format or inspect.
+        stdout: The stdout value.
+        json_output: The JSON output value.
+    """
     payload = upload_result_payload(result)
     if json_output:
         print(json.dumps({"upload_rag": payload}, indent=2, sort_keys=True), file=stdout)
@@ -939,6 +1240,20 @@ async def ingest_uploads(
     json_output: bool,
     emit_output: bool = True,
 ) -> RagUploadResult | None:
+    """Ingest uploads.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+        paths: Filesystem paths to inspect.
+        thread_id: Conversation thread identifier.
+        stdout: The stdout value.
+        stderr: The stderr value.
+        json_output: The JSON output value.
+        emit_output: The emit output value.
+
+    Returns:
+        The ingest uploads result.
+    """
     if not paths:
         return None
 
@@ -969,6 +1284,19 @@ async def run_agent_prompt(
     stderr: TextIO,
     emit_json: bool = True,
 ) -> int | dict[str, Any]:
+    """Stream one CLI prompt through the configured agent.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+        args: Parsed command-line arguments.
+        prompt: The prompt value.
+        stdout: The stdout value.
+        stderr: The stderr value.
+        emit_json: The emit JSON value.
+
+    Returns:
+        A process-style status code or JSON-compatible response payload.
+    """
     thread_id = str(args.thread_id or DEFAULT_CLI_THREAD_ID).strip() or DEFAULT_CLI_THREAD_ID
     reasoning_level: ReasoningLevel = normalize_reasoning_level(
         args.reasoning,
@@ -1094,6 +1422,17 @@ async def interactive_repl(
     stdout: TextIO,
     stderr: TextIO,
 ) -> int:
+    """Run the interactive CLI prompt loop.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+        args: Parsed command-line arguments.
+        stdout: The stdout value.
+        stderr: The stderr value.
+
+    Returns:
+        The interactive REPL result.
+    """
     print("ChainAgents CLI. Press Ctrl-D to exit.", file=stderr)
     while True:
         try:
@@ -1126,6 +1465,19 @@ async def run_cli(
     stdin: TextIO,
     parser: argparse.ArgumentParser | None = None,
 ) -> int:
+    """Run the CLI with parsed arguments and runtime configuration.
+
+    Args:
+        args: Parsed command-line arguments.
+        runtime: Agent runtime used by the operation.
+        stdout: The stdout value.
+        stderr: The stderr value.
+        stdin: The stdin value.
+        parser: The parser value.
+
+    Returns:
+        The command result.
+    """
     prompt = prompt_from_args(args, stdin=stdin, parser=parser)
     has_prompt = bool(prompt and prompt.strip())
 
@@ -1213,6 +1565,14 @@ async def run_cli(
 
 
 async def async_main(argv: list[str] | None = None) -> int:
+    """Run the asynchronous command-line entry point.
+
+    Args:
+        argv: The argv value.
+
+    Returns:
+        The async main result.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     config = RuntimeConfig.from_env(runtime_overrides_from_args(args))
@@ -1231,6 +1591,14 @@ async def async_main(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the command-line entry point.
+
+    Args:
+        argv: The argv value.
+
+    Returns:
+        The main result.
+    """
     return asyncio.run(async_main(argv))
 
 

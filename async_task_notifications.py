@@ -1,3 +1,5 @@
+"""Monitor asynchronous LangGraph subagent tasks and notify Chainlit users."""
+
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +18,11 @@ TERMINAL_STATUSES = {"success", "error", "cancelled", "interrupted", "timeout"}
 
 
 def async_subagent_url_override() -> str | None:
+    """Return the configured Agent Protocol URL for async subagents.
+
+    Returns:
+        The configured Agent Protocol URL, or the local default.
+    """
     for key in (
         "CHAINLIT_ASYNC_SUBAGENT_URL",
         "LANGGRAPH_SERVER_URL",
@@ -28,6 +35,11 @@ def async_subagent_url_override() -> str | None:
 
 
 def async_task_poll_seconds() -> float:
+    """Return the positive polling interval for async task monitoring.
+
+    Returns:
+        The positive polling interval in seconds.
+    """
     try:
         seconds = float(os.getenv("CHAINLIT_ASYNC_TASK_POLL_SECONDS", "").strip())
     except ValueError:
@@ -36,6 +48,14 @@ def async_task_poll_seconds() -> float:
 
 
 def resolved_headers(spec: AsyncSubagentConfig) -> dict[str, str]:
+    """Return request headers with the default LangSmith auth scheme applied.
+
+    Args:
+        spec: Configuration specification to convert or inspect.
+
+    Returns:
+        Headers with a default authentication scheme included.
+    """
     headers = dict(spec.headers or {})
     if "x-auth-scheme" not in headers:
         headers["x-auth-scheme"] = "langsmith"
@@ -43,12 +63,28 @@ def resolved_headers(spec: AsyncSubagentConfig) -> dict[str, str]:
 
 
 def task_values(snapshot: Any) -> dict[str, Any]:
+    """Extract async task records from a LangGraph state snapshot.
+
+    Args:
+        snapshot: The snapshot value.
+
+    Returns:
+        A mapping of async task IDs to task records.
+    """
     values = getattr(snapshot, "values", {}) or {}
     async_tasks = values.get("async_tasks") if isinstance(values, dict) else None
     return async_tasks if isinstance(async_tasks, dict) else {}
 
 
 def result_from_thread_values(thread_values: dict[str, Any]) -> str:
+    """Return the final message content from completed thread values.
+
+    Args:
+        thread_values: The thread values value.
+
+    Returns:
+        The final message content, or a fallback completion message.
+    """
     messages = thread_values.get("messages", [])
     if not messages:
         return "(completed with no output messages)"
@@ -59,6 +95,14 @@ def result_from_thread_values(thread_values: dict[str, Any]) -> str:
 
 
 def format_task_result(result: dict[str, Any]) -> str:
+    """Format task result.
+
+    Args:
+        result: Result payload to format or inspect.
+
+    Returns:
+        A user-facing summary of the async task result.
+    """
     status = result.get("status", "unknown")
     agent_name = result.get("agent_name", "async subagent")
     task_id = result.get("task_id", "")
@@ -74,6 +118,8 @@ def format_task_result(result: dict[str, Any]) -> str:
 
 
 class AsyncTaskNotifier:
+    """Poll async subagent runs and send one Chainlit completion notice per task."""
+
     def __init__(
         self,
         *,
@@ -81,6 +127,13 @@ class AsyncTaskNotifier:
         async_subagents: tuple[AsyncSubagentConfig, ...],
         url_override: str | None,
     ) -> None:
+        """Initialize the async task notifier instance.
+
+        Args:
+            agent: Agent or runtime object used for the operation.
+            async_subagents: Async subagent configurations available for monitoring.
+            url_override: Agent Protocol URL override, if one is configured.
+        """
         self.agent = agent
         self.async_subagents = {subagent.name: subagent for subagent in async_subagents}
         self.url_override = url_override
@@ -90,9 +143,23 @@ class AsyncTaskNotifier:
         self.tasks: set[asyncio.Task[Any]] = set()
 
     def matches(self, *, agent: Any, url_override: str | None) -> bool:
+        """Return whether this notifier matches the active agent and URL.
+
+        Args:
+            agent: Agent or runtime object used for the operation.
+            url_override: Agent Protocol URL override, if one is configured.
+
+        Returns:
+            True when the agent and URL match this notifier; otherwise, False.
+        """
         return self.agent is agent and self.url_override == url_override
 
     async def schedule_from_state(self, *, thread_id: str) -> None:
+        """Schedule watchers for non-terminal async tasks in the thread state.
+
+        Args:
+            thread_id: Conversation thread identifier.
+        """
         if not self.async_subagents:
             return
 
@@ -111,11 +178,17 @@ class AsyncTaskNotifier:
             monitor_task.add_done_callback(self.tasks.discard)
 
     def cancel(self) -> None:
+        """Cancel the async task notifier."""
         for task in self.tasks:
             task.cancel()
         self.tasks.clear()
 
     async def _watch_task(self, task: dict[str, Any]) -> None:
+        """Poll one async subagent task until it reaches a terminal status.
+
+        Args:
+            task: The task value.
+        """
         task_id = str(task.get("task_id") or task.get("thread_id") or "").strip()
         agent_name = str(task.get("agent_name") or "").strip()
         run_id = str(task.get("run_id") or "").strip()
@@ -180,6 +253,12 @@ class AsyncTaskNotifier:
             await client.aclose()
 
     async def _notify_once(self, task_id: str, content: str) -> None:
+        """Send one Chainlit notification for a completed async task.
+
+        Args:
+            task_id: Task identifier.
+            content: Message or document content to process.
+        """
         if task_id in self.notified_task_ids:
             return
         self.notified_task_ids.add(task_id)

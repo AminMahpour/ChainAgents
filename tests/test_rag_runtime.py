@@ -1,3 +1,5 @@
+"""Test RAG configuration, indexing, searching, and upload handling."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -24,15 +26,33 @@ from rag_runtime import (
 
 
 class DummySplitter:
+    """Represent dummy splitter."""
+
     def __init__(self, *, chunk_size: int, chunk_overlap: int) -> None:
+        """Initialize the dummy splitter instance.
+
+        Args:
+            chunk_size: The chunk size value.
+            chunk_overlap: The chunk overlap value.
+        """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
     def split_documents(self, documents: list[Document]) -> list[Document]:
+        """Split documents with the test text splitter.
+
+        Args:
+            documents: The documents value.
+
+        Returns:
+            The split documents result.
+        """
         return list(documents)
 
 
 class DummyChroma:
+    """Represent dummy chroma."""
+
     def __init__(
         self,
         *,
@@ -40,6 +60,13 @@ class DummyChroma:
         embedding_function: object,
         persist_directory: str,
     ) -> None:
+        """Initialize the dummy chroma instance.
+
+        Args:
+            collection_name: The collection name value.
+            embedding_function: The embedding function value.
+            persist_directory: The persist directory value.
+        """
         self.collection_name = collection_name
         self.embedding_function = embedding_function
         self.persist_directory = persist_directory
@@ -54,6 +81,17 @@ class DummyChroma:
         collection_name: str,
         persist_directory: str,
     ) -> "DummyChroma":
+        """Create this object from documents.
+
+        Args:
+            documents: The documents value.
+            embedding: The embedding value.
+            collection_name: The collection name value.
+            persist_directory: The persist directory value.
+
+        Returns:
+            The created this object from documents.
+        """
         instance = cls(
             collection_name=collection_name,
             embedding_function=embedding,
@@ -68,6 +106,15 @@ class DummyChroma:
         *,
         k: int,
     ) -> list[tuple[Document, float]]:
+        """Return scored documents from the dummy vector store.
+
+        Args:
+            query: Search query text.
+            k: The k value.
+
+        Returns:
+            Scored documents from the dummy vector store.
+        """
         results = [
             (
                 document,
@@ -79,6 +126,14 @@ class DummyChroma:
 
 
 def make_resolved_rag_config(project_root: Path) -> ResolvedRagConfig:
+    """Build a resolved RAG configuration for tests.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The constructed a resolved rag configuration for tests.
+    """
     return ResolvedRagConfig(
         enabled=True,
         persist_directory=project_root / ".rag",
@@ -96,6 +151,11 @@ def make_resolved_rag_config(project_root: Path) -> ResolvedRagConfig:
 
 
 def test_parse_rag_config_defaults(tmp_path: Path) -> None:
+    """Verify that parse RAG config defaults.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     config = parse_rag_config({}, tmp_path / "deepagent.toml")
 
     assert config.enabled is False
@@ -105,6 +165,11 @@ def test_parse_rag_config_defaults(tmp_path: Path) -> None:
 
 
 def test_resolve_rag_config_auto_ollama_defaults(tmp_path: Path) -> None:
+    """Verify that resolve RAG config auto ollama defaults.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     config = RagConfig(
         enabled=True,
         persist_directory=tmp_path / ".rag",
@@ -124,6 +189,11 @@ def test_resolve_rag_config_auto_ollama_defaults(tmp_path: Path) -> None:
 
 
 def test_resolve_rag_config_requires_model_for_openai_compatible(tmp_path: Path) -> None:
+    """Verify that resolve RAG config requires model for openai compatible.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     config = RagConfig(
         enabled=True,
         persist_directory=tmp_path / ".rag",
@@ -139,6 +209,11 @@ def test_resolve_rag_config_requires_model_for_openai_compatible(tmp_path: Path)
 
 
 def test_discover_source_paths_only_indexes_docs(tmp_path: Path) -> None:
+    """Verify that discover source paths only indexes docs.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     (tmp_path / "README.md").write_text("readme", encoding="utf-8")
     (tmp_path / "chainlit.md").write_text("chainlit", encoding="utf-8")
     (tmp_path / "prompts").mkdir()
@@ -164,6 +239,12 @@ def test_discover_source_paths_only_indexes_docs(tmp_path: Path) -> None:
 
 
 def test_manifest_staleness_detects_doc_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that manifest staleness detects doc changes.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     (tmp_path / "README.md").write_text("readme", encoding="utf-8")
     monkeypatch.setattr(rag_runtime, "Chroma", DummyChroma)
     monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
@@ -181,7 +262,10 @@ def test_manifest_staleness_detects_doc_changes(tmp_path: Path, monkeypatch: pyt
 
 
 def test_search_workspace_knowledge_tool_has_object_schema() -> None:
+    """Verify that search workspace knowledge tool has object schema."""
     class FakeRAG:
+        """Represent fake r a g."""
+
         def search(
             self,
             *,
@@ -189,6 +273,16 @@ def test_search_workspace_knowledge_tool_has_object_schema() -> None:
             top_k: int | None = None,
             thread_id: str | None = None,
         ) -> dict[str, object]:
+            """Search the fake r a g.
+
+            Args:
+                query: Search query text.
+                top_k: Maximum number of search results to return.
+                thread_id: Conversation thread identifier.
+
+            Returns:
+                Search results matching the query.
+            """
             return {"query": query, "results": [{"path": "README.md", "excerpt": "", "score": 1.0}]}
 
     tool = create_search_workspace_knowledge_tool(FakeRAG())
@@ -204,6 +298,12 @@ def test_ingest_uploaded_files_adds_thread_scoped_results(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that ingest uploaded files adds thread scoped results.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     monkeypatch.setattr(rag_runtime, "Chroma", DummyChroma)
     monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
     monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: object())
@@ -233,6 +333,12 @@ def test_ingest_uploaded_files_rejects_unsupported_extensions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that ingest uploaded files rejects unsupported extensions.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     monkeypatch.setattr(rag_runtime, "Chroma", DummyChroma)
     monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
     monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: object())

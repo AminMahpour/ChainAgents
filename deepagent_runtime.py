@@ -1,3 +1,5 @@
+"""Build and configure the LangChain Deep Agent runtime used by ChainAgents."""
+
 from __future__ import annotations
 
 import asyncio
@@ -103,6 +105,15 @@ def normalize_reasoning_level(
     *,
     default: ReasoningLevel = DEFAULT_REASONING_LEVEL,
 ) -> ReasoningLevel:
+    """Normalize reasoning level.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        default: Fallback value used when no explicit value is available.
+
+    Returns:
+        The normalized value.
+    """
     candidate = (value or default).strip().lower()
     if candidate not in {"low", "medium", "high"}:
         return default
@@ -114,6 +125,18 @@ def normalize_model_provider(
     *,
     default: ModelProvider = DEFAULT_MODEL_PROVIDER,
 ) -> ModelProvider:
+    """Normalize model provider.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        default: Fallback value used when no explicit value is available.
+
+    Returns:
+        The normalized value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     candidate = str(value or default).strip().lower().replace("-", "_")
     if not candidate:
         return default
@@ -125,12 +148,28 @@ def normalize_model_provider(
 
 
 def format_model_provider(provider: ModelProvider) -> str:
+    """Format model provider.
+
+    Args:
+        provider: The provider value.
+
+    Returns:
+        The formatted value.
+    """
     if provider == "openai_compatible":
         return "OpenAI-compatible"
     return "Ollama"
 
 
 def _first_openai_compatible_delta(chunk: dict[str, Any]) -> dict[str, Any]:
+    """Return the first delta object from an OpenAI-compatible chunk.
+
+    Args:
+        chunk: Streamed event chunk to normalize.
+
+    Returns:
+        The first delta object from an OpenAI-compatible chunk.
+    """
     choices = chunk.get("choices", [])
     if not choices:
         nested_chunk = chunk.get("chunk")
@@ -151,6 +190,14 @@ def _first_openai_compatible_delta(chunk: dict[str, Any]) -> dict[str, Any]:
 
 
 def _openai_compatible_reasoning_delta(chunk: dict[str, Any]) -> Any:
+    """Return reasoning content from an OpenAI-compatible delta.
+
+    Args:
+        chunk: Streamed event chunk to normalize.
+
+    Returns:
+        Reasoning content from an OpenAI-compatible delta.
+    """
     delta = _first_openai_compatible_delta(chunk)
     for key in OPENAI_COMPATIBLE_REASONING_DELTA_KEYS:
         value = delta.get(key)
@@ -160,12 +207,24 @@ def _openai_compatible_reasoning_delta(chunk: dict[str, Any]) -> Any:
 
 
 class OpenAICompatibleChatOpenAI(ChatOpenAI):
+    """Adapt OpenAI-compatible chat chunks while preserving reasoning deltas."""
+
     def _convert_chunk_to_generation_chunk(
         self,
         chunk: dict[str, Any],
         default_chunk_class: type,
         base_generation_info: dict | None,
     ):
+        """Convert provider chunks while preserving OpenAI-compatible reasoning.
+
+        Args:
+            chunk: Streamed event chunk to normalize.
+            default_chunk_class: The default chunk class value.
+            base_generation_info: The base generation info value.
+
+        Returns:
+            The convert chunk to generation chunk result.
+        """
         generation_chunk = super()._convert_chunk_to_generation_chunk(
             chunk,
             default_chunk_class,
@@ -186,6 +245,14 @@ class OpenAICompatibleChatOpenAI(ChatOpenAI):
 
 
 def normalize_model_endpoint(value: str | None) -> str:
+    """Normalize model endpoint.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized value.
+    """
     candidate = (value or DEFAULT_OLLAMA_ENDPOINT).strip()
     if not candidate:
         candidate = DEFAULT_OLLAMA_ENDPOINT
@@ -195,6 +262,14 @@ def normalize_model_endpoint(value: str | None) -> str:
 
 
 def normalize_model_port(value: Any | None) -> int:
+    """Normalize model port.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized value.
+    """
     if value is None:
         return DEFAULT_OLLAMA_PORT
 
@@ -209,6 +284,14 @@ def normalize_model_port(value: Any | None) -> int:
 
 
 def normalize_model_temperature(value: Any | None) -> float:
+    """Normalize model temperature.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized value.
+    """
     if value is None:
         return DEFAULT_TEMPERATURE
 
@@ -228,6 +311,19 @@ def normalize_recursion_limit(
     default: int = DEFAULT_RECURSION_LIMIT,
     field_name: str = "recursion_limit",
 ) -> int:
+    """Normalize recursion limit.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        default: Fallback value used when no explicit value is available.
+        field_name: The field name value.
+
+    Returns:
+        The normalized value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     if value is None or str(value).strip() == "":
         return default
 
@@ -242,6 +338,17 @@ def normalize_recursion_limit(
 
 
 def normalize_repeat_penalty(value: Any | None) -> float | None:
+    """Normalize repeat penalty.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     if value is None:
         return None
     if isinstance(value, str):
@@ -265,6 +372,19 @@ def normalize_model_base_url(
     default: str | None = None,
     required_message: str | None = None,
 ) -> str:
+    """Normalize model base URL.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        default: Fallback value used when no explicit value is available.
+        required_message: The required message value.
+
+    Returns:
+        The normalized value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     candidate = str(value or default or "").strip()
     if not candidate:
         if required_message:
@@ -280,6 +400,15 @@ def normalize_openai_endpoint_url(
     *,
     required_message: str | None = None,
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Normalize openai endpoint URL.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        required_message: The required message value.
+
+    Returns:
+        The normalized value.
+    """
     candidate = normalize_model_base_url(
         value,
         required_message=required_message,
@@ -301,6 +430,14 @@ def normalize_openai_endpoint_url(
 def model_endpoint_query_to_dict(
     query: tuple[tuple[str, str], ...],
 ) -> dict[str, object]:
+    """Parse endpoint query parameters into a dictionary.
+
+    Args:
+        query: Search query text.
+
+    Returns:
+        The parsed endpoint query parameters into a dictionary.
+    """
     values: dict[str, object] = {}
     for key, value in query:
         existing = values.get(key)
@@ -314,11 +451,28 @@ def model_endpoint_query_to_dict(
 
 
 def normalize_optional_string(value: Any | None) -> str | None:
+    """Normalize optional string.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized value.
+    """
     candidate = str(value or "").strip()
     return candidate or None
 
 
 def compose_base_url(endpoint: str | None, port: int) -> str:
+    """Compose base URL.
+
+    Args:
+        endpoint: The endpoint value.
+        port: The port value.
+
+    Returns:
+        The composed value.
+    """
     parsed = urlsplit(normalize_model_endpoint(endpoint))
     hostname = parsed.hostname
     if hostname is None:
@@ -340,15 +494,40 @@ def compose_base_url(endpoint: str | None, port: int) -> str:
 
 
 def deepagent_artifacts_root(project_root: Path | None = None) -> Path:
+    """Return the local directory used for stored tool artifacts.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The local directory used for stored tool artifacts.
+    """
     root = (project_root or PROJECT_ROOT).resolve()
     return root / DEEPAGENT_ARTIFACTS_DIRECTORY
 
 
 def deepagent_artifacts_route_prefix(project_root: Path | None = None) -> str:
+    """Return the URL route prefix for stored tool artifacts.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The URL route prefix for stored tool artifacts.
+    """
     return f"{deepagent_artifacts_root(project_root).as_posix().rstrip('/')}/"
 
 
 def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
+    """Summarize tool exception.
+
+    Args:
+        exc: The exc value.
+        limit: The limit value.
+
+    Returns:
+        The summary value.
+    """
     detail = " ".join(str(exc).split()).strip()
     if not detail:
         return exc.__class__.__name__
@@ -372,6 +551,15 @@ WORKSPACE_PATH_TOOL_ARG_KEYS = {
 
 
 def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
+    """Map one virtual workspace path value to a local path.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The mapped value.
+    """
     if isinstance(value, str):
         return virtual_workspace_path_to_local(value, project_root)
     if isinstance(value, list):
@@ -382,6 +570,15 @@ def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
 
 
 def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None) -> Any:
+    """Map workspace paths in tool args.
+
+    Args:
+        args: Parsed command-line arguments.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The mapped value.
+    """
     if not isinstance(args, dict):
         return args
 
@@ -394,10 +591,22 @@ def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None
 
 
 class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Wrap tool execution with workspace path mapping and recoverable errors."""
+
     def __init__(self, *, project_root: Path | None = None) -> None:
+        """Initialize the tool execution resilience middleware instance.
+
+        Args:
+            project_root: Project root used to resolve local paths.
+        """
         self.project_root = (project_root or PROJECT_ROOT).resolve()
 
     def _map_workspace_path_args(self, request: ToolCallRequest) -> None:
+        """Map virtual workspace paths inside tool-call arguments.
+
+        Args:
+            request: The request value.
+        """
         args = request.tool_call.get("args")
         mapped_args = map_workspace_paths_in_tool_args(args, self.project_root)
         if mapped_args is not args:
@@ -408,6 +617,15 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         request: ToolCallRequest,
         exc: Exception,
     ) -> ToolMessage:
+        """Build a ToolMessage describing a recoverable tool failure.
+
+        Args:
+            request: The request value.
+            exc: The exc value.
+
+        Returns:
+            The constructed a toolmessage describing a recoverable tool failure.
+        """
         tool_name = (
             str(request.tool_call.get("name") or getattr(request.tool, "name", "tool")).strip()
             or "tool"
@@ -436,6 +654,15 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
+        """Wrap synchronous tool calls with path mapping and error handling.
+
+        Args:
+            request: The request value.
+            handler: The handler value.
+
+        Returns:
+            The wrap tool call result.
+        """
         try:
             self._map_workspace_path_args(request)
             return handler(request)
@@ -449,6 +676,15 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
+        """Wrap asynchronous tool calls with path mapping and error handling.
+
+        Args:
+            request: The request value.
+            handler: The handler value.
+
+        Returns:
+            The awrap tool call result.
+        """
         try:
             self._map_workspace_path_args(request)
             return await handler(request)
@@ -459,16 +695,38 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
 
 
 class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Emit stream events when conversation history summarization is about to run."""
+
     def __init__(self, inner: AgentMiddleware[Any, Any, Any], *, source: str = "main-agent") -> None:
+        """Initialize the summarization status middleware instance.
+
+        Args:
+            inner: The inner value.
+            source: The source value.
+        """
         super().__init__()
         self.inner = inner
         self.source = source
 
     @property
     def name(self) -> str:
+        """Return the wrapped summarization middleware name.
+
+        Returns:
+            The middleware name exposed to LangGraph.
+        """
         return str(getattr(self.inner, "name", "SummarizationMiddleware"))
 
     def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """Run middleware logic before a model invocation.
+
+        Args:
+            state: Runtime state to inspect or update.
+            runtime: Agent runtime used by the operation.
+
+        Returns:
+            The before model result.
+        """
         will_summarize = self._will_summarize(state)
         if will_summarize:
             self._emit(runtime, "started", "Conversation summarization triggered.")
@@ -485,6 +743,15 @@ class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
         return result
 
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """Run asynchronous middleware logic before a model invocation.
+
+        Args:
+            state: Runtime state to inspect or update.
+            runtime: Agent runtime used by the operation.
+
+        Returns:
+            The abefore model result.
+        """
         will_summarize = self._will_summarize(state)
         if will_summarize:
             self._emit(runtime, "started", "Conversation summarization triggered.")
@@ -501,6 +768,14 @@ class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
         return result
 
     def _will_summarize(self, state: Any) -> bool:
+        """Return whether the next model call will trigger summarization.
+
+        Args:
+            state: Runtime state to inspect or update.
+
+        Returns:
+            Whether the next model call will trigger summarization.
+        """
         try:
             messages = state["messages"]
             ensure_ids = getattr(self.inner, "_ensure_message_ids", None)
@@ -518,6 +793,13 @@ class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
             return False
 
     def _emit(self, runtime: Any, status: str, message: str) -> None:
+        """Emit a custom stream event through the configured writer.
+
+        Args:
+            runtime: Agent runtime used by the operation.
+            status: The status value.
+            message: Chainlit message or LangChain message to process.
+        """
         stream_writer = getattr(runtime, "stream_writer", None)
         if not callable(stream_writer):
             return
@@ -541,6 +823,17 @@ def _build_summarization_middleware(
     model_name: str | None = None,
     source: str = "main-agent",
 ) -> AgentMiddleware[Any, Any, Any] | None:
+    """Build summarization middleware when the extension is enabled.
+
+    Args:
+        config: Configuration object used by the operation.
+        reasoning_level: The reasoning level value.
+        model_name: The model name value.
+        source: The source value.
+
+    Returns:
+        The constructed summarization middleware when the extension is enabled.
+    """
     try:
         from langchain.agents.middleware import SummarizationMiddleware
     except Exception:
@@ -586,6 +879,18 @@ def build_agent_middleware(
     source: str = "main-agent",
     project_root: Path | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
+    """Build agent middleware.
+
+    Args:
+        config: Configuration object used by the operation.
+        reasoning_level: The reasoning level value.
+        model_name: The model name value.
+        source: The source value.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The constructed agent middleware.
+    """
     middleware: list[AgentMiddleware[Any, Any, Any]] = [
         ToolExecutionResilienceMiddleware(project_root=project_root)
     ]
@@ -606,6 +911,15 @@ def build_agent_middleware(
 
 
 def resolve_local_path(path_value: str, base_dir: Path) -> Path:
+    """Resolve local path.
+
+    Args:
+        path_value: The path value value.
+        base_dir: The base dir value.
+
+    Returns:
+        The resolved local path.
+    """
     path = Path(path_value)
     if not path.is_absolute():
         path = (base_dir / path).resolve()
@@ -613,6 +927,14 @@ def resolve_local_path(path_value: str, base_dir: Path) -> Path:
 
 
 def normalize_mcp_transport(value: str) -> str:
+    """Normalize MCP transport.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized value.
+    """
     transport = value.strip().lower()
     if transport == "streamable-http":
         return "streamable_http"
@@ -620,6 +942,18 @@ def normalize_mcp_transport(value: str) -> str:
 
 
 def normalize_skill_source_path(path_value: str, base_dir: Path) -> str:
+    """Normalize skill source path.
+
+    Args:
+        path_value: The path value value.
+        base_dir: The base dir value.
+
+    Returns:
+        The normalized value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     raw = path_value.strip()
     if not raw:
         raise ValueError("Skill source paths cannot be empty.")
@@ -643,6 +977,18 @@ def normalize_skill_source_path(path_value: str, base_dir: Path) -> str:
 
 
 def normalize_mcp_server_config(raw_server: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    """Normalize MCP server config.
+
+    Args:
+        raw_server: Raw server to process.
+        base_dir: The base dir value.
+
+    Returns:
+        The normalized value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     server = dict(raw_server)
     transport = normalize_mcp_transport(str(server.get("transport", "")).strip())
     if not transport:
@@ -670,6 +1016,18 @@ def normalize_string_mapping(
     *,
     field_name: str,
 ) -> dict[str, str] | None:
+    """Normalize string mapping.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        field_name: The field name value.
+
+    Returns:
+        The normalized value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -679,6 +1037,17 @@ def normalize_string_mapping(
 
 @dataclass(frozen=True)
 class SubagentConfig:
+    """Describe a synchronous subagent from the deepagent configuration.
+
+    Attributes:
+        name: The name value.
+        description: The description value.
+        system_prompt: The system prompt value.
+        skills: The skills value.
+        mcp_servers: The MCP servers value.
+        model: Model name or model object used by the runtime.
+    """
+
     name: str
     description: str
     system_prompt: str
@@ -692,6 +1061,15 @@ class SubagentConfig:
         tools: list[Any] | None = None,
         middleware: list[AgentMiddleware[Any, Any, Any]] | None = None,
     ) -> dict[str, Any]:
+        """Convert this object to deepagents spec.
+
+        Args:
+            tools: The tools value.
+            middleware: The middleware value.
+
+        Returns:
+            The converted value.
+        """
         spec: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
@@ -710,6 +1088,16 @@ class SubagentConfig:
 
 @dataclass(frozen=True)
 class AsyncSubagentConfig:
+    """Describe an async subagent that runs through the Agent Protocol.
+
+    Attributes:
+        name: The name value.
+        description: The description value.
+        graph_id: Graph identifier.
+        url: The URL value.
+        headers: The headers value.
+    """
+
     name: str
     description: str
     graph_id: str
@@ -721,6 +1109,14 @@ class AsyncSubagentConfig:
         *,
         url_override: str | None = None,
     ) -> AsyncSubAgent:
+        """Convert this object to deepagents spec.
+
+        Args:
+            url_override: Agent Protocol URL override, if one is configured.
+
+        Returns:
+            The converted value.
+        """
         spec: AsyncSubAgent = {
             "name": self.name,
             "description": self.description,
@@ -736,6 +1132,18 @@ class AsyncSubagentConfig:
 
 @dataclass(frozen=True)
 class ChainlitCommandConfig:
+    """Describe a native Chainlit command backed by a configured target.
+
+    Attributes:
+        name: The name value.
+        description: The description value.
+        target: The target value.
+        value: Value to normalize, convert, or serialize.
+        template: Template string applied to command input.
+        mcp_server: The MCP server value.
+        source: The source value.
+    """
+
     name: str
     description: str
     target: Literal["prompt", "subagent", "mcp_tool", "skill"]
@@ -747,6 +1155,16 @@ class ChainlitCommandConfig:
 
 @dataclass(frozen=True)
 class SkillCommandMetadata:
+    """Track metadata required to expose a configured skill as a command.
+
+    Attributes:
+        name: The name value.
+        description: The description value.
+        path: Filesystem path to read or write.
+        source: The source value.
+        owner: The owner value.
+    """
+
     name: str
     description: str
     path: str
@@ -755,6 +1173,11 @@ class SkillCommandMetadata:
 
     @property
     def label(self) -> str:
+        """Return the display label for a skill command.
+
+        Returns:
+            The display label for a skill command.
+        """
         if self.source == "agent_skill":
             return f"main agent skill `{self.path}`"
         if self.owner:
@@ -762,6 +1185,11 @@ class SkillCommandMetadata:
         return f"subagent skill `{self.path}`"
 
     def to_chainlit_command(self) -> ChainlitCommandConfig:
+        """Convert this object to chainlit command.
+
+        Returns:
+            The converted value.
+        """
         return ChainlitCommandConfig(
             name=self.name,
             description=self.description,
@@ -772,6 +1200,15 @@ class SkillCommandMetadata:
 
 
 def virtual_workspace_path_to_local(path_value: str, project_root: Path | None = None) -> str:
+    """Convert a virtual workspace path into a local filesystem path.
+
+    Args:
+        path_value: The path value value.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The virtual workspace path to local result.
+    """
     normalized = path_value.strip().replace("\\", "/")
     workspace_prefix = "/workspace"
     if normalized != workspace_prefix and not normalized.startswith(f"{workspace_prefix}/"):
@@ -789,6 +1226,29 @@ def virtual_workspace_path_to_local(path_value: str, project_root: Path | None =
 
 @dataclass(frozen=True)
 class ExtensionsConfig:
+    """Store optional runtime extension settings parsed from configuration.
+
+    Attributes:
+        config_path: Path to the config.
+        mcp_tool_name_prefix: The MCP tool name prefix value.
+        mcp_stateful: The MCP stateful value.
+        recursion_limit: The recursion limit value.
+        mcp_servers: The MCP servers value.
+        skills: The skills value.
+        agent_mcp_servers: The agent MCP servers value.
+        subagents: The subagents value.
+        async_subagents: Async subagent configurations available for monitoring.
+        chainlit_commands: The chainlit commands value.
+        chainlit_model_mode_enabled: The chainlit model mode enabled value.
+        chainlit_reasoning_mode_enabled: The chainlit reasoning mode enabled value.
+        chainlit_startup_status_enabled: The chainlit startup status enabled value.
+        chainlit_chronological_ui_enabled: The chainlit chronological UI enabled value.
+        summarization_middleware_enabled: The summarization middleware enabled value.
+        summarization_trigger_tokens: The summarization trigger tokens value.
+        summarization_keep_tokens: The summarization keep tokens value.
+        custom_instruction: The custom instruction value.
+    """
+
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
     mcp_stateful: bool = False
@@ -810,6 +1270,11 @@ class ExtensionsConfig:
 
     @property
     def enabled(self) -> bool:
+        """Return whether optional runtime extensions are configured.
+
+        Returns:
+            True when at least one optional extension is configured; otherwise, False.
+        """
         return bool(
             self.skills
             or self.agent_mcp_servers
@@ -821,6 +1286,21 @@ class ExtensionsConfig:
 
 @dataclass(frozen=True)
 class ModelDefaults:
+    """Store resolved model provider defaults for the runtime.
+
+    Attributes:
+        provider: The provider value.
+        base_url: URL for the base.
+        endpoint_query: The endpoint query value.
+        name: The name value.
+        api_key: The API key value.
+        models: The models value.
+        name_is_explicit: The name is explicit value.
+        reasoning_effort: The reasoning effort value.
+        temperature: The temperature value.
+        repeat_penalty: The repeat penalty value.
+    """
+
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
     base_url: str = DEFAULT_OLLAMA_BASE_URL
     endpoint_query: tuple[tuple[str, str], ...] = ()
@@ -835,12 +1315,31 @@ class ModelDefaults:
 
 @dataclass(frozen=True)
 class FileConfig:
+    """Store resolved virtual file-system settings for the runtime.
+
+    Attributes:
+        model: Model name or model object used by the runtime.
+        extensions: The extensions value.
+        rag: The RAG value.
+    """
+
     model: ModelDefaults
     extensions: ExtensionsConfig
     rag: RagConfig = RagConfig()
 
 
 def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
+    """Parse model defaults.
+
+    Args:
+        raw_config: Raw config to process.
+
+    Returns:
+        The parsed model defaults.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     raw_model = raw_config.get("model", {})
     if raw_model and not isinstance(raw_model, dict):
         raise ValueError("The top-level 'model' config must be a table/object.")
@@ -916,6 +1415,19 @@ def parse_async_subagent_config(
     index: int,
     source_name: str,
 ) -> AsyncSubagentConfig:
+    """Parse async subagent config.
+
+    Args:
+        raw_subagent: Raw subagent to process.
+        index: The index value.
+        source_name: The source name value.
+
+    Returns:
+        The parsed async subagent config.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     name = str(raw_subagent.get("name", "")).strip()
     description = str(raw_subagent.get("description", "")).strip()
     graph_id = str(raw_subagent.get("graph_id", "")).strip()
@@ -963,6 +1475,20 @@ def parse_sync_subagent_config(
     base_dir: Path,
     mcp_servers: dict[str, dict[str, Any]],
 ) -> SubagentConfig:
+    """Parse sync subagent config.
+
+    Args:
+        raw_subagent: Raw subagent to process.
+        index: The index value.
+        base_dir: The base dir value.
+        mcp_servers: The MCP servers value.
+
+    Returns:
+        The parsed sync subagent config.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     name = str(raw_subagent.get("name", "")).strip()
     description = str(raw_subagent.get("description", "")).strip()
     if not name or not description:
@@ -1015,6 +1541,18 @@ def parse_sync_subagent_config(
 
 
 def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> ExtensionsConfig:
+    """Parse extensions config.
+
+    Args:
+        raw_config: Raw config to process.
+        config_path: Path to the config.
+
+    Returns:
+        The parsed extensions config.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
     base_dir = config_path.parent
     mcp_section = raw_config.get("mcp", {})
     if mcp_section and not isinstance(mcp_section, dict):
@@ -1221,6 +1759,14 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
 
 
 def load_agents_md_instruction(project_root: Path | None = None) -> str | None:
+    """Load agents md instruction.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The loaded value.
+    """
     agents_md_path = (project_root or PROJECT_ROOT).resolve() / AGENTS_MD_FILENAME
     try:
         instruction = agents_md_path.read_text(encoding="utf-8").strip()
@@ -1238,6 +1784,16 @@ def compose_agent_system_prompt(
     *,
     project_root: Path | None = None,
 ) -> str:
+    """Compose agent system prompt.
+
+    Args:
+        base_prompt: The base prompt value.
+        custom_instruction: The custom instruction value.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The composed value.
+    """
     sections = [base_prompt]
     agents_md_instruction = load_agents_md_instruction(project_root)
     if agents_md_instruction:
@@ -1257,6 +1813,14 @@ def compose_agent_system_prompt(
 
 
 def load_file_config(config_path: str | Path | None = None) -> FileConfig:
+    """Load file config.
+
+    Args:
+        config_path: Path to the config.
+
+    Returns:
+        The loaded value.
+    """
     config_name = (
         str(config_path).strip()
         if config_path is not None
@@ -1285,11 +1849,36 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
 
 def load_extensions_config(config_path: str | Path | None = None) -> ExtensionsConfig:
     # Keep the previous public helper for existing imports and tests.
+    """Load extensions config.
+
+    Args:
+        config_path: Path to the config.
+
+    Returns:
+        The loaded value.
+    """
     return load_file_config(config_path).extensions
 
 
 @dataclass(frozen=True)
 class RuntimeConfigOverrides:
+    """Capture CLI-provided runtime settings that override defaults.
+
+    Attributes:
+        config_path: Path to the config.
+        database_url: URL for the database.
+        disable_database: The disable database value.
+        model_provider: The model provider value.
+        model_name: The model name value.
+        model_base_url: URL for the model base.
+        model_endpoint_url: URL for the model endpoint.
+        model_api_key: The model API key value.
+        model_temperature: The model temperature value.
+        reasoning_level: The reasoning level value.
+        recursion_limit: The recursion limit value.
+        disable_rag: The disable RAG value.
+    """
+
     config_path: str | Path | None = None
     database_url: str | None = None
     disable_database: bool = False
@@ -1306,6 +1895,27 @@ class RuntimeConfigOverrides:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    """Hold resolved runtime configuration and factory helpers.
+
+    Attributes:
+        database_url: URL for the database.
+        model_provider: The model provider value.
+        model_name: The model name value.
+        model_choices: The model choices value.
+        model_base_url: URL for the model base.
+        model_api_key: The model API key value.
+        model_temperature: The model temperature value.
+        default_reasoning: The default reasoning value.
+        persistence_mode: The persistence mode value.
+        extensions: The extensions value.
+        model_repeat_penalty: The model repeat penalty value.
+        recursion_limit: The recursion limit value.
+        rag_requested: The RAG requested value.
+        rag: The RAG value.
+        rag_error: The RAG error value.
+        model_endpoint_query: The model endpoint query value.
+    """
+
     database_url: str | None
     model_provider: ModelProvider
     model_name: str
@@ -1328,6 +1938,17 @@ class RuntimeConfig:
         cls,
         overrides: RuntimeConfigOverrides | None = None,
     ) -> "RuntimeConfig":
+        """Create this object from environment.
+
+        Args:
+            overrides: The overrides value.
+
+        Returns:
+            The created this object from environment.
+
+        Raises:
+            ValueError: If the supplied value is invalid.
+        """
         overrides = overrides or RuntimeConfigOverrides()
         file_config = load_file_config(overrides.config_path)
         model_defaults = file_config.model
@@ -1499,6 +2120,16 @@ def build_model(
     *,
     model_name: str | None = None,
 ) -> Any:
+    """Build model.
+
+    Args:
+        config: Configuration object used by the operation.
+        reasoning_level: The reasoning level value.
+        model_name: The model name value.
+
+    Returns:
+        The constructed model.
+    """
     selected_model = str(model_name or config.model_name).strip() or config.model_name
     if config.model_provider == "ollama":
         kwargs: dict[str, Any] = {
@@ -1524,6 +2155,14 @@ def build_model(
 
 
 def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:
+    """Build deepagent backend.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The constructed deepagent backend.
+    """
     resolved_project_root = project_root or PROJECT_ROOT
     artifacts_root = deepagent_artifacts_root(resolved_project_root)
     return CompositeBackend(
@@ -1544,6 +2183,14 @@ def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBac
 
 
 def normalize_chainlit_command_name(value: str) -> str:
+    """Normalize chainlit command name.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized value.
+    """
     return value.strip().lstrip("/").lower()
 
 
@@ -1555,6 +2202,18 @@ def _load_skill_command_bucket(
     project_root: Path | None = None,
     owner: str | None = None,
 ) -> tuple[SkillCommandMetadata, ...]:
+    """Load skill command metadata from one configured source bucket.
+
+    Args:
+        backend: The backend value.
+        source_paths: Paths to the source.
+        source: The source value.
+        project_root: Project root used to resolve local paths.
+        owner: The owner value.
+
+    Returns:
+        The loaded value.
+    """
     commands_by_name: dict[str, SkillCommandMetadata] = {}
     for source_path in source_paths:
         try:
@@ -1601,6 +2260,15 @@ def _resolve_chainlit_project_root(
     backend: CompositeBackend | None,
     project_root: Path | None,
 ) -> Path:
+    """Resolve the project root used for Chainlit command discovery.
+
+    Args:
+        backend: The backend value.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The resolved the project root used for chainlit command discovery.
+    """
     if project_root is not None:
         return project_root
 
@@ -1618,6 +2286,16 @@ def build_chainlit_command_catalog(
     backend: CompositeBackend | None = None,
     project_root: Path | None = None,
 ) -> tuple[tuple[ChainlitCommandConfig, ...], tuple[str, ...]]:
+    """Build chainlit command catalog.
+
+    Args:
+        extensions: The extensions value.
+        backend: The backend value.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The constructed chainlit command catalog.
+    """
     resolved_project_root = _resolve_chainlit_project_root(
         backend=backend,
         project_root=project_root,
@@ -1694,6 +2372,15 @@ def sanitize_tools_for_model(
     model_provider: ModelProvider,
     tools: list[Any],
 ) -> list[Any]:
+    """Sanitize tools for model.
+
+    Args:
+        model_provider: The model provider value.
+        tools: The tools value.
+
+    Returns:
+        The sanitized value.
+    """
     if model_provider != "openai_compatible":
         return list(tools)
 
@@ -1717,6 +2404,14 @@ def sanitize_tools_for_model(
 
 
 def tool_supports_openai_compatible_schema(tool: Any) -> bool:
+    """Return whether a tool schema is OpenAI-compatible.
+
+    Args:
+        tool: The tool value.
+
+    Returns:
+        Whether a tool schema is OpenAI-compatible.
+    """
     try:
         schema = convert_to_openai_tool(tool)
     except Exception:
@@ -1731,6 +2426,15 @@ def build_graph_subagent_specs(
     *,
     include_async_subagents: bool,
 ) -> list[Any]:
+    """Build graph subagent specs.
+
+    Args:
+        config: Configuration object used by the operation.
+        include_async_subagents: Whether to include async subagents.
+
+    Returns:
+        The constructed graph subagent specs.
+    """
     subagent_specs: list[Any] = [
         subagent.to_deepagents_spec(
             middleware=build_agent_middleware(
@@ -1756,6 +2460,16 @@ def create_configured_graph(
     system_prompt: str = SYSTEM_PROMPT,
     apply_custom_instruction: bool = False,
 ) -> Any:
+    """Create configured graph.
+
+    Args:
+        include_async_subagents: Whether to include async subagents.
+        system_prompt: The system prompt value.
+        apply_custom_instruction: The apply custom instruction value.
+
+    Returns:
+        The created configured graph.
+    """
     config = RuntimeConfig.from_env()
     subagent_specs = build_graph_subagent_specs(
         config,
@@ -1800,16 +2514,32 @@ def create_configured_graph(
 
 @dataclass(frozen=True)
 class AppSettings:
+    """Store user-selected Chainlit settings for a chat session.
+
+    Attributes:
+        reasoning_level: The reasoning level value.
+        thread_id: Conversation thread identifier.
+        model_name: The model name value.
+    """
+
     reasoning_level: ReasoningLevel
     thread_id: str
     model_name: str
 
 
 class AgentRuntime:
+    """Own configured agents, MCP sessions, persistence handles, and RAG state."""
+
     _instance: "AgentRuntime | None" = None
     _instance_lock = asyncio.Lock()
 
     def __init__(self, config: RuntimeConfig, *, project_root: Path | None = None) -> None:
+        """Initialize the agent runtime instance.
+
+        Args:
+            config: Configuration object used by the operation.
+            project_root: Project root used to resolve local paths.
+        """
         self.config = config
         self.project_root = project_root or PROJECT_ROOT
         self._exit_stack = AsyncExitStack()
@@ -1834,6 +2564,11 @@ class AgentRuntime:
 
     @classmethod
     async def get(cls) -> "AgentRuntime":
+        """Get the agent runtime.
+
+        Returns:
+            The requested value.
+        """
         async with cls._instance_lock:
             if cls._instance is None:
                 instance = cls(RuntimeConfig.from_env())
@@ -1848,44 +2583,99 @@ class AgentRuntime:
         *,
         project_root: Path | None = None,
     ) -> "AgentRuntime":
+        """Create the agent runtime.
+
+        Args:
+            config: Configuration object used by the operation.
+            project_root: Project root used to resolve local paths.
+
+        Returns:
+            The created the agent runtime.
+        """
         instance = cls(config or RuntimeConfig.from_env(), project_root=project_root)
         await instance._initialize()
         return instance
 
     @classmethod
     def current(cls) -> "AgentRuntime | None":
+        """Return the current.
+
+        Returns:
+            The current.
+        """
         return cls._instance
 
     @property
     def checkpointer(self) -> AsyncPostgresSaver | MemorySaver:
+        """Return the initialized LangGraph checkpointer.
+
+        Returns:
+            The initialized LangGraph checkpointer.
+
+        Raises:
+            RuntimeError: If the runtime is not in a usable state.
+        """
         if self._checkpointer is None:
             raise RuntimeError("Checkpointer is not initialized.")
         return self._checkpointer
 
     @property
     def store(self) -> AsyncPostgresStore | InMemoryStore:
+        """Store the agent runtime.
+
+        Returns:
+            The stored value.
+
+        Raises:
+            RuntimeError: If the runtime is not in a usable state.
+        """
         if self._store is None:
             raise RuntimeError("Store is not initialized.")
         return self._store
 
     @property
     def persistence_enabled(self) -> bool:
+        """Return whether durable persistence is configured.
+
+        Returns:
+            Whether durable persistence is configured.
+        """
         return self.config.persistence_mode == "postgres"
 
     @property
     def rag_enabled(self) -> bool:
+        """Return whether the RAG service is available.
+
+        Returns:
+            Whether the RAG service is available.
+        """
         return self.config.rag_requested
 
     @property
     def chainlit_commands(self) -> tuple[ChainlitCommandConfig, ...]:
+        """Return configured native Chainlit commands.
+
+        Returns:
+            Configured native Chainlit commands.
+        """
         return self._chainlit_commands
 
     @property
     def chainlit_command_notes(self) -> tuple[str, ...]:
+        """Return notes explaining configured Chainlit commands.
+
+        Returns:
+            Notes explaining configured Chainlit commands.
+        """
         return self._chainlit_command_notes
 
     @property
     def rag_status(self) -> RagStatus:
+        """Return the current RAG service status.
+
+        Returns:
+            The current RAG service status.
+        """
         if self._rag_service is not None:
             return self._rag_service.snapshot()
         if self.config.rag_requested:
@@ -1898,6 +2688,7 @@ class AgentRuntime:
         return RagStatus.disabled()
 
     async def _initialize(self) -> None:
+        """Initialize persistence, RAG, MCP clients, and configured agents."""
         if self.config.extensions.mcp_servers:
             self._mcp_client = MultiServerMCPClient(
                 self.config.extensions.mcp_servers,
@@ -1938,6 +2729,18 @@ class AgentRuntime:
         async_subagent_url_override: str | None = None,
         mcp_session_id: str | None = None,
     ):
+        """Return the configured agent for a specific runtime context.
+
+        Args:
+            reasoning_level: The reasoning level value.
+            model_name: The model name value.
+            thread_id: Conversation thread identifier.
+            async_subagent_url_override: The async subagent URL override value.
+            mcp_session_id: MCP session identifier.
+
+        Returns:
+            The configured agent for a specific runtime context.
+        """
         selected_model = str(model_name or self.config.model_name).strip() or self.config.model_name
         mcp_scope = self._mcp_scope(
             mcp_session_id=mcp_session_id,
@@ -2020,6 +2823,11 @@ class AgentRuntime:
             return agent
 
     async def rebuild_rag_index(self) -> RagStatus:
+        """Rebuild RAG index.
+
+        Returns:
+            The rebuilt object or status.
+        """
         if self._rag_service is None:
             if self.config.rag_requested:
                 return RagStatus.unavailable(
@@ -2042,6 +2850,15 @@ class AgentRuntime:
         thread_id: str,
         uploads: list[UploadedRagFile],
     ) -> RagUploadResult:
+        """Ingest RAG uploads.
+
+        Args:
+            thread_id: Conversation thread identifier.
+            uploads: Uploaded files supplied by the user.
+
+        Returns:
+            The ingest RAG uploads result.
+        """
         if self._rag_service is None:
             return RagUploadResult(
                 thread_id=thread_id,
@@ -2055,6 +2872,14 @@ class AgentRuntime:
         )
 
     def resolve_chainlit_command(self, name: str) -> ChainlitCommandConfig | None:
+        """Resolve a native Chainlit command by name.
+
+        Args:
+            name: The name value.
+
+        Returns:
+            The matching command configuration, or None when no command matches.
+        """
         normalized = normalize_chainlit_command_name(name)
         if not normalized:
             return None
@@ -2072,6 +2897,21 @@ class AgentRuntime:
         mcp_session_id: str | None = None,
         server_name: str | None = None,
     ) -> Any:
+        """Invoke a configured MCP tool command with parsed arguments.
+
+        Args:
+            tool_name: Name of the tool to invoke.
+            raw_args: Raw argument text supplied with the command.
+            thread_id: Conversation thread identifier.
+            mcp_session_id: MCP session identifier.
+            server_name: The server name value.
+
+        Returns:
+            The invoke MCP tool command result.
+
+        Raises:
+            ValueError: If the supplied value is invalid.
+        """
         candidate_servers: tuple[str, ...]
         if server_name:
             candidate_servers = (server_name,)
@@ -2117,10 +2957,26 @@ class AgentRuntime:
         return await selected_tool.ainvoke(parsed_args)
 
     def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
+        """Sanitize tools for the active model provider.
+
+        Args:
+            tools: The tools value.
+
+        Returns:
+            The sanitized value.
+        """
         return sanitize_tools_for_model(self.config.model_provider, tools)
 
     @staticmethod
     def _tool_supports_openai_compatible_schema(tool: Any) -> bool:
+        """Return whether a tool supports OpenAI-compatible schemas.
+
+        Args:
+            tool: The tool value.
+
+        Returns:
+            Whether a tool supports OpenAI-compatible schemas.
+        """
         return tool_supports_openai_compatible_schema(tool)
 
     def _build_model(
@@ -2129,6 +2985,15 @@ class AgentRuntime:
         *,
         model_name: str | None = None,
     ) -> Any:
+        """Build the chat model for the current runtime settings.
+
+        Args:
+            reasoning_level: The reasoning level value.
+            model_name: The model name value.
+
+        Returns:
+            The constructed the chat model for the current runtime settings.
+        """
         return build_model(self.config, reasoning_level, model_name=model_name)
 
     def _mcp_scope(
@@ -2137,6 +3002,15 @@ class AgentRuntime:
         mcp_session_id: str | None,
         thread_id: str | None = None,
     ) -> str | None:
+        """Open or reuse MCP client resources for the current scope.
+
+        Args:
+            mcp_session_id: MCP session identifier.
+            thread_id: Conversation thread identifier.
+
+        Returns:
+            The MCP scope result.
+        """
         if not self.config.extensions.mcp_stateful:
             return None
 
@@ -2154,6 +3028,19 @@ class AgentRuntime:
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> Any:
+        """Return the cached MCP session for a Chainlit session.
+
+        Args:
+            server_name: The server name value.
+            thread_id: Conversation thread identifier.
+            mcp_session_id: MCP session identifier.
+
+        Returns:
+            The cached MCP session for a Chainlit session.
+
+        Raises:
+            RuntimeError: If the runtime is not in a usable state.
+        """
         scope = self._mcp_scope(
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
@@ -2182,6 +3069,16 @@ class AgentRuntime:
         thread_id: str | None = None,
         mcp_session_id: str | None = None,
     ) -> list[Any]:
+        """Load MCP tools for the active runtime context.
+
+        Args:
+            server_names: The server names value.
+            thread_id: Conversation thread identifier.
+            mcp_session_id: MCP session identifier.
+
+        Returns:
+            The requested value.
+        """
         if not server_names or self._mcp_client is None:
             return []
 
@@ -2226,6 +3123,15 @@ class AgentRuntime:
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> list[Any]:
+        """Build the main agent tool list for a runtime context.
+
+        Args:
+            thread_id: Conversation thread identifier.
+            mcp_session_id: MCP session identifier.
+
+        Returns:
+            The constructed the main agent tool list for a runtime context.
+        """
         tools = await self._get_mcp_tools(
             self.config.extensions.agent_mcp_servers,
             thread_id=thread_id,
@@ -2242,10 +3148,16 @@ class AgentRuntime:
         return tools
 
     async def _clear_agent_cache(self) -> None:
+        """Clear cached agents after runtime tool state changes."""
         async with self._agent_lock:
             self._agents.clear()
 
     async def close_mcp_session(self, mcp_session_id: str | None) -> None:
+        """Close MCP session.
+
+        Args:
+            mcp_session_id: MCP session identifier.
+        """
         mcp_scope = self._mcp_scope(mcp_session_id=mcp_session_id)
         if mcp_scope is None:
             return
@@ -2273,6 +3185,7 @@ class AgentRuntime:
             await stack.aclose()
 
     async def close_all_mcp_sessions(self) -> None:
+        """Close all MCP sessions."""
         async with self._agent_lock:
             async with self._mcp_lock:
                 stacks = list(self._mcp_session_stacks.values())
@@ -2285,10 +3198,19 @@ class AgentRuntime:
             await stack.aclose()
 
     async def close(self) -> None:
+        """Close the agent runtime."""
         await self._exit_stack.aclose()
         self._checkpointer = None
         self._store = None
         self._mcp_client = None
 
     def _build_backend(self, runtime):
+        """Build the Deep Agent backend for the current runtime settings.
+
+        Args:
+            runtime: Agent runtime used by the operation.
+
+        Returns:
+            The constructed the deep agent backend for the current runtime settings.
+        """
         return build_deepagent_backend(project_root=self.project_root)
