@@ -151,10 +151,22 @@ Run the same underlying agent from a terminal without the Chainlit UI:
 uv run chainagents --prompt "Summarize this repository" --thread-id cli
 ```
 
+Start the full-screen terminal UI:
+
+```bash
+uv run chainagents --tui
+```
+
+The TUI defaults to thread ID `tui`, keeps the prompt box at the bottom, shows
+the conversation in the main pane, and splits reasoning and tool activity in the
+right sidebar. Type `/` in the TUI prompt to show configured slash commands, and
+press Tab to complete the first matching command.
+
 Useful CLI examples:
 
 ```bash
 uv run chainagents --status --no-rag
+uv run chainagents --tui --reasoning high
 uv run chainagents --list-commands
 uv run chainagents --command ask-researcher --prompt "Find the config entrypoints"
 uv run chainagents --stdin --model gemma4:26b --reasoning high < prompt.txt

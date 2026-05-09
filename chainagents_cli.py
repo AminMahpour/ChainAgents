@@ -20,6 +20,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
 from agent_commands import (
     dumps_tool_result,
     parse_native_command,
@@ -106,8 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--thread-id",
-        default=DEFAULT_CLI_THREAD_ID,
-        help=f"LangGraph thread ID. Defaults to {DEFAULT_CLI_THREAD_ID!r}.",
+        default=None,
+        help=(
+            f"LangGraph thread ID. Defaults to {DEFAULT_CLI_THREAD_ID!r}, "
+            "or 'tui' in --tui mode."
+        ),
     )
     parser.add_argument("--recursion-limit", type=int, help="LangGraph recursion limit.")
 
@@ -168,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="json_output",
         action="store_true",
         help="Print machine-readable JSON output.",
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Run the full-screen terminal UI.",
     )
     return parser
 
@@ -628,13 +637,8 @@ class CliEventRenderer:
         self.show_reasoning = show_reasoning
         self.show_tools = show_tools
         self.response_buffer = ""
-        self.response_streamed_from_messages = False
-        self.reasoning_buffers: dict[str, str] = {}
+        self.stream_adapter = AgentStreamEventAdapter(prompt=prompt)
         self.reasoning_line_source: str | None = None
-        self.tool_names: dict[str, str] = {}
-        self.tool_args_buffers: dict[str, str] = {}
-        self.tool_call_started: set[str] = set()
-        self.completed_tool_results: set[tuple[str, str, str]] = set()
         self.stdout_console = cli_console(stdout)
         self.stderr_console = cli_console(stderr)
 
@@ -644,26 +648,21 @@ class CliEventRenderer:
         Args:
             event: LangGraph stream event to process.
         """
-        if event.get("event") != "on_chain_stream":
-            return
-        if event.get("parent_ids"):
-            return
+        for stream_event in self.stream_adapter.events_from_raw_event(event):
+            self._handle_stream_event(stream_event)
 
-        data = event.get("data")
-        if not isinstance(data, dict):
-            return
-
-        part = langgraph_part_from_event_chunk(data.get("chunk"))
-        if part is None:
-            return
-
-        kind = part["type"]
-        if kind == "messages":
-            self._handle_message_chunk(part)
-        elif kind == "updates":
-            self._handle_update_chunk(part)
-        elif kind == "custom":
-            self._handle_custom_chunk(part)
+    def _handle_stream_event(self, event: AgentStreamEvent) -> None:
+        """Render one normalized agent stream event."""
+        if event.kind == "response_delta":
+            self._stream_response_delta(event.text)
+        elif event.kind == "reasoning_delta":
+            self._stream_reasoning_delta(event.source, event.text)
+        elif event.kind == "tool_call":
+            self._stream_tool_call_event(event)
+        elif event.kind == "tool_result":
+            self._complete_tool_event(event)
+        elif event.kind == "summarization_status":
+            self._stream_summarization_status(event)
 
     def finish(self) -> str:
         """Finish the CLI event renderer.
@@ -682,91 +681,21 @@ class CliEventRenderer:
             self.stdout_console.print(Text(self.response_buffer, style="bright_white"))
         return self.response_buffer
 
-    def _handle_message_chunk(self, part: dict[str, Any]) -> None:
-        """Handle message chunk.
-
-        Args:
-            part: The part value.
-        """
-        token, metadata = part["data"]
-        metadata = metadata if isinstance(metadata, dict) else {}
-        ns = tuple(part.get("ns", ()))
-        source = namespace_label(ns, metadata)
-        is_main_source = not ns
-
-        reasoning_text = reasoning_text_from_token(token)
-        if reasoning_text:
-            self._stream_reasoning(source, reasoning_text)
-
-        tool_call_chunks = getattr(token, "tool_call_chunks", None) or []
-        if tool_call_chunks:
-            for chunk in tool_call_chunks:
-                self._stream_tool_call(source, chunk)
-
-        if getattr(token, "type", None) == "tool":
-            self._complete_tool(source, token)
-            return
-
-        content_text = stringify_content(getattr(token, "content", ""))
-        if is_main_source and content_text and not tool_call_chunks:
-            self.response_streamed_from_messages = True
-            self._stream_response(content_text)
-
-    def _handle_update_chunk(self, part: dict[str, Any]) -> None:
-        """Handle update chunk.
-
-        Args:
-            part: The part value.
-        """
-        ns = tuple(part.get("ns", ()))
-        source = namespace_label(ns, {"lc_agent_name": None})
-
-        for node_name, data in part["data"].items():
-            if node_name != "tools":
-                if not ns and not self.response_streamed_from_messages:
-                    assistant_messages = assistant_messages_for_current_prompt(
-                        messages_from_node_data(data),
-                        self.prompt,
-                    )
-                    if assistant_messages:
-                        content_text = stringify_content(
-                            getattr(assistant_messages[-1], "content", "")
-                        )
-                        if content_text:
-                            self._stream_response(content_text)
-                continue
-
-            for message in messages_from_node_data(data):
-                if getattr(message, "type", None) == "tool":
-                    self._complete_tool(source, message)
-
-    def _handle_custom_chunk(self, part: dict[str, Any]) -> None:
-        """Handle custom chunk.
-
-        Args:
-            part: The part value.
-        """
-        data = part.get("data")
-        if not isinstance(data, dict):
-            return
-        if data.get("kind") != SUMMARIZATION_STATUS_KIND:
-            return
+    def _stream_summarization_status(self, event: AgentStreamEvent) -> None:
+        """Render a summarization status update."""
         if self.json_output:
             return
 
-        status = str(data.get("status") or "triggered").strip() or "triggered"
-        source = str(data.get("source") or "main-agent").strip() or "main-agent"
-        message = str(data.get("message") or "Conversation summarization triggered.").strip()
         self._close_reasoning_line()
         body = Text.assemble(
             ("status: ", "dim"),
-            (status, "bold cyan"),
+            (event.status, "bold cyan"),
             ("\nsource: ", "dim"),
-            (source, "cyan"),
+            (event.source, "cyan"),
         )
-        if message:
+        if event.text:
             body.append("\nmessage: ", style="dim")
-            body.append(message, style="white")
+            body.append(event.text, style="white")
         self.stderr_console.print(
             cli_panel(
                 body,
@@ -775,31 +704,27 @@ class CliEventRenderer:
             )
         )
 
-    def _stream_response(self, text: str) -> None:
+    def _stream_response_delta(self, text: str) -> None:
         """Stream final response text into the active output target.
 
         Args:
             text: Text content to process.
         """
-        delta = text[len(self.response_buffer) :] if text.startswith(self.response_buffer) else text
-        if not delta:
+        if not text:
             return
-        self.response_buffer += delta
+        self.response_buffer += text
         if self.stream and not self.json_output:
-            self.stdout_console.print(Text(delta, style="bright_white"), end="")
+            self.stdout_console.print(Text(text, style="bright_white"), end="")
 
-    def _stream_reasoning(self, source: str, text: str) -> None:
+    def _stream_reasoning_delta(self, source: str, text: str) -> None:
         """Stream reasoning text into the active output target.
 
         Args:
             source: The source value.
             text: Text content to process.
         """
-        previous = self.reasoning_buffers.get(source, "")
-        delta = text[len(previous) :] if text.startswith(previous) else text
-        if not delta:
+        if not text:
             return
-        self.reasoning_buffers[source] = previous + delta
         if self.show_reasoning:
             if self.reasoning_line_source != source:
                 self._close_reasoning_line()
@@ -808,7 +733,7 @@ class CliEventRenderer:
                     end="",
                 )
                 self.reasoning_line_source = source
-            self.stderr_console.print(Text(delta, style="magenta"), end="")
+            self.stderr_console.print(Text(text, style="magenta"), end="")
 
     def _close_reasoning_line(self) -> None:
         """Close the active reasoning line before rendering other output."""
@@ -817,39 +742,21 @@ class CliEventRenderer:
         self.stderr_console.print()
         self.reasoning_line_source = None
 
-    def _stream_tool_call(self, source: str, chunk: dict[str, Any]) -> None:
-        """Render a streamed tool call and its accumulated arguments.
-
-        Args:
-            source: The source value.
-            chunk: Streamed event chunk to normalize.
-        """
-        call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
-        tool_name = str(chunk.get("name") or self.tool_names.get(call_id) or "tool")
-        self.tool_names[call_id] = tool_name
-        args_delta = chunk.get("args")
-        if args_delta:
-            self.tool_args_buffers[call_id] = self.tool_args_buffers.get(call_id, "") + str(
-                args_delta
-            )
-
+    def _stream_tool_call_event(self, event: AgentStreamEvent) -> None:
+        """Render a streamed tool call and its accumulated arguments."""
         if not self.show_tools:
-            return
-        if not chunk.get("name") and call_id not in self.tool_call_started:
             return
 
         self._close_reasoning_line()
-        status = "start" if call_id not in self.tool_call_started else "update"
-        self.tool_call_started.add(call_id)
         body = Text.assemble(
             ("status: ", "dim"),
-            (status, "bold yellow"),
+            (event.status, "bold yellow"),
             ("\nsource: ", "dim"),
-            (source, "cyan"),
+            (event.source, "cyan"),
             ("\ntool: ", "dim"),
-            (tool_name, "bold white"),
+            (event.tool_name, "bold white"),
         )
-        args = pretty_tool_call_args(self.tool_args_buffers.get(call_id))
+        args = pretty_tool_call_args(event.tool_args)
         if args:
             body.append("\nargs: ", style="dim yellow")
             body.append(args, style="yellow")
@@ -861,37 +768,20 @@ class CliEventRenderer:
             )
         )
 
-    def _complete_tool(self, source: str, tool_message: Any) -> None:
-        """Render the final status and output for a completed tool call.
-
-        Args:
-            source: The source value.
-            tool_message: The tool message value.
-        """
+    def _complete_tool_event(self, event: AgentStreamEvent) -> None:
+        """Render the final status and output for a completed tool call."""
         if not self.show_tools:
             return
-        name = str(getattr(tool_message, "name", "") or "tool")
-        status = str(getattr(tool_message, "status", "") or "done")
-        content = truncate_tool_result_content(getattr(tool_message, "content", ""))
-        result_key = self._tool_result_key(
-            source=source,
-            name=name,
-            tool_message=tool_message,
-            content=content,
-        )
-        if result_key in self.completed_tool_results:
-            return
-        self.completed_tool_results.add(result_key)
-
+        content = truncate_tool_result_content(event.tool_result)
         self._close_reasoning_line()
-        status_style = "bold red" if status.lower() == "error" else "bold green"
+        status_style = "bold red" if event.status.lower() == "error" else "bold green"
         body = Text.assemble(
             ("status: ", "dim"),
-            (status, status_style),
+            (event.status, status_style),
             ("\nsource: ", "dim"),
-            (source, "cyan"),
+            (event.source, "cyan"),
             ("\ntool: ", "dim"),
-            (name, "bold white"),
+            (event.tool_name, "bold white"),
         )
         if content:
             body.append("\nresult: ", style="dim yellow")
@@ -900,7 +790,7 @@ class CliEventRenderer:
             cli_panel(
                 body,
                 title="Tool Result",
-                border_style="red" if status.lower() == "error" else "green",
+                border_style="red" if event.status.lower() == "error" else "green",
             )
         )
 
@@ -1478,6 +1368,36 @@ async def run_cli(
     Returns:
         The command result.
     """
+    if args.tui:
+        if args.prompt or args.prompt_parts or args.stdin:
+            print("tui: start the TUI without a one-shot prompt.", file=stderr)
+            return 2
+        unsupported_tui_flags = []
+        if args.photo:
+            unsupported_tui_flags.append("--photo")
+        if args.command:
+            unsupported_tui_flags.append("--command")
+        if args.rebuild_rag:
+            unsupported_tui_flags.append("--rebuild-rag")
+        if args.upload_rag:
+            unsupported_tui_flags.append("--upload-rag")
+        if args.status:
+            unsupported_tui_flags.append("--status")
+        if args.list_commands:
+            unsupported_tui_flags.append("--list-commands")
+        if args.json_output:
+            unsupported_tui_flags.append("--json")
+        if unsupported_tui_flags:
+            print(
+                "tui: unsupported flags in TUI mode: "
+                + ", ".join(unsupported_tui_flags),
+                file=stderr,
+            )
+            return 2
+        from chainagents_tui import run_tui
+
+        return await run_tui(runtime, args)
+
     prompt = prompt_from_args(args, stdin=stdin, parser=parser)
     has_prompt = bool(prompt and prompt.strip())
 
@@ -1519,10 +1439,11 @@ async def run_cli(
                 json_output=False,
             )
 
+    thread_id = str(args.thread_id or DEFAULT_CLI_THREAD_ID).strip() or DEFAULT_CLI_THREAD_ID
     upload_result = await ingest_uploads(
         runtime,
         paths=args.upload_rag,
-        thread_id=args.thread_id,
+        thread_id=thread_id,
         stdout=stdout,
         stderr=stderr,
         json_output=False,
