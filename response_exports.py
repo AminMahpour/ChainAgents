@@ -1,3 +1,5 @@
+"""Create Markdown and PDF exports for Chainlit response messages."""
+
 from __future__ import annotations
 
 import re
@@ -27,6 +29,13 @@ def attach_response_export_actions(
     prompt: str,
     response_text: str,
 ) -> None:
+    """Attach response export actions.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+        prompt: The prompt value.
+        response_text: The response text value.
+    """
     message_id = str(getattr(message, "id", "") or "").strip()
     if not message_id or not response_text.strip():
         return
@@ -58,6 +67,11 @@ def attach_response_export_actions(
 
 
 async def send_markdown_export(action: cl.Action) -> None:
+    """Send markdown export.
+
+    Args:
+        action: The action value.
+    """
     export = response_export_for_action(action)
     if export is None:
         await _send_export_unavailable_message()
@@ -77,6 +91,11 @@ async def send_markdown_export(action: cl.Action) -> None:
 
 
 async def send_pdf_export(action: cl.Action) -> None:
+    """Send PDF export.
+
+    Args:
+        action: The action value.
+    """
     export = response_export_for_action(action)
     if export is None:
         await _send_export_unavailable_message()
@@ -95,6 +114,14 @@ async def send_pdf_export(action: cl.Action) -> None:
 
 
 def response_export_for_action(action: cl.Action) -> dict[str, str] | None:
+    """Return the stored response export for a Chainlit action.
+
+    Args:
+        action: The action value.
+
+    Returns:
+        The stored response export for a Chainlit action.
+    """
     message_id = response_message_id_from_action(action)
     if not message_id:
         return None
@@ -118,12 +145,29 @@ def response_export_for_action(action: cl.Action) -> dict[str, str] | None:
 
 
 def response_message_id_from_action(action: cl.Action) -> str:
+    """Extract the response message ID from a Chainlit action.
+
+    Args:
+        action: The action value.
+
+    Returns:
+        The response message ID, or None when it cannot be determined.
+    """
     payload = action.payload if isinstance(action.payload, dict) else {}
     message_id = str(action.forId or payload.get("response_id") or "").strip()
     return message_id
 
 
 def suggested_export_basename(prompt: str, message_id: str) -> str:
+    """Suggest export basename.
+
+    Args:
+        prompt: The prompt value.
+        message_id: Message identifier.
+
+    Returns:
+        The suggested value.
+    """
     source = next((line.strip() for line in prompt.splitlines() if line.strip()), "")
     slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
     if not slug:
@@ -133,6 +177,14 @@ def suggested_export_basename(prompt: str, message_id: str) -> str:
 
 
 def build_pdf_bytes(text: str) -> bytes:
+    """Build PDF bytes.
+
+    Args:
+        text: Text content to process.
+
+    Returns:
+        The constructed pdf bytes.
+    """
     wrapped_lines = _wrap_pdf_lines(text)
     pages = _chunk_lines(wrapped_lines or [""], PDF_MAX_LINES_PER_PAGE)
 
@@ -171,6 +223,13 @@ async def _send_export_element(
     export_kind: str,
     element: Element,
 ) -> None:
+    """Send a generated export file as a Chainlit element.
+
+    Args:
+        action: The action value.
+        export_kind: The export kind value.
+        element: The element value.
+    """
     message_id = response_message_id_from_action(action)
     if not message_id:
         await _send_export_unavailable_message()
@@ -188,6 +247,7 @@ async def _send_export_element(
 
 
 async def _send_export_unavailable_message() -> None:
+    """Notify the user that no exportable response is available."""
     await cl.Message(
         content="That response is no longer available for download in this session.",
         author="System",
@@ -195,6 +255,11 @@ async def _send_export_unavailable_message() -> None:
 
 
 def _get_response_exports() -> dict[str, dict[str, str]]:
+    """Return the session response export registry.
+
+    Returns:
+        The session response export registry.
+    """
     raw_exports = cl.user_session.get(RESPONSE_EXPORTS_SESSION_KEY)
     if isinstance(raw_exports, dict):
         return {
@@ -206,6 +271,11 @@ def _get_response_exports() -> dict[str, dict[str, str]]:
 
 
 def _get_sent_export_elements() -> dict[str, dict[str, Element]]:
+    """Return IDs of export elements already sent this session.
+
+    Returns:
+        IDs of export elements already sent this session.
+    """
     raw_elements = cl.user_session.get(RESPONSE_EXPORT_ELEMENTS_SESSION_KEY)
     if not isinstance(raw_elements, dict):
         return {}
@@ -225,6 +295,14 @@ def _get_sent_export_elements() -> dict[str, dict[str, Element]]:
 
 
 def _wrap_pdf_lines(text: str) -> list[str]:
+    """Wrap plain text into PDF-safe line fragments.
+
+    Args:
+        text: Text content to process.
+
+    Returns:
+        The wrap PDF lines result.
+    """
     wrapper = textwrap.TextWrapper(
         width=PDF_MAX_CHARS_PER_LINE,
         replace_whitespace=False,
@@ -246,10 +324,27 @@ def _wrap_pdf_lines(text: str) -> list[str]:
 
 
 def _chunk_lines(lines: list[str], size: int) -> list[list[str]]:
+    """Group wrapped PDF lines into page-sized chunks.
+
+    Args:
+        lines: The lines value.
+        size: The size value.
+
+    Returns:
+        The chunk lines result.
+    """
     return [lines[index : index + size] for index in range(0, len(lines), size)] or [[]]
 
 
 def _build_pdf_content_stream(lines: list[str]) -> bytes:
+    """Build a PDF content stream for one page of text.
+
+    Args:
+        lines: The lines value.
+
+    Returns:
+        The constructed a pdf content stream for one page of text.
+    """
     start_x = PDF_MARGIN
     start_y = PDF_PAGE_HEIGHT - PDF_MARGIN
     commands = [
@@ -266,11 +361,27 @@ def _build_pdf_content_stream(lines: list[str]) -> bytes:
 
 
 def _pdf_stream_object(content: bytes) -> bytes:
+    """Serialize one PDF stream object with its byte length.
+
+    Args:
+        content: Message or document content to process.
+
+    Returns:
+        The PDF stream object result.
+    """
     header = f"<< /Length {len(content)} >>\nstream\n".encode("latin-1")
     return header + content + b"\nendstream"
 
 
 def _escape_pdf_text(text: str) -> str:
+    """Escape text for inclusion in PDF string literals.
+
+    Args:
+        text: Text content to process.
+
+    Returns:
+        The escape PDF text result.
+    """
     return (
         text.replace("\\", "\\\\")
         .replace("(", "\\(")
@@ -279,6 +390,14 @@ def _escape_pdf_text(text: str) -> str:
 
 
 def _serialize_pdf(objects: dict[int, bytes]) -> bytes:
+    """Serialize PDF objects, xref table, trailer, and EOF marker.
+
+    Args:
+        objects: The objects value.
+
+    Returns:
+        The serialize PDF result.
+    """
     object_ids = sorted(objects)
     pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offsets: dict[int, int] = {}

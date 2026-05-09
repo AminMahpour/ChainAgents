@@ -1,3 +1,5 @@
+"""Bridge LangGraph stream events into Chainlit messages, steps, and task lists."""
+
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +33,11 @@ LANGGRAPH_STREAM_MODES = {
 
 
 def load_auto_collapse_delay_seconds() -> float:
+    """Load auto collapse delay seconds.
+
+    Returns:
+        The loaded value.
+    """
     if not CHAINLIT_APP_CONFIG_PATH.exists():
         return DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS
 
@@ -62,6 +69,14 @@ AUTO_COLLAPSE_DELAY_SECONDS = load_auto_collapse_delay_seconds()
 
 
 def stringify_content(value: Any) -> str:
+    """Convert content.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The string representation.
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -79,6 +94,14 @@ def stringify_content(value: Any) -> str:
 
 
 def pretty_data(value: Any) -> str:
+    """Format data.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The formatted display value.
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -94,6 +117,15 @@ def pretty_data(value: Any) -> str:
 
 
 def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
+    """Return a display label for a tool namespace.
+
+    Args:
+        ns: The ns value.
+        metadata: The metadata value.
+
+    Returns:
+        A display label for a tool namespace.
+    """
     agent_name = metadata.get("lc_agent_name")
     if agent_name:
         return str(agent_name)
@@ -110,6 +142,14 @@ def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
 
 
 def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
+    """Normalize stream event chunks into LangGraph part metadata.
+
+    Args:
+        chunk: Streamed event chunk to normalize.
+
+    Returns:
+        The langgraph part from event chunk result.
+    """
     if isinstance(chunk, dict):
         mode = chunk.get("type")
         if isinstance(mode, str) and mode in LANGGRAPH_STREAM_MODES and "data" in chunk:
@@ -146,6 +186,14 @@ def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
 
 
 def reasoning_text_from_token(token: Any) -> str:
+    """Extract reasoning text from a streamed model token.
+
+    Args:
+        token: Streamed model token to inspect.
+
+    Returns:
+        The extracted reasoning text from a streamed model token.
+    """
     if hasattr(token, "additional_kwargs"):
         text = stringify_content(token.additional_kwargs.get("reasoning_content"))
         if text:
@@ -156,6 +204,14 @@ def reasoning_text_from_token(token: Any) -> str:
 
 
 def iter_messages(value: Any) -> list[Any]:
+    """Iterate over messages.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        An iterator over the matching values.
+    """
     if value is None:
         return []
     if isinstance(value, (list, tuple)):
@@ -183,6 +239,14 @@ def iter_messages(value: Any) -> list[Any]:
 
 
 def messages_from_node_data(data: Any) -> list[Any]:
+    """Extract message objects from LangGraph node update payloads.
+
+    Args:
+        data: Payload data to inspect.
+
+    Returns:
+        The extracted message objects from langgraph node update payloads.
+    """
     if data is None:
         return []
     if isinstance(data, dict):
@@ -191,6 +255,14 @@ def messages_from_node_data(data: Any) -> list[Any]:
 
 
 def todos_from_node_data(data: Any) -> list[dict[str, str]]:
+    """Extract todo items from LangGraph node update payloads.
+
+    Args:
+        data: Payload data to inspect.
+
+    Returns:
+        The extracted todo items from langgraph node update payloads.
+    """
     if data is None:
         return []
 
@@ -230,6 +302,14 @@ def todos_from_node_data(data: Any) -> list[dict[str, str]]:
 
 
 def todos_from_write_todos_args(raw_args: str) -> list[dict[str, str]]:
+    """Extract todo items from write_todos tool arguments.
+
+    Args:
+        raw_args: Raw argument text supplied with the command.
+
+    Returns:
+        The extracted todo items from write_todos tool arguments.
+    """
     text = raw_args.strip()
     if not text:
         return []
@@ -262,6 +342,14 @@ def todos_from_write_todos_args(raw_args: str) -> list[dict[str, str]]:
 
 
 def todos_from_tool_message_content(content: Any) -> list[dict[str, str]]:
+    """Extract todo items from a write_todos tool result message.
+
+    Args:
+        content: Message or document content to process.
+
+    Returns:
+        The extracted todo items from a write_todos tool result message.
+    """
     text = stringify_content(content).strip()
     prefix = "Updated todo list to "
     if not text.startswith(prefix):
@@ -291,6 +379,14 @@ def todos_from_tool_message_content(content: Any) -> list[dict[str, str]]:
 
 
 def parse_tool_args(raw_args: str) -> Any:
+    """Parse tool args.
+
+    Args:
+        raw_args: Raw argument text supplied with the command.
+
+    Returns:
+        The parsed tool args.
+    """
     text = raw_args.strip()
     if not text:
         return None
@@ -303,6 +399,15 @@ def parse_tool_args(raw_args: str) -> Any:
 
 
 def shorten_title(text: str, limit: int = 72) -> str:
+    """Shorten long titles for compact Chainlit task display.
+
+    Args:
+        text: Text content to process.
+        limit: The limit value.
+
+    Returns:
+        The shorten title result.
+    """
     compact = " ".join(text.strip().split())
     if len(compact) <= limit:
         return compact
@@ -310,6 +415,16 @@ def shorten_title(text: str, limit: int = 72) -> str:
 
 
 def tool_task_title(source: str, tool_name: str, raw_args: str) -> str:
+    """Build the visible task title for a tool invocation.
+
+    Args:
+        source: The source value.
+        tool_name: Name of the tool to invoke.
+        raw_args: Raw argument text supplied with the command.
+
+    Returns:
+        The constructed the visible task title for a tool invocation.
+    """
     name = tool_name.strip() or "tool"
     parsed = parse_tool_args(raw_args)
 
@@ -338,14 +453,39 @@ def tool_task_title(source: str, tool_name: str, raw_args: str) -> str:
 
 
 def is_assistant_message(message: Any) -> bool:
+    """Return whether assistant message.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+
+    Returns:
+        Whether assistant message.
+    """
     return getattr(message, "type", None) in {"ai", "AIMessageChunk"}
 
 
 def message_text(message: Any) -> str:
+    """Build the message for text.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+
+    Returns:
+        The constructed the message for text.
+    """
     return stringify_content(getattr(message, "content", "")).strip()
 
 
 def assistant_messages_for_current_prompt(messages: list[Any], prompt: str) -> list[Any]:
+    """Return assistant messages produced after the current prompt began.
+
+    Args:
+        messages: The messages value.
+        prompt: The prompt value.
+
+    Returns:
+        Assistant messages produced after the current prompt began.
+    """
     prompt_text = prompt.strip()
     current_prompt_index = -1
     for index, message in enumerate(messages):
@@ -366,6 +506,16 @@ def assistant_messages_for_current_prompt(messages: list[Any], prompt: str) -> l
 
 @dataclass
 class ToolStepState:
+    """Track rendered input and output for an active Chainlit tool step.
+
+    Attributes:
+        call_id: Call identifier.
+        source: The source value.
+        step: The step value.
+        name: The name value.
+        arg_chunks: The arg chunks value.
+    """
+
     call_id: str
     source: str
     step: cl.Step
@@ -374,14 +524,26 @@ class ToolStepState:
 
     @property
     def rendered_input(self) -> str:
+        """Return the rendered input associated with a tool step.
+
+        Returns:
+            The rendered input associated with a tool step.
+        """
         return pretty_data("".join(self.arg_chunks).strip())
 
 
 class RunTaskList:
+    """Maintain the Chainlit task list shown for a single agent run."""
+
     MAIN_REASONING_KEY = "reasoning:main-agent"
     RESPONSE_KEY = "response"
 
     def __init__(self, task_list: cl.TaskList) -> None:
+        """Initialize the run task list instance.
+
+        Args:
+            task_list: The task list value.
+        """
         self.task_list = task_list
         self.using_todos = False
         self.tasks_by_key: dict[str, cl.Task] = {}
@@ -390,14 +552,25 @@ class RunTaskList:
 
     @classmethod
     async def create(cls) -> RunTaskList:
+        """Create the run task list.
+
+        Returns:
+            The created the run task list.
+        """
         return cls(cl.TaskList(status="Ready"))
 
     async def show_ready(self) -> None:
+        """Show the task list before the first stream event arrives."""
         self._reset_dynamic_tasks()
         self.task_list.status = "Ready"
         await self.task_list.send()
 
     async def start(self, response_for_id: str | None = None) -> None:
+        """Start the run task list.
+
+        Args:
+            response_for_id: Response for identifier.
+        """
         self._reset_dynamic_tasks()
         self.response_for_id = response_for_id
         self._ensure_task(
@@ -408,6 +581,12 @@ class RunTaskList:
         await self._sync()
 
     async def mark_reasoning(self, source: str, for_id: str | None = None) -> None:
+        """Mark reasoning activity on the task list.
+
+        Args:
+            source: The source value.
+            for_id: For identifier.
+        """
         if self.using_todos:
             return
         key = self._reasoning_key(source)
@@ -426,6 +605,13 @@ class RunTaskList:
         *,
         for_id: str | None = None,
     ) -> None:
+        """Mark a tool task as running and attach its input.
+
+        Args:
+            call_id: Call identifier.
+            title: The title value.
+            for_id: For identifier.
+        """
         if self.using_todos:
             return
         self._finish_running_reasoning()
@@ -445,6 +631,14 @@ class RunTaskList:
         for_id: str | None = None,
         failed: bool = False,
     ) -> None:
+        """Mark a tool task as finished and attach its output.
+
+        Args:
+            call_id: Call identifier.
+            title: The title value.
+            for_id: For identifier.
+            failed: The failed value.
+        """
         if self.using_todos:
             return
         key = self._tool_key(call_id)
@@ -462,6 +656,11 @@ class RunTaskList:
         await self._sync()
 
     async def mark_response_started(self, for_id: str | None = None) -> None:
+        """Mark the final response task as running.
+
+        Args:
+            for_id: For identifier.
+        """
         if self.using_todos:
             return
         self._finish_running_reasoning()
@@ -480,6 +679,7 @@ class RunTaskList:
         await self._sync()
 
     async def finish(self) -> None:
+        """Finish the run task list."""
         if self.using_todos:
             self.task_list.status = self._status_from_tasks(self.task_list.tasks, finished=True)
             await self.task_list.send()
@@ -498,6 +698,7 @@ class RunTaskList:
         await self.task_list.send()
 
     async def fail(self) -> None:
+        """Fail the run task list."""
         self.task_list.status = "Failed"
         for task in self.task_list.tasks:
             if task.status != cl.TaskStatus.DONE:
@@ -505,6 +706,11 @@ class RunTaskList:
         await self.task_list.send()
 
     async def update_todos(self, todos: list[dict[str, str]]) -> None:
+        """Refresh dynamic todo tasks from streamed todo updates.
+
+        Args:
+            todos: The todos value.
+        """
         if not todos:
             return
 
@@ -522,6 +728,7 @@ class RunTaskList:
         await self.task_list.send()
 
     def _reset_dynamic_tasks(self) -> None:
+        """Remove dynamic tasks that will be rebuilt from current state."""
         self.using_todos = False
         self.tasks_by_key.clear()
         self.task_order.clear()
@@ -536,6 +743,17 @@ class RunTaskList:
         *,
         for_id: str | None = None,
     ) -> cl.Task:
+        """Return an existing task or create it in display order.
+
+        Args:
+            key: The key value.
+            title: The title value.
+            status: The status value.
+            for_id: For identifier.
+
+        Returns:
+            An existing task or create it in display order.
+        """
         task = self.tasks_by_key.get(key)
         if task is None:
             task = cl.Task(title=title, status=status, forId=for_id)
@@ -551,25 +769,53 @@ class RunTaskList:
         return task
 
     def _finish_running_reasoning(self) -> None:
+        """Close any reasoning task that is still marked running."""
         for key, task in self.tasks_by_key.items():
             if key.startswith("reasoning:") and task.status == cl.TaskStatus.RUNNING:
                 task.status = cl.TaskStatus.DONE
 
     def _rebuild_tasks(self) -> None:
+        """Rebuild the Chainlit task list from stored task state."""
         self.task_list.tasks = [self.tasks_by_key[key] for key in self.task_order]
 
     async def _sync(self) -> None:
+        """Synchronize task objects with the Chainlit task list element."""
         self._rebuild_tasks()
         self.task_list.status = self._status_from_tasks(self.task_list.tasks, finished=False)
         await self.task_list.send()
 
     def _reasoning_key(self, source: str) -> str:
+        """Build a task key for a reasoning segment.
+
+        Args:
+            source: The source value.
+
+        Returns:
+            The constructed a task key for a reasoning segment.
+        """
         return f"reasoning:{source}"
 
     def _tool_key(self, call_id: str) -> str:
+        """Build a task key for a tool invocation.
+
+        Args:
+            call_id: Call identifier.
+
+        Returns:
+            The constructed a task key for a tool invocation.
+        """
         return f"tool:{call_id}"
 
     def _status_from_tasks(self, tasks: list[cl.Task], *, finished: bool) -> str:
+        """Derive the aggregate task-list status from child tasks.
+
+        Args:
+            tasks: The tasks value.
+            finished: The finished value.
+
+        Returns:
+            The status from tasks result.
+        """
         if not tasks:
             return "Done" if finished else "Ready"
         if any(task.status == cl.TaskStatus.FAILED for task in tasks):
@@ -581,6 +827,14 @@ class RunTaskList:
         return "Returned" if finished else "Pending"
 
     def _todo_status_to_task_status(self, status: str) -> cl.TaskStatus:
+        """Map todo statuses onto Chainlit task statuses.
+
+        Args:
+            status: The status value.
+
+        Returns:
+            The todo status to task status result.
+        """
         normalized = status.strip().lower()
         if normalized == "in_progress":
             return cl.TaskStatus.RUNNING
@@ -590,6 +844,8 @@ class RunTaskList:
 
 
 class ChainlitEventBridge:
+    """Translate LangGraph stream events into Chainlit UI updates."""
+
     def __init__(
         self,
         prompt: str,
@@ -597,6 +853,13 @@ class ChainlitEventBridge:
         *,
         chronological_ui_enabled: bool = True,
     ) -> None:
+        """Initialize the chainlit event bridge instance.
+
+        Args:
+            prompt: The prompt value.
+            run_task_list: The run task list value.
+            chronological_ui_enabled: The chronological UI enabled value.
+        """
         self.prompt = prompt
         self.run_task_list = run_task_list
         self.response_message: cl.Message | None = None
@@ -614,10 +877,16 @@ class ChainlitEventBridge:
         self.chronological_ui_enabled = chronological_ui_enabled
 
     async def start(self) -> None:
+        """Start the chainlit event bridge."""
         if self.run_task_list is not None:
             await self.run_task_list.start()
 
     async def handle_part(self, part: dict[str, Any]) -> None:
+        """Handle one normalized LangGraph stream part.
+
+        Args:
+            part: The part value.
+        """
         kind = part["type"]
         if kind == "messages":
             await self._handle_message_chunk(part)
@@ -629,6 +898,11 @@ class ChainlitEventBridge:
             await self._handle_custom_chunk(part)
 
     async def handle_event(self, event: dict[str, Any]) -> None:
+        """Handle one raw LangGraph stream event.
+
+        Args:
+            event: LangGraph stream event to process.
+        """
         if event.get("event") != "on_chain_stream":
             return
         if event.get("parent_ids"):
@@ -645,12 +919,19 @@ class ChainlitEventBridge:
         await self.handle_part(part)
 
     async def finish(self) -> None:
+        """Finish the chainlit event bridge."""
         await self._close_all_open_steps()
         await self._send_final_response_message()
         if self.run_task_list is not None:
             await self.run_task_list.finish()
 
     async def fail(self, exc: Exception, details: str) -> None:
+        """Fail the chainlit event bridge.
+
+        Args:
+            exc: The exc value.
+            details: The details value.
+        """
         await self._close_all_open_steps()
         if self.run_task_list is not None:
             await self.run_task_list.fail()
@@ -660,6 +941,11 @@ class ChainlitEventBridge:
         await cl.Message(content=f"{type(exc).__name__}: {exc}", author="System").send()
 
     async def _handle_message_chunk(self, part: dict[str, Any]) -> None:
+        """Handle message chunk.
+
+        Args:
+            part: The part value.
+        """
         token, metadata = part["data"]
         ns = tuple(part.get("ns", ()))
         source = namespace_label(ns, metadata)
@@ -685,6 +971,11 @@ class ChainlitEventBridge:
             await self._stream_response(content_text)
 
     async def _handle_update_chunk(self, part: dict[str, Any]) -> None:
+        """Handle update chunk.
+
+        Args:
+            part: The part value.
+        """
         ns = tuple(part.get("ns", ()))
         metadata = {"lc_agent_name": None}
         source = namespace_label(ns, metadata)
@@ -714,6 +1005,11 @@ class ChainlitEventBridge:
                     await self._complete_tool_step(source, message)
 
     async def _handle_custom_chunk(self, part: dict[str, Any]) -> None:
+        """Handle custom chunk.
+
+        Args:
+            part: The part value.
+        """
         data = part.get("data")
         if not isinstance(data, dict):
             return
@@ -742,6 +1038,12 @@ class ChainlitEventBridge:
         await step.update()
 
     async def _stream_reasoning(self, source: str, text: str) -> None:
+        """Stream reasoning text into the active output target.
+
+        Args:
+            source: The source value.
+            text: Text content to process.
+        """
         previous = self.reasoning_buffers.get(source, "")
         delta = text[len(previous) :] if text.startswith(previous) else text
         if not delta:
@@ -768,6 +1070,11 @@ class ChainlitEventBridge:
         self.reasoning_buffers[source] = previous + delta
 
     async def _stream_response(self, text: str) -> None:
+        """Stream final response text into the active output target.
+
+        Args:
+            text: Text content to process.
+        """
         delta = text[len(self.response_buffer) :] if text.startswith(self.response_buffer) else text
         if not delta:
             return
@@ -786,6 +1093,7 @@ class ChainlitEventBridge:
             await self._flush_response_stream()
 
     async def _send_final_response_message(self) -> None:
+        """Send the buffered final response as a Chainlit message."""
         if not self.response_buffer:
             return
 
@@ -809,6 +1117,11 @@ class ChainlitEventBridge:
         await self.response_message.update()
 
     def _should_flush_response_stream(self) -> bool:
+        """Return whether buffered response text should be flushed now.
+
+        Returns:
+            Whether buffered response text should be flushed now.
+        """
         if len(self.pending_response_stream) >= RESPONSE_STREAM_FLUSH_CHARS:
             return True
         if not self.last_response_flush_at:
@@ -819,6 +1132,7 @@ class ChainlitEventBridge:
         )
 
     async def _flush_response_stream(self) -> None:
+        """Flush buffered response text to the Chainlit message."""
         if not self.pending_response_stream:
             return
         pending = self.pending_response_stream
@@ -828,6 +1142,12 @@ class ChainlitEventBridge:
         self.last_response_flush_at = time.monotonic()
 
     async def _stream_tool_call(self, source: str, chunk: dict[str, Any]) -> None:
+        """Render a streamed tool call and its accumulated arguments.
+
+        Args:
+            source: The source value.
+            chunk: Streamed event chunk to normalize.
+        """
         if self.chronological_ui_enabled:
             await self._close_reasoning_step(source)
         call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
@@ -872,6 +1192,12 @@ class ChainlitEventBridge:
         await state.step.update()
 
     async def _complete_tool_step(self, source: str, tool_message: Any) -> None:
+        """Finish the Chainlit step associated with a completed tool call.
+
+        Args:
+            source: The source value.
+            tool_message: The tool message value.
+        """
         state = self._resolve_tool_step(source, tool_message)
         if state is None:
             step = cl.Step(
@@ -910,6 +1236,11 @@ class ChainlitEventBridge:
         self.tool_steps.pop(state.call_id, None)
 
     async def _close_reasoning_step(self, source: str) -> None:
+        """Close one active Chainlit reasoning step.
+
+        Args:
+            source: The source value.
+        """
         step = self.reasoning_steps.pop(source, None)
         if step is None:
             return
@@ -919,10 +1250,20 @@ class ChainlitEventBridge:
         self._schedule_step_auto_collapse(step)
 
     async def _close_active_reasoning_steps(self) -> None:
+        """Close all active Chainlit reasoning steps."""
         for source in list(self.reasoning_steps):
             await self._close_reasoning_step(source)
 
     def _resolve_tool_step(self, source: str, tool_message: Any) -> ToolStepState | None:
+        """Return the active Chainlit step for a streamed tool call.
+
+        Args:
+            source: The source value.
+            tool_message: The tool message value.
+
+        Returns:
+            The active Chainlit step for a streamed tool call.
+        """
         tool_call_id = getattr(tool_message, "tool_call_id", None)
         if tool_call_id and tool_call_id in self.tool_steps:
             return self.tool_steps[tool_call_id]
@@ -955,6 +1296,7 @@ class ChainlitEventBridge:
         return None
 
     async def _close_all_open_steps(self) -> None:
+        """Close all Chainlit steps that remain open at run completion."""
         for state in list(self.tool_steps.values()):
             if not state.step.output:
                 state.step.output = "Finished without a streamed tool result."
@@ -979,12 +1321,18 @@ class ChainlitEventBridge:
         self.summarization_steps.clear()
 
     def _schedule_step_auto_collapse(self, step: cl.Step) -> None:
+        """Schedule delayed auto-collapse for a Chainlit step.
+
+        Args:
+            step: The step value.
+        """
         if step.id in self.collapse_scheduled_step_ids:
             return
 
         self.collapse_scheduled_step_ids.add(step.id)
 
         async def collapse_later() -> None:
+            """Collapse a Chainlit step after the configured delay."""
             try:
                 await asyncio.sleep(AUTO_COLLAPSE_DELAY_SECONDS)
                 step.auto_collapse = True

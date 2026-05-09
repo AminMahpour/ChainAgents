@@ -1,3 +1,5 @@
+"""Test Deep Agent runtime configuration, RAG, MCP, and command integration."""
+
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +38,14 @@ from rag_runtime import (
 
 
 def make_runtime_rag_config(project_root: Path) -> ResolvedRagConfig:
+    """Build a test runtime RAG configuration.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The constructed a test runtime rag configuration.
+    """
     return ResolvedRagConfig(
         enabled=True,
         persist_directory=project_root / ".rag",
@@ -57,6 +67,15 @@ def make_runtime_config(
     *,
     extensions: ExtensionsConfig | None = None,
 ) -> RuntimeConfig:
+    """Build a test runtime configuration.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+        extensions: The extensions value.
+
+    Returns:
+        The constructed a test runtime configuration.
+    """
     return RuntimeConfig(
         database_url=None,
         model_provider="ollama",
@@ -79,6 +98,15 @@ def make_extensions_config(
     mcp_stateful: bool = False,
     agent_mcp_servers: tuple[str, ...] = (),
 ) -> ExtensionsConfig:
+    """Build a test extensions configuration.
+
+    Args:
+        mcp_stateful: The MCP stateful value.
+        agent_mcp_servers: The agent MCP servers value.
+
+    Returns:
+        The constructed a test extensions configuration.
+    """
     return ExtensionsConfig(
         config_path=None,
         mcp_stateful=mcp_stateful,
@@ -88,6 +116,7 @@ def make_extensions_config(
 
 
 def test_openai_compatible_model_preserves_vllm_reasoning_delta() -> None:
+    """Verify that openai compatible model preserves vllm reasoning delta."""
     config = RuntimeConfig(
         database_url=None,
         model_provider="openai_compatible",
@@ -135,6 +164,14 @@ def write_skill(
     name: str,
     description: str,
 ) -> None:
+    """Write a temporary skill file for command catalog tests.
+
+    Args:
+        root: The root value.
+        directory: The directory value.
+        name: The name value.
+        description: The description value.
+    """
     skill_path = root / directory / "SKILL.md"
     skill_path.parent.mkdir(parents=True, exist_ok=True)
     skill_path.write_text(
@@ -150,6 +187,11 @@ def write_skill(
 
 
 def test_virtual_workspace_path_to_local_maps_project_files(tmp_path: Path) -> None:
+    """Verify that virtual workspace path to local maps project files.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     assert virtual_workspace_path_to_local(
         "/workspace/skills/reviewer/SKILL.md",
         tmp_path,
@@ -159,6 +201,11 @@ def test_virtual_workspace_path_to_local_maps_project_files(tmp_path: Path) -> N
 def test_virtual_workspace_path_to_local_leaves_unknown_paths_unchanged(
     tmp_path: Path,
 ) -> None:
+    """Verify that virtual workspace path to local leaves unknown paths unchanged.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     assert virtual_workspace_path_to_local(
         "/memories/skills/reviewer/SKILL.md",
         tmp_path,
@@ -173,6 +220,12 @@ def test_runtime_config_reports_rag_error_for_openai_auto_embeddings(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that runtime config reports RAG error for openai auto embeddings.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -203,6 +256,12 @@ def test_load_extensions_config_reads_mcp_stateful_flag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config reads MCP stateful flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -230,6 +289,12 @@ def test_runtime_config_reads_model_choices_from_toml(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that runtime config reads model choices from TOML.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -253,6 +318,12 @@ def test_runtime_config_reads_openai_endpoint_url_from_toml(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that runtime config reads openai endpoint URL from TOML.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -277,6 +348,12 @@ def test_runtime_config_rejects_ollama_provider_switch_with_only_endpoint_url(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that runtime config rejects ollama provider switch with only endpoint URL.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -304,6 +381,12 @@ def test_runtime_config_reads_recursion_limit_from_toml(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that runtime config reads recursion limit from TOML.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -325,6 +408,12 @@ def test_runtime_config_env_overrides_recursion_limit(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that runtime config environment overrides recursion limit.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -345,6 +434,12 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that build deepagent backend stores large tool results inside project.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     monkeypatch.setattr(deepagent_runtime, "PROJECT_ROOT", tmp_path)
 
     backend = deepagent_runtime.build_deepagent_backend()
@@ -368,6 +463,7 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
 
 
 def test_tool_execution_resilience_middleware_returns_error_tool_message() -> None:
+    """Verify that tool execution resilience middleware returns error tool message."""
     middleware = ToolExecutionResilienceMiddleware()
     request = ToolCallRequest(
         tool_call={
@@ -382,6 +478,14 @@ def test_tool_execution_resilience_middleware_returns_error_tool_message() -> No
     )
 
     async def failing_handler(_request: ToolCallRequest):
+        """Raise a test exception from a middleware-wrapped tool.
+
+        Args:
+            _request: The request value.
+
+        Raises:
+            ValueError: If the supplied value is invalid.
+        """
         raise ValueError("bad path")
 
     result = asyncio.run(middleware.awrap_tool_call(request, failing_handler))
@@ -395,6 +499,11 @@ def test_tool_execution_resilience_middleware_returns_error_tool_message() -> No
 
 
 def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path) -> None:
+    """Verify that tool execution middleware maps workspace path tool args.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     middleware = ToolExecutionResilienceMiddleware(project_root=tmp_path)
     request = ToolCallRequest(
         tool_call={
@@ -409,6 +518,14 @@ def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path)
     )
 
     def handler(updated_request: ToolCallRequest) -> ToolMessage:
+        """Capture tool-call arguments for middleware tests.
+
+        Args:
+            updated_request: The updated request value.
+
+        Returns:
+            The handler result.
+        """
         assert updated_request.tool_call["args"] == {
             "path": str(tmp_path / "skills/reviewer/SKILL.md")
         }
@@ -429,16 +546,35 @@ def test_agent_runtime_initialize_runs_rag_startup_check(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that agent runtime initialize runs RAG startup check.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     created_services: list[object] = []
 
     class DummyRAG:
+        """Represent dummy r a g."""
+
         def __init__(self, config, *, project_root: Path) -> None:
+            """Initialize the dummy r a g instance.
+
+            Args:
+                config: Configuration object used by the operation.
+                project_root: Project root used to resolve local paths.
+            """
             self.config = config
             self.project_root = project_root
             self.ensure_ready_calls = 0
             created_services.append(self)
 
         def ensure_ready(self) -> RagStatus:
+            """Ensure ready.
+
+            Returns:
+                The ready object or status.
+            """
             self.ensure_ready_calls += 1
             return RagStatus.ready_status(
                 file_count=2,
@@ -447,6 +583,11 @@ def test_agent_runtime_initialize_runs_rag_startup_check(
             )
 
         def snapshot(self) -> RagStatus:
+            """Return a snapshot of.
+
+            Returns:
+                A snapshot of.
+            """
             return RagStatus.ready_status(
                 file_count=2,
                 chunk_count=3,
@@ -467,15 +608,37 @@ def test_get_agent_includes_rag_tool_when_ready(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that get agent includes RAG tool when ready.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     captured: dict[str, object] = {}
 
     def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests.
+
+        Args:
+            tools: The tools value.
+            kwargs: The kwargs value.
+
+        Returns:
+            The fake create deep agent result.
+        """
         captured["tools"] = tools or []
         captured["kwargs"] = kwargs
         return object()
 
     class ReadyRAG:
+        """Represent ready r a g."""
+
         def snapshot(self) -> RagStatus:
+            """Return a snapshot of.
+
+            Returns:
+                A snapshot of.
+            """
             return RagStatus.ready_status(
                 file_count=1,
                 chunk_count=1,
@@ -489,6 +652,16 @@ def test_get_agent_includes_rag_tool_when_ready(
             top_k: int | None = None,
             thread_id: str | None = None,
         ):
+            """Search the ready r a g.
+
+            Args:
+                query: Search query text.
+                top_k: Maximum number of search results to return.
+                thread_id: Conversation thread identifier.
+
+            Returns:
+                Search results matching the query.
+            """
             return {"query": query, "results": []}
 
     monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
@@ -510,15 +683,40 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that get agent includes summarization middleware when enabled.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     captured: dict[str, object] = {}
 
     def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests.
+
+        Args:
+            tools: The tools value.
+            kwargs: The kwargs value.
+
+        Returns:
+            The fake create deep agent result.
+        """
         captured["tools"] = tools or []
         captured["kwargs"] = kwargs
         return object()
 
     class FakeSummarizationMiddleware:
+        """Represent fake summarization middleware."""
+
         def __init__(self, model=None, trigger=None, keep=None, **kwargs) -> None:
+            """Initialize the fake summarization middleware instance.
+
+            Args:
+                model: Model name or model object used by the runtime.
+                trigger: The trigger value.
+                keep: The keep value.
+                kwargs: The kwargs value.
+            """
             self.model = model
             self.trigger = trigger
             self.keep = keep
@@ -584,23 +782,67 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
 
 
 def test_summarization_status_middleware_emits_stream_events() -> None:
+    """Verify that summarization status middleware emits stream events."""
     events: list[dict[str, str]] = []
 
     class FakeRuntime:
+        """Represent fake runtime."""
+
         def stream_writer(self, event: dict[str, str]) -> None:
+            """Capture custom stream events emitted by middleware tests.
+
+            Args:
+                event: LangGraph stream event to process.
+            """
             events.append(event)
 
     class FakeSummarizationMiddleware:
+        """Represent fake summarization middleware."""
+
         def token_counter(self, messages) -> int:
+            """Return a fixed token count for summarization tests.
+
+            Args:
+                messages: The messages value.
+
+            Returns:
+                A fixed token count for summarization tests.
+            """
             return 12
 
         def _should_summarize(self, messages, total_tokens: int) -> bool:
+            """Return the configured summarization decision for tests.
+
+            Args:
+                messages: The messages value.
+                total_tokens: The total tokens value.
+
+            Returns:
+                The configured summarization decision for tests.
+            """
             return total_tokens >= 10
 
         def _determine_cutoff_index(self, messages) -> int:
+            """Return the configured summarization cutoff index for tests.
+
+            Args:
+                messages: The messages value.
+
+            Returns:
+                The configured summarization cutoff index for tests.
+            """
             return 1
 
         def before_model(self, state, runtime):
+            """Run middleware logic before a model invocation.
+
+            Args:
+                state: Runtime state to inspect or update.
+                runtime: Agent runtime used by the operation.
+
+            Returns:
+                The before model result.
+            """
             return {"messages": ["summary"]}
 
     middleware = deepagent_runtime.SummarizationStatusMiddleware(
@@ -634,9 +876,24 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that get agent omits RAG tool when service is missing.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     captured: dict[str, object] = {}
 
     def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests.
+
+        Args:
+            tools: The tools value.
+            kwargs: The kwargs value.
+
+        Returns:
+            The fake create deep agent result.
+        """
         captured["tools"] = tools or []
         captured["kwargs"] = kwargs
         return object()
@@ -659,16 +916,38 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that stateful MCP reuses session per chainlit session.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     created_sessions: list[tuple[str, object]] = []
     closed_sessions: list[object] = []
     load_calls: list[tuple[object, str]] = []
 
     class FakeMCPClient:
+        """Represent fake m c p client.
+
+        Attributes:
+            callbacks: The callbacks value.
+            tool_interceptors: The tool interceptors value.
+        """
+
         callbacks = object()
         tool_interceptors: list[object] = []
 
         @asynccontextmanager
         async def session(self, server_name: str, *, auto_initialize: bool = True):
+            """Return an async context manager for fake MCP sessions.
+
+            Args:
+                server_name: The server name value.
+                auto_initialize: The auto initialize value.
+
+            Yields:
+                Values produced by session.
+            """
             session = object()
             created_sessions.append((server_name, session))
             try:
@@ -677,6 +956,14 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
                 closed_sessions.append(session)
 
         async def get_tools(self, *, server_name: str | None = None):
+            """Return fake MCP tools from the fake client.
+
+            Args:
+                server_name: The server name value.
+
+            Raises:
+                AssertionError: If the underlying operation fails.
+            """
             raise AssertionError("stateful MCP mode should not call get_tools()")
 
     async def fake_load_mcp_tools(
@@ -685,6 +972,16 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         server_name: str | None = None,
         **kwargs,
     ):
+        """Return fake MCP tools for runtime tests.
+
+        Args:
+            session: The session value.
+            server_name: The server name value.
+            kwargs: The kwargs value.
+
+        Returns:
+            Fake MCP tools for runtime tests.
+        """
         assert kwargs["tool_name_prefix"] is True
         load_calls.append((session, str(server_name)))
         return [SimpleNamespace(name=f"{server_name}_tool", session=session)]
@@ -703,6 +1000,11 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
     runtime._mcp_client = FakeMCPClient()
 
     async def exercise_runtime():
+        """Exercise runtime agent loading for a Chainlit session.
+
+        Returns:
+            The exercise runtime result.
+        """
         session_1_tools_first = await runtime._get_mcp_tools(
             ("repo",),
             thread_id="thread-1",
@@ -745,8 +1047,20 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
 def test_rebuild_rag_index_clears_cached_agents(
     tmp_path: Path,
 ) -> None:
+    """Verify that rebuild RAG index clears cached agents.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     class RebuildableRAG:
+        """Represent rebuildable r a g."""
+
         def rebuild(self) -> RagStatus:
+            """Rebuild the rebuildable r a g.
+
+            Returns:
+                The rebuilt object or status.
+            """
             return RagStatus.ready_status(
                 file_count=3,
                 chunk_count=4,
@@ -754,6 +1068,11 @@ def test_rebuild_rag_index_clears_cached_agents(
             )
 
         def snapshot(self) -> RagStatus:
+            """Return a snapshot of.
+
+            Returns:
+                A snapshot of.
+            """
             return self.rebuild()
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
@@ -767,8 +1086,24 @@ def test_rebuild_rag_index_clears_cached_agents(
 
 
 def test_ingest_rag_uploads_delegates_to_rag_service(tmp_path: Path) -> None:
+    """Verify that ingest RAG uploads delegates to RAG service.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     class UploadableRAG:
+        """Represent uploadable r a g."""
+
         def ingest_uploaded_files(self, *, thread_id: str, uploads: list[UploadedRagFile]) -> RagUploadResult:
+            """Ingest uploaded files.
+
+            Args:
+                thread_id: Conversation thread identifier.
+                uploads: Uploaded files supplied by the user.
+
+            Returns:
+                The ingest uploaded files result.
+            """
             return RagUploadResult(
                 thread_id=thread_id,
                 added_files=tuple(upload.name for upload in uploads),
@@ -797,6 +1132,12 @@ def test_load_extensions_config_parses_chainlit_commands(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config parses chainlit commands.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -841,6 +1182,12 @@ def test_load_extensions_config_parses_summarization_middleware_flag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config parses summarization middleware flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -864,6 +1211,12 @@ def test_load_extensions_config_rejects_non_boolean_summarization_middleware_fla
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config rejects non boolean summarization middleware flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -882,6 +1235,12 @@ def test_load_extensions_config_rejects_invalid_summarization_token_thresholds(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config rejects invalid summarization token thresholds.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -901,6 +1260,12 @@ def test_load_extensions_config_rejects_non_boolean_startup_status_flag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config rejects non boolean startup status flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -919,6 +1284,12 @@ def test_load_extensions_config_rejects_non_boolean_reasoning_mode_flag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config rejects non boolean reasoning mode flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -937,6 +1308,12 @@ def test_load_extensions_config_rejects_non_boolean_chronological_ui_flag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config rejects non boolean chronological UI flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -955,6 +1332,12 @@ def test_load_extensions_config_rejects_non_boolean_model_mode_flag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config rejects non boolean model mode flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -973,6 +1356,12 @@ def test_load_extensions_config_rejects_unknown_chainlit_subagent(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Verify that load extensions config rejects unknown chainlit subagent.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
         """
@@ -992,6 +1381,11 @@ commands = [
 def test_build_chainlit_command_catalog_includes_main_and_subagent_skills(
     tmp_path: Path,
 ) -> None:
+    """Verify that build chainlit command catalog includes main and subagent skills.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     write_skill(
         tmp_path,
         "skills/reviewer",
@@ -1033,6 +1427,11 @@ def test_build_chainlit_command_catalog_includes_main_and_subagent_skills(
 def test_compose_agent_system_prompt_includes_agents_md(
     tmp_path: Path,
 ) -> None:
+    """Verify that compose agent system prompt includes agents md.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     agents_md = tmp_path / "AGENTS.md"
     agents_md.write_text(
         "# Agent Notes\n\nPrefer focused changes.",
@@ -1054,6 +1453,11 @@ def test_compose_agent_system_prompt_includes_agents_md(
 def test_compose_agent_system_prompt_ignores_missing_agents_md(
     tmp_path: Path,
 ) -> None:
+    """Verify that compose agent system prompt ignores missing agents md.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     prompt = deepagent_runtime.compose_agent_system_prompt(
         "Base prompt.",
         None,
@@ -1066,6 +1470,11 @@ def test_compose_agent_system_prompt_ignores_missing_agents_md(
 def test_build_chainlit_command_catalog_uses_backend_workspace_root_when_project_root_missing(
     tmp_path: Path,
 ) -> None:
+    """Verify that build chainlit command catalog uses backend workspace root when project root missing.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     write_skill(
         tmp_path,
         "skills/reviewer",
@@ -1090,6 +1499,11 @@ def test_build_chainlit_command_catalog_uses_backend_workspace_root_when_project
 def test_build_chainlit_command_catalog_prefers_explicit_command_over_skill(
     tmp_path: Path,
 ) -> None:
+    """Verify that build chainlit command catalog prefers explicit command over skill.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     write_skill(
         tmp_path,
         "skills/reviewer",
@@ -1124,6 +1538,11 @@ def test_build_chainlit_command_catalog_prefers_explicit_command_over_skill(
 def test_build_chainlit_command_catalog_prefers_main_agent_skill_over_subagent_skill(
     tmp_path: Path,
 ) -> None:
+    """Verify that build chainlit command catalog prefers main agent skill over subagent skill.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     write_skill(
         tmp_path,
         "skills/reviewer",
@@ -1166,6 +1585,11 @@ def test_build_chainlit_command_catalog_prefers_main_agent_skill_over_subagent_s
 def test_build_chainlit_command_catalog_uses_later_skill_source_in_same_bucket(
     tmp_path: Path,
 ) -> None:
+    """Verify that build chainlit command catalog uses later skill source in same bucket.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     write_skill(
         tmp_path,
         "skills-a/reviewer",
@@ -1196,10 +1620,29 @@ def test_build_chainlit_command_catalog_uses_later_skill_source_in_same_bucket(
 
 
 def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:
+    """Verify that invoke MCP tool command calls configured tool.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
     class FakeTool:
+        """Represent fake tool.
+
+        Attributes:
+            name: The name value.
+        """
+
         name = "repo_read_file"
 
         async def ainvoke(self, payload):
+            """Return a fake asynchronous tool invocation result.
+
+            Args:
+                payload: The payload value.
+
+            Returns:
+                A fake asynchronous tool invocation result.
+            """
             return {"ok": True, "payload": payload}
 
     runtime = AgentRuntime(
@@ -1213,6 +1656,16 @@ def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:
     )
 
     async def fake_get_mcp_tools(server_names, *, thread_id=None, mcp_session_id=None):
+        """Return fake MCP tools for command invocation tests.
+
+        Args:
+            server_names: The server names value.
+            thread_id: Conversation thread identifier.
+            mcp_session_id: MCP session identifier.
+
+        Returns:
+            Fake MCP tools for command invocation tests.
+        """
         assert server_names == ("repo",)
         assert thread_id == "thread-1"
         assert mcp_session_id is None

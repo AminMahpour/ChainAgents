@@ -1,3 +1,5 @@
+"""Run the Chainlit UI for the configured ChainAgents runtime."""
+
 from __future__ import annotations
 
 import asyncio
@@ -81,6 +83,11 @@ AUTH_ENABLED = bool(AUTH_SECRET and AUTH_USERNAME and AUTH_PASSWORD)
 
 
 def current_chainlit_thread_id() -> str:
+    """Return the current chainlit thread ID.
+
+    Returns:
+        The current chainlit thread ID.
+    """
     try:
         session = cl.context.session
     except Exception:
@@ -90,6 +97,11 @@ def current_chainlit_thread_id() -> str:
 
 
 def current_chainlit_session_id() -> str:
+    """Return the current chainlit session ID.
+
+    Returns:
+        The current chainlit session ID.
+    """
     try:
         session = cl.context.session
     except Exception:
@@ -98,12 +110,22 @@ def current_chainlit_session_id() -> str:
 
 
 def store_mcp_session_id() -> str:
+    """Store MCP session ID.
+
+    Returns:
+        The stored value.
+    """
     session_id = current_chainlit_session_id() or current_chainlit_thread_id()
     cl.user_session.set(SESSION_MCP_SESSION_ID_KEY, session_id)
     return session_id
 
 
 def current_mcp_session_id() -> str:
+    """Return the current MCP session ID.
+
+    Returns:
+        The current MCP session ID.
+    """
     session_id = str(cl.user_session.get(SESSION_MCP_SESSION_ID_KEY) or "").strip()
     if session_id:
         return session_id
@@ -111,6 +133,14 @@ def current_mcp_session_id() -> str:
 
 
 def settings_payload(settings: AppSettings) -> dict[str, str]:
+    """Build a serializable payload from Chainlit chat settings.
+
+    Args:
+        settings: The settings value.
+
+    Returns:
+        The constructed a serializable payload from chainlit chat settings.
+    """
     return {
         "model_name": settings.model_name,
         "reasoning_level": settings.reasoning_level,
@@ -119,10 +149,24 @@ def settings_payload(settings: AppSettings) -> dict[str, str]:
 
 
 def store_settings(settings: AppSettings) -> None:
+    """Store settings.
+
+    Args:
+        settings: The settings value.
+    """
     cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
 
 
 def build_langgraph_config(settings: AppSettings, *, recursion_limit: int) -> dict[str, Any]:
+    """Build the LangGraph run configuration for a Chainlit thread.
+
+    Args:
+        settings: The settings value.
+        recursion_limit: The recursion limit value.
+
+    Returns:
+        A LangGraph configuration dictionary for the thread.
+    """
     return {
         "configurable": {"thread_id": settings.thread_id},
         "recursion_limit": recursion_limit,
@@ -130,6 +174,11 @@ def build_langgraph_config(settings: AppSettings, *, recursion_limit: int) -> di
 
 
 def build_rag_action() -> cl.Action:
+    """Build RAG action.
+
+    Returns:
+        The constructed rag action.
+    """
     return cl.Action(
         name=REBUILD_RAG_INDEX_ACTION,
         payload={},
@@ -140,6 +189,11 @@ def build_rag_action() -> cl.Action:
 
 
 def build_upload_rag_action() -> cl.Action:
+    """Build upload RAG action.
+
+    Returns:
+        The constructed upload rag action.
+    """
     return cl.Action(
         name=UPLOAD_RAG_FILE_ACTION,
         payload={},
@@ -150,10 +204,23 @@ def build_upload_rag_action() -> cl.Action:
 
 
 def rag_actions() -> list[cl.Action]:
+    """Return Chainlit action buttons for RAG workflows.
+
+    Returns:
+        Chainlit action buttons for RAG workflows.
+    """
     return [build_rag_action(), build_upload_rag_action()]
 
 
 def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
+    """Build native command specs.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+
+    Returns:
+        The constructed native command specs.
+    """
     icon_by_target = {
         "prompt": "square-pen",
         "subagent": "bot",
@@ -173,10 +240,23 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
 
 
 async def publish_native_commands(runtime: AgentRuntime) -> None:
+    """Publish native commands.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+    """
     await cl.context.emitter.set_commands(build_native_command_specs(runtime))
 
 
 def rag_status_line(runtime: AgentRuntime) -> str:
+    """Render one status line for the RAG service.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+
+    Returns:
+        The RAG status line result.
+    """
     status = runtime.rag_status
     if not status.enabled:
         return "- RAG: disabled\n"
@@ -193,6 +273,14 @@ def rag_status_line(runtime: AgentRuntime) -> str:
 
 
 def message_uploaded_rag_files(message: cl.Message) -> list[UploadedRagFile]:
+    """Build the message for uploaded RAG files.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+
+    Returns:
+        The constructed the message for uploaded rag files.
+    """
     uploads: list[UploadedRagFile] = []
     for element in getattr(message, "elements", []) or []:
         raw_path = getattr(element, "path", None)
@@ -207,6 +295,14 @@ def message_uploaded_rag_files(message: cl.Message) -> list[UploadedRagFile]:
 
 
 def upload_result_prompt_note(added_files: tuple[str, ...]) -> str:
+    """Build the prompt note describing uploaded RAG files.
+
+    Args:
+        added_files: The added files value.
+
+    Returns:
+        The constructed the prompt note describing uploaded rag files.
+    """
     if not added_files:
         return ""
     file_list = ", ".join(f"`{name}`" for name in added_files)
@@ -217,6 +313,14 @@ def upload_result_prompt_note(added_files: tuple[str, ...]) -> str:
 
 
 def upload_result_message(upload_result) -> str:
+    """Build the Chainlit message for a RAG upload result.
+
+    Args:
+        upload_result: The upload result value.
+
+    Returns:
+        The constructed the chainlit message for a rag upload result.
+    """
     if upload_result.added_files:
         added = ", ".join(f"`{name}`" for name in upload_result.added_files)
         content = (
@@ -243,6 +347,17 @@ async def handle_native_command(
     parsed: ParsedNativeCommand,
     mcp_session_id: str | None = None,
 ) -> str | None:
+    """Handle a native slash command selected in Chainlit.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+        settings: The settings value.
+        parsed: Parsed native command details.
+        mcp_session_id: MCP session identifier.
+
+    Returns:
+        The handle native command result.
+    """
     result = await resolve_runtime_command(
         runtime=runtime,
         parsed=parsed,
@@ -268,6 +383,11 @@ async def handle_native_command(
 
 
 async def ask_for_rag_upload() -> list[UploadedRagFile]:
+    """Ask for for RAG upload.
+
+    Returns:
+        The prompt or response used to ask the user.
+    """
     files = await cl.AskFileMessage(
         content=(
             "Upload text-based files for this chat thread's knowledge index.\n\n"
@@ -294,6 +414,16 @@ def resolve_model_name(
     available_models: tuple[str, ...],
     default: str,
 ) -> str:
+    """Resolve model name.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        available_models: The available models value.
+        default: Fallback value used when no explicit value is available.
+
+    Returns:
+        The resolved model name.
+    """
     candidate = str(value or "").strip()
     if candidate in available_models:
         return candidate
@@ -306,6 +436,16 @@ def build_chat_settings(
     available_models: tuple[str, ...],
     model_mode_enabled: bool = True,
 ) -> cl.ChatSettings:
+    """Build chat settings.
+
+    Args:
+        settings: The settings value.
+        available_models: The available models value.
+        model_mode_enabled: The model mode enabled value.
+
+    Returns:
+        The constructed chat settings.
+    """
     reasoning_levels = ["low", "medium", "high"]
     inputs: list[Any] = []
     if model_mode_enabled:
@@ -351,6 +491,17 @@ def build_modes(
     model_mode_enabled: bool = True,
     reasoning_mode_enabled: bool = True,
 ) -> list[cl.Mode]:
+    """Build modes.
+
+    Args:
+        settings: The settings value.
+        available_models: The available models value.
+        model_mode_enabled: The model mode enabled value.
+        reasoning_mode_enabled: The reasoning mode enabled value.
+
+    Returns:
+        The constructed modes.
+    """
     reasoning_levels = ["low", "medium", "high"]
     modes: list[cl.Mode] = []
     if model_mode_enabled:
@@ -409,6 +560,14 @@ async def publish_modes(
     model_mode_enabled: bool = True,
     reasoning_mode_enabled: bool = True,
 ) -> None:
+    """Publish modes.
+
+    Args:
+        settings: The settings value.
+        available_models: The available models value.
+        model_mode_enabled: The model mode enabled value.
+        reasoning_mode_enabled: The reasoning mode enabled value.
+    """
     try:
         await cl.context.emitter.set_modes(
             build_modes(
@@ -434,6 +593,16 @@ def coerce_settings(
     default_model_name: str,
     available_models: tuple[str, ...],
 ) -> AppSettings:
+    """Coerce settings.
+
+    Args:
+        raw_settings: Raw settings to process.
+        default_model_name: The default model name value.
+        available_models: The available models value.
+
+    Returns:
+        The coerced value.
+    """
     if raw_settings is None:
         raw_settings = {}
     if isinstance(raw_settings, AppSettings):
@@ -472,6 +641,16 @@ def resolve_reasoning_level_for_message(
     *,
     reasoning_mode_enabled: bool = True,
 ) -> str:
+    """Resolve reasoning level for message.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+        settings: The settings value.
+        reasoning_mode_enabled: The reasoning mode enabled value.
+
+    Returns:
+        The resolved reasoning level for message.
+    """
     if not reasoning_mode_enabled:
         return settings.reasoning_level
     raw_modes = getattr(message, "modes", None)
@@ -490,6 +669,17 @@ def resolve_model_name_for_message(
     available_models: tuple[str, ...],
     model_mode_enabled: bool = True,
 ) -> str:
+    """Resolve model name for message.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+        settings: The settings value.
+        available_models: The available models value.
+        model_mode_enabled: The model mode enabled value.
+
+    Returns:
+        The resolved model name for message.
+    """
     if not model_mode_enabled:
         return settings.model_name
     raw_modes = getattr(message, "modes", None)
@@ -506,6 +696,15 @@ if AUTH_ENABLED:
 
     @cl.password_auth_callback
     def password_auth_callback(username: str, password: str) -> cl.User | None:
+        """Authenticate a Chainlit user from configured password settings.
+
+        Args:
+            username: The username value.
+            password: The password value.
+
+        Returns:
+            The password auth callback result.
+        """
         if not (
             secrets.compare_digest(username, AUTH_USERNAME)
             and secrets.compare_digest(password, AUTH_PASSWORD)
@@ -520,6 +719,11 @@ if AUTH_ENABLED:
 
 
 async def get_runtime_or_notify() -> AgentRuntime | None:
+    """Return the runtime or notify the user that startup failed.
+
+    Returns:
+        The runtime or notify the user that startup failed.
+    """
     try:
         return await AgentRuntime.get()
     except Exception as exc:
@@ -528,6 +732,11 @@ async def get_runtime_or_notify() -> AgentRuntime | None:
 
 
 async def get_run_task_list() -> RunTaskList:
+    """Return the per-session Chainlit run task list.
+
+    Returns:
+        The per-session Chainlit run task list.
+    """
     run_task_list = cl.user_session.get(SESSION_TASK_LIST_KEY)
     if isinstance(run_task_list, RunTaskList):
         return run_task_list
@@ -543,6 +752,16 @@ def get_async_task_notifier(
     runtime: AgentRuntime,
     url_override: str | None,
 ) -> AsyncTaskNotifier | None:
+    """Return the per-session async task notifier.
+
+    Args:
+        agent: Agent or runtime object used for the operation.
+        runtime: Agent runtime used by the operation.
+        url_override: Agent Protocol URL override, if one is configured.
+
+    Returns:
+        The per-session async task notifier.
+    """
     if not runtime.config.extensions.async_subagents:
         return None
 
@@ -567,6 +786,7 @@ def get_async_task_notifier(
 
 @cl.on_chat_start
 async def on_chat_start() -> None:
+    """Initialize Chainlit session state when a chat starts."""
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
@@ -655,6 +875,11 @@ async def on_chat_start() -> None:
 
 @cl.on_chat_resume
 async def on_chat_resume(thread: ThreadDict) -> None:
+    """Restore Chainlit session state when a chat resumes.
+
+    Args:
+        thread: The thread value.
+    """
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
@@ -705,6 +930,11 @@ async def on_chat_resume(thread: ThreadDict) -> None:
 
 @cl.on_settings_update
 async def on_settings_update(raw_settings: dict[str, Any]) -> None:
+    """Persist updated Chainlit chat settings for the current session.
+
+    Args:
+        raw_settings: Raw settings to process.
+    """
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
@@ -724,16 +954,31 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
 
 @cl.action_callback(DOWNLOAD_MARKDOWN_ACTION)
 async def download_response_markdown(action: cl.Action) -> None:
+    """Download response markdown.
+
+    Args:
+        action: The action value.
+    """
     await send_markdown_export(action)
 
 
 @cl.action_callback(DOWNLOAD_PDF_ACTION)
 async def download_response_pdf(action: cl.Action) -> None:
+    """Download response PDF.
+
+    Args:
+        action: The action value.
+    """
     await send_pdf_export(action)
 
 
 @cl.action_callback(REBUILD_RAG_INDEX_ACTION)
 async def rebuild_knowledge_index(action: cl.Action) -> None:
+    """Rebuild knowledge index.
+
+    Args:
+        action: The action value.
+    """
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
@@ -758,6 +1003,11 @@ async def rebuild_knowledge_index(action: cl.Action) -> None:
 
 @cl.action_callback(UPLOAD_RAG_FILE_ACTION)
 async def upload_rag_file(action: cl.Action) -> None:
+    """Ingest one uploaded file into thread-scoped RAG storage.
+
+    Args:
+        action: The action value.
+    """
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
@@ -787,6 +1037,11 @@ async def upload_rag_file(action: cl.Action) -> None:
 
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
+    """Handle a Chainlit user message by streaming the agent response.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+    """
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
@@ -931,6 +1186,7 @@ async def on_message(message: cl.Message) -> None:
 
 @cl.on_chat_end
 async def on_chat_end() -> None:
+    """Clean up runtime resources when the Chainlit chat ends."""
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()

@@ -1,3 +1,5 @@
+"""Test native Chainlit command and mode handling in the main app."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -8,6 +10,7 @@ import pytest
 
 
 def test_resolve_native_command_prefers_explicit_slash_text() -> None:
+    """Verify that resolve native command prefers explicit slash text."""
     parsed = agent_commands.resolve_native_command(
         raw_text="/summarize hello world",
         selected_command="ask-researcher",
@@ -20,6 +23,7 @@ def test_resolve_native_command_prefers_explicit_slash_text() -> None:
 
 
 def test_resolve_native_command_uses_selected_command_input() -> None:
+    """Verify that resolve native command uses selected command input."""
     parsed = agent_commands.resolve_native_command(
         raw_text="hello world",
         selected_command="summarize",
@@ -32,6 +36,7 @@ def test_resolve_native_command_uses_selected_command_input() -> None:
 
 
 def test_resolve_native_command_returns_none_without_command() -> None:
+    """Verify that resolve native command returns none without command."""
     parsed = agent_commands.resolve_native_command(
         raw_text="hello world",
         selected_command=None,
@@ -41,6 +46,7 @@ def test_resolve_native_command_returns_none_without_command() -> None:
 
 
 def test_resolve_reasoning_level_for_message_defaults_to_settings() -> None:
+    """Verify that resolve reasoning level for message defaults to settings."""
     message = SimpleNamespace(content="hello")
     settings = SimpleNamespace(reasoning_level="medium")
 
@@ -50,6 +56,7 @@ def test_resolve_reasoning_level_for_message_defaults_to_settings() -> None:
 
 
 def test_resolve_reasoning_level_for_message_uses_mode_override() -> None:
+    """Verify that resolve reasoning level for message uses mode override."""
     message = SimpleNamespace(content="hello", modes={"reasoning_level": "high"})
     settings = SimpleNamespace(reasoning_level="medium")
 
@@ -59,6 +66,7 @@ def test_resolve_reasoning_level_for_message_uses_mode_override() -> None:
 
 
 def test_resolve_reasoning_level_for_message_falls_back_to_settings_default() -> None:
+    """Verify that resolve reasoning level for message falls back to settings default."""
     message = SimpleNamespace(content="hello", modes={})
     settings = SimpleNamespace(reasoning_level="low")
 
@@ -68,6 +76,7 @@ def test_resolve_reasoning_level_for_message_falls_back_to_settings_default() ->
 
 
 def test_resolve_reasoning_level_for_message_ignores_override_when_disabled() -> None:
+    """Verify that resolve reasoning level for message ignores override when disabled."""
     message = SimpleNamespace(content="hello", modes={"reasoning_level": "high"})
     settings = SimpleNamespace(reasoning_level="low")
 
@@ -81,6 +90,7 @@ def test_resolve_reasoning_level_for_message_ignores_override_when_disabled() ->
 
 
 def test_resolve_model_name_for_message_uses_mode_override() -> None:
+    """Verify that resolve model name for message uses mode override."""
     message = SimpleNamespace(content="hello", modes={"model_name": "gemma4:27b"})
     settings = SimpleNamespace(model_name="gpt-oss:20b")
 
@@ -94,6 +104,7 @@ def test_resolve_model_name_for_message_uses_mode_override() -> None:
 
 
 def test_resolve_model_name_for_message_falls_back_to_settings() -> None:
+    """Verify that resolve model name for message falls back to settings."""
     message = SimpleNamespace(content="hello", modes={"model_name": "unknown"})
     settings = SimpleNamespace(model_name="gpt-oss:20b")
 
@@ -107,6 +118,7 @@ def test_resolve_model_name_for_message_falls_back_to_settings() -> None:
 
 
 def test_resolve_model_name_for_message_ignores_override_when_disabled() -> None:
+    """Verify that resolve model name for message ignores override when disabled."""
     message = SimpleNamespace(content="hello", modes={"model_name": "gemma4:27b"})
     settings = SimpleNamespace(model_name="gpt-oss:20b")
 
@@ -121,6 +133,7 @@ def test_resolve_model_name_for_message_ignores_override_when_disabled() -> None
 
 
 def test_build_langgraph_config_includes_recursion_limit() -> None:
+    """Verify that build langgraph config includes recursion limit."""
     settings = SimpleNamespace(thread_id="thread-1")
 
     config = main.build_langgraph_config(settings, recursion_limit=100)
@@ -133,8 +146,23 @@ def test_build_langgraph_config_includes_recursion_limit() -> None:
 
 @pytest.mark.anyio
 async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> None:
+    """Verify that publish modes ignores missing modes column error.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
     class _Emitter:
+        """Provide an internal helper for emitter."""
+
         async def set_modes(self, _modes):
+            """Record requested Chainlit mode definitions on the test emitter.
+
+            Args:
+                _modes: The modes value.
+
+            Raises:
+                RuntimeError: If the runtime is not in a usable state.
+            """
             raise RuntimeError('column "modes" does not exist')
 
     monkeypatch.setattr(main.cl, "context", SimpleNamespace(emitter=_Emitter()))
@@ -147,8 +175,23 @@ async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> 
 
 @pytest.mark.anyio
 async def test_publish_modes_raises_for_unrelated_errors(monkeypatch) -> None:
+    """Verify that publish modes raises for unrelated errors.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
     class _Emitter:
+        """Provide an internal helper for emitter."""
+
         async def set_modes(self, _modes):
+            """Record requested Chainlit mode definitions on the test emitter.
+
+            Args:
+                _modes: The modes value.
+
+            Raises:
+                RuntimeError: If the runtime is not in a usable state.
+            """
             raise RuntimeError("boom")
 
     monkeypatch.setattr(main.cl, "context", SimpleNamespace(emitter=_Emitter()))
@@ -161,7 +204,14 @@ async def test_publish_modes_raises_for_unrelated_errors(monkeypatch) -> None:
 
 
 class _DummyRuntime:
+    """Provide a test double for dummy runtime."""
+
     def __init__(self, command=None) -> None:
+        """Initialize the dummy runtime instance.
+
+        Args:
+            command: Configured command to render or execute.
+        """
         self.invocation: dict[str, str | None] | None = None
         self.command = command or SimpleNamespace(
             name="repo-readme",
@@ -173,6 +223,14 @@ class _DummyRuntime:
         )
 
     def resolve_chainlit_command(self, command_name: str):
+        """Resolve chainlit command.
+
+        Args:
+            command_name: Name of the native command.
+
+        Returns:
+            The resolved chainlit command.
+        """
         if command_name == self.command.name:
             return self.command
         return None
@@ -186,6 +244,18 @@ class _DummyRuntime:
         mcp_session_id: str | None = None,
         server_name: str | None = None,
     ):
+        """Invoke a configured MCP tool command with parsed arguments.
+
+        Args:
+            tool_name: Name of the tool to invoke.
+            raw_args: Raw argument text supplied with the command.
+            thread_id: Conversation thread identifier.
+            mcp_session_id: MCP session identifier.
+            server_name: The server name value.
+
+        Returns:
+            The invoke MCP tool command result.
+        """
         self.invocation = {
             "tool_name": tool_name,
             "raw_args": raw_args,
@@ -197,15 +267,32 @@ class _DummyRuntime:
 
 
 class _DummyMessage:
+    """Provide a test double for dummy message."""
+
     def __init__(self, **kwargs):
+        """Initialize the dummy message instance.
+
+        Args:
+            kwargs: The kwargs value.
+        """
         self.kwargs = kwargs
 
     async def send(self):
+        """Record that the dummy Chainlit message was sent.
+
+        Returns:
+            The sent message or element.
+        """
         return None
 
 
 @pytest.mark.anyio
 async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) -> None:
+    """Verify that handle native command applies template for MCP tool.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
     runtime = _DummyRuntime()
     settings = SimpleNamespace(thread_id="thread-1")
     monkeypatch.setattr(main.cl, "Message", _DummyMessage)
@@ -223,6 +310,7 @@ async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) 
 
 
 def test_build_skill_command_prompt_requires_skill_and_request() -> None:
+    """Verify that build skill command prompt requires skill and request."""
     prompt = agent_commands.build_skill_command_prompt(
         skill_name="reviewer",
         skill_path="/workspace/skills/reviewer/SKILL.md",
@@ -236,6 +324,7 @@ def test_build_skill_command_prompt_requires_skill_and_request() -> None:
 
 
 def test_build_skill_command_prompt_without_request_asks_for_task() -> None:
+    """Verify that build skill command prompt without request asks for task."""
     prompt = agent_commands.build_skill_command_prompt(
         skill_name="reviewer",
         skill_path="/workspace/skills/reviewer/SKILL.md",
@@ -247,6 +336,7 @@ def test_build_skill_command_prompt_without_request_asks_for_task() -> None:
 
 @pytest.mark.anyio
 async def test_handle_native_command_returns_forced_skill_prompt() -> None:
+    """Verify that handle native command returns forced skill prompt."""
     runtime = _DummyRuntime(
         command=SimpleNamespace(
             name="reviewer",
@@ -275,6 +365,7 @@ async def test_handle_native_command_returns_forced_skill_prompt() -> None:
 
 @pytest.mark.anyio
 async def test_handle_native_command_without_skill_args_requests_clarification() -> None:
+    """Verify that handle native command without skill args requests clarification."""
     runtime = _DummyRuntime(
         command=SimpleNamespace(
             name="reviewer",
@@ -302,6 +393,7 @@ async def test_handle_native_command_without_skill_args_requests_clarification()
 
 @pytest.mark.anyio
 async def test_handle_native_command_uses_selected_skill_command_input() -> None:
+    """Verify that handle native command uses selected skill command input."""
     runtime = _DummyRuntime(
         command=SimpleNamespace(
             name="reviewer",

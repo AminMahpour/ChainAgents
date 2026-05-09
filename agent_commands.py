@@ -1,3 +1,5 @@
+"""Parse and resolve native slash commands for the ChainAgents runtime."""
+
 from __future__ import annotations
 
 import json
@@ -6,12 +8,29 @@ from typing import Any, Literal, NamedTuple
 
 
 class ParsedNativeCommand(NamedTuple):
+    """Represent a parsed native command and its raw argument text.
+
+    Attributes:
+        command_name: Name of the native command.
+        raw_args: Raw argument text supplied with the command.
+    """
+
     command_name: str
     raw_args: str
 
 
 @dataclass(frozen=True)
 class RuntimeCommandResult:
+    """Describe how a resolved runtime command should be handled.
+
+    Attributes:
+        target: The target value.
+        command_name: Name of the native command.
+        description: The description value.
+        prompt: The prompt value.
+        tool_result: The tool result value.
+    """
+
     target: Literal["unknown", "prompt", "mcp_tool"]
     command_name: str
     description: str = ""
@@ -20,6 +39,14 @@ class RuntimeCommandResult:
 
 
 def parse_native_command(raw_text: str) -> ParsedNativeCommand | None:
+    """Parse native command.
+
+    Args:
+        raw_text: Raw user text to parse.
+
+    Returns:
+        The parsed native command.
+    """
     text = raw_text.strip()
     if not text.startswith("/"):
         return None
@@ -37,6 +64,15 @@ def resolve_native_command(
     raw_text: str,
     selected_command: str | None = None,
 ) -> ParsedNativeCommand | None:
+    """Resolve native command.
+
+    Args:
+        raw_text: Raw user text to parse.
+        selected_command: Command selected through the Chainlit UI, if any.
+
+    Returns:
+        The resolved native command.
+    """
     parsed = parse_native_command(raw_text)
     if parsed is not None:
         return parsed
@@ -52,12 +88,31 @@ def resolve_native_command(
 
 
 def apply_native_template(template: str | None, raw_args: str) -> str:
+    """Apply native template.
+
+    Args:
+        template: Template string applied to command input.
+        raw_args: Raw argument text supplied with the command.
+
+    Returns:
+        The transformed value.
+    """
     if template is None:
         return raw_args.strip()
     return template.replace("{input}", raw_args.strip()).strip()
 
 
 def build_skill_command_prompt(*, skill_name: str, skill_path: str, raw_args: str) -> str:
+    """Build skill command prompt.
+
+    Args:
+        skill_name: The skill name value.
+        skill_path: Path to the skill.
+        raw_args: Raw argument text supplied with the command.
+
+    Returns:
+        The constructed skill command prompt.
+    """
     prelude = (
         f"Use the configured `{skill_name}` skill for this request.\n"
         f"Read `{skill_path}` before taking any other action and follow it for this entire turn.\n"
@@ -83,6 +138,17 @@ async def resolve_runtime_command(
     thread_id: str,
     mcp_session_id: str | None = None,
 ) -> RuntimeCommandResult:
+    """Resolve runtime command.
+
+    Args:
+        runtime: Agent runtime used by the operation.
+        parsed: Parsed native command details.
+        thread_id: Conversation thread identifier.
+        mcp_session_id: MCP session identifier.
+
+    Returns:
+        The resolved runtime command.
+    """
     command = runtime.resolve_chainlit_command(parsed.command_name)
     if command is None:
         return RuntimeCommandResult(
@@ -138,4 +204,12 @@ async def resolve_runtime_command(
 
 
 def dumps_tool_result(value: Any) -> str:
+    """Serialize a tool result as stable JSON for display.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        A stable JSON string suitable for display.
+    """
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True, default=str)

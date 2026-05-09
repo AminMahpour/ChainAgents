@@ -1,3 +1,5 @@
+"""Test Chainlit bridge streaming behavior for LangGraph event chunks."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -9,6 +11,8 @@ from chainlit_bridge import ChainlitEventBridge, RunTaskList
 
 
 class _TaskStatus:
+    """Provide an internal helper for task status."""
+
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
@@ -16,40 +20,79 @@ class _TaskStatus:
 
 
 class _Task:
+    """Provide an internal helper for task."""
+
     def __init__(self, title: str, status: str, forId: str | None = None) -> None:
+        """Initialize the task instance.
+
+        Args:
+            title: The title value.
+            status: The status value.
+            forId: The for ID value.
+        """
         self.title = title
         self.status = status
         self.forId = forId
 
 
 class _TaskList:
+    """Provide an internal helper for task list."""
+
     def __init__(self) -> None:
+        """Initialize the task list instance."""
         self.status = "Ready"
         self.tasks: list[_Task] = []
         self.send_count = 0
 
     async def send(self) -> None:
+        """Record send calls on the test double."""
         self.send_count += 1
 
 
 class _ResponseMessage:
+    """Provide an internal helper for response message.
+
+    Attributes:
+        id: The ID value.
+    """
+
     id = "message-1"
 
     def __init__(self) -> None:
+        """Initialize the response message instance."""
         self.tokens: list[str] = []
         self.update_count = 0
 
     async def stream_token(self, token: str) -> None:
+        """Stream token.
+
+        Args:
+            token: Streamed model token to inspect.
+        """
         self.tokens.append(token)
 
     async def update(self) -> None:
+        """Record update calls on the test double."""
         self.update_count += 1
 
 
 class _Message:
+    """Provide an internal helper for message.
+
+    Attributes:
+        instances: The instances value.
+    """
+
     instances: list["_Message"] = []
 
     def __init__(self, content: str = "", author: str | None = None, **_kwargs: Any) -> None:
+        """Initialize the message instance.
+
+        Args:
+            content: Message or document content to process.
+            author: The author value.
+            _kwargs: The kwargs value.
+        """
         self.content = content
         self.author = author
         self.id = f"message-{len(self.instances) + 1}"
@@ -60,17 +103,34 @@ class _Message:
         self.instances.append(self)
 
     async def send(self) -> "_Message":
+        """Record send calls on the test double.
+
+        Returns:
+            The sent message or element.
+        """
         self.send_count += 1
         return self
 
     async def stream_token(self, token: str) -> None:
+        """Stream token.
+
+        Args:
+            token: Streamed model token to inspect.
+        """
         self.tokens.append(token)
 
     async def update(self) -> None:
+        """Record update calls on the test double."""
         self.update_count += 1
 
 
 class _Step:
+    """Provide an internal helper for step.
+
+    Attributes:
+        instances: The instances value.
+    """
+
     instances: list["_Step"] = []
 
     def __init__(
@@ -80,6 +140,14 @@ class _Step:
         default_open: bool = False,
         **_kwargs: Any,
     ) -> None:
+        """Initialize the step instance.
+
+        Args:
+            name: The name value.
+            type: The type value.
+            default_open: The default open value.
+            _kwargs: The kwargs value.
+        """
         self.name = name
         self.type = type
         self.default_open = default_open
@@ -94,17 +162,29 @@ class _Step:
         self.instances.append(self)
 
     async def send(self) -> None:
+        """Record send calls on the test double."""
         self.send_count += 1
 
     async def stream_token(self, token: str) -> None:
+        """Stream token.
+
+        Args:
+            token: Streamed model token to inspect.
+        """
         self.tokens.append(token)
 
     async def update(self) -> None:
+        """Record update calls on the test double."""
         self.update_count += 1
 
 
 @pytest.fixture(autouse=True)
 def _patch_chainlit_tasks(monkeypatch) -> None:
+    """Patch Chainlit task classes with local test doubles.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
     _Message.instances.clear()
     _Step.instances.clear()
     monkeypatch.setattr(chainlit_bridge.cl, "TaskStatus", _TaskStatus)
@@ -115,6 +195,7 @@ def _patch_chainlit_tasks(monkeypatch) -> None:
 
 @pytest.mark.anyio
 async def test_response_task_starts_once_for_rapid_response_tokens() -> None:
+    """Verify that response task starts once for rapid response tokens."""
     task_list = _TaskList()
     run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
 
@@ -133,6 +214,11 @@ async def test_response_task_starts_once_for_rapid_response_tokens() -> None:
 
 @pytest.mark.anyio
 async def test_response_message_is_created_on_finish_after_reasoning_steps(monkeypatch) -> None:
+    """Verify that response message is created on finish after reasoning steps.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
     task_list = _TaskList()
     run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
     bridge = ChainlitEventBridge(prompt="hello", run_task_list=run_task_list)
@@ -177,6 +263,7 @@ async def test_response_message_is_created_on_finish_after_reasoning_steps(monke
 
 @pytest.mark.anyio
 async def test_reasoning_after_tool_call_starts_a_new_chronological_step() -> None:
+    """Verify that reasoning after tool call starts a new chronological step."""
     bridge = ChainlitEventBridge(prompt="hello")
 
     await bridge._stream_reasoning("main-agent", "first thought")
@@ -198,6 +285,11 @@ async def test_reasoning_after_tool_call_starts_a_new_chronological_step() -> No
 
 @pytest.mark.anyio
 async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> None:
+    """Verify that response stream buffers fast chunks until finish.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
     response_message = _ResponseMessage()
     bridge = ChainlitEventBridge(prompt="hello")
     bridge.response_message = response_message  # type: ignore[assignment]
@@ -224,6 +316,7 @@ async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> 
 
 @pytest.mark.anyio
 async def test_non_chronological_mode_streams_response_immediately() -> None:
+    """Verify that non chronological mode streams response immediately."""
     bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
 
     await bridge._stream_response("A")
@@ -235,6 +328,7 @@ async def test_non_chronological_mode_streams_response_immediately() -> None:
 
 @pytest.mark.anyio
 async def test_non_chronological_mode_keeps_reasoning_step_open_across_tool_call() -> None:
+    """Verify that non chronological mode keeps reasoning step open across tool call."""
     bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
 
     await bridge._stream_reasoning("main-agent", "first thought")
@@ -253,10 +347,16 @@ async def test_non_chronological_mode_keeps_reasoning_step_open_across_tool_call
 
 @pytest.mark.anyio
 async def test_astream_events_chain_stream_tuple_chunk_is_normalized() -> None:
+    """Verify that astream events chain stream tuple chunk is normalized."""
     bridge = ChainlitEventBridge(prompt="hello")
     handled_parts: list[dict[str, Any]] = []
 
     async def handle_part(part: dict[str, Any]) -> None:
+        """Capture normalized stream parts for assertions.
+
+        Args:
+            part: The part value.
+        """
         handled_parts.append(part)
 
     bridge.handle_part = handle_part  # type: ignore[method-assign]
@@ -285,10 +385,16 @@ async def test_astream_events_chain_stream_tuple_chunk_is_normalized() -> None:
 
 @pytest.mark.anyio
 async def test_astream_events_ignores_non_langgraph_stream_chunks() -> None:
+    """Verify that astream events ignores non langgraph stream chunks."""
     bridge = ChainlitEventBridge(prompt="hello")
     handled_parts: list[dict[str, Any]] = []
 
     async def handle_part(part: dict[str, Any]) -> None:
+        """Capture normalized stream parts for assertions.
+
+        Args:
+            part: The part value.
+        """
         handled_parts.append(part)
 
     bridge.handle_part = handle_part  # type: ignore[method-assign]
@@ -324,6 +430,7 @@ async def test_astream_events_ignores_non_langgraph_stream_chunks() -> None:
 
 @pytest.mark.anyio
 async def test_chainlit_bridge_shows_summarization_status() -> None:
+    """Verify that chainlit bridge shows summarization status."""
     bridge = ChainlitEventBridge(prompt="hello")
 
     await bridge.handle_event(
