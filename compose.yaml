@@ -1,4 +1,37 @@
 services:
+  app:
+    build:
+      context: .
+    image: chainagents:local
+    container_name: chainagents-app
+    restart: unless-stopped
+    ports:
+      - "${CHAINAGENTS_PORT:-8000}:8000"
+    environment:
+      DEEPAGENT_CONFIG: ${DEEPAGENT_CONFIG:-deepagent.toml}
+      DEEPAGENT_MODEL_PROVIDER: ${DEEPAGENT_MODEL_PROVIDER:-ollama}
+      DEEPAGENT_MODEL_BASE_URL: ${DEEPAGENT_MODEL_BASE_URL:-http://host.docker.internal:11434}
+      DEEPAGENT_MODEL_ENDPOINT_URL: ${DEEPAGENT_MODEL_ENDPOINT_URL:-}
+      DEEPAGENT_MODEL_NAME: ${DEEPAGENT_MODEL_NAME:-gemma4:26b}
+      DEEPAGENT_MODEL_API_KEY: ${DEEPAGENT_MODEL_API_KEY:-}
+      DEEPAGENT_MODEL_REASONING: ${DEEPAGENT_MODEL_REASONING:-medium}
+      DEEPAGENT_RECURSION_LIMIT: ${DEEPAGENT_RECURSION_LIMIT:-200}
+      DATABASE_URL: ${DATABASE_URL-postgresql://chainagents:chainagents@postgres:5432/chainagents?sslmode=disable}
+      CHAINLIT_AUTH_SECRET: ${CHAINLIT_AUTH_SECRET:-}
+      CHAINLIT_AUTH_USERNAME: ${CHAINLIT_AUTH_USERNAME:-}
+      CHAINLIT_AUTH_PASSWORD: ${CHAINLIT_AUTH_PASSWORD:-}
+      CHAINLIT_AUTH_USERS_FILE: ${CHAINLIT_AUTH_USERS_FILE:-/app/.files/users.json}
+      CHAINLIT_ASYNC_SUBAGENT_URL: ${CHAINLIT_ASYNC_SUBAGENT_URL:-}
+      CHAINLIT_ASYNC_TASK_POLL_SECONDS: ${CHAINLIT_ASYNC_TASK_POLL_SECONDS:-}
+    volumes:
+      - chainagents-files:/app/.files
+      - chainagents-rag:/app/.rag
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   postgres:
     image: postgres:17
     container_name: chainagents-postgres
@@ -18,4 +51,6 @@ services:
       retries: 10
 
 volumes:
+  chainagents-files:
+  chainagents-rag:
   postgres-data:

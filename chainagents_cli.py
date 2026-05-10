@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import getpass
 import json
 import mimetypes
 import sys
@@ -26,6 +27,14 @@ from agent_commands import (
     parse_native_command,
     resolve_native_command,
     resolve_runtime_command,
+)
+from chainlit_users import (
+    CHAINLIT_AUTH_USERS_FILE_ENV,
+    UserStoreError,
+    add_user,
+    list_users,
+    remove_user,
+    resolve_users_file,
 )
 from deepagent_runtime import (
     AgentRuntime,
@@ -191,6 +200,201 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         The parsed args.
     """
     return build_parser().parse_args(argv)
+
+
+def build_users_parser() -> argparse.ArgumentParser:
+    """Build the Chainlit user management parser.
+
+    Returns:
+        The constructed parser.
+    """
+    parser = argparse.ArgumentParser(
+        prog="chainagents users",
+        description="Manage local Chainlit password users.",
+    )
+    parser.add_argument(
+        "--file",
+        dest="users_file",
+        help=(
+            "Path to users.json. Defaults to "
+            f"${CHAINLIT_AUTH_USERS_FILE_ENV} or .files/users.json."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Print machine-readable JSON output.",
+    )
+    subparsers = parser.add_subparsers(dest="users_command", required=True)
+
+    add_parser = subparsers.add_parser("add", help="Add a Chainlit user.")
+    add_parser.add_argument("username")
+    add_parser.add_argument("--display-name", help="Display name shown in Chainlit.")
+    add_parser.add_argument("--password", help="Password to store as a salted hash.")
+    add_parser.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="Read the password from stdin.",
+    )
+    add_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the user if it already exists.",
+    )
+    add_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print machine-readable JSON output.",
+    )
+
+    remove_parser = subparsers.add_parser("remove", help="Remove a Chainlit user.")
+    remove_parser.add_argument("username")
+    remove_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print machine-readable JSON output.",
+    )
+
+    list_parser = subparsers.add_parser("list", help="List Chainlit users.")
+    list_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print machine-readable JSON output.",
+    )
+    return parser
+
+
+def password_from_user_args(
+    args: argparse.Namespace,
+    *,
+    stdin: TextIO,
+    stderr: TextIO,
+) -> str | None:
+    """Resolve the password supplied to a user-management command.
+
+    Args:
+        args: Parsed user-management arguments.
+        stdin: The stdin value.
+        stderr: The stderr value.
+
+    Returns:
+        The resolved password, if one was supplied.
+    """
+    if args.password and args.password_stdin:
+        print("users add: use only one of --password or --password-stdin.", file=stderr)
+        return None
+    if args.password_stdin:
+        return stdin.read().rstrip("\r\n")
+    if args.password:
+        return args.password
+    return getpass.getpass("Password: ")
+
+
+def run_users_cli(
+    argv: list[str],
+    *,
+    stdout: TextIO,
+    stderr: TextIO,
+    stdin: TextIO,
+) -> int:
+    """Run the Chainlit user management CLI.
+
+    Args:
+        argv: User command argv, excluding the leading "users".
+        stdout: The stdout value.
+        stderr: The stderr value.
+        stdin: The stdin value.
+
+    Returns:
+        A process-style status code.
+    """
+    parser = build_users_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code)
+
+    users_file = resolve_users_file(args.users_file)
+    try:
+        if args.users_command == "add":
+            password = password_from_user_args(args, stdin=stdin, stderr=stderr)
+            if password is None:
+                return 2
+            user = add_user(
+                users_file,
+                username=args.username,
+                password=password,
+                display_name=args.display_name,
+                overwrite=args.overwrite,
+            )
+            payload = {
+                "user": {
+                    "username": user.username,
+                    "display_name": user.display_name,
+                },
+                "users_file": str(users_file),
+            }
+            if args.json_output:
+                print(json.dumps(payload, indent=2, sort_keys=True), file=stdout)
+            else:
+                print(f"Added user {user.username} to {users_file}", file=stdout)
+            return 0
+        if args.users_command == "remove":
+            removed = remove_user(users_file, args.username)
+            if not removed:
+                print(f"User {args.username} does not exist in {users_file}", file=stderr)
+                return 1
+            if args.json_output:
+                print(
+                    json.dumps(
+                        {
+                            "removed": args.username,
+                            "users_file": str(users_file),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    file=stdout,
+                )
+            else:
+                print(f"Removed user {args.username} from {users_file}", file=stdout)
+            return 0
+        if args.users_command == "list":
+            users = [
+                {"display_name": user.display_name, "username": user.username}
+                for user in list_users(users_file)
+            ]
+            if args.json_output:
+                print(json.dumps({"users": users}, indent=2, sort_keys=True), file=stdout)
+            else:
+                table = Table(
+                    box=CLI_TABLE_BOX,
+                    border_style="bright_black",
+                    header_style="bold cyan",
+                )
+                table.add_column("Username", style="bold bright_white")
+                table.add_column("Display Name", style="white")
+                for user in users:
+                    table.add_row(user["username"], user["display_name"])
+                cli_console(stdout).print(
+                    cli_panel(
+                        table,
+                        title=f"Chainlit Users ({len(users)})",
+                        border_style="cyan",
+                    )
+                )
+            return 0
+    except UserStoreError as exc:
+        print(f"users: {exc}", file=stderr)
+        return 1
+    return 2
 
 
 def runtime_overrides_from_args(args: argparse.Namespace) -> RuntimeConfigOverrides:
@@ -1520,6 +1724,15 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         The main result.
     """
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "users":
+        return run_users_cli(
+            argv[1:],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            stdin=sys.stdin,
+        )
     return asyncio.run(async_main(argv))
 
 

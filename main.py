@@ -24,6 +24,11 @@ from agent_commands import (
 )
 from async_task_notifications import AsyncTaskNotifier, async_subagent_url_override
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
+from chainlit_users import (
+    CHAINLIT_AUTH_USERS_FILE_ENV,
+    authenticate_user,
+    resolve_users_file,
+)
 from deepagent_runtime import (
     DEFAULT_REASONING_LEVEL,
     AgentRuntime,
@@ -79,7 +84,8 @@ RAG_UPLOAD_ACCEPT = {
 AUTH_USERNAME = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
 AUTH_PASSWORD = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
 AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
-AUTH_ENABLED = bool(AUTH_SECRET and AUTH_USERNAME and AUTH_PASSWORD)
+AUTH_USERS_FILE = os.getenv(CHAINLIT_AUTH_USERS_FILE_ENV, "").strip()
+AUTH_ENABLED = bool(AUTH_SECRET and ((AUTH_USERNAME and AUTH_PASSWORD) or AUTH_USERS_FILE))
 
 
 def current_chainlit_thread_id() -> str:
@@ -692,6 +698,56 @@ def resolve_model_name_for_message(
     )
 
 
+def auth_enabled_from_env() -> bool:
+    """Return whether Chainlit password auth is configured.
+
+    Returns:
+        Whether password auth should be enabled.
+    """
+    auth_secret = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
+    auth_username = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
+    auth_password = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
+    auth_users_file = os.getenv(CHAINLIT_AUTH_USERS_FILE_ENV, "").strip()
+    return bool(auth_secret and ((auth_username and auth_password) or auth_users_file))
+
+
+def authenticate_configured_user(username: str, password: str) -> cl.User | None:
+    """Authenticate a Chainlit password user from configured credentials.
+
+    Args:
+        username: Username supplied by Chainlit.
+        password: Password supplied by Chainlit.
+
+    Returns:
+        The authenticated Chainlit user, if credentials are valid.
+    """
+    if not auth_enabled_from_env():
+        return None
+
+    users_file = os.getenv(CHAINLIT_AUTH_USERS_FILE_ENV, "").strip()
+    if users_file:
+        record = authenticate_user(resolve_users_file(users_file), username, password)
+        if record is not None:
+            return cl.User(
+                identifier=record.username,
+                display_name=record.display_name,
+                metadata={"provider": "credentials", "source": "users_file"},
+            )
+
+    auth_username = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
+    auth_password = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
+    if auth_username and auth_password and (
+        secrets.compare_digest(username, auth_username)
+        and secrets.compare_digest(password, auth_password)
+    ):
+        return cl.User(
+            identifier=auth_username,
+            display_name=auth_username,
+            metadata={"provider": "credentials", "source": "env"},
+        )
+    return None
+
+
 if AUTH_ENABLED:
 
     @cl.password_auth_callback
@@ -705,17 +761,7 @@ if AUTH_ENABLED:
         Returns:
             The password auth callback result.
         """
-        if not (
-            secrets.compare_digest(username, AUTH_USERNAME)
-            and secrets.compare_digest(password, AUTH_PASSWORD)
-        ):
-            return None
-
-        return cl.User(
-            identifier=AUTH_USERNAME,
-            display_name=AUTH_USERNAME,
-            metadata={"provider": "credentials"},
-        )
+        return authenticate_configured_user(username, password)
 
 
 async def get_runtime_or_notify() -> AgentRuntime | None:
@@ -819,7 +865,7 @@ async def on_chat_start() -> None:
     history_line = (
         "- History bar: enabled for authenticated users\n"
         if runtime.persistence_enabled and AUTH_ENABLED
-        else "- History bar: disabled; set `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` to enable native Chainlit history\n"
+        else "- History bar: disabled; set `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, and `CHAINLIT_AUTH_USERS_FILE` to enable native Chainlit history\n"
     )
     extensions = runtime.config.extensions
     configured_command_count = len(extensions.chainlit_commands)

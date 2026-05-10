@@ -29,6 +29,7 @@ export DEEPAGENT_RECURSION_LIMIT="200"
 # export DEEPAGENT_MODEL_API_KEY="optional-for-secured-openai-compatible-servers"
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
+export CHAINLIT_AUTH_USERS_FILE=".files/users.json"
 export CHAINLIT_AUTH_USERNAME="admin"
 export CHAINLIT_AUTH_PASSWORD="change-me"
 ```
@@ -55,27 +56,42 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 - it controls the maximum LangGraph steps for a single agent run
 - raise it when long tool-heavy Deep Agent runs hit `GraphRecursionError`
 
-`CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
+`CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERS_FILE`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
 
-- when all three are set, the app enables Chainlit password authentication
+- when `CHAINLIT_AUTH_SECRET` and `CHAINLIT_AUTH_USERS_FILE` are set, the app enables multi-user Chainlit password authentication from the users file
+- the legacy `CHAINLIT_AUTH_USERNAME` and `CHAINLIT_AUTH_PASSWORD` pair is still supported for a single environment-defined user
 - together with `DATABASE_URL`, that unlocks the native Chainlit history bar and chat resume UI
 - when they are unset, the app stays unauthenticated and the history bar remains unavailable
 
-## Optional: Install Postgres
+## Run With Docker Compose
 
-You only need Postgres if you want durable LangGraph checkpoints and `/memories/`.
-If `DATABASE_URL` is unset, the app runs fully in memory for the current process.
-
-This repo includes a Compose file for a local Postgres instance:
+Build and run the Chainlit app container with Postgres:
 
 ```bash
-docker compose up -d postgres
+docker compose up --build app
 ```
 
-Point the app at that database:
+Open the UI at [http://localhost:8000](http://localhost:8000).
+
+`docker compose up app` also starts the `postgres` service, waits for its healthcheck, and points the app at `postgresql://chainagents:chainagents@postgres:5432/chainagents?sslmode=disable` unless you explicitly set `DATABASE_URL`.
+
+By default, the app container expects an Ollama-compatible model server on the host at `http://host.docker.internal:11434`; override the model settings with the same `DEEPAGENT_MODEL_*` variables described above:
 
 ```bash
-export DATABASE_URL="postgresql://chainagents:chainagents@127.0.0.1:5432/chainagents?sslmode=disable"
+DEEPAGENT_MODEL_BASE_URL="http://host.docker.internal:1234/v1" \
+DEEPAGENT_MODEL_PROVIDER="openai_compatible" \
+DEEPAGENT_MODEL_NAME="your-loaded-model-id" \
+docker compose up --build app
+```
+
+The app service stores Chainlit files and the local RAG index in Docker volumes named `chainagents-files` and `chainagents-rag`.
+
+## Optional: Run Without Postgres
+
+If you want in-memory-only state for a one-off run, set `DATABASE_URL` to an empty value and skip dependencies:
+
+```bash
+DATABASE_URL= docker compose up --build --no-deps app
 ```
 
 Optional verification:
@@ -86,7 +102,7 @@ docker compose exec postgres psql -U chainagents -d chainagents -c "select 1;"
 
 Notes:
 
-- The Compose file lives at [compose.yaml](compose.yaml) and creates a persistent `postgres-data` volume.
+- The Postgres container creates a persistent `postgres-data` volume.
 - If you already have Postgres installed locally, create an empty database and set `DATABASE_URL` to that instance instead.
 - No separate migration step is required for this app. On startup it calls the LangGraph Postgres store and checkpointer `setup()` routines automatically.
 
@@ -94,21 +110,37 @@ Notes:
 
 Chainlit only shows its built-in history sidebar when both persistence and authentication are enabled.
 
-This app includes a simple password-based auth callback driven by environment variables:
+This app includes password-based auth for one or more local users. User records are stored as salted password hashes in a JSON file.
 
 ```bash
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
-export CHAINLIT_AUTH_USERNAME="admin"
-export CHAINLIT_AUTH_PASSWORD="change-me"
+export CHAINLIT_AUTH_USERS_FILE=".files/users.json"
+printf "change-me-now\n" | uv run chainagents users add admin --password-stdin
 ```
 
-With both `DATABASE_URL` and the `CHAINLIT_AUTH_*` variables set:
+Manage users with the CLI:
+
+```bash
+uv run chainagents users list
+printf "new-password\n" | uv run chainagents users add alice --display-name "Alice" --password-stdin
+uv run chainagents users remove alice
+```
+
+For Docker Compose, the default users file is `/app/.files/users.json`, stored in the `chainagents-files` volume:
+
+```bash
+export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
+printf "change-me-now\n" | docker compose run --rm --no-deps app chainagents users add admin --password-stdin
+docker compose up --build app
+```
+
+With both `DATABASE_URL` and Chainlit auth configured:
 
 - users can sign in through Chainlit's native auth screen
 - the history sidebar can list and reopen prior chats
 - resumed chats default the LangGraph thread ID to the persisted Chainlit thread ID for that conversation
 
-If you leave auth disabled, Chainlit can still persist thread records in Postgres, but the native history bar will stay hidden.
+If you prefer the old single-user environment setup, set `CHAINLIT_AUTH_USERNAME` and `CHAINLIT_AUTH_PASSWORD` along with `CHAINLIT_AUTH_SECRET`. If you leave auth disabled, Chainlit can still persist thread records in Postgres, but the native history bar will stay hidden.
 
 ## Setup
 
@@ -590,7 +622,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 
 ## Notes
 
-- Native Chainlit history is available when both `DATABASE_URL` and the `CHAINLIT_AUTH_*` variables are configured.
+- Native Chainlit history is available when `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, and either `CHAINLIT_AUTH_USERS_FILE` or the legacy `CHAINLIT_AUTH_USERNAME` / `CHAINLIT_AUTH_PASSWORD` pair are configured.
 - If `DATABASE_URL` is set but authentication is not configured, Chainlit still persists thread records, but they are not browseable from the UI.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.

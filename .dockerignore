@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__
+*.py[oc]
+build
+dist
+wheels
+*.egg-info
+ChainAgents.egg-info
+
+# Local environments and caches
+.venv
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Git and local agent state
+.git
+.github
+.codex
+AGENTS.md
+
+# Runtime state mounted as Docker volumes
+.files
+.rag
+
+# Local-only files
+.DS_Store
+mock_test.txt
