@@ -14,6 +14,7 @@ from typing import Any
 import chainlit as cl
 from chainlit.utils import utc_now
 
+from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
 from response_exports import attach_response_export_actions
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
@@ -868,6 +869,7 @@ class ChainlitEventBridge:
         self.response_task_started = False
         self.last_response_flush_at = 0.0
         self.response_streamed_from_messages = False
+        self.stream_adapter = AgentStreamEventAdapter(prompt=prompt)
         self.reasoning_steps: dict[str, cl.Step] = {}
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
@@ -887,15 +889,34 @@ class ChainlitEventBridge:
         Args:
             part: The part value.
         """
-        kind = part["type"]
-        if kind == "messages":
-            await self._handle_message_chunk(part)
+        if part["type"] == "updates" and self.run_task_list is not None:
+            await self._update_todos_from_update_part(part)
+
+        for stream_event in self.stream_adapter.events_from_part(part):
+            await self._handle_stream_event(stream_event)
+
+    async def _handle_stream_event(self, event: AgentStreamEvent) -> None:
+        """Render one normalized agent stream event."""
+        if event.kind == "response_delta":
+            await self._stream_response(event.text)
+        elif event.kind == "reasoning_delta":
+            await self._stream_reasoning(event.source, event.text)
+        elif event.kind == "tool_call":
+            await self._stream_tool_call_event(event)
+        elif event.kind == "tool_result":
+            await self._complete_tool_event(event)
+        elif event.kind == "summarization_status":
+            await self._stream_summarization_status_event(event)
+
+    async def _update_todos_from_update_part(self, part: dict[str, Any]) -> None:
+        """Refresh Chainlit task list todos from a LangGraph update part."""
+        data_by_node = part.get("data")
+        if not isinstance(data_by_node, dict):
             return
-        if kind == "updates":
-            await self._handle_update_chunk(part)
-            return
-        if kind == "custom":
-            await self._handle_custom_chunk(part)
+        for data in data_by_node.values():
+            todos = todos_from_node_data(data)
+            if todos:
+                await self.run_task_list.update_todos(todos)
 
     async def handle_event(self, event: dict[str, Any]) -> None:
         """Handle one raw LangGraph stream event.
@@ -1036,6 +1057,119 @@ class ChainlitEventBridge:
             step.end = utc_now()
             self._schedule_step_auto_collapse(step)
         await step.update()
+
+    async def _stream_summarization_status_event(self, event: AgentStreamEvent) -> None:
+        """Render a normalized summarization status event."""
+        source = event.source or "main-agent"
+        status = (event.status or "triggered").strip().lower() or "triggered"
+        message = event.text or "Conversation summarization triggered."
+        step = self.summarization_steps.get(source)
+        if step is None:
+            step = cl.Step(
+                name=f"{source} summarization",
+                type="llm",
+                default_open=True,
+            )
+            step.input = self.prompt if source == "main-agent" else ""
+            step.start = utc_now()
+            await step.send()
+            self.summarization_steps[source] = step
+
+        step.output = message
+        if status in {"completed", "skipped", "failed"}:
+            step.end = utc_now()
+            self._schedule_step_auto_collapse(step)
+        await step.update()
+
+    async def _stream_tool_call_event(self, event: AgentStreamEvent) -> None:
+        """Render a normalized streamed tool call event."""
+        if self.chronological_ui_enabled:
+            await self._close_reasoning_step(event.source)
+
+        state = self.tool_steps.get(event.tool_call_id)
+        if state is None:
+            step = cl.Step(
+                name=f"{event.source} tool",
+                type="tool",
+                default_open=True,
+                show_input="json",
+                language="json",
+            )
+            step.start = utc_now()
+            step.output = "Running..."
+            await step.send()
+            state = ToolStepState(
+                call_id=event.tool_call_id,
+                source=event.source,
+                step=step,
+            )
+            self.tool_steps[event.tool_call_id] = state
+
+        if event.tool_name:
+            state.name = event.tool_name
+            state.step.name = f"{event.source} · {state.name}"
+
+        if event.tool_args:
+            state.arg_chunks = [event.tool_args]
+            if state.name == "write_todos" and self.run_task_list is not None:
+                todos = todos_from_write_todos_args(event.tool_args)
+                if todos:
+                    await self.run_task_list.update_todos(todos)
+
+        if self.run_task_list is not None:
+            await self.run_task_list.mark_tool_started(
+                state.call_id,
+                tool_task_title(event.source, state.name, event.tool_args),
+                for_id=getattr(state.step, "id", None),
+            )
+
+        rendered_input = state.rendered_input
+        if rendered_input:
+            state.step.input = rendered_input
+        await state.step.update()
+
+    async def _complete_tool_event(self, event: AgentStreamEvent) -> None:
+        """Render a normalized completed tool call event."""
+        state = self._resolve_tool_step_from_event(event)
+        if state is None:
+            step = cl.Step(
+                name=f"{event.source} · {event.tool_name or 'tool'}",
+                type="tool",
+                default_open=True,
+                show_input="json",
+                language="json",
+            )
+            step.start = utc_now()
+            await step.send()
+            state = ToolStepState(
+                call_id=event.tool_call_id or event.source,
+                source=event.source,
+                step=step,
+                name=event.tool_name or "tool",
+            )
+
+        if event.tool_name:
+            state.name = event.tool_name
+            state.step.name = f"{event.source} · {state.name}"
+        if not state.step.input:
+            state.step.input = state.rendered_input
+        state.step.output = pretty_data(event.tool_result)
+        state.step.end = utc_now()
+        await state.step.update()
+        self._schedule_step_auto_collapse(state.step)
+
+        if self.run_task_list is not None:
+            await self.run_task_list.mark_tool_finished(
+                state.call_id,
+                title=tool_task_title(event.source, state.name, "".join(state.arg_chunks)),
+                for_id=getattr(state.step, "id", None),
+                failed=event.status.lower() == "error",
+            )
+        if state.name == "write_todos" and self.run_task_list is not None:
+            todos = todos_from_tool_message_content(event.tool_result)
+            if todos:
+                await self.run_task_list.update_todos(todos)
+        self.tool_steps.pop(state.call_id, None)
 
     async def _stream_reasoning(self, source: str, text: str) -> None:
         """Stream reasoning text into the active output target.
@@ -1287,6 +1421,44 @@ class ChainlitEventBridge:
             state
             for state in self.tool_steps.values()
             if tool_name is not None and state.name == tool_name
+        ]
+        if name_matches:
+            return name_matches[0]
+
+        if self.tool_steps:
+            return next(iter(self.tool_steps.values()))
+        return None
+
+    def _resolve_tool_step_from_event(
+        self,
+        event: AgentStreamEvent,
+    ) -> ToolStepState | None:
+        """Return the active Chainlit step for a normalized tool event."""
+        if event.tool_call_id and event.tool_call_id in self.tool_steps:
+            return self.tool_steps[event.tool_call_id]
+
+        source_name_matches = [
+            state
+            for state in self.tool_steps.values()
+            if (
+                state.source == event.source
+                and bool(event.tool_name)
+                and state.name == event.tool_name
+            )
+        ]
+        if source_name_matches:
+            return source_name_matches[0]
+
+        source_matches = [
+            state for state in self.tool_steps.values() if state.source == event.source
+        ]
+        if source_matches:
+            return source_matches[0]
+
+        name_matches = [
+            state
+            for state in self.tool_steps.values()
+            if bool(event.tool_name) and state.name == event.tool_name
         ]
         if name_matches:
             return name_matches[0]
