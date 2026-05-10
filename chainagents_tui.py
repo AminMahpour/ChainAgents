@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import Any
 
+from langchain_mcp_adapters import sessions as mcp_sessions
 from rich.panel import Panel
 from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Input, RichLog, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Footer, Header, Input, Markdown, RichLog, Static
 
 from agent_commands import (
     dumps_tool_result,
@@ -24,10 +26,37 @@ from deepagent_runtime import AgentRuntime, ReasoningLevel, normalize_reasoning_
 
 
 DEFAULT_TUI_THREAD_ID = "tui"
+TUI_SIDE_PANEL_WIDTH = 56
+TUI_STDERR_LOG = Path(".files/tui-stderr.log")
+
+
+def tui_stderr_log_path(runtime: AgentRuntime) -> Path:
+    """Return the log path used for stderr emitted during TUI mode."""
+    project_root = Path(getattr(runtime, "project_root", Path(__file__).resolve().parent))
+    return project_root / TUI_STDERR_LOG
+
+
+@contextmanager
+def capture_mcp_stdio_stderr(log_path: Path):
+    """Route stdio MCP server stderr to a log file during TUI mode."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    original_stdio_client = mcp_sessions.stdio_client
+    try:
+        with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
+
+            def stdio_client_with_log(server, errlog=None):
+                return original_stdio_client(server, errlog=log_file)
+
+            mcp_sessions.stdio_client = stdio_client_with_log
+            yield
+    finally:
+        mcp_sessions.stdio_client = original_stdio_client
 
 
 class ChainAgentsTuiApp(App[int]):
     """Interactive Textual app for the configured ChainAgents runtime."""
+
+    TITLE = "ChainAgents"
 
     CSS = """
     Screen {
@@ -49,10 +78,27 @@ class ChainAgentsTuiApp(App[int]):
         width: 2fr;
         height: 100%;
         border: solid $primary;
+        padding: 0 1;
+    }
+
+    .conversation-label {
+        height: 1;
+        margin: 1 0 0 0;
+        color: $text-muted;
+    }
+
+    .conversation-user {
+        margin: 0 0 1 0;
+    }
+
+    .conversation-assistant {
+        margin: 0 0 1 0;
+        padding: 0 1;
+        border: solid $success;
     }
 
     #side {
-        width: 42;
+        width: __SIDE_PANEL_WIDTH__;
         height: 100%;
     }
 
@@ -77,7 +123,7 @@ class ChainAgentsTuiApp(App[int]):
         border: solid $warning;
         display: none;
     }
-    """
+    """.replace("__SIDE_PANEL_WIDTH__", str(TUI_SIDE_PANEL_WIDTH))
 
     BINDINGS = [
         ("ctrl+c", "cancel_or_quit", "Cancel/Quit"),
@@ -100,6 +146,7 @@ class ChainAgentsTuiApp(App[int]):
         self.active_task: asyncio.Task[None] | None = None
         self.status_message = "Ready."
         self.conversation_entries: list[tuple[str, str]] = []
+        self.assistant_markdown_widgets: dict[int, Markdown] = {}
         self.reasoning_entries: list[tuple[str, str]] = []
         self.reasoning_entry_indexes: dict[str, int] = {}
         self.tool_entries: list[str] = []
@@ -112,7 +159,7 @@ class ChainAgentsTuiApp(App[int]):
         yield Header(show_clock=True)
         yield Static(self.status_message, id="status")
         with Horizontal(id="main"):
-            yield RichLog(id="conversation", wrap=True, markup=True, highlight=False)
+            yield VerticalScroll(id="conversation")
             with Vertical(id="side"):
                 yield RichLog(id="reasoning", wrap=True, markup=True, highlight=False)
                 yield RichLog(id="tools", wrap=True, markup=True, highlight=False)
@@ -166,10 +213,11 @@ class ChainAgentsTuiApp(App[int]):
         if self.active_task is not None and not self.active_task.done():
             return
         self.conversation_entries.clear()
+        self.assistant_markdown_widgets.clear()
         self.reasoning_entries.clear()
         self.reasoning_entry_indexes.clear()
         self.tool_entries.clear()
-        self.query_one("#conversation", RichLog).clear()
+        self.query_one("#conversation", VerticalScroll).remove_children()
         self.query_one("#reasoning", RichLog).clear()
         self.query_one("#tools", RichLog).clear()
         self._set_status("Cleared.")
@@ -188,7 +236,7 @@ class ChainAgentsTuiApp(App[int]):
         prompt_input = self.query_one("#prompt", Input)
         prompt_input.disabled = True
         self._set_status("Running...")
-        self._append_conversation("You", raw_prompt)
+        await self._append_conversation("You", raw_prompt)
         self.reasoning_entry_indexes.clear()
 
         try:
@@ -321,14 +369,14 @@ class ChainAgentsTuiApp(App[int]):
                 except StopAsyncIteration:
                     break
                 for stream_event in adapter.events_from_raw_event(event):
-                    self._handle_stream_event(stream_event)
+                    await self._handle_stream_event(stream_event)
         finally:
             with suppress(Exception):
                 await stream.aclose()
 
-    def _handle_stream_event(self, event: AgentStreamEvent) -> None:
+    async def _handle_stream_event(self, event: AgentStreamEvent) -> None:
         if event.kind == "response_delta":
-            self._append_response_delta(event.text)
+            await self._append_response_delta(event.text)
         elif event.kind == "reasoning_delta":
             self._append_reasoning(event.source, event.text)
         elif event.kind == "tool_call":
@@ -362,33 +410,71 @@ class ChainAgentsTuiApp(App[int]):
                 f"{event.source} summarization {event.status}: {event.text}"
             )
 
-    def _append_conversation(self, role: str, text: str) -> None:
+    async def _append_conversation(self, role: str, text: str) -> None:
         self.conversation_entries.append((role, text))
-        self._render_conversation()
+        widget = await self._mount_conversation_entry(
+            len(self.conversation_entries) - 1,
+            role,
+            text,
+        )
+        if role == "Assistant" and text and widget is not None:
+            await widget.append(text)
+            self.query_one("#conversation", VerticalScroll).scroll_end(animate=False)
 
-    def _append_response_delta(self, text: str) -> None:
+    async def _append_response_delta(self, text: str) -> None:
         if not text:
             return
         if self.conversation_entries and self.conversation_entries[-1][0] == "Assistant":
             role, current = self.conversation_entries[-1]
-            self.conversation_entries[-1] = (role, current + text)
+            updated_text = current + text
+            entry_index = len(self.conversation_entries) - 1
+            self.conversation_entries[-1] = (role, updated_text)
+            widget = self.assistant_markdown_widgets.get(entry_index)
+            if widget is not None:
+                await widget.append(text)
         else:
             self.conversation_entries.append(("Assistant", text))
-        self._render_conversation()
+            widget = await self._mount_conversation_entry(
+                len(self.conversation_entries) - 1,
+                "Assistant",
+            )
+            if widget is not None:
+                await widget.append(text)
+        self.query_one("#conversation", VerticalScroll).scroll_end(animate=False)
 
-    def _render_conversation(self) -> None:
-        log = self.query_one("#conversation", RichLog)
-        log.clear()
-        for role, text in self.conversation_entries:
-            style = "cyan" if role == "You" else "green"
-            log.write(
-                Panel(
-                    Text(text, style="white"),
-                    title=role,
-                    title_align="left",
-                    border_style=style,
+    async def _mount_conversation_entry(
+        self,
+        index: int,
+        role: str,
+        text: str = "",
+    ) -> Markdown | None:
+        conversation = self.query_one("#conversation", VerticalScroll)
+        if role == "Assistant":
+            markdown = Markdown("", classes="conversation-assistant")
+            markdown.code_indent_guides = False
+            self.assistant_markdown_widgets[index] = markdown
+            await conversation.mount_all(
+                (
+                    Static("Assistant", classes="conversation-label"),
+                    markdown,
                 )
             )
+            conversation.scroll_end(animate=False)
+            return markdown
+        else:
+            await conversation.mount(
+                Static(
+                    Panel(
+                        Text(text, style="white"),
+                        title=role,
+                        title_align="left",
+                        border_style="cyan",
+                    ),
+                    classes="conversation-user",
+                )
+            )
+        conversation.scroll_end(animate=False)
+        return None
 
     def _append_reasoning(self, source: str, text: str) -> None:
         if not text:
@@ -435,5 +521,6 @@ class ChainAgentsTuiApp(App[int]):
 async def run_tui(runtime: AgentRuntime, args: Any) -> int:
     """Run the Textual TUI and return a process-style exit code."""
     app = ChainAgentsTuiApp(runtime=runtime, args=args)
-    result = await app.run_async()
+    with capture_mcp_stdio_stderr(tui_stderr_log_path(runtime)):
+        result = await app.run_async()
     return int(result or 0)

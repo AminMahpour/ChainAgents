@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from textual.widgets import Input, RichLog
+from textual.containers import VerticalScroll
+from textual.widgets import Input, Markdown, RichLog
 
 import chainagents_cli
-from chainagents_tui import DEFAULT_TUI_THREAD_ID, ChainAgentsTuiApp
+from chainagents_tui import (
+    DEFAULT_TUI_THREAD_ID,
+    ChainAgentsTuiApp,
+    TUI_SIDE_PANEL_WIDTH,
+    capture_mcp_stdio_stderr,
+    run_tui,
+)
 
 
 class _Token:
@@ -141,11 +149,73 @@ class _FakeRuntime:
         return tuple(self.commands.values())
 
 
+@pytest.mark.anyio
+async def test_run_tui_leaves_app_stderr_visible(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.project_root = tmp_path
+
+    async def fake_run_async(self):
+        os.write(2, b"Textual terminal output\n")
+        return 0
+
+    monkeypatch.setattr(ChainAgentsTuiApp, "run_async", fake_run_async)
+
+    code = await run_tui(runtime, _args())
+
+    assert code == 0
+    assert "Textual terminal output" in capfd.readouterr().err
+    log_path = tmp_path / ".files" / "tui-stderr.log"
+    assert not log_path.exists() or "Textual terminal output" not in log_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_capture_mcp_stdio_stderr_routes_stdio_client_errlog(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_mcp_adapters import sessions
+
+    captured_errlog = None
+
+    def fake_stdio_client(server, errlog=None):
+        nonlocal captured_errlog
+        captured_errlog = errlog
+        errlog.write("Secure MCP Filesystem Server running on stdio\n")
+        errlog.flush()
+        return "stdio-context"
+
+    monkeypatch.setattr(sessions, "stdio_client", fake_stdio_client)
+    log_path = tmp_path / ".files" / "tui-stderr.log"
+
+    with capture_mcp_stdio_stderr(log_path):
+        assert sessions.stdio_client("server") == "stdio-context"
+
+    assert captured_errlog is not None
+    assert "Secure MCP Filesystem Server running on stdio" in log_path.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_cli_parses_tui_flag() -> None:
     args = chainagents_cli.parse_args(["--tui"])
 
     assert args.tui is True
     assert args.thread_id is None
+
+
+def test_tui_title_is_chainagents() -> None:
+    app = ChainAgentsTuiApp(runtime=_FakeRuntime(_FakeAgent([])), args=_args())
+
+    assert app.title == "ChainAgents"
+
+
+def test_tui_side_panel_width_is_wide_enough() -> None:
+    assert TUI_SIDE_PANEL_WIDTH == 56
 
 
 @pytest.mark.anyio
@@ -189,7 +259,7 @@ async def test_tui_mounts_expected_panes_and_prompt() -> None:
 
     async with app.run_test():
         assert app.thread_id == DEFAULT_TUI_THREAD_ID
-        assert app.query_one("#conversation", RichLog)
+        assert app.query_one("#conversation", VerticalScroll)
         assert app.query_one("#reasoning", RichLog)
         assert app.query_one("#tools", RichLog)
         assert app.query_one("#prompt", Input)
@@ -217,6 +287,27 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
         ("You", "hello"),
         ("Assistant", "Hello from agent"),
     ]
+
+
+@pytest.mark.anyio
+async def test_tui_renders_assistant_response_as_markdown_widget() -> None:
+    agent = _FakeAgent(
+        [
+            _raw_event(((), "messages", (_Token("## Heading\n\n"), {}))),
+            _raw_event(((), "messages", (_Token("- item"), {}))),
+        ]
+    )
+    app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = "format this"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        markdown = app.query_one("#conversation Markdown", Markdown)
+
+    assert markdown.source == "## Heading\n\n- item"
 
 
 @pytest.mark.anyio
