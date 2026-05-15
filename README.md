@@ -2,7 +2,8 @@
 
 ![Workspace Deep Agent logo](logo.png)
 
-This project runs a local-first LangChain DeepAgent behind a Chainlit UI.
+This hobby, personal project is made available using open source Python
+libraries and runs a local-first LangChain DeepAgent behind a Chainlit UI.
 
 The app is wired for:
 
@@ -599,4 +600,6 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
+This hobby, personal project is made available under the MIT License and is
+built with open source Python libraries. See [LICENSE](LICENSE) for the full
+text.
