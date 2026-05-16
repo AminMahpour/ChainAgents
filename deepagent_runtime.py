@@ -16,6 +16,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
+from langchain_warning_filters import install_langchain_warning_filters
+
+install_langchain_warning_filters()
+
 from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
