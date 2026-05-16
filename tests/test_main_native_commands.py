@@ -182,6 +182,53 @@ def test_message_uploaded_image_parts_builds_data_url_parts(tmp_path) -> None:
     ]
 
 
+def test_message_uploaded_image_parts_skips_unsupported_provider_formats(tmp_path) -> None:
+    """Verify that unsupported image formats are not sent to vision providers."""
+    heic = tmp_path / "receipt.heic"
+    heic.write_bytes(b"fake heic bytes")
+    tiff = tmp_path / "scan.tiff"
+    tiff.write_bytes(b"fake tiff bytes")
+    message = SimpleNamespace(
+        elements=[
+            SimpleNamespace(path=str(heic), name="receipt.heic", mime="image/heic"),
+            SimpleNamespace(path=str(tiff), name="scan.tiff", mime="image/tiff"),
+        ]
+    )
+
+    assert main.message_uploaded_image_parts(message) == []
+    assert main.message_uploaded_image_names(message) == ()
+    assert main.unsupported_uploaded_image_names(message) == (
+        "receipt.heic",
+        "scan.tiff",
+    )
+
+
+def test_message_uploaded_image_parts_uses_safe_mime_for_octet_stream_image(
+    tmp_path,
+) -> None:
+    """Verify that safe image extensions override generic upload MIME types."""
+    photo = tmp_path / "receipt.png"
+    photo.write_bytes(b"fake png bytes")
+    message = SimpleNamespace(
+        elements=[
+            SimpleNamespace(
+                path=str(photo),
+                name="receipt.png",
+                mime="application/octet-stream",
+            ),
+        ]
+    )
+
+    image_parts = main.message_uploaded_image_parts(message)
+
+    assert image_parts == [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,ZmFrZSBwbmcgYnl0ZXM="},
+        }
+    ]
+
+
 def test_chainlit_user_message_content_includes_uploaded_images() -> None:
     """Verify that agent payload content includes text and uploaded image parts."""
     image_part = {

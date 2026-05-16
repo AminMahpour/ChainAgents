@@ -10,6 +10,7 @@ The app is wired for:
 - `ChatOllama` or `ChatOpenAI` with a configurable local model backend
 - native Chainlit streaming for reasoning, tool calls, and final response
 - Chainlit image uploads sent to vision-capable models as photo attachments for OCR or image analysis
+- Chainlit OCR/image uploads accept PNG, JPEG, WEBP, and GIF files
 - config-driven synchronous and async DeepAgents subagents
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set

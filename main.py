@@ -94,6 +94,20 @@ IMAGE_UPLOAD_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+VISION_IMAGE_MIME_TYPE_BY_EXTENSION = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+VISION_IMAGE_MIME_TYPES = frozenset(VISION_IMAGE_MIME_TYPE_BY_EXTENSION.values())
+VISION_IMAGE_MIME_ALIASES = {
+    "image/jpg": "image/jpeg",
+    "image/pjpeg": "image/jpeg",
+    "image/x-png": "image/png",
+}
+GENERIC_UPLOAD_MIME_TYPES = {"", "application/octet-stream"}
 AUTH_USERNAME = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
 AUTH_PASSWORD = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
 AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
@@ -334,6 +348,18 @@ def is_image_upload(path: Path, mime_type: str) -> bool:
     return path.suffix.lower() in IMAGE_UPLOAD_EXTENSIONS
 
 
+def provider_safe_image_mime_type(path: Path, mime_type: str) -> str | None:
+    """Return a vision-provider-safe MIME type for an uploaded image."""
+    normalized_mime = VISION_IMAGE_MIME_ALIASES.get(mime_type, mime_type)
+    if normalized_mime in VISION_IMAGE_MIME_TYPES:
+        return normalized_mime
+
+    inferred_mime = VISION_IMAGE_MIME_TYPE_BY_EXTENSION.get(path.suffix.lower())
+    if inferred_mime and normalized_mime in GENERIC_UPLOAD_MIME_TYPES:
+        return inferred_mime
+    return None
+
+
 def message_uploaded_rag_files(message: cl.Message) -> list[UploadedRagFile]:
     """Build the message for uploaded RAG files.
 
@@ -356,7 +382,17 @@ def message_uploaded_image_names(message: cl.Message) -> tuple[str, ...]:
     return tuple(
         name
         for path, name, mime_type in message_uploads(message)
+        if provider_safe_image_mime_type(path, mime_type) is not None
+    )
+
+
+def unsupported_uploaded_image_names(message: cl.Message) -> tuple[str, ...]:
+    """Return names for image files that cannot be sent to vision providers."""
+    return tuple(
+        name
+        for path, name, mime_type in message_uploads(message)
         if is_image_upload(path, mime_type)
+        and provider_safe_image_mime_type(path, mime_type) is None
     )
 
 
@@ -371,13 +407,9 @@ def message_uploaded_image_parts(message: cl.Message) -> list[dict[str, Any]]:
     """
     parts: list[dict[str, Any]] = []
     for path, _name, mime_type in message_uploads(message):
-        if not is_image_upload(path, mime_type):
+        image_mime_type = provider_safe_image_mime_type(path, mime_type)
+        if image_mime_type is None:
             continue
-        image_mime_type = (
-            mime_type
-            or mimetypes.guess_type(path.name)[0]
-            or "image/jpeg"
-        )
         try:
             encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         except OSError:
@@ -424,6 +456,17 @@ def chainlit_user_message_content(
     if not image_parts:
         return prompt
     return [{"type": "text", "text": prompt}, *image_parts]
+
+
+def unsupported_uploaded_images_message(image_names: tuple[str, ...]) -> str:
+    """Build a user-facing note for unsupported image uploads."""
+    names = ", ".join(f"`{name}`" for name in image_names)
+    return (
+        "Some uploaded images were not attached to the agent request because their "
+        "formats are not supported by the configured vision providers.\n\n"
+        f"- Unsupported: {names}\n"
+        "- Supported image formats: PNG, JPEG, WEBP, GIF"
+    )
 
 
 def upload_result_prompt_note(added_files: tuple[str, ...]) -> str:
@@ -1198,6 +1241,7 @@ async def on_message(message: cl.Message) -> None:
     uploaded_files = message_uploaded_rag_files(message)
     uploaded_image_parts = message_uploaded_image_parts(message)
     uploaded_image_names = message_uploaded_image_names(message)
+    unsupported_image_names = unsupported_uploaded_image_names(message)
     prompt_note = ""
     if uploaded_files:
         upload_result = await runtime.ingest_rag_uploads(
@@ -1213,6 +1257,12 @@ async def on_message(message: cl.Message) -> None:
             upload_message.actions = rag_actions()
         await upload_message.send()
 
+    if unsupported_image_names:
+        await cl.Message(
+            content=unsupported_uploaded_images_message(unsupported_image_names),
+            author="System",
+        ).send()
+
     parsed_command = resolve_native_command(
         raw_text=message.content,
         selected_command=getattr(message, "command", None),
@@ -1221,6 +1271,13 @@ async def on_message(message: cl.Message) -> None:
     if (
         not message.content.strip()
         and uploaded_files
+        and not uploaded_image_parts
+        and parsed_command is None
+    ):
+        return
+    if (
+        not message.content.strip()
+        and not uploaded_files
         and not uploaded_image_parts
         and parsed_command is None
     ):
