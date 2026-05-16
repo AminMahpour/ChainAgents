@@ -144,6 +144,82 @@ def test_build_langgraph_config_includes_recursion_limit() -> None:
     }
 
 
+def test_message_uploaded_rag_files_skips_image_uploads(tmp_path) -> None:
+    """Verify that RAG uploads ignore Chainlit image attachments."""
+    notes = tmp_path / "notes.md"
+    notes.write_text("# Notes\n", encoding="utf-8")
+    photo = tmp_path / "receipt.jpg"
+    photo.write_bytes(b"fake jpeg bytes")
+    message = SimpleNamespace(
+        elements=[
+            SimpleNamespace(path=str(notes), name="notes.md", mime="text/markdown"),
+            SimpleNamespace(path=str(photo), name="receipt.jpg", mime="image/jpeg"),
+        ]
+    )
+
+    uploads = main.message_uploaded_rag_files(message)
+
+    assert [upload.name for upload in uploads] == ["notes.md"]
+
+
+def test_message_uploaded_image_parts_builds_data_url_parts(tmp_path) -> None:
+    """Verify that Chainlit image attachments become multimodal data URL parts."""
+    photo = tmp_path / "receipt.jpg"
+    photo.write_bytes(b"fake jpeg bytes")
+    message = SimpleNamespace(
+        elements=[
+            SimpleNamespace(path=str(photo), name="receipt.jpg", mime="image/jpeg"),
+        ]
+    )
+
+    image_parts = main.message_uploaded_image_parts(message)
+
+    assert image_parts == [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,ZmFrZSBqcGVnIGJ5dGVz"},
+        }
+    ]
+
+
+def test_chainlit_user_message_content_includes_uploaded_images() -> None:
+    """Verify that agent payload content includes text and uploaded image parts."""
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+    }
+
+    content = main.chainlit_user_message_content(
+        "OCR this receipt.",
+        image_parts=[image_part],
+    )
+
+    assert content == [{"type": "text", "text": "OCR this receipt."}, image_part]
+
+
+def test_chainlit_prompt_text_defaults_to_ocr_for_image_only_upload() -> None:
+    """Verify that image-only messages ask the agent to extract visible text."""
+    prompt = main.chainlit_prompt_text(
+        "",
+        image_names=("receipt.jpg",),
+        prompt_note="",
+    )
+
+    assert "Extract any visible text" in prompt
+    assert "receipt.jpg" in prompt
+
+
+def test_chainlit_prompt_text_preserves_text_without_images() -> None:
+    """Verify that non-image prompts keep their existing text shape."""
+    prompt = main.chainlit_prompt_text(
+        "  keep my spacing  ",
+        image_names=(),
+        prompt_note="\n\nRAG note",
+    )
+
+    assert prompt == "  keep my spacing  \n\nRAG note"
+
+
 @pytest.mark.anyio
 async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> None:
     """Verify that publish modes ignores missing modes column error.

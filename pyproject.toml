@@ -38,6 +38,7 @@ py-modules = [
     "chainlit_bridge",
     "deepagent_runtime",
     "langgraph_app",
+    "langchain_warning_filters",
     "main",
     "rag_runtime",
     "response_exports",

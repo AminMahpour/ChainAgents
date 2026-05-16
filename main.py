@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import mimetypes
 import os
 import secrets
 import traceback
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+
+from langchain_warning_filters import install_langchain_warning_filters
+
+install_langchain_warning_filters()
 
 import chainlit as cl
 from chainlit.input_widget import Select, TextInput
@@ -75,6 +81,18 @@ RAG_UPLOAD_ACCEPT = {
         ".yaml",
         ".yml",
     ],
+}
+IMAGE_UPLOAD_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
 }
 AUTH_USERNAME = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
 AUTH_PASSWORD = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
@@ -272,6 +290,50 @@ def rag_status_line(runtime: AgentRuntime) -> str:
     return f"- RAG: unavailable; {reason}\n"
 
 
+def message_uploads(message: cl.Message) -> list[tuple[Path, str, str]]:
+    """Return readable files attached to a Chainlit message.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+
+    Returns:
+        Tuples of path, display name, and MIME type for attached files.
+    """
+    uploads: list[tuple[Path, str, str]] = []
+    for element in getattr(message, "elements", []) or []:
+        raw_path = getattr(element, "path", None)
+        if not raw_path:
+            continue
+        path = Path(str(raw_path))
+        if not path.exists() or not path.is_file():
+            continue
+        name = str(getattr(element, "name", "") or path.name).strip() or path.name
+        mime_type = uploaded_file_mime_type(element, path=path, name=name)
+        uploads.append((path, name, mime_type))
+    return uploads
+
+
+def uploaded_file_mime_type(element: Any, *, path: Path, name: str) -> str:
+    """Resolve the MIME type for an uploaded Chainlit file."""
+    for attr in ("mime", "mime_type", "content_type"):
+        raw_mime = getattr(element, attr, None)
+        if isinstance(raw_mime, str) and "/" in raw_mime:
+            return raw_mime.split(";", 1)[0].strip().lower()
+
+    for candidate in (name, path.name):
+        guessed_type, _ = mimetypes.guess_type(candidate)
+        if guessed_type:
+            return guessed_type.lower()
+    return ""
+
+
+def is_image_upload(path: Path, mime_type: str) -> bool:
+    """Return whether an uploaded file should be sent as an image attachment."""
+    if mime_type.startswith("image/"):
+        return True
+    return path.suffix.lower() in IMAGE_UPLOAD_EXTENSIONS
+
+
 def message_uploaded_rag_files(message: cl.Message) -> list[UploadedRagFile]:
     """Build the message for uploaded RAG files.
 
@@ -282,16 +344,86 @@ def message_uploaded_rag_files(message: cl.Message) -> list[UploadedRagFile]:
         The constructed the message for uploaded rag files.
     """
     uploads: list[UploadedRagFile] = []
-    for element in getattr(message, "elements", []) or []:
-        raw_path = getattr(element, "path", None)
-        if not raw_path:
+    for path, name, mime_type in message_uploads(message):
+        if is_image_upload(path, mime_type):
             continue
-        path = Path(str(raw_path))
-        if not path.exists() or not path.is_file():
-            continue
-        name = str(getattr(element, "name", "") or path.name).strip() or path.name
         uploads.append(UploadedRagFile(path=path, name=name))
     return uploads
+
+
+def message_uploaded_image_names(message: cl.Message) -> tuple[str, ...]:
+    """Return names for image files attached to a Chainlit message."""
+    return tuple(
+        name
+        for path, name, mime_type in message_uploads(message)
+        if is_image_upload(path, mime_type)
+    )
+
+
+def message_uploaded_image_parts(message: cl.Message) -> list[dict[str, Any]]:
+    """Build multimodal content parts for uploaded Chainlit images.
+
+    Args:
+        message: Chainlit message or LangChain message to process.
+
+    Returns:
+        OpenAI-compatible image content parts backed by data URLs.
+    """
+    parts: list[dict[str, Any]] = []
+    for path, _name, mime_type in message_uploads(message):
+        if not is_image_upload(path, mime_type):
+            continue
+        image_mime_type = (
+            mime_type
+            or mimetypes.guess_type(path.name)[0]
+            or "image/jpeg"
+        )
+        try:
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError:
+            continue
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{image_mime_type};base64,{encoded}"},
+            }
+        )
+    return parts
+
+
+def chainlit_prompt_text(
+    content: str,
+    *,
+    image_names: tuple[str, ...],
+    prompt_note: str,
+) -> str:
+    """Build the text part of a Chainlit user message sent to the agent."""
+    if not image_names:
+        return f"{content}{prompt_note}"
+
+    prompt = content.strip()
+    if not prompt and image_names:
+        prompt = "Extract any visible text from the attached image(s)."
+
+    attached = ", ".join(f"`{name}`" for name in image_names)
+    prompt = (
+        f"{prompt}\n\n"
+        f"Attached image file(s): {attached}. "
+        "Use the image content directly when answering."
+    )
+
+    return f"{prompt}{prompt_note}"
+
+
+def chainlit_user_message_content(
+    prompt: str,
+    *,
+    image_parts: list[dict[str, Any]],
+) -> str | list[dict[str, Any]]:
+    """Build the multimodal user message content sent from Chainlit."""
+    if not image_parts:
+        return prompt
+    return [{"type": "text", "text": prompt}, *image_parts]
 
 
 def upload_result_prompt_note(added_files: tuple[str, ...]) -> str:
@@ -1064,6 +1196,8 @@ async def on_message(message: cl.Message) -> None:
     mcp_session_id = current_mcp_session_id()
     run_task_list = await get_run_task_list()
     uploaded_files = message_uploaded_rag_files(message)
+    uploaded_image_parts = message_uploaded_image_parts(message)
+    uploaded_image_names = message_uploaded_image_names(message)
     prompt_note = ""
     if uploaded_files:
         upload_result = await runtime.ingest_rag_uploads(
@@ -1084,7 +1218,12 @@ async def on_message(message: cl.Message) -> None:
         selected_command=getattr(message, "command", None),
     )
     slash_command_from_text = parse_native_command(message.content)
-    if not message.content.strip() and uploaded_files and parsed_command is None:
+    if (
+        not message.content.strip()
+        and uploaded_files
+        and not uploaded_image_parts
+        and parsed_command is None
+    ):
         return
 
     if parsed_command is not None:
@@ -1116,6 +1255,11 @@ async def on_message(message: cl.Message) -> None:
                 return
             message.content = transformed_prompt
 
+    agent_prompt = chainlit_prompt_text(
+        message.content,
+        image_names=uploaded_image_names,
+        prompt_note=prompt_note,
+    )
     async_url_override = async_subagent_url_override()
     agent = await runtime.get_agent(
         effective_reasoning_level,
@@ -1130,7 +1274,7 @@ async def on_message(message: cl.Message) -> None:
         url_override=async_url_override,
     )
     bridge = ChainlitEventBridge(
-        prompt=message.content,
+        prompt=agent_prompt,
         run_task_list=run_task_list,
         chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
     )
@@ -1144,7 +1288,10 @@ async def on_message(message: cl.Message) -> None:
         "messages": [
             {
                 "role": "user",
-                "content": f"{message.content}{prompt_note}",
+                "content": chainlit_user_message_content(
+                    agent_prompt,
+                    image_parts=uploaded_image_parts,
+                ),
             }
         ]
     }
