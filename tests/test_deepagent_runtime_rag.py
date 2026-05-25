@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import AIMessageChunk, ToolMessage
+from deepagents.backends import CompositeBackend
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 import pytest
@@ -542,6 +543,83 @@ def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path)
     assert result.status == "success"
 
 
+def test_tool_execution_middleware_maps_large_tool_result_paths(tmp_path: Path) -> None:
+    """Verify that large tool result paths map to project-local artifacts."""
+    middleware = ToolExecutionResilienceMiddleware(project_root=tmp_path)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "read_file",
+            "args": {"path": "/large_tool_results/tool-call-1"},
+            "type": "tool_call",
+        },
+        tool=SimpleNamespace(name="read_file"),
+        state={},
+        runtime=SimpleNamespace(),
+    )
+
+    def handler(updated_request: ToolCallRequest) -> ToolMessage:
+        """Capture tool-call arguments for middleware tests."""
+        assert updated_request.tool_call["args"] == {
+            "path": str(
+                tmp_path / ".files/deepagent/large_tool_results/tool-call-1"
+            )
+        }
+        return ToolMessage(
+            content="ok",
+            name="read_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    result = middleware.wrap_tool_call(request, handler)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "success"
+
+
+def test_tool_execution_middleware_materializes_state_large_tool_results(
+    tmp_path: Path,
+) -> None:
+    """Verify that state-backed large tool results are materialized for MCP tools."""
+    middleware = ToolExecutionResilienceMiddleware(project_root=tmp_path)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "read_file",
+            "args": {"path": "/large_tool_results/tool-call-1"},
+            "type": "tool_call",
+        },
+        tool=SimpleNamespace(name="read_file"),
+        state={
+            "files": {
+                "/large_tool_results/tool-call-1": {
+                    "content": "tool output",
+                    "encoding": "utf-8",
+                }
+            }
+        },
+        runtime=SimpleNamespace(),
+    )
+    local_path = tmp_path / ".files/deepagent/large_tool_results/tool-call-1"
+
+    def handler(updated_request: ToolCallRequest) -> ToolMessage:
+        """Capture tool-call arguments and materialized file content."""
+        assert updated_request.tool_call["args"] == {"path": str(local_path)}
+        assert local_path.read_text(encoding="utf-8") == "tool output"
+        return ToolMessage(
+            content="ok",
+            name="read_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    result = middleware.wrap_tool_call(request, handler)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "success"
+
+
 def test_agent_runtime_initialize_runs_rag_startup_check(
     tmp_path: Path,
     monkeypatch,
@@ -666,7 +744,7 @@ def test_get_agent_includes_rag_tool_when_ready(
 
     monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
 
-    runtime = AgentRuntime(make_runtime_config(tmp_path))
+    runtime = AgentRuntime(make_runtime_config(tmp_path), project_root=tmp_path)
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
     runtime._rag_service = ReadyRAG()
@@ -677,6 +755,9 @@ def test_get_agent_includes_rag_tool_when_ready(
     assert "search_workspace_knowledge" in tool_names
     middleware = captured["kwargs"]["middleware"]
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+    backend = captured["kwargs"]["backend"]
+    assert isinstance(backend, CompositeBackend)
+    assert backend.artifacts_root == str(tmp_path / ".files/deepagent")
 
 
 def test_get_agent_includes_summarization_middleware_when_enabled(

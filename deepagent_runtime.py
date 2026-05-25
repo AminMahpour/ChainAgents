@@ -68,6 +68,7 @@ DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+LARGE_TOOL_RESULTS_PREFIX = "/large_tool_results"
 AGENTS_MD_FILENAME = "AGENTS.md"
 logger = logging.getLogger(__name__)
 OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
@@ -522,6 +523,98 @@ def deepagent_artifacts_route_prefix(project_root: Path | None = None) -> str:
     return f"{deepagent_artifacts_root(project_root).as_posix().rstrip('/')}/"
 
 
+def large_tool_result_path_to_local(
+    path_value: str,
+    project_root: Path | None = None,
+) -> str:
+    """Convert a large tool result path into a local artifact path.
+
+    Args:
+        path_value: The path value to convert.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The local artifact path, or the original value when it is not a large
+        tool result path.
+    """
+    normalized = path_value.strip().replace("\\", "/")
+    if normalized != LARGE_TOOL_RESULTS_PREFIX and not normalized.startswith(
+        f"{LARGE_TOOL_RESULTS_PREFIX}/"
+    ):
+        return path_value
+
+    relative = PurePosixPath(normalized.removeprefix("/"))
+    if ".." in relative.parts:
+        return path_value
+
+    return str((deepagent_artifacts_root(project_root) / Path(*relative.parts)).resolve())
+
+
+def state_file_text_content(file_data: Any) -> str | None:
+    """Return text content from a DeepAgents state file entry.
+
+    Args:
+        file_data: State-backed file data.
+
+    Returns:
+        Text content when the state entry is text-like, otherwise None.
+    """
+    if not isinstance(file_data, dict):
+        return None
+
+    encoding = file_data.get("encoding")
+    if encoding not in {None, "utf-8"}:
+        return None
+
+    content = file_data.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(line) for line in content)
+    return None
+
+
+def materialize_state_large_tool_result(
+    path_value: str,
+    state: Any,
+    project_root: Path,
+) -> str:
+    """Materialize a state-backed large tool result into the local artifacts dir.
+
+    Args:
+        path_value: The requested large tool result path.
+        state: Current agent state, potentially including state-backed files.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The local artifact path for large tool result paths, otherwise the
+        original path.
+    """
+    local_path_value = large_tool_result_path_to_local(path_value, project_root)
+    if local_path_value == path_value:
+        return path_value
+
+    local_path = Path(local_path_value)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_path.exists():
+        return local_path_value
+
+    if not isinstance(state, dict):
+        return local_path_value
+
+    files = state.get("files")
+    if not isinstance(files, dict):
+        return local_path_value
+
+    normalized = path_value.strip().replace("\\", "/")
+    content = state_file_text_content(files.get(normalized))
+    if content is None:
+        return local_path_value
+
+    local_path.write_text(content, encoding="utf-8")
+    return local_path_value
+
+
 def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
     """Summarize tool exception.
 
@@ -554,31 +647,49 @@ WORKSPACE_PATH_TOOL_ARG_KEYS = {
 }
 
 
-def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
+def _map_workspace_tool_path_value(
+    value: Any,
+    project_root: Path,
+    state: Any = None,
+) -> Any:
     """Map one virtual workspace path value to a local path.
 
     Args:
         value: Value to normalize, convert, or serialize.
         project_root: Project root used to resolve local paths.
+        state: Current agent state used to materialize state-backed artifacts.
 
     Returns:
         The mapped value.
     """
     if isinstance(value, str):
-        return virtual_workspace_path_to_local(value, project_root)
+        return materialize_state_large_tool_result(
+            virtual_workspace_path_to_local(value, project_root),
+            state,
+            project_root,
+        )
     if isinstance(value, list):
-        return [_map_workspace_tool_path_value(item, project_root) for item in value]
+        return [
+            _map_workspace_tool_path_value(item, project_root, state) for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_map_workspace_tool_path_value(item, project_root) for item in value)
+        return tuple(
+            _map_workspace_tool_path_value(item, project_root, state) for item in value
+        )
     return value
 
 
-def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None) -> Any:
+def map_workspace_paths_in_tool_args(
+    args: Any,
+    project_root: Path | None = None,
+    state: Any = None,
+) -> Any:
     """Map workspace paths in tool args.
 
     Args:
         args: Parsed command-line arguments.
         project_root: Project root used to resolve local paths.
+        state: Current agent state used to materialize state-backed artifacts.
 
     Returns:
         The mapped value.
@@ -590,7 +701,7 @@ def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None
     mapped = dict(args)
     for key, value in args.items():
         if str(key).lower() in WORKSPACE_PATH_TOOL_ARG_KEYS:
-            mapped[key] = _map_workspace_tool_path_value(value, root)
+            mapped[key] = _map_workspace_tool_path_value(value, root, state)
     return mapped
 
 
@@ -612,7 +723,11 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             request: The request value.
         """
         args = request.tool_call.get("args")
-        mapped_args = map_workspace_paths_in_tool_args(args, self.project_root)
+        mapped_args = map_workspace_paths_in_tool_args(
+            args,
+            self.project_root,
+            request.state,
+        )
         if mapped_args is not args:
             request.tool_call["args"] = mapped_args
 
@@ -2805,6 +2920,7 @@ class AgentRuntime:
                     )
                     for subagent in self.config.extensions.async_subagents
                 )
+                backend = build_deepagent_backend(project_root=self.project_root)
                 agent = create_deep_agent(
                     model=model,
                     tools=main_tools or None,
@@ -2817,7 +2933,7 @@ class AgentRuntime:
                         rag_enabled=rag_tool_enabled,
                     ),
                     middleware=middleware,
-                    backend=self._build_backend,
+                    backend=backend,
                     store=self.store,
                     checkpointer=self.checkpointer,
                     skills=list(self.config.extensions.skills) or None,

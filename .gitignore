@@ -12,6 +12,11 @@ wheels/
 # Chainlit file storage
 .files/
 .codex
+.langgraph_api/
 
 # Local RAG index
 .rag/
+
+# Local test/browser artifacts
+.pytest_cache/
+.playwright-mcp/
