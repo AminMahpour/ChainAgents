@@ -462,6 +462,53 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     assert read_result.file_data["content"] == "tool output"
 
 
+def test_build_deepagent_backend_redirects_workspace_writes_to_output(
+    tmp_path: Path,
+) -> None:
+    """Verify that generated workspace files are written under Output.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
+    (tmp_path / "README.md").write_text("root readme", encoding="utf-8")
+    backend = build_deepagent_backend(project_root=tmp_path)
+
+    write_result = backend.write("/workspace/report.md", "generated report")
+
+    assert write_result.error is None
+    assert write_result.path == "/workspace/Output/report.md"
+    assert not (tmp_path / "report.md").exists()
+    assert (tmp_path / "Output" / "report.md").read_text(
+        encoding="utf-8"
+    ) == "generated report"
+
+    read_existing_result = backend.read("/workspace/README.md")
+
+    assert read_existing_result.error is None
+    assert read_existing_result.file_data is not None
+    assert read_existing_result.file_data["content"] == "root readme"
+
+
+def test_build_deepagent_backend_keeps_explicit_output_workspace_writes(
+    tmp_path: Path,
+) -> None:
+    """Verify that explicit Output writes are not nested under Output/Output.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
+    backend = build_deepagent_backend(project_root=tmp_path)
+
+    write_result = backend.write("/workspace/Output/summary.md", "summary")
+
+    assert write_result.error is None
+    assert write_result.path == "/workspace/Output/summary.md"
+    assert (tmp_path / "Output" / "summary.md").read_text(
+        encoding="utf-8"
+    ) == "summary"
+    assert not (tmp_path / "Output" / "Output" / "summary.md").exists()
+
+
 def test_tool_execution_resilience_middleware_returns_error_tool_message() -> None:
     """Verify that tool execution resilience middleware returns error tool message."""
     middleware = ToolExecutionResilienceMiddleware()
@@ -532,6 +579,100 @@ def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path)
         return ToolMessage(
             content="ok",
             name="read_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    result = middleware.wrap_tool_call(request, handler)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "success"
+
+
+def test_tool_execution_middleware_redirects_repo_write_paths_to_output(
+    tmp_path: Path,
+) -> None:
+    """Verify that repo MCP write paths are redirected to Output.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
+    middleware = ToolExecutionResilienceMiddleware(project_root=tmp_path)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "repo_write_file",
+            "args": {"path": "/workspace/report.md", "content": "report"},
+            "type": "tool_call",
+        },
+        tool=SimpleNamespace(name="repo_write_file"),
+        state={},
+        runtime=SimpleNamespace(),
+    )
+
+    def handler(updated_request: ToolCallRequest) -> ToolMessage:
+        """Capture tool-call arguments for middleware tests.
+
+        Args:
+            updated_request: The updated request value.
+
+        Returns:
+            The handler result.
+        """
+        assert updated_request.tool_call["args"] == {
+            "path": str(tmp_path / "Output" / "report.md"),
+            "content": "report",
+        }
+        return ToolMessage(
+            content="ok",
+            name="repo_write_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    result = middleware.wrap_tool_call(request, handler)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "success"
+
+
+def test_tool_execution_middleware_redirects_relative_repo_write_paths_to_output(
+    tmp_path: Path,
+) -> None:
+    """Verify that relative repo MCP write paths are redirected to Output.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
+    middleware = ToolExecutionResilienceMiddleware(project_root=tmp_path)
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-1",
+            "name": "write_file",
+            "args": {"path": "nested/report.md", "content": "report"},
+            "type": "tool_call",
+        },
+        tool=SimpleNamespace(name="write_file"),
+        state={},
+        runtime=SimpleNamespace(),
+    )
+
+    def handler(updated_request: ToolCallRequest) -> ToolMessage:
+        """Capture tool-call arguments for middleware tests.
+
+        Args:
+            updated_request: The updated request value.
+
+        Returns:
+            The handler result.
+        """
+        assert updated_request.tool_call["args"] == {
+            "path": str(tmp_path / "Output" / "nested" / "report.md"),
+            "content": "report",
+        }
+        return ToolMessage(
+            content="ok",
+            name="write_file",
             tool_call_id="call-1",
             status="success",
         )

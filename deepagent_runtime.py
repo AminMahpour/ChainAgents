@@ -68,6 +68,7 @@ DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+AGENT_OUTPUT_DIRECTORY = Path("Output")
 AGENTS_MD_FILENAME = "AGENTS.md"
 logger = logging.getLogger(__name__)
 OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
@@ -86,6 +87,8 @@ You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
 - Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
+- Create new generated files under `/workspace/{AGENT_OUTPUT_DIRECTORY.as_posix()}/`.
+  Existing project files may still be read or edited in place when the user asks for code changes.
 - Use `/memories/` for agent memory. Persistence depends on runtime configuration.
 - Use any other absolute path only for ephemeral scratch work.
 
@@ -522,6 +525,43 @@ def deepagent_artifacts_route_prefix(project_root: Path | None = None) -> str:
     return f"{deepagent_artifacts_root(project_root).as_posix().rstrip('/')}/"
 
 
+def agent_output_root(project_root: Path | None = None) -> Path:
+    """Return the local directory used for agent-generated files.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The local directory used for agent-generated files.
+    """
+    root = (project_root or PROJECT_ROOT).resolve()
+    return root / AGENT_OUTPUT_DIRECTORY
+
+
+def workspace_output_virtual_path(path_value: str) -> str:
+    """Return the `/workspace/Output/...` path for a generated workspace write.
+
+    Args:
+        path_value: Workspace path requested by the agent.
+
+    Returns:
+        The redirected workspace path.
+    """
+    normalized = path_value.strip().replace("\\", "/")
+    workspace_prefix = "/workspace"
+    output_name = AGENT_OUTPUT_DIRECTORY.as_posix()
+    output_prefix = f"{workspace_prefix}/{output_name}"
+    if normalized == workspace_prefix or normalized == f"{workspace_prefix}/":
+        return output_prefix
+    if not normalized.startswith(f"{workspace_prefix}/"):
+        return path_value
+    if normalized == output_prefix or normalized.startswith(f"{output_prefix}/"):
+        return normalized
+
+    relative = PurePosixPath(normalized.removeprefix(workspace_prefix).lstrip("/"))
+    return (PurePosixPath(output_prefix) / relative).as_posix()
+
+
 def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
     """Summarize tool exception.
 
@@ -553,6 +593,35 @@ WORKSPACE_PATH_TOOL_ARG_KEYS = {
     "src",
 }
 
+GENERATED_FILE_OUTPUT_ARG_KEYS = {
+    "destination",
+    "dest",
+    "dst",
+    "path",
+    "paths",
+}
+
+GENERATED_FILE_TOOL_NAME_SUFFIXES = (
+    "create_directory",
+    "write_file",
+)
+
+
+def is_generated_file_tool(tool_name: str | None) -> bool:
+    """Return whether a tool creates new files or directories.
+
+    Args:
+        tool_name: Tool name from a tool call.
+
+    Returns:
+        Whether the tool creates new filesystem entries.
+    """
+    normalized = str(tool_name or "").strip()
+    return any(
+        normalized == suffix or normalized.endswith(f"_{suffix}")
+        for suffix in GENERATED_FILE_TOOL_NAME_SUFFIXES
+    )
+
 
 def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
     """Map one virtual workspace path value to a local path.
@@ -573,12 +642,84 @@ def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
     return value
 
 
-def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None) -> Any:
+def _output_relative_path_to_local(path_value: str, project_root: Path) -> str:
+    """Map a generated relative path to the local Output directory.
+
+    Args:
+        path_value: Relative path requested by a file-generating tool.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The local Output path.
+    """
+    normalized = path_value.strip().replace("\\", "/")
+    output_name = AGENT_OUTPUT_DIRECTORY.as_posix()
+    relative = PurePosixPath(normalized)
+    if relative.parts and relative.parts[0] == output_name:
+        return str((project_root / Path(*relative.parts)).resolve())
+    return str((project_root / AGENT_OUTPUT_DIRECTORY / Path(*relative.parts)).resolve())
+
+
+def _output_local_project_path(path_value: str, project_root: Path) -> str | None:
+    """Map a generated local project path to the local Output directory.
+
+    Args:
+        path_value: Absolute local path requested by a file-generating tool.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The redirected local Output path, or None when the path is outside the project.
+    """
+    local_path = Path(path_value).expanduser().resolve()
+    try:
+        relative = local_path.relative_to(project_root)
+    except ValueError:
+        return None
+    if relative.parts and relative.parts[0] == AGENT_OUTPUT_DIRECTORY.as_posix():
+        return str(local_path)
+    return str((project_root / AGENT_OUTPUT_DIRECTORY / relative).resolve())
+
+
+def _map_generated_output_tool_path_value(value: Any, project_root: Path) -> Any:
+    """Map one generated-file path value to the local Output directory.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The mapped value.
+    """
+    if isinstance(value, str):
+        normalized = value.strip().replace("\\", "/")
+        if normalized == "/workspace" or normalized.startswith("/workspace/"):
+            return virtual_workspace_path_to_local(
+                workspace_output_virtual_path(normalized),
+                project_root,
+            )
+        if Path(normalized).is_absolute():
+            redirected = _output_local_project_path(normalized, project_root)
+            return redirected if redirected is not None else value
+        return _output_relative_path_to_local(normalized, project_root)
+    if isinstance(value, list):
+        return [_map_generated_output_tool_path_value(item, project_root) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_map_generated_output_tool_path_value(item, project_root) for item in value)
+    return value
+
+
+def map_workspace_paths_in_tool_args(
+    args: Any,
+    project_root: Path | None = None,
+    *,
+    tool_name: str | None = None,
+) -> Any:
     """Map workspace paths in tool args.
 
     Args:
         args: Parsed command-line arguments.
         project_root: Project root used to resolve local paths.
+        tool_name: Tool name from a tool call.
 
     Returns:
         The mapped value.
@@ -588,8 +729,12 @@ def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None
 
     root = (project_root or PROJECT_ROOT).resolve()
     mapped = dict(args)
+    output_redirect_enabled = is_generated_file_tool(tool_name)
     for key, value in args.items():
-        if str(key).lower() in WORKSPACE_PATH_TOOL_ARG_KEYS:
+        normalized_key = str(key).lower()
+        if output_redirect_enabled and normalized_key in GENERATED_FILE_OUTPUT_ARG_KEYS:
+            mapped[key] = _map_generated_output_tool_path_value(value, root)
+        elif normalized_key in WORKSPACE_PATH_TOOL_ARG_KEYS:
             mapped[key] = _map_workspace_tool_path_value(value, root)
     return mapped
 
@@ -612,7 +757,14 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             request: The request value.
         """
         args = request.tool_call.get("args")
-        mapped_args = map_workspace_paths_in_tool_args(args, self.project_root)
+        tool_name = str(
+            request.tool_call.get("name") or getattr(request.tool, "name", "")
+        ).strip()
+        mapped_args = map_workspace_paths_in_tool_args(
+            args,
+            self.project_root,
+            tool_name=tool_name,
+        )
         if mapped_args is not args:
             request.tool_call["args"] = mapped_args
 
@@ -2158,6 +2310,60 @@ def build_model(
     return OpenAICompatibleChatOpenAI(**kwargs)
 
 
+class AgentOutputCompositeBackend(CompositeBackend):
+    """Composite backend that routes generated workspace writes to Output."""
+
+    @staticmethod
+    def _redirect_generated_workspace_write(file_path: str) -> str:
+        """Redirect generated workspace writes to `/workspace/Output/`.
+
+        Args:
+            file_path: File path requested by the agent.
+
+        Returns:
+            Redirected file path.
+        """
+        return workspace_output_virtual_path(file_path)
+
+    def write(
+        self,
+        file_path: str,
+        content: str,
+    ):
+        """Create a new file, redirecting workspace writes to Output.
+
+        Args:
+            file_path: File path requested by the agent.
+            content: File content as a string.
+
+        Returns:
+            Write result from the routed backend.
+        """
+        return super().write(
+            self._redirect_generated_workspace_write(file_path),
+            content,
+        )
+
+    async def awrite(
+        self,
+        file_path: str,
+        content: str,
+    ):
+        """Async version of write.
+
+        Args:
+            file_path: File path requested by the agent.
+            content: File content as a string.
+
+        Returns:
+            Write result from the routed backend.
+        """
+        return await super().awrite(
+            self._redirect_generated_workspace_write(file_path),
+            content,
+        )
+
+
 def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:
     """Build deepagent backend.
 
@@ -2169,7 +2375,7 @@ def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBac
     """
     resolved_project_root = project_root or PROJECT_ROOT
     artifacts_root = deepagent_artifacts_root(resolved_project_root)
-    return CompositeBackend(
+    return AgentOutputCompositeBackend(
         default=StateBackend(),
         routes={
             deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(

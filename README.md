@@ -588,6 +588,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 ## Workspace Contract
 
 - `/workspace/` maps to this repo on disk.
+- agent-generated files are deposited under `/workspace/Output/`, while existing project files can still be read or edited in place.
 - `/memories/` is durable across LangGraph threads only when `DATABASE_URL` is configured.
 - any other absolute path is treated as ephemeral scratch space by the deep agent backend.
 
