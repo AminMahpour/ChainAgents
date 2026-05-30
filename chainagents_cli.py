@@ -104,6 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", help="API key for OpenAI-compatible model servers.")
     parser.add_argument("--temperature", type=float, help="Model temperature.")
     parser.add_argument(
+        "--disable-streaming-for-tool-calls",
+        action="store_true",
+        help=(
+            "Bypass model streaming only for requests that include tools. "
+            "Useful for model servers with unreliable streamed tool-call chunks."
+        ),
+    )
+    parser.add_argument(
         "--reasoning",
         choices=("low", "medium", "high"),
         help="Reasoning effort for this run.",
@@ -215,6 +223,9 @@ def runtime_overrides_from_args(args: argparse.Namespace) -> RuntimeConfigOverri
         model_endpoint_url=args.endpoint_url,
         model_api_key=args.api_key,
         model_temperature=args.temperature,
+        model_disable_streaming=(
+            "tool_calling" if args.disable_streaming_for_tool_calls else None
+        ),
         reasoning_level=args.reasoning,
         recursion_limit=args.recursion_limit,
         disable_rag=args.no_rag,
@@ -882,6 +893,7 @@ def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
         "model_choices": list(runtime.config.model_choices),
         "model_base_url": runtime.config.model_base_url,
         "reasoning": runtime.config.default_reasoning,
+        "model_disable_streaming": runtime.config.model_disable_streaming,
         "recursion_limit": runtime.config.recursion_limit,
         "persistence": runtime.config.persistence_mode,
         "rag": rag_status_payload(runtime.rag_status),
@@ -944,6 +956,10 @@ def print_runtime_status(
         Text(str(payload["model_base_url"] or "not set"), "white"),
     )
     table.add_row("Reasoning", Text(str(payload["reasoning"]), "cyan"))
+    table.add_row(
+        "Disable streaming",
+        Text(str(payload["model_disable_streaming"]), "white"),
+    )
     table.add_row("Recursion limit", Text(str(payload["recursion_limit"]), "white"))
     table.add_row("Persistence", Text(str(payload["persistence"]), "white"))
     table.add_row("RAG", rag_status_text(payload["rag"]))

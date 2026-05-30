@@ -57,6 +57,7 @@ from rag_runtime import (
 
 ModelProvider = Literal["ollama", "openai_compatible", "anthropic"]
 ReasoningLevel = Literal["low", "medium", "high"]
+DisableStreaming = bool | Literal["tool_calling"]
 PersistenceMode = Literal["memory", "postgres"]
 DEFAULT_MODEL = "gpt-oss:20b"
 DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
@@ -125,6 +126,74 @@ def normalize_reasoning_level(
     if candidate not in {"low", "medium", "high"}:
         return default
     return candidate  # type: ignore[return-value]
+
+
+def normalize_disable_streaming(value: Any | None) -> DisableStreaming:
+    """Normalize the LangChain disable_streaming model option.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized disable streaming value.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    candidate = str(value).strip().lower().replace("-", "_")
+    if not candidate:
+        return False
+    if candidate in {"true", "1", "yes", "on"}:
+        return True
+    if candidate in {"false", "0", "no", "off"}:
+        return False
+    if candidate == "tool_calling":
+        return "tool_calling"
+    raise ValueError(
+        "Model disable_streaming must be a boolean or 'tool_calling'."
+    )
+
+
+def normalize_disable_streaming_for_tool_calls(value: Any | None) -> bool:
+    """Normalize whether to disable streaming only when tools are bound.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        Whether streaming should be disabled for tool-calling requests.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    normalized = normalize_disable_streaming(value)
+    if normalized == "tool_calling":
+        return True
+    if isinstance(normalized, bool):
+        return normalized
+    return False
+
+
+def parse_model_disable_streaming(raw_model: dict[str, Any]) -> DisableStreaming:
+    """Parse model streaming-disabling settings.
+
+    Args:
+        raw_model: Raw model config table.
+
+    Returns:
+        The parsed LangChain disable_streaming value.
+    """
+    if "disable_streaming" in raw_model:
+        return normalize_disable_streaming(raw_model.get("disable_streaming"))
+    if normalize_disable_streaming_for_tool_calls(
+        raw_model.get("disable_streaming_for_tool_calls")
+    ):
+        return "tool_calling"
+    return False
 
 
 def normalize_model_provider(
@@ -1337,6 +1406,7 @@ class ModelDefaults:
         reasoning_effort: The reasoning effort value.
         temperature: The temperature value.
         repeat_penalty: The repeat penalty value.
+        disable_streaming: Whether to disable model streaming.
     """
 
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
@@ -1349,6 +1419,7 @@ class ModelDefaults:
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
     temperature: float = DEFAULT_TEMPERATURE
     repeat_penalty: float | None = None
+    disable_streaming: DisableStreaming = False
 
 
 @dataclass(frozen=True)
@@ -1455,6 +1526,7 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
             raw_model.get("temperature", raw_model.get("tempreature"))
         ),
         repeat_penalty=normalize_repeat_penalty(raw_model.get("repeat_penalty")),
+        disable_streaming=parse_model_disable_streaming(raw_model),
     )
 
 
@@ -1926,6 +1998,7 @@ class RuntimeConfigOverrides:
         reasoning_level: The reasoning level value.
         recursion_limit: The recursion limit value.
         disable_rag: The disable RAG value.
+        model_disable_streaming: Whether to disable model streaming.
     """
 
     config_path: str | Path | None = None
@@ -1940,6 +2013,7 @@ class RuntimeConfigOverrides:
     reasoning_level: str | None = None
     recursion_limit: int | None = None
     disable_rag: bool = False
+    model_disable_streaming: DisableStreaming | None = None
 
 
 @dataclass(frozen=True)
@@ -1963,6 +2037,7 @@ class RuntimeConfig:
         rag: The RAG value.
         rag_error: The RAG error value.
         model_endpoint_query: The model endpoint query value.
+        model_disable_streaming: Whether to disable model streaming.
     """
 
     database_url: str | None
@@ -1981,6 +2056,7 @@ class RuntimeConfig:
     rag: ResolvedRagConfig | None = None
     rag_error: str | None = None
     model_endpoint_query: tuple[tuple[str, str], ...] = ()
+    model_disable_streaming: DisableStreaming = False
 
     @classmethod
     def from_env(
@@ -2159,6 +2235,23 @@ class RuntimeConfig:
             else model_defaults.temperature
         )
         model_repeat_penalty = model_defaults.repeat_penalty
+        if overrides.model_disable_streaming is not None:
+            model_disable_streaming = normalize_disable_streaming(
+                overrides.model_disable_streaming
+            )
+        else:
+            raw_disable_streaming = os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING")
+            if raw_disable_streaming is not None:
+                model_disable_streaming = normalize_disable_streaming(raw_disable_streaming)
+            elif os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS") is not None:
+                if normalize_disable_streaming_for_tool_calls(
+                    os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS")
+                ):
+                    model_disable_streaming = "tool_calling"
+                else:
+                    model_disable_streaming = False
+            else:
+                model_disable_streaming = model_defaults.disable_streaming
         default_reasoning = normalize_reasoning_level(
             generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
@@ -2202,6 +2295,7 @@ class RuntimeConfig:
             rag=rag,
             rag_error=rag_error,
             model_endpoint_query=model_endpoint_query,
+            model_disable_streaming=model_disable_streaming,
         )
 
 
@@ -2228,6 +2322,7 @@ def build_model(
             "base_url": config.model_base_url,
             "reasoning": reasoning_level,
             "temperature": config.model_temperature,
+            "disable_streaming": config.model_disable_streaming,
         }
         if config.model_repeat_penalty is not None:
             kwargs["repeat_penalty"] = config.model_repeat_penalty
@@ -2239,6 +2334,7 @@ def build_model(
             "base_url": config.model_base_url,
             "temperature": config.model_temperature,
             "effort": reasoning_level,
+            "disable_streaming": config.model_disable_streaming,
         }
         if config.model_api_key:
             kwargs["api_key"] = config.model_api_key
@@ -2249,6 +2345,7 @@ def build_model(
         "base_url": config.model_base_url,
         "api_key": config.model_api_key or "deepagent",
         "temperature": config.model_temperature,
+        "disable_streaming": config.model_disable_streaming,
     }
     default_query = model_endpoint_query_to_dict(config.model_endpoint_query)
     if default_query:
