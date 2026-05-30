@@ -7,7 +7,7 @@ libraries and runs a local-first LangChain DeepAgent behind a Chainlit UI.
 
 The app is wired for:
 
-- `ChatOllama` or `ChatOpenAI` with a configurable local model backend
+- `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic` with configurable model backends
 - native Chainlit streaming for reasoning, tool calls, and final response
 - Chainlit image uploads sent to vision-capable models as photo attachments for OCR or image analysis
 - Chainlit OCR/image uploads accept PNG, JPEG, WEBP, and GIF files
@@ -25,11 +25,12 @@ Set these variables before starting the app if you want environment-based overri
 export DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=disable"
 export DEEPAGENT_MODEL_PROVIDER="ollama"
 export DEEPAGENT_MODEL_BASE_URL="http://127.0.0.1:11434"
-# export DEEPAGENT_MODEL_ENDPOINT_URL="https://api.example.test/custom/chat/completions?api-version=2026-01-01"
+# export DEEPAGENT_MODEL_ENDPOINT_URL="https://api.example.test/custom/v1/messages"
 export DEEPAGENT_MODEL_NAME="gpt-oss:20b"
 export DEEPAGENT_MODEL_REASONING="medium"
 export DEEPAGENT_RECURSION_LIMIT="200"
 # export DEEPAGENT_MODEL_API_KEY="optional-for-secured-openai-compatible-servers"
+# export ANTHROPIC_API_KEY="required-for-provider-anthropic-unless-DEEPAGENT_MODEL_API_KEY-is-set"
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
 export CHAINLIT_AUTH_USERNAME="admin"
@@ -49,7 +50,8 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 `DEEPAGENT_MODEL_*` variables are optional:
 
 - they override the matching `[model]` values in `deepagent.toml`
-- `DEEPAGENT_MODEL_API_KEY` is only needed for secured OpenAI-compatible servers
+- `DEEPAGENT_MODEL_API_KEY` is used for secured OpenAI-compatible servers and can also supply the Anthropic API key
+- `ANTHROPIC_API_KEY` is also read when `provider = "anthropic"` or `provider = "claude"`
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
 
 `DEEPAGENT_RECURSION_LIMIT` is optional:
@@ -123,6 +125,7 @@ ollama pull gpt-oss:20b
 ```
 
 If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
+If you are using Claude through Anthropic, set `[model].provider = "anthropic"` and provide `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY`.
 
 If you enable workspace-docs RAG with Ollama embeddings, also pull an embedding model such as:
 
@@ -223,16 +226,32 @@ name = "your-loaded-model-id"
 # api_key = "optional"
 ```
 
+For Claude through Anthropic:
+
+```toml
+[model]
+provider = "anthropic"
+temperature = 0
+name = "claude-sonnet-4-6"
+models = ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"]
+reasoning_effort = "medium"
+# api_key = "optional-if-ANTHROPIC_API_KEY-or-DEEPAGENT_MODEL_API_KEY-is-set"
+# base_url = "https://api.anthropic.com"
+# endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
+```
+
 Notes:
 
-- `provider` selects `ChatOllama` or `ChatOpenAI`.
+- `provider` selects `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic`.
+- `provider = "claude"` is accepted as an alias for `provider = "anthropic"`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
-- `endpoint_url` is an OpenAI-compatible override for full non-standard chat-completions URLs; query parameters are forwarded as OpenAI client default query parameters.
+- `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
-- `api_key` is optional and only used for `provider = "openai_compatible"`. When omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
+- `api_key` is optional for `provider = "openai_compatible"`; when omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
+- Anthropic requires an API key from `api_key`, `DEEPAGENT_MODEL_API_KEY`, or `ANTHROPIC_API_KEY`.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
-- `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly; OpenAI-compatible servers may ignore it.
+- `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly, Anthropic maps it to Claude `effort`, and OpenAI-compatible servers may ignore it.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, and `DEEPAGENT_MODEL_REASONING` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
 
@@ -282,6 +301,7 @@ Notes:
 - With `provider = "auto"`, the embedding backend follows the active chat-model provider.
 - For Ollama, the default embedding model is `nomic-embed-text`.
 - For OpenAI-compatible embeddings, set `[rag.embedding].model` explicitly.
+- For Anthropic chat models, set `[rag.embedding].provider` explicitly to `ollama` or `openai_compatible`; `auto` cannot infer a Claude embedding backend.
 - On startup, the UI reports whether RAG is ready and how many files/chunks were indexed.
 - The startup message includes a `Rebuild Knowledge Index` action so you can refresh the index after documentation changes.
 - The startup message also includes `Upload File For RAG`, which lets you add text-based files to the current chat thread's knowledge index.

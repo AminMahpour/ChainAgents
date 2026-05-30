@@ -208,6 +208,26 @@ def test_resolve_rag_config_requires_model_for_openai_compatible(tmp_path: Path)
         )
 
 
+def test_resolve_rag_config_rejects_auto_for_anthropic(tmp_path: Path) -> None:
+    """Verify that auto RAG embeddings reject unsupported Anthropic inference.
+
+    Args:
+        tmp_path: Path to the tmp.
+    """
+    config = RagConfig(
+        enabled=True,
+        persist_directory=tmp_path / ".rag",
+        embedding=RagEmbeddingConfig(provider="auto"),
+    )
+
+    with pytest.raises(ValueError, match="rag.embedding.provider"):
+        resolve_rag_config(
+            config,
+            model_provider="anthropic",
+            model_base_url="https://api.anthropic.com",
+        )
+
+
 def test_discover_source_paths_only_indexes_docs(tmp_path: Path) -> None:
     """Verify that discover source paths only indexes docs.
 

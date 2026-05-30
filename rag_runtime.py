@@ -489,7 +489,7 @@ def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig
 def resolve_rag_config(
     config: RagConfig,
     *,
-    model_provider: ResolvedRagEmbeddingProvider,
+    model_provider: str,
     model_base_url: str,
 ) -> ResolvedRagConfig | None:
     """Resolve RAG config.
@@ -511,6 +511,12 @@ def resolve_rag_config(
     provider = config.embedding.provider
     resolved_provider: ResolvedRagEmbeddingProvider
     if provider == "auto":
+        if model_provider not in {"ollama", "openai_compatible"}:
+            raise ValueError(
+                "RAG embedding provider 'auto' cannot infer embeddings for "
+                f"model provider '{model_provider}'. Set 'rag.embedding.provider' "
+                "to 'ollama' or 'openai_compatible' with an embedding model."
+            )
         resolved_provider = model_provider
     else:
         resolved_provider = provider

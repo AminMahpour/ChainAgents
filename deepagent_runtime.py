@@ -30,6 +30,7 @@ from deepagents.backends import (
 from deepagents.middleware.skills import _list_skills
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_anthropic import ChatAnthropic
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -54,7 +55,7 @@ from rag_runtime import (
 )
 
 
-ModelProvider = Literal["ollama", "openai_compatible"]
+ModelProvider = Literal["ollama", "openai_compatible", "anthropic"]
 ReasoningLevel = Literal["low", "medium", "high"]
 PersistenceMode = Literal["memory", "postgres"]
 DEFAULT_MODEL = "gpt-oss:20b"
@@ -62,6 +63,7 @@ DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
 DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
 DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
@@ -72,6 +74,7 @@ AGENTS_MD_FILENAME = "AGENTS.md"
 logger = logging.getLogger(__name__)
 OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
 OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
+ANTHROPIC_MESSAGES_PATH_SUFFIX = "/v1/messages"
 
 OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
     "reasoning_content",
@@ -144,9 +147,12 @@ def normalize_model_provider(
     candidate = str(value or default).strip().lower().replace("-", "_")
     if not candidate:
         return default
-    if candidate not in {"ollama", "openai_compatible"}:
+    if candidate == "claude":
+        candidate = "anthropic"
+    if candidate not in {"ollama", "openai_compatible", "anthropic"}:
         raise ValueError(
-            "The model provider must be 'ollama' or 'openai_compatible'."
+            "The model provider must be 'ollama', 'openai_compatible', "
+            "'anthropic', or 'claude'."
         )
     return candidate  # type: ignore[return-value]
 
@@ -162,6 +168,8 @@ def format_model_provider(provider: ModelProvider) -> str:
     """
     if provider == "openai_compatible":
         return "OpenAI-compatible"
+    if provider == "anthropic":
+        return "Anthropic Claude"
     return "Ollama"
 
 
@@ -429,6 +437,32 @@ def normalize_openai_endpoint_url(
 
     base_url = urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
     return base_url, tuple(parse_qsl(parsed.query, keep_blank_values=True))
+
+
+def normalize_anthropic_endpoint_url(
+    value: Any | None,
+    *,
+    required_message: str | None = None,
+) -> str:
+    """Normalize Anthropic endpoint URL to the API base URL.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+        required_message: The required message value.
+
+    Returns:
+        The normalized Anthropic API base URL.
+    """
+    candidate = normalize_model_base_url(
+        value,
+        required_message=required_message,
+    )
+    parsed = urlsplit(candidate)
+    path = parsed.path.rstrip("/")
+    if path.endswith(ANTHROPIC_MESSAGES_PATH_SUFFIX):
+        path = path[: -len(ANTHROPIC_MESSAGES_PATH_SUFFIX)].rstrip("/")
+
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
 def model_endpoint_query_to_dict(
@@ -1359,9 +1393,12 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
         if candidate and candidate not in parsed_models:
             parsed_models.append(candidate)
 
-    if provider == "openai_compatible" and not raw_name and not parsed_models:
+    if provider in {"openai_compatible", "anthropic"} and not raw_name and not parsed_models:
+        provider_label = (
+            "OpenAI-compatible" if provider == "openai_compatible" else "Anthropic"
+        )
         raise ValueError(
-            "OpenAI-compatible model config must define a non-empty 'name' or 'models'."
+            f"{provider_label} model config must define a non-empty 'name' or 'models'."
         )
 
     raw_base_url = str(raw_model.get("base_url", "")).strip()
@@ -1378,7 +1415,7 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
                 raw_model.get("endpoint"),
                 normalize_model_port(raw_model.get("port")),
             )
-    else:
+    elif provider == "openai_compatible":
         required_message = (
             "OpenAI-compatible model config must define a non-empty "
             "'base_url' or 'endpoint_url'."
@@ -1392,6 +1429,14 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
             base_url = normalize_model_base_url(
                 raw_model.get("base_url"),
                 required_message=required_message,
+            )
+    else:
+        if normalize_optional_string(raw_endpoint_url):
+            base_url = normalize_anthropic_endpoint_url(raw_endpoint_url)
+        else:
+            base_url = normalize_model_base_url(
+                raw_model.get("base_url"),
+                default=DEFAULT_ANTHROPIC_BASE_URL,
             )
 
     return ModelDefaults(
@@ -2008,12 +2053,16 @@ class RuntimeConfig:
         endpoint_url_satisfies_provider_switch = (
             model_provider == "openai_compatible" and bool(generic_model_endpoint_url)
         )
-        if (
-            model_provider_override
-            and model_provider != model_defaults.provider
+        provider_changed = (
+            bool(model_provider_override) and model_provider != model_defaults.provider
+        )
+        provider_switch_requires_url = (
+            provider_changed
+            and model_provider in {"ollama", "openai_compatible"}
             and not generic_model_base_url
             and not endpoint_url_satisfies_provider_switch
-        ):
+        )
+        if provider_switch_requires_url:
             required_url_env = "DEEPAGENT_MODEL_BASE_URL"
             if model_provider == "openai_compatible":
                 required_url_env = (
@@ -2034,6 +2083,15 @@ class RuntimeConfig:
                 "OpenAI-compatible runtime must define DEEPAGENT_MODEL_NAME "
                 "or set a non-empty [model].name in deepagent.toml."
             )
+        if (
+            model_provider == "anthropic"
+            and not generic_model_name
+            and (provider_changed or not model_defaults.name_is_explicit)
+        ):
+            raise ValueError(
+                "Anthropic runtime must define DEEPAGENT_MODEL_NAME "
+                "or set a non-empty [model].name in deepagent.toml."
+            )
 
         model_name = generic_model_name or model_name_alias or model_defaults.name
         model_choices = tuple(
@@ -2045,7 +2103,26 @@ class RuntimeConfig:
             )
         )
         model_endpoint_query = model_defaults.endpoint_query
-        if model_provider == "openai_compatible" and generic_model_endpoint_url:
+        if model_provider == "anthropic":
+            if generic_model_endpoint_url:
+                model_base_url = normalize_anthropic_endpoint_url(
+                    generic_model_endpoint_url,
+                    required_message="The Anthropic model endpoint URL cannot be empty.",
+                )
+            else:
+                model_base_url = normalize_model_base_url(
+                    (
+                        generic_model_base_url
+                        or (
+                            model_defaults.base_url
+                            if model_defaults.provider == "anthropic"
+                            else ""
+                        )
+                    ),
+                    default=DEFAULT_ANTHROPIC_BASE_URL,
+                )
+            model_endpoint_query = ()
+        elif model_provider == "openai_compatible" and generic_model_endpoint_url:
             model_base_url, model_endpoint_query = normalize_openai_endpoint_url(
                 generic_model_endpoint_url,
                 required_message="The model endpoint URL cannot be empty.",
@@ -2064,7 +2141,17 @@ class RuntimeConfig:
         else:
             model_api_key = (
                 normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+                or (
+                    normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+                    if model_provider == "anthropic"
+                    else None
+                )
                 or model_defaults.api_key
+            )
+        if model_provider == "anthropic" and not model_api_key:
+            raise ValueError(
+                "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
+                "ANTHROPIC_API_KEY, or [model].api_key."
             )
         model_temperature = (
             normalize_model_temperature(overrides.model_temperature)
@@ -2145,6 +2232,17 @@ def build_model(
         if config.model_repeat_penalty is not None:
             kwargs["repeat_penalty"] = config.model_repeat_penalty
         return ChatOllama(**kwargs)
+
+    if config.model_provider == "anthropic":
+        kwargs = {
+            "model": selected_model,
+            "base_url": config.model_base_url,
+            "temperature": config.model_temperature,
+            "effort": reasoning_level,
+        }
+        if config.model_api_key:
+            kwargs["api_key"] = config.model_api_key
+        return ChatAnthropic(**kwargs)
 
     kwargs: dict[str, Any] = {
         "model": selected_model,
