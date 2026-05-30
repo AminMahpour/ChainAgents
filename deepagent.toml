@@ -1,22 +1,22 @@
-#[model]
-#provider = "ollama"
-#base_url = "http://127.0.0.1:11434"
-#temperature = 0.3
-#repeat_penalty = 1.1
+[model]
+provider = "ollama"
+base_url = "http://10.0.1.152:11434"
+temperature = 0.3
+repeat_penalty = 1.1
 
-#name = "gemma4:26b"
+name = "qwen3.6:35b-a3b"
 #models = ["gpt-oss:20b", "gemma4:26b", "qwen3.6:27b"]
 
-#reasoning_effort = "medium"
+reasoning_effort = "medium"
 
 # For LM Studio or another OpenAI-compatible server, switch to:
-[model]
-provider = "openai_compatible"
-base_url = "http://10.0.1.152:1234/v1"
-temperature = 0
-name = "qwen3.6-35b-a3b-mtp"
-reasoning_effort = "medium"
-api_key = "optional"
+#[model]
+#provider = "openai_compatible"
+#base_url = "http://10.0.1.152:1234/v1"
+#temperature = 0
+#name = "qwen3.6-35b-a3b-mtp"
+#reasoning_effort = "medium"
+#api_key = "optional"
 
 
 

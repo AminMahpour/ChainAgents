@@ -11,6 +11,13 @@ reasoning_effort = "medium"
 # endpoint_url = "https://api.example.test/custom/chat/completions?api-version=2026-01-01"
 # name = "your-loaded-model-id"
 # api_key = ""
+#
+# For Claude through Anthropic, switch to:
+# provider = "anthropic"
+# name = "claude-sonnet-4-6"
+# models = ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"]
+# endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
+# api_key = ""  # optional when ANTHROPIC_API_KEY or DEEPAGENT_MODEL_API_KEY is set
 
 [mcp]
 tool_name_prefix = true
@@ -74,6 +81,9 @@ provider = "auto"
 # model = "text-embedding-3-large"
 # base_url = "http://127.0.0.1:1234/v1"
 # api_key = ""
+#
+# For Anthropic chat models, do not leave provider = "auto"; set an explicit
+# Ollama or OpenAI-compatible embedding backend.
 
 [[subagents]]
 name = "repo-researcher"

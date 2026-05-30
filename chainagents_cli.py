@@ -88,13 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force in-memory state even when DATABASE_URL is set.",
     )
-    parser.add_argument("--provider", help="Model provider: ollama or openai_compatible.")
+    parser.add_argument(
+        "--provider",
+        help="Model provider: ollama, openai_compatible, anthropic, or claude.",
+    )
     parser.add_argument("--base-url", help="Model server base URL.")
     parser.add_argument(
         "--endpoint-url",
         help=(
-            "OpenAI-compatible full endpoint URL. "
-            "Use this for non-standard /chat/completions paths."
+            "Full model endpoint URL. Use this for non-standard "
+            "/chat/completions, /responses, or Anthropic /v1/messages paths."
         ),
     )
     parser.add_argument("--model", help="Model name to run.")
