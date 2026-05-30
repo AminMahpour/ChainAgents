@@ -30,18 +30,10 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
-[mcp.servers.playwright]
-transport = "stdio"
-command = "npx"
-args = ["-y", "@playwright/mcp@latest", "--headless"]
-# Set true to run Playwright MCP without a visible browser window.
-#headless = true
-cwd = "."
-
 [agent]
 recursion_limit = 200
 skills = ["skills"]
-mcp_servers = ["repo", "playwright"]
+mcp_servers = ["repo"]
 summarization_middleware_enabled = true
 # Optional token thresholds used when the installed LangChain middleware supports them.
 summarization_trigger_tokens = 150000
