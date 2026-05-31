@@ -36,8 +36,9 @@ cwd = "."
 recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
+# Legacy flag retained for compatibility; DeepAgents provides summarization.
 summarization_middleware_enabled = true
-# Optional token thresholds used when the installed LangChain middleware supports them.
+# Token thresholds tune DeepAgents' built-in summarizer.
 summarization_trigger_tokens = 150000
 summarization_keep_tokens = 10000
 

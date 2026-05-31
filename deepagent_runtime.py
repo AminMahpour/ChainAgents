@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import threading
 import tomllib
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
@@ -73,6 +74,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 AGENTS_MD_FILENAME = "AGENTS.md"
 logger = logging.getLogger(__name__)
+_DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
 OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
 OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
 ANTHROPIC_MESSAGES_PATH_SUFFIX = "/v1/messages"
@@ -978,6 +980,77 @@ def _build_summarization_middleware(
     return SummarizationStatusMiddleware(middleware, source=source)
 
 
+def _build_deepagents_summarization_factory(
+    config: RuntimeConfig,
+) -> Callable[[Any, Any], AgentMiddleware[Any, Any, Any]] | None:
+    """Build a DeepAgents summarization factory honoring configured thresholds.
+
+    Args:
+        config: Configuration object used by the operation.
+
+    Returns:
+        A replacement DeepAgents summarization factory, or None when the
+        built-in defaults should be used unchanged.
+    """
+    trigger_tokens = config.extensions.summarization_trigger_tokens
+    keep_tokens = config.extensions.summarization_keep_tokens
+    if trigger_tokens is None and keep_tokens is None:
+        return None
+
+    def factory(model: Any, backend: Any) -> AgentMiddleware[Any, Any, Any]:
+        """Create DeepAgents summarization middleware with configured thresholds."""
+        from deepagents.middleware.summarization import (
+            SummarizationMiddleware,
+            compute_summarization_defaults,
+        )
+
+        defaults = compute_summarization_defaults(model)
+        trigger = (
+            ("tokens", trigger_tokens)
+            if trigger_tokens is not None
+            else defaults["trigger"]
+        )
+        keep = ("tokens", keep_tokens) if keep_tokens is not None else defaults["keep"]
+        return SummarizationMiddleware(
+            model=model,
+            backend=backend,
+            trigger=trigger,
+            keep=keep,
+            trim_tokens_to_summarize=None,
+            truncate_args_settings=defaults["truncate_args_settings"],
+        )
+
+    return factory
+
+
+def create_deep_agent_with_configured_summarization(
+    config: RuntimeConfig,
+    **kwargs: Any,
+) -> Any:
+    """Create a DeepAgents graph while applying configured summarization thresholds.
+
+    Args:
+        config: Configuration object used by the operation.
+        kwargs: Keyword arguments passed to create_deep_agent.
+
+    Returns:
+        The created DeepAgents graph.
+    """
+    summarization_factory = _build_deepagents_summarization_factory(config)
+    if summarization_factory is None:
+        return create_deep_agent(**kwargs)
+
+    import deepagents.graph as deepagents_graph
+
+    with _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK:
+        original_factory = deepagents_graph.create_summarization_middleware
+        deepagents_graph.create_summarization_middleware = summarization_factory
+        try:
+            return create_deep_agent(**kwargs)
+        finally:
+            deepagents_graph.create_summarization_middleware = original_factory
+
+
 def build_agent_middleware(
     *,
     config: RuntimeConfig | None = None,
@@ -998,22 +1071,12 @@ def build_agent_middleware(
     Returns:
         The constructed agent middleware.
     """
+    # DeepAgents 0.6.7 owns summarization middleware in its base main-agent and
+    # sync-subagent stacks. Passing another SummarizationMiddleware here creates
+    # duplicate middleware names that LangChain rejects during agent creation.
     middleware: list[AgentMiddleware[Any, Any, Any]] = [
         ToolExecutionResilienceMiddleware(project_root=project_root)
     ]
-    if (
-        config
-        and config.extensions.summarization_middleware_enabled
-        and reasoning_level is not None
-    ):
-        summarization_middleware = _build_summarization_middleware(
-            config=config,
-            reasoning_level=reasoning_level,
-            model_name=model_name,
-            source=source,
-        )
-        if summarization_middleware is not None:
-            middleware.append(summarization_middleware)
     return middleware
 
 
@@ -2684,7 +2747,8 @@ def create_configured_graph(
     else:
         if config.rag_requested and config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
-    return create_deep_agent(
+    return create_deep_agent_with_configured_summarization(
+        config,
         model=build_model(config, config.default_reasoning),
         tools=sanitize_tools_for_model(config.model_provider, tools) or None,
         system_prompt=compose_rag_system_prompt(
@@ -3000,7 +3064,8 @@ class AgentRuntime:
                     )
                     for subagent in self.config.extensions.async_subagents
                 )
-                agent = create_deep_agent(
+                agent = create_deep_agent_with_configured_summarization(
+                    self.config,
                     model=model,
                     tools=main_tools or None,
                     system_prompt=compose_rag_system_prompt(
