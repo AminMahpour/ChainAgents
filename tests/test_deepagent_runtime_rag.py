@@ -1030,6 +1030,76 @@ def test_get_agent_with_summarization_subagent_does_not_duplicate_middleware(
     assert agent is not None
 
 
+def test_get_agent_applies_configured_deepagents_summarization_thresholds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify configured summarization token thresholds reach DeepAgents.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    created_summarizers: list[dict[str, object]] = []
+
+    class CapturingSummarizationMiddleware(deepagent_runtime.AgentMiddleware):
+        """Capture summarization construction arguments."""
+
+        @property
+        def name(self) -> str:
+            """Return the public summarization middleware name."""
+            return "SummarizationMiddleware"
+
+        def __init__(self, model, *, backend, trigger=None, keep=None, **kwargs) -> None:
+            """Initialize the fake summarization middleware instance."""
+            created_summarizers.append(
+                {
+                    "model": model,
+                    "backend": backend,
+                    "trigger": trigger,
+                    "keep": keep,
+                    "kwargs": kwargs,
+                }
+            )
+
+    monkeypatch.setattr(
+        "deepagents.middleware.summarization.SummarizationMiddleware",
+        CapturingSummarizationMiddleware,
+    )
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "build_model",
+        lambda *_args, **_kwargs: FakeListChatModel(responses=["ok"]),
+    )
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                summarization_trigger_tokens=5000,
+                summarization_keep_tokens=2000,
+                subagents=(
+                    SubagentConfig(
+                        name="repo-researcher",
+                        description="Researches the repo",
+                        system_prompt="Do research",
+                    ),
+                ),
+            ),
+        )
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    agent = asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert agent is not None
+    assert created_summarizers
+    assert {item["trigger"] for item in created_summarizers} == {("tokens", 5000)}
+    assert {item["keep"] for item in created_summarizers} == {("tokens", 2000)}
+
+
 def test_summarization_status_middleware_emits_stream_events() -> None:
     """Verify that summarization status middleware emits stream events."""
     events: list[dict[str, str]] = []

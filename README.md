@@ -397,6 +397,8 @@ cwd = "."
 recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
+summarization_trigger_tokens = 6000
+summarization_keep_tokens = 2400
 
 [[subagents]]
 name = "repo-researcher"
@@ -433,7 +435,9 @@ Main `[agent]` additions:
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
 - DeepAgents provides its own summarization middleware in the main agent and sync subagents.
-- Legacy `summarization_middleware_enabled`, `summarization_trigger_tokens`, and `summarization_keep_tokens` entries are still parsed for compatibility, but ChainAgents no longer injects a second summarization middleware.
+- `summarization_trigger_tokens`: optional positive integer token threshold for DeepAgents' built-in summarization middleware.
+- `summarization_keep_tokens`: optional positive integer token budget to keep after DeepAgents summarizes conversation history.
+- Legacy `summarization_middleware_enabled` entries are still parsed for compatibility, but ChainAgents no longer injects a second summarization middleware.
 
 ## Chainlit Native Commands
 

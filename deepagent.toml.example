@@ -44,8 +44,9 @@ mcp_servers = ["repo"]
 # Optional instruction appended to the main agent system prompt.
 # custom_instruction = "Always ask clarifying questions before editing files."
 # DeepAgents 0.6.7 provides summarization middleware in its base agent stack.
-# Legacy summarization_middleware_enabled and token threshold entries are parsed
-# for compatibility, but ChainAgents no longer injects a second middleware.
+# These optional token thresholds tune DeepAgents' built-in summarizer.
+summarization_trigger_tokens = 6000
+summarization_keep_tokens = 2400
 
 [chainlit]
 # Set false to hide model selection in chat settings and Modes.
