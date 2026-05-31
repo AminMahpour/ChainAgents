@@ -397,9 +397,6 @@ cwd = "."
 recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
-summarization_middleware_enabled = false
-summarization_trigger_tokens = 6000
-summarization_keep_tokens = 2400
 
 [[subagents]]
 name = "repo-researcher"
@@ -435,10 +432,8 @@ Main `[agent]` additions:
 - `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
-- `summarization_middleware_enabled`: optional boolean (default `false`) to add LangChain's summarization middleware to the main agent and sync subagents.
-- `summarization_trigger_tokens`: optional positive integer token threshold that triggers summarization when reached.
-- `summarization_keep_tokens`: optional positive integer token budget to keep in conversation history after summarization.
-- When summarization runs, the CLI prints a summarization status panel and Chainlit shows a summarization step in the UI.
+- DeepAgents provides its own summarization middleware in the main agent and sync subagents.
+- Legacy `summarization_middleware_enabled`, `summarization_trigger_tokens`, and `summarization_keep_tokens` entries are still parsed for compatibility, but ChainAgents no longer injects a second summarization middleware.
 
 ## Chainlit Native Commands
 

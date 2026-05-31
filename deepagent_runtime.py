@@ -998,22 +998,12 @@ def build_agent_middleware(
     Returns:
         The constructed agent middleware.
     """
+    # DeepAgents 0.6.7 owns summarization middleware in its base main-agent and
+    # sync-subagent stacks. Passing another SummarizationMiddleware here creates
+    # duplicate middleware names that LangChain rejects during agent creation.
     middleware: list[AgentMiddleware[Any, Any, Any]] = [
         ToolExecutionResilienceMiddleware(project_root=project_root)
     ]
-    if (
-        config
-        and config.extensions.summarization_middleware_enabled
-        and reasoning_level is not None
-    ):
-        summarization_middleware = _build_summarization_middleware(
-            config=config,
-            reasoning_level=reasoning_level,
-            model_name=model_name,
-            source=source,
-        )
-        if summarization_middleware is not None:
-            middleware.append(summarization_middleware)
     return middleware
 
 

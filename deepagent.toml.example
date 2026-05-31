@@ -43,11 +43,9 @@ skills = ["skills"]
 mcp_servers = ["repo"]
 # Optional instruction appended to the main agent system prompt.
 # custom_instruction = "Always ask clarifying questions before editing files."
-# Set true to add LangChain's SummarizationMiddleware to the main agent and sync subagents.
-summarization_middleware_enabled = false
-# Optional token thresholds used when the installed LangChain middleware supports them.
-summarization_trigger_tokens = 6000
-summarization_keep_tokens = 2400
+# DeepAgents 0.6.7 provides summarization middleware in its base agent stack.
+# Legacy summarization_middleware_enabled and token threshold entries are parsed
+# for compatibility, but ChainAgents no longer injects a second middleware.
 
 [chainlit]
 # Set false to hide model selection in chat settings and Modes.

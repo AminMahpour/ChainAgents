@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from langchain.agents.middleware.types import ToolCallRequest
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -917,11 +918,11 @@ def test_get_agent_includes_rag_tool_when_ready(
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
 
 
-def test_get_agent_includes_summarization_middleware_when_enabled(
+def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """Verify that get agent includes summarization middleware when enabled.
+    """Verify that get agent does not duplicate DeepAgents summarization middleware.
 
     Args:
         tmp_path: Path to the tmp.
@@ -943,33 +944,7 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
         captured["kwargs"] = kwargs
         return object()
 
-    class FakeSummarizationMiddleware:
-        """Represent fake summarization middleware."""
-
-        def __init__(self, model=None, trigger=None, keep=None, **kwargs) -> None:
-            """Initialize the fake summarization middleware instance.
-
-            Args:
-                model: Model name or model object used by the runtime.
-                trigger: The trigger value.
-                keep: The keep value.
-                kwargs: The kwargs value.
-            """
-            self.model = model
-            self.trigger = trigger
-            self.keep = keep
-            self.kwargs = kwargs
-
     monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(
-        "langchain.agents.middleware.SummarizationMiddleware",
-        FakeSummarizationMiddleware,
-    )
-    monkeypatch.setattr(
-        deepagent_runtime,
-        "build_model",
-        lambda *_args, model_name=None, **_kwargs: f"model::{model_name or 'default'}",
-    )
 
     runtime = AgentRuntime(
         make_runtime_config(
@@ -997,26 +972,62 @@ def test_get_agent_includes_summarization_middleware_when_enabled(
 
     middleware = captured["kwargs"]["middleware"]
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
-    summarizers = [
-        item.inner
+    assert not any(
+        isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
         for item in middleware
-        if isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
-    ]
-    assert len(summarizers) == 1
-    assert isinstance(summarizers[0], FakeSummarizationMiddleware)
-    assert summarizers[0].model == "model::gpt-oss:20b"
-    assert summarizers[0].trigger == ("tokens", 5000)
-    assert summarizers[0].keep == ("tokens", 2000)
+    )
     subagent_specs = captured["kwargs"]["subagents"]
     subagent_middleware = subagent_specs[0]["middleware"]
-    subagent_summarizers = [
-        item.inner
+    assert any(
+        isinstance(item, ToolExecutionResilienceMiddleware)
         for item in subagent_middleware
-        if isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
-    ]
-    assert len(subagent_summarizers) == 1
-    assert isinstance(subagent_summarizers[0], FakeSummarizationMiddleware)
-    assert subagent_summarizers[0].model == "model::gpt-oss:120b"
+    )
+    assert not any(
+        isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
+        for item in subagent_middleware
+    )
+
+
+def test_get_agent_with_summarization_subagent_does_not_duplicate_middleware(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify DeepAgents managed summarization does not collide with subagents.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "build_model",
+        lambda *_args, **_kwargs: FakeListChatModel(responses=["ok"]),
+    )
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                summarization_middleware_enabled=True,
+                summarization_trigger_tokens=5000,
+                summarization_keep_tokens=2000,
+                subagents=(
+                    SubagentConfig(
+                        name="repo-researcher",
+                        description="Researches the repo",
+                        system_prompt="Do research",
+                    ),
+                ),
+            ),
+        )
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    agent = asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert agent is not None
 
 
 def test_summarization_status_middleware_emits_stream_events() -> None:
