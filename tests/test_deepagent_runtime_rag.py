@@ -314,6 +314,65 @@ models = ["gpt-oss:20b", "gemma4:27b"]
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
+def test_runtime_config_disables_streaming_for_tool_calls_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify TOML can disable streaming only for tool-calling requests.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "gpt-oss:20b"
+disable_streaming_for_tool_calls = true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_disable_streaming == "tool_calling"
+    assert model.disable_streaming == "tool_calling"
+
+
+def test_runtime_config_disable_streaming_env_overrides_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify environment can override the model disable_streaming option.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "gpt-oss:20b"
+disable_streaming = false
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_DISABLE_STREAMING", "tool_calling")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_disable_streaming == "tool_calling"
+
+
 def test_runtime_config_reads_openai_endpoint_url_from_toml(
     tmp_path: Path,
     monkeypatch,

@@ -30,6 +30,7 @@ def test_cli_parses_prompt_and_runtime_flags() -> None:
             "--thread-id",
             "thread-1",
             "--no-stream",
+            "--disable-streaming-for-tool-calls",
             "--json",
         ]
     )
@@ -40,6 +41,7 @@ def test_cli_parses_prompt_and_runtime_flags() -> None:
     assert args.reasoning == "high"
     assert args.thread_id == "thread-1"
     assert args.stream is False
+    assert args.disable_streaming_for_tool_calls is True
     assert args.json_output is True
 
 
@@ -88,6 +90,7 @@ recursion_limit = 20
             "cli-key",
             "--temperature",
             "0.7",
+            "--disable-streaming-for-tool-calls",
             "--reasoning",
             "high",
             "--recursion-limit",
@@ -105,6 +108,7 @@ recursion_limit = 20
     assert config.model_name == "cli-model"
     assert config.model_api_key == "cli-key"
     assert config.model_temperature == 0.7
+    assert config.model_disable_streaming == "tool_calling"
     assert config.default_reasoning == "high"
     assert config.recursion_limit == 77
     assert config.rag_requested is False
@@ -478,6 +482,7 @@ async def test_cli_json_combines_multiple_actions(tmp_path: Path) -> None:
         model_choices=["fake-model"],
         model_base_url=None,
         default_reasoning="medium",
+        model_disable_streaming=False,
         recursion_limit=50,
         persistence_mode="memory",
         extensions=SimpleNamespace(
