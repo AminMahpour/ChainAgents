@@ -3077,7 +3077,7 @@ class AgentRuntime:
                         rag_enabled=rag_tool_enabled,
                     ),
                     middleware=middleware,
-                    backend=self._build_backend,
+                    backend=build_deepagent_backend(project_root=self.project_root),
                     store=self.store,
                     checkpointer=self.checkpointer,
                     skills=list(self.config.extensions.skills) or None,

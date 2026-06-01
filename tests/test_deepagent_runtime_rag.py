@@ -918,6 +918,45 @@ def test_get_agent_includes_rag_tool_when_ready(
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
 
 
+def test_get_agent_passes_deepagents_backend_instance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that get agent passes a concrete DeepAgents backend instance.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests.
+
+        Args:
+            tools: The tools value.
+            kwargs: The kwargs value.
+
+        Returns:
+            The fake create deep agent result.
+        """
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(make_runtime_config(tmp_path), project_root=tmp_path)
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    backend = captured["kwargs"]["backend"]
+    assert isinstance(backend, deepagent_runtime.CompositeBackend)
+    assert not callable(backend)
+    assert backend.routes["/workspace/"].cwd == tmp_path
+
+
 def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
     tmp_path: Path,
     monkeypatch,
