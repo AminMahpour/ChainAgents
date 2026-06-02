@@ -25,6 +25,7 @@ LANGGRAPH_STREAM_MODES = {
     "debug",
 }
 SUMMARIZATION_STATUS_KIND = "summarization_status"
+ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 
 
 @dataclass(frozen=True)
@@ -51,12 +52,23 @@ def stringify_content(value: Any) -> str:
     if isinstance(value, list):
         return "".join(stringify_content(item) for item in value)
     if isinstance(value, dict):
+        if value.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
+            return ""
         for key in ("text", "reasoning", "content"):
             nested = value.get(key)
             if isinstance(nested, (str, list, dict)):
                 return stringify_content(nested)
         return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True)
     return str(value)
+
+
+def anthropic_thinking_text(value: Any) -> str:
+    """Extract Claude thinking text from LangChain Anthropic content blocks."""
+    if isinstance(value, list):
+        return "".join(anthropic_thinking_text(item) for item in value)
+    if not isinstance(value, dict) or value.get("type") != "thinking":
+        return ""
+    return stringify_content(value.get("thinking"))
 
 
 def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
@@ -104,6 +116,8 @@ def reasoning_text_from_token(token: Any) -> str:
             return text
     if hasattr(token, "reasoning_content"):
         return stringify_content(token.reasoning_content)
+    if hasattr(token, "content"):
+        return anthropic_thinking_text(token.content)
     return ""
 
 
@@ -170,7 +184,9 @@ def message_text(message: Any) -> str:
     return stringify_content(getattr(message, "content", "")).strip()
 
 
-def assistant_messages_for_current_prompt(messages: list[Any], prompt: str) -> list[Any]:
+def assistant_messages_for_current_prompt(
+    messages: list[Any], prompt: str
+) -> list[Any]:
     """Return assistant messages produced after the current prompt began."""
     prompt_text = prompt.strip()
     current_prompt_index = -1
@@ -230,7 +246,9 @@ class AgentStreamEventAdapter:
             return self._events_from_custom_chunk(part)
         return []
 
-    def _events_from_message_chunk(self, part: dict[str, Any]) -> list[AgentStreamEvent]:
+    def _events_from_message_chunk(
+        self, part: dict[str, Any]
+    ) -> list[AgentStreamEvent]:
         token, metadata = part["data"]
         metadata = metadata if isinstance(metadata, dict) else {}
         ns = tuple(part.get("ns", ()))
@@ -311,7 +329,11 @@ class AgentStreamEventAdapter:
         ]
 
     def _response_event(self, source: str, text: str) -> AgentStreamEvent | None:
-        delta = text[len(self.response_buffer) :] if text.startswith(self.response_buffer) else text
+        delta = (
+            text[len(self.response_buffer) :]
+            if text.startswith(self.response_buffer)
+            else text
+        )
         if not delta:
             return None
         self.response_buffer += delta

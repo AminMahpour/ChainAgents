@@ -67,6 +67,7 @@ def load_auto_collapse_delay_seconds() -> float:
 
 
 AUTO_COLLAPSE_DELAY_SECONDS = load_auto_collapse_delay_seconds()
+ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 
 
 def stringify_content(value: Any) -> str:
@@ -86,12 +87,30 @@ def stringify_content(value: Any) -> str:
         parts = [stringify_content(item) for item in value]
         return "".join(part for part in parts if part)
     if isinstance(value, dict):
+        if value.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
+            return ""
         for key in ("text", "reasoning", "content"):
             nested = value.get(key)
             if isinstance(nested, (str, list, dict)):
                 return stringify_content(nested)
         return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True)
     return str(value)
+
+
+def anthropic_thinking_text(value: Any) -> str:
+    """Extract Claude thinking text from LangChain Anthropic content blocks.
+
+    Args:
+        value: Message content to inspect.
+
+    Returns:
+        Extracted thinking text, if present.
+    """
+    if isinstance(value, list):
+        return "".join(anthropic_thinking_text(item) for item in value)
+    if not isinstance(value, dict) or value.get("type") != "thinking":
+        return ""
+    return stringify_content(value.get("thinking"))
 
 
 def pretty_data(value: Any) -> str:
@@ -201,6 +220,8 @@ def reasoning_text_from_token(token: Any) -> str:
             return text
     if hasattr(token, "reasoning_content"):
         return stringify_content(token.reasoning_content)
+    if hasattr(token, "content"):
+        return anthropic_thinking_text(token.content)
     return ""
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 
 from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
 
@@ -27,6 +26,15 @@ class _ReasoningToken:
         self.additional_kwargs = {"reasoning_content": reasoning}
 
 
+class _AnthropicThinkingToken:
+    type = "AIMessageChunk"
+    additional_kwargs: dict[str, str] = {}
+    tool_call_chunks: list[dict[str, str]] = []
+
+    def __init__(self, content: object) -> None:
+        self.content = content
+
+
 class _ToolCallChunkToken:
     type = "AIMessageChunk"
     content = ""
@@ -46,7 +54,9 @@ class _ToolMessage:
         self.content = content
 
 
-def _raw_event(chunk: object, *, parent_ids: list[str] | None = None) -> dict[str, object]:
+def _raw_event(
+    chunk: object, *, parent_ids: list[str] | None = None
+) -> dict[str, object]:
     return {
         "event": "on_chain_stream",
         "parent_ids": parent_ids or [],
@@ -87,6 +97,74 @@ def test_adapter_streams_reasoning_deltas_by_source() -> None:
     ]
     assert second == [
         AgentStreamEvent(kind="reasoning_delta", source="main-agent", text=" more")
+    ]
+
+
+def test_adapter_streams_anthropic_thinking_blocks_as_reasoning() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    events = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _AnthropicThinkingToken(
+                        [
+                            {
+                                "type": "thinking",
+                                "thinking": "checking Claude reasoning",
+                            },
+                            {"type": "redacted_thinking", "data": "signature"},
+                        ]
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+
+    assert events == [
+        AgentStreamEvent(
+            kind="reasoning_delta",
+            source="main-agent",
+            text="checking Claude reasoning",
+        )
+    ]
+
+
+def test_adapter_omits_anthropic_thinking_blocks_from_response_text() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    events = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _AnthropicThinkingToken(
+                        [
+                            {"type": "thinking", "thinking": "private reasoning"},
+                            {"type": "text", "text": "Final answer"},
+                        ]
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+
+    assert events == [
+        AgentStreamEvent(
+            kind="reasoning_delta",
+            source="main-agent",
+            text="private reasoning",
+        ),
+        AgentStreamEvent(
+            kind="response_delta",
+            source="main-agent",
+            text="Final answer",
+        ),
     ]
 
 
