@@ -10,6 +10,42 @@ import chainlit_bridge
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
 
 
+class _AnthropicThinkingToken:
+    """Provide an internal helper for Anthropic thinking token."""
+
+    type = "AIMessageChunk"
+    additional_kwargs: dict[str, str] = {}
+    tool_call_chunks: list[dict[str, str]] = []
+
+    def __init__(self, thinking: str) -> None:
+        """Initialize the Anthropic thinking token instance.
+
+        Args:
+            thinking: The thinking delta value.
+        """
+        self.content = [
+            {
+                "type": "thinking",
+                "thinking": thinking,
+                "index": 0,
+            }
+        ]
+
+
+def test_reasoning_text_from_token_extracts_anthropic_thinking_block() -> None:
+    """Verify that Anthropic thinking content blocks are treated as reasoning."""
+    token = _AnthropicThinkingToken("checking Claude reasoning")
+
+    assert chainlit_bridge.reasoning_text_from_token(token) == "checking Claude reasoning"
+
+
+def test_stringify_content_omits_anthropic_thinking_block() -> None:
+    """Verify that Anthropic thinking content blocks do not render as answer text."""
+    token = _AnthropicThinkingToken("hidden reasoning")
+
+    assert chainlit_bridge.stringify_content(token.content) == ""
+
+
 class _TaskStatus:
     """Provide an internal helper for task status."""
 

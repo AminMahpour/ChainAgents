@@ -79,6 +79,9 @@ OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
 OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
 ANTHROPIC_MESSAGES_PATH_SUFFIX = "/v1/messages"
 
+# Anthropic reasoning is not represented by OpenAI-style `delta` keys here.
+# LangChain Anthropic maps Claude `thinking_delta` and `signature_delta` stream
+# events into structured `thinking` content blocks.
 OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
     "reasoning_content",
     "reasoning",
