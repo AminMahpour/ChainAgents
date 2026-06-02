@@ -485,6 +485,37 @@ api_key = "toml-key"
     assert model.anthropic_api_url == "https://claude-proxy.example/anthropic"
 
 
+def test_runtime_config_prefers_anthropic_api_key_for_anthropic_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Anthropic uses its provider-specific key before generic keys.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "toml-key"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_API_KEY", "generic-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_api_key == "anthropic-key"
+    assert model.anthropic_api_key.get_secret_value() == "anthropic-key"
+
+
 def test_runtime_config_switches_to_anthropic_without_base_url_override(
     tmp_path: Path,
     monkeypatch,
