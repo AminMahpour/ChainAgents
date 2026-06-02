@@ -2281,13 +2281,14 @@ class RuntimeConfig:
         if overrides.model_api_key is not None:
             model_api_key = normalize_optional_string(overrides.model_api_key)
         else:
+            provider_specific_api_key = (
+                normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+                if model_provider == "anthropic"
+                else None
+            )
             model_api_key = (
-                normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
-                or (
-                    normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
-                    if model_provider == "anthropic"
-                    else None
-                )
+                provider_specific_api_key
+                or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
                 or model_defaults.api_key
             )
         if model_provider == "anthropic" and not model_api_key:

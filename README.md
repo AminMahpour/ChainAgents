@@ -51,8 +51,8 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 `DEEPAGENT_MODEL_*` variables are optional:
 
 - they override the matching `[model]` values in `deepagent.toml`
-- `DEEPAGENT_MODEL_API_KEY` is used for secured OpenAI-compatible servers and can also supply the Anthropic API key
-- `ANTHROPIC_API_KEY` is also read when `provider = "anthropic"` or `provider = "claude"`
+- `DEEPAGENT_MODEL_API_KEY` is used for secured OpenAI-compatible servers and can also supply the Anthropic API key when `ANTHROPIC_API_KEY` is unset
+- `ANTHROPIC_API_KEY` is read first when `provider = "anthropic"` or `provider = "claude"`, so stale generic keys do not override the Claude credential
 - `DEEPAGENT_MODEL_DISABLE_STREAMING` accepts `true`, `false`, or `tool_calling`; `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS=true` is a convenience alias for `tool_calling`
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
 
@@ -255,7 +255,7 @@ Notes:
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `api_key` is optional for `provider = "openai_compatible"`; when omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
-- Anthropic requires an API key from `api_key`, `DEEPAGENT_MODEL_API_KEY`, or `ANTHROPIC_API_KEY`.
+- Anthropic requires an API key from `ANTHROPIC_API_KEY`, `DEEPAGENT_MODEL_API_KEY`, or `api_key`; when multiple are set, `ANTHROPIC_API_KEY` takes precedence over the generic key.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly, Anthropic maps it to Claude `effort`, and OpenAI-compatible servers may ignore it.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, `DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_DISABLE_STREAMING`, and `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS` override the TOML defaults when set.
