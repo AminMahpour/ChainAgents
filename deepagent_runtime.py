@@ -536,7 +536,7 @@ def normalize_anthropic_endpoint_url(
     if path.endswith(ANTHROPIC_MESSAGES_PATH_SUFFIX):
         path = path[: -len(ANTHROPIC_MESSAGES_PATH_SUFFIX)].rstrip("/")
 
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, "")).rstrip("/")
 
 
 def model_endpoint_query_to_dict(
@@ -2217,6 +2217,19 @@ class RuntimeConfig:
             )
 
         if (
+            provider_changed
+            and model_provider == "anthropic"
+            and generic_model_base_url
+            and not generic_model_endpoint_url
+        ):
+            raise ValueError(
+                "Switching model providers to Anthropic with a model base URL "
+                "override is ambiguous. Use DEEPAGENT_MODEL_ENDPOINT_URL or "
+                "--endpoint-url with the Anthropic /v1/messages path for proxy "
+                "endpoints, or remove stale DEEPAGENT_MODEL_BASE_URL."
+            )
+
+        if (
             model_provider == "openai_compatible"
             and not generic_model_name
             and not model_defaults.name_is_explicit
@@ -2286,10 +2299,15 @@ class RuntimeConfig:
                 if model_provider == "anthropic"
                 else None
             )
+            model_default_api_key = (
+                model_defaults.api_key
+                if model_defaults.provider == model_provider
+                else None
+            )
             model_api_key = (
                 provider_specific_api_key
                 or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
-                or model_defaults.api_key
+                or model_default_api_key
             )
         if model_provider == "anthropic" and not model_api_key:
             raise ValueError(

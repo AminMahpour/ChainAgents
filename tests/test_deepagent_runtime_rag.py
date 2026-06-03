@@ -585,6 +585,98 @@ name = "local-model"
     assert config.model_base_url == "https://claude-proxy.example/proxy"
 
 
+def test_runtime_config_rejects_non_anthropic_toml_key_for_anthropic_switch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Anthropic provider switches do not reuse another provider's key.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "openai_compatible"
+base_url = "https://api.openai.example/v1"
+name = "openai-model"
+api_key = "openai-key"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "anthropic")
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "claude-opus-4-8")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPAGENT_MODEL_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
+def test_runtime_config_rejects_stale_base_url_for_anthropic_switch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Anthropic provider switches do not inherit generic stale base URLs.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "anthropic")
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "claude-opus-4-8")
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "https://api.openai.example/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
+
+    with pytest.raises(ValueError, match="DEEPAGENT_MODEL_ENDPOINT_URL"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
+def test_runtime_config_preserves_anthropic_endpoint_query_params(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Anthropic endpoint URL query params remain available to proxies.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "anthropic"
+endpoint_url = "https://claude-proxy.example/anthropic/v1/messages?route=claude&token=abc"
+name = "claude-sonnet-4-6"
+api_key = "toml-key"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    expected_url = "https://claude-proxy.example/anthropic?route=claude&token=abc"
+    assert config.model_base_url == expected_url
+    assert model.anthropic_api_url == expected_url
+
+
 def test_runtime_config_requires_anthropic_model_name_when_switching_providers(
     tmp_path: Path,
     monkeypatch,
