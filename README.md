@@ -1,7 +1,7 @@
 
 <div align="center">
-<img src="logo.png" width="300" />
-  <h1>ChainAgents</h1>
+<img src="logo.png"/>
+
 </div>
 
 <div align="center">
