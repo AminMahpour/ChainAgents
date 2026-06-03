@@ -13,6 +13,7 @@ import tomllib
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -330,6 +331,20 @@ class OpenAICompatibleChatOpenAI(ChatOpenAI):
         return generation_chunk
 
 
+class AnthropicDefaultQueryChatAnthropic(ChatAnthropic):
+    """ChatAnthropic variant that forwards endpoint query params to the SDK."""
+
+    default_query: dict[str, object] | None = None
+
+    @cached_property
+    def _client_params(self) -> dict[str, Any]:
+        """Return Anthropic client params with optional default query values."""
+        params = super()._client_params.copy()
+        if self.default_query:
+            params["default_query"] = self.default_query
+        return params
+
+
 def normalize_model_endpoint(value: str | None) -> str:
     """Normalize model endpoint.
 
@@ -517,7 +532,7 @@ def normalize_anthropic_endpoint_url(
     value: Any | None,
     *,
     required_message: str | None = None,
-) -> str:
+) -> tuple[str, tuple[tuple[str, str], ...]]:
     """Normalize Anthropic endpoint URL to the API base URL.
 
     Args:
@@ -525,7 +540,7 @@ def normalize_anthropic_endpoint_url(
         required_message: The required message value.
 
     Returns:
-        The normalized Anthropic API base URL.
+        The normalized Anthropic API base URL and query params.
     """
     candidate = normalize_model_base_url(
         value,
@@ -536,7 +551,8 @@ def normalize_anthropic_endpoint_url(
     if path.endswith(ANTHROPIC_MESSAGES_PATH_SUFFIX):
         path = path[: -len(ANTHROPIC_MESSAGES_PATH_SUFFIX)].rstrip("/")
 
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+    base_url = urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+    return base_url, tuple(parse_qsl(parsed.query, keep_blank_values=True))
 
 
 def model_endpoint_query_to_dict(
@@ -1569,7 +1585,7 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
             )
     else:
         if normalize_optional_string(raw_endpoint_url):
-            base_url = normalize_anthropic_endpoint_url(raw_endpoint_url)
+            base_url, endpoint_query = normalize_anthropic_endpoint_url(raw_endpoint_url)
         else:
             base_url = normalize_model_base_url(
                 raw_model.get("base_url"),
@@ -2164,9 +2180,13 @@ class RuntimeConfig:
             normalize_optional_string(overrides.model_name)
             or os.getenv("DEEPAGENT_MODEL_NAME", "").strip()
         )
-        generic_model_base_url = (
-            normalize_optional_string(overrides.model_base_url)
-            or os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
+        override_model_base_url = normalize_optional_string(overrides.model_base_url)
+        env_model_base_url = normalize_optional_string(
+            os.getenv("DEEPAGENT_MODEL_BASE_URL")
+        )
+        generic_model_base_url = override_model_base_url or env_model_base_url or ""
+        generic_model_base_url_from_env = (
+            override_model_base_url is None and env_model_base_url is not None
         )
         generic_model_endpoint_url = (
             normalize_optional_string(overrides.model_endpoint_url)
@@ -2217,6 +2237,21 @@ class RuntimeConfig:
             )
 
         if (
+            provider_changed
+            and model_provider == "anthropic"
+            and generic_model_base_url
+            and generic_model_base_url_from_env
+            and not generic_model_endpoint_url
+        ):
+            raise ValueError(
+                "Switching model providers to Anthropic with "
+                "DEEPAGENT_MODEL_BASE_URL is ambiguous. Remove stale "
+                "DEEPAGENT_MODEL_BASE_URL, pass --base-url explicitly, or use "
+                "DEEPAGENT_MODEL_ENDPOINT_URL or --endpoint-url with the "
+                "Anthropic /v1/messages path for proxy endpoints."
+            )
+
+        if (
             model_provider == "openai_compatible"
             and not generic_model_name
             and not model_defaults.name_is_explicit
@@ -2247,7 +2282,7 @@ class RuntimeConfig:
         model_endpoint_query = model_defaults.endpoint_query
         if model_provider == "anthropic":
             if generic_model_endpoint_url:
-                model_base_url = normalize_anthropic_endpoint_url(
+                model_base_url, model_endpoint_query = normalize_anthropic_endpoint_url(
                     generic_model_endpoint_url,
                     required_message="The Anthropic model endpoint URL cannot be empty.",
                 )
@@ -2263,7 +2298,11 @@ class RuntimeConfig:
                     ),
                     default=DEFAULT_ANTHROPIC_BASE_URL,
                 )
-            model_endpoint_query = ()
+                model_endpoint_query = (
+                    model_defaults.endpoint_query
+                    if model_defaults.provider == "anthropic"
+                    else ()
+                )
         elif model_provider == "openai_compatible" and generic_model_endpoint_url:
             model_base_url, model_endpoint_query = normalize_openai_endpoint_url(
                 generic_model_endpoint_url,
@@ -2286,10 +2325,15 @@ class RuntimeConfig:
                 if model_provider == "anthropic"
                 else None
             )
+            model_default_api_key = (
+                model_defaults.api_key
+                if model_defaults.provider == model_provider
+                else None
+            )
             model_api_key = (
                 provider_specific_api_key
                 or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
-                or model_defaults.api_key
+                or model_default_api_key
             )
         if model_provider == "anthropic" and not model_api_key:
             raise ValueError(
@@ -2396,7 +2440,7 @@ def build_model(
         return ChatOllama(**kwargs)
 
     if config.model_provider == "anthropic":
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "model": selected_model,
             "base_url": config.model_base_url,
             "temperature": config.model_temperature,
@@ -2405,6 +2449,10 @@ def build_model(
         }
         if config.model_api_key:
             kwargs["api_key"] = config.model_api_key
+        default_query = model_endpoint_query_to_dict(config.model_endpoint_query)
+        if default_query:
+            kwargs["default_query"] = default_query
+            return AnthropicDefaultQueryChatAnthropic(**kwargs)
         return ChatAnthropic(**kwargs)
 
     kwargs: dict[str, Any] = {
