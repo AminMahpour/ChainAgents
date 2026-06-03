@@ -1,11 +1,33 @@
-# ChainAgents
+
+<div align="center">
 
 ![Workspace Deep Agent logo](logo.png)
 
-This hobby, personal project is made available using open source Python
-libraries and runs a local-first LangChain DeepAgent behind a Chainlit UI.
+  <h1>ChainAgents</h1>
+</div>
 
-The app is wired for:
+<div align="center">
+
+[![CI](https://img.shields.io/github/actions/workflow/status/AminMahpour/ChainAgents/ci.yml?branch=master&label=CI&logo=githubactions&logoColor=white)](https://github.com/AminMahpour/ChainAgents/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
+[![License](https://img.shields.io/github/license/AminMahpour/ChainAgents?color=blue)](LICENSE)
+![Chainlit](https://img.shields.io/badge/Chainlit-2.8%2B-FF5A5F)
+![LangChain](https://img.shields.io/badge/LangChain-powered-1C3C3C)
+
+**This hobby, personal project powers a highly configurable, local-first LangChain DeepAgent. We also provide interface to the agent though Chainlit, CLI and TUI.**
+</div>
+
+**Implemented features include:**
+
+- **Sub-agents** — delegate tasks to agents with isolated context windows
+- **Filesystem** — read, write, edit, or search over pluggable local, sandboxed, or remote backends
+- **Context management** — summarize long threads and offload tool outputs to disk
+- **Persistent memory** — pluggable state and store backends for cross-session recall
+- **Skills** — reusable behaviors the agent can load on demand
+- **Tools** — bring your own functions or any MCP server
+
+Highlights
+----------
 
 - `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic` with configurable model backends
 - native Chainlit streaming for reasoning, tool calls, and final response
