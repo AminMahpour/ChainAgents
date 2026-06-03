@@ -73,7 +73,7 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 - they override the matching `[model]` values in `deepagent.toml`
 - `DEEPAGENT_MODEL_API_KEY` is used for secured OpenAI-compatible servers and can also supply the Anthropic API key when `ANTHROPIC_API_KEY` is unset
 - `ANTHROPIC_API_KEY` is read first when `provider = "anthropic"` or `provider = "claude"`, so stale generic keys do not override the Claude credential
-- when switching to Anthropic with `DEEPAGENT_MODEL_PROVIDER`, unset stale `DEEPAGENT_MODEL_BASE_URL`; use `DEEPAGENT_MODEL_ENDPOINT_URL` with the `/v1/messages` path for Anthropic proxies
+- when switching to Anthropic with `DEEPAGENT_MODEL_PROVIDER`, unset stale `DEEPAGENT_MODEL_BASE_URL`; use `DEEPAGENT_MODEL_ENDPOINT_URL` with the `/v1/messages` path for env-based Anthropic proxy switches, or pass `--base-url` explicitly from the CLI
 - `DEEPAGENT_MODEL_DISABLE_STREAMING` accepts `true`, `false`, or `tool_calling`; `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS=true` is a convenience alias for `tool_calling`
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
 

@@ -646,6 +646,42 @@ name = "local-model"
         deepagent_runtime.RuntimeConfig.from_env()
 
 
+def test_runtime_config_allows_cli_base_url_for_anthropic_switch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify explicit CLI base URL overrides work for Anthropic switches.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env(
+        deepagent_runtime.RuntimeConfigOverrides(
+            model_provider="anthropic",
+            model_base_url="https://corp-proxy.example",
+            model_name="claude-opus-4-8",
+            model_api_key="cli-key",
+        )
+    )
+
+    assert config.model_provider == "anthropic"
+    assert config.model_base_url == "https://corp-proxy.example"
+    assert config.model_api_key == "cli-key"
+
+
 def test_runtime_config_preserves_anthropic_endpoint_query_params(
     tmp_path: Path,
     monkeypatch,

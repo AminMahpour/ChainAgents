@@ -2180,9 +2180,13 @@ class RuntimeConfig:
             normalize_optional_string(overrides.model_name)
             or os.getenv("DEEPAGENT_MODEL_NAME", "").strip()
         )
-        generic_model_base_url = (
-            normalize_optional_string(overrides.model_base_url)
-            or os.getenv("DEEPAGENT_MODEL_BASE_URL", "").strip()
+        override_model_base_url = normalize_optional_string(overrides.model_base_url)
+        env_model_base_url = normalize_optional_string(
+            os.getenv("DEEPAGENT_MODEL_BASE_URL")
+        )
+        generic_model_base_url = override_model_base_url or env_model_base_url or ""
+        generic_model_base_url_from_env = (
+            override_model_base_url is None and env_model_base_url is not None
         )
         generic_model_endpoint_url = (
             normalize_optional_string(overrides.model_endpoint_url)
@@ -2236,13 +2240,15 @@ class RuntimeConfig:
             provider_changed
             and model_provider == "anthropic"
             and generic_model_base_url
+            and generic_model_base_url_from_env
             and not generic_model_endpoint_url
         ):
             raise ValueError(
-                "Switching model providers to Anthropic with a model base URL "
-                "override is ambiguous. Use DEEPAGENT_MODEL_ENDPOINT_URL or "
-                "--endpoint-url with the Anthropic /v1/messages path for proxy "
-                "endpoints, or remove stale DEEPAGENT_MODEL_BASE_URL."
+                "Switching model providers to Anthropic with "
+                "DEEPAGENT_MODEL_BASE_URL is ambiguous. Remove stale "
+                "DEEPAGENT_MODEL_BASE_URL, pass --base-url explicitly, or use "
+                "DEEPAGENT_MODEL_ENDPOINT_URL or --endpoint-url with the "
+                "Anthropic /v1/messages path for proxy endpoints."
             )
 
         if (
