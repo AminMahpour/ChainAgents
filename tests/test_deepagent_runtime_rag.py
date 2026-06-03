@@ -672,9 +672,11 @@ api_key = "toml-key"
     config = deepagent_runtime.RuntimeConfig.from_env()
     model = deepagent_runtime.build_model(config, "medium")
 
-    expected_url = "https://claude-proxy.example/anthropic?route=claude&token=abc"
-    assert config.model_base_url == expected_url
-    assert model.anthropic_api_url == expected_url
+    assert config.model_base_url == "https://claude-proxy.example/anthropic"
+    assert config.model_endpoint_query == (("route", "claude"), ("token", "abc"))
+    assert model.anthropic_api_url == "https://claude-proxy.example/anthropic"
+    assert model._client.default_query == {"route": "claude", "token": "abc"}
+    assert model._async_client.default_query == {"route": "claude", "token": "abc"}
 
 
 def test_runtime_config_requires_anthropic_model_name_when_switching_providers(

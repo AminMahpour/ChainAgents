@@ -273,7 +273,7 @@ Notes:
 - Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
-- `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL.
+- `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `api_key` is optional for `provider = "openai_compatible"`; when omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
 - Anthropic requires an API key from `ANTHROPIC_API_KEY`, `DEEPAGENT_MODEL_API_KEY`, or `api_key`; when multiple are set, `ANTHROPIC_API_KEY` takes precedence over the generic key.
