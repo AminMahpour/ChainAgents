@@ -1,8 +1,6 @@
 
 <div align="center">
-
-![Workspace Deep Agent logo](logo.png)
-
+<img src="logo.png" width="300" />
   <h1>ChainAgents</h1>
 </div>
 
