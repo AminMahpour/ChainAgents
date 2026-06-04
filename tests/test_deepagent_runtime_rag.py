@@ -8,8 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from langchain.agents.middleware.types import ToolCallRequest
+from langchain_anthropic.chat_models import convert_to_anthropic_tool
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 import pytest
@@ -114,6 +116,43 @@ def make_extensions_config(
         mcp_servers={"repo": {"transport": "stdio", "command": "npx", "args": []}},
         agent_mcp_servers=agent_mcp_servers,
     )
+
+
+def test_anthropic_tool_sanitization_adds_object_type_to_mcp_dict_schema() -> None:
+    """Verify Anthropic tool sanitization fixes MCP-style dict schemas."""
+    async def fake_mcp_tool(**kwargs):
+        """Return fake MCP tool arguments.
+
+        Args:
+            kwargs: Keyword arguments passed to the tool.
+
+        Returns:
+            The supplied keyword arguments.
+        """
+        return kwargs
+
+    tool = StructuredTool(
+        name="read_file",
+        description="Read a file.",
+        args_schema={
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        coroutine=fake_mcp_tool,
+    )
+
+    sanitized = deepagent_runtime.sanitize_tools_for_model("anthropic", [tool])
+
+    assert sanitized[0] is not tool
+    assert tool.args_schema == {
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
+    anthropic_tool = convert_to_anthropic_tool(sanitized[0])
+    assert anthropic_tool["input_schema"]["type"] == "object"
+    assert anthropic_tool["input_schema"]["properties"] == {
+        "path": {"type": "string"},
+    }
 
 
 def test_openai_compatible_model_preserves_vllm_reasoning_delta() -> None:
@@ -453,6 +492,115 @@ reasoning_effort = "low"
     assert model.anthropic_api_key.get_secret_value() == "toml-key"
     assert model.temperature == 0.2
     assert model.effort == "medium"
+    assert model.thinking == {"type": "adaptive"}
+
+
+def test_anthropic_adaptive_thinking_is_not_enabled_for_unsupported_models(
+    tmp_path: Path,
+) -> None:
+    """Verify unsupported Anthropic models do not receive adaptive thinking."""
+    from langchain_anthropic import ChatAnthropic
+
+    config = make_runtime_config(tmp_path)
+    config = RuntimeConfig(
+        database_url=config.database_url,
+        model_provider="anthropic",
+        model_name="claude-haiku-4-5-20251001",
+        model_choices=("claude-haiku-4-5-20251001",),
+        model_base_url="https://api.anthropic.com",
+        model_api_key="test-key",
+        model_temperature=config.model_temperature,
+        default_reasoning=config.default_reasoning,
+        persistence_mode=config.persistence_mode,
+        extensions=config.extensions,
+        rag_requested=config.rag_requested,
+        rag=config.rag,
+        rag_error=config.rag_error,
+    )
+
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert isinstance(model, ChatAnthropic)
+    assert model.effort == "medium"
+    assert model.thinking is None
+
+
+def test_runtime_config_disables_anthropic_thinking_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify TOML can disable Anthropic thinking."""
+    from langchain_anthropic import ChatAnthropic
+
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "toml-key"
+thinking = "disabled"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_thinking == "disabled"
+    assert isinstance(model, ChatAnthropic)
+    assert model.thinking is None
+
+
+def test_runtime_config_forces_anthropic_adaptive_thinking_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify TOML can force Anthropic adaptive thinking."""
+    from langchain_anthropic import ChatAnthropic
+
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "anthropic"
+name = "claude-haiku-4-5-20251001"
+api_key = "toml-key"
+thinking = "adaptive"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_thinking == "adaptive"
+    assert isinstance(model, ChatAnthropic)
+    assert model.thinking == {"type": "adaptive"}
+
+
+def test_runtime_config_rejects_invalid_model_thinking(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify invalid model thinking config is rejected."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "toml-key"
+thinking = "manual"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="model.thinking"):
+        deepagent_runtime.RuntimeConfig.from_env()
 
 
 def test_runtime_config_reads_anthropic_endpoint_url_from_toml(

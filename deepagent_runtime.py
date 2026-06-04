@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -60,6 +61,7 @@ from rag_runtime import (
 ModelProvider = Literal["ollama", "openai_compatible", "anthropic"]
 ReasoningLevel = Literal["low", "medium", "high"]
 DisableStreaming = bool | Literal["tool_calling"]
+ModelThinking = Literal["auto", "adaptive", "disabled"]
 PersistenceMode = Literal["memory", "postgres"]
 DEFAULT_MODEL = "gpt-oss:20b"
 DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
@@ -68,6 +70,7 @@ DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
+DEFAULT_MODEL_THINKING: ModelThinking = "auto"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
@@ -162,6 +165,30 @@ def normalize_disable_streaming(value: Any | None) -> DisableStreaming:
     raise ValueError(
         "Model disable_streaming must be a boolean or 'tool_calling'."
     )
+
+
+def normalize_model_thinking(value: Any | None) -> ModelThinking:
+    """Normalize Anthropic model thinking configuration.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized thinking mode.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None:
+        return DEFAULT_MODEL_THINKING
+    candidate = str(value).strip().lower().replace("-", "_")
+    if not candidate:
+        return DEFAULT_MODEL_THINKING
+    if candidate not in {"auto", "adaptive", "disabled"}:
+        raise ValueError(
+            "model.thinking must be one of 'auto', 'adaptive', or 'disabled'."
+        )
+    return candidate  # type: ignore[return-value]
 
 
 def normalize_disable_streaming_for_tool_calls(value: Any | None) -> bool:
@@ -1486,6 +1513,7 @@ class ModelDefaults:
         models: The models value.
         name_is_explicit: The name is explicit value.
         reasoning_effort: The reasoning effort value.
+        thinking: The Anthropic thinking mode.
         temperature: The temperature value.
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
@@ -1499,6 +1527,7 @@ class ModelDefaults:
     models: tuple[str, ...] = ()
     name_is_explicit: bool = False
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
+    thinking: ModelThinking = DEFAULT_MODEL_THINKING
     temperature: float = DEFAULT_TEMPERATURE
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
@@ -1604,6 +1633,7 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
             raw_model.get("reasoning_effort"),
             default=DEFAULT_REASONING_LEVEL,
         ),
+        thinking=normalize_model_thinking(raw_model.get("thinking")),
         temperature=normalize_model_temperature(
             raw_model.get("temperature", raw_model.get("tempreature"))
         ),
@@ -2120,6 +2150,7 @@ class RuntimeConfig:
         rag_error: The RAG error value.
         model_endpoint_query: The model endpoint query value.
         model_disable_streaming: Whether to disable model streaming.
+        model_thinking: Anthropic thinking mode.
     """
 
     database_url: str | None
@@ -2139,6 +2170,7 @@ class RuntimeConfig:
     rag_error: str | None = None
     model_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_disable_streaming: DisableStreaming = False
+    model_thinking: ModelThinking = DEFAULT_MODEL_THINKING
 
     @classmethod
     def from_env(
@@ -2407,6 +2439,7 @@ class RuntimeConfig:
             rag_error=rag_error,
             model_endpoint_query=model_endpoint_query,
             model_disable_streaming=model_disable_streaming,
+            model_thinking=model_defaults.thinking,
         )
 
 
@@ -2447,6 +2480,11 @@ def build_model(
             "effort": reasoning_level,
             "disable_streaming": config.model_disable_streaming,
         }
+        if should_enable_anthropic_adaptive_thinking(
+            selected_model,
+            config.model_thinking,
+        ):
+            kwargs["thinking"] = {"type": "adaptive"}
         if config.model_api_key:
             kwargs["api_key"] = config.model_api_key
         default_query = model_endpoint_query_to_dict(config.model_endpoint_query)
@@ -2466,6 +2504,47 @@ def build_model(
     if default_query:
         kwargs["default_query"] = default_query
     return OpenAICompatibleChatOpenAI(**kwargs)
+
+
+def should_enable_anthropic_adaptive_thinking(
+    model_name: str,
+    thinking: ModelThinking,
+) -> bool:
+    """Return whether adaptive thinking should be enabled for Anthropic.
+
+    Args:
+        model_name: The model name value.
+        thinking: The configured thinking mode.
+
+    Returns:
+        Whether adaptive thinking should be enabled.
+    """
+    if thinking == "disabled":
+        return False
+    if thinking == "adaptive":
+        return True
+    return anthropic_model_supports_adaptive_thinking(model_name)
+
+
+def anthropic_model_supports_adaptive_thinking(model_name: str) -> bool:
+    """Return whether an Anthropic model supports adaptive thinking.
+
+    Args:
+        model_name: The model name value.
+
+    Returns:
+        Whether the model supports adaptive thinking.
+    """
+    normalized = model_name.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+        )
+    )
 
 
 def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:
@@ -2695,6 +2774,9 @@ def sanitize_tools_for_model(
     Returns:
         The sanitized value.
     """
+    if model_provider == "anthropic":
+        return [normalize_anthropic_tool_schema(tool) for tool in tools]
+
     if model_provider != "openai_compatible":
         return list(tools)
 
@@ -2715,6 +2797,53 @@ def sanitize_tools_for_model(
         )
 
     return compatible_tools
+
+
+def normalize_anthropic_tool_schema(tool: Any) -> Any:
+    """Normalize tool schemas for Anthropic's stricter root object requirement.
+
+    Args:
+        tool: The tool value.
+
+    Returns:
+        The normalized tool value.
+    """
+    schema = getattr(tool, "args_schema", None)
+    if not isinstance(schema, dict):
+        return tool
+
+    normalized_schema = normalize_json_object_schema_root(schema)
+    if normalized_schema is schema:
+        return tool
+
+    if hasattr(tool, "model_copy"):
+        return tool.model_copy(update={"args_schema": normalized_schema})
+
+    try:
+        cloned = copy.copy(tool)
+        setattr(cloned, "args_schema", normalized_schema)
+        return cloned
+    except Exception:
+        setattr(tool, "args_schema", normalized_schema)
+        return tool
+
+
+def normalize_json_object_schema_root(schema: dict[str, Any]) -> dict[str, Any]:
+    """Ensure a JSON schema dict declares an object root when unspecified.
+
+    Args:
+        schema: The schema value.
+
+    Returns:
+        The normalized schema.
+    """
+    if schema.get("type") == "object":
+        return schema
+
+    if schema.get("type") is not None:
+        return schema
+
+    return {**schema, "type": "object"}
 
 
 def tool_supports_openai_compatible_schema(tool: Any) -> bool:

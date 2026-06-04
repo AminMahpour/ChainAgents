@@ -261,6 +261,7 @@ temperature = 0
 name = "claude-sonnet-4-6"
 models = ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"]
 reasoning_effort = "medium"
+thinking = "auto"
 # api_key = "optional-if-ANTHROPIC_API_KEY-or-DEEPAGENT_MODEL_API_KEY-is-set"
 # base_url = "https://api.anthropic.com"
 # endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
@@ -280,6 +281,7 @@ Notes:
 - When switching from another provider to Anthropic through environment or CLI overrides, provide Anthropic credentials through `ANTHROPIC_API_KEY`, `DEEPAGENT_MODEL_API_KEY`, or `--api-key`; the runtime will not reuse an `api_key` from another provider's TOML config.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
 - `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly, Anthropic maps it to Claude `effort`, and OpenAI-compatible servers may ignore it.
+- `thinking` controls Anthropic adaptive thinking: `auto` enables it only for known supported Claude models, `adaptive` always sends `thinking = {"type": "adaptive"}`, and `disabled` never sends a thinking parameter.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, `DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_DISABLE_STREAMING`, and `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
 
