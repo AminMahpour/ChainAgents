@@ -18,6 +18,7 @@ disable_streaming_for_tool_calls = false
 # provider = "anthropic"
 # name = "claude-sonnet-4-6"
 # models = ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"]
+# thinking = "auto"  # auto, adaptive, or disabled
 # endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
 # api_key = ""  # optional when ANTHROPIC_API_KEY or DEEPAGENT_MODEL_API_KEY is set
 
