@@ -1337,6 +1337,39 @@ def test_get_agent_omits_store_and_checkpointer_when_stateless(
     assert "checkpointer" not in captured["kwargs"]
 
 
+def test_get_agent_disables_memories_backend_and_prompt_when_stateless(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify stateless agents do not expose unusable memory routes."""
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests."""
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    config = make_runtime_config(tmp_path)
+    config = dataclasses.replace(
+        config,
+        agent_state="stateless",
+        extensions=dataclasses.replace(config.extensions, agent_state="stateless"),
+    )
+    runtime = AgentRuntime(config, project_root=tmp_path)
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    backend = captured["kwargs"]["backend"]
+    system_prompt = captured["kwargs"]["system_prompt"]
+    assert "/memories/" not in backend.routes
+    assert "/memories/" not in system_prompt
+    assert "Agent memory is disabled for this runtime." in system_prompt
+
+
 def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
     tmp_path: Path,
     monkeypatch,

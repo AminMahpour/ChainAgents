@@ -95,13 +95,17 @@ OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
     "reasoning_details",
 )
 SUMMARIZATION_STATUS_EVENT_KIND = "summarization_status"
+SYSTEM_PROMPT_MEMORY_LINE = (
+    "- Use `/memories/` for agent memory. Persistence depends on runtime configuration."
+)
+STATELESS_SYSTEM_PROMPT_MEMORY_LINE = "- Agent memory is disabled for this runtime."
 
 SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
 - Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
-- Use `/memories/` for agent memory. Persistence depends on runtime configuration.
+{SYSTEM_PROMPT_MEMORY_LINE}
 - Use any other absolute path only for ephemeral scratch work.
 
 Operating constraints:
@@ -2075,6 +2079,27 @@ def compose_agent_system_prompt(
     return "\n\n".join(sections)
 
 
+def system_prompt_for_agent_state(
+    base_prompt: str,
+    agent_state: AgentStateMode,
+) -> str:
+    """Return the system prompt adjusted for configured agent state.
+
+    Args:
+        base_prompt: The base prompt value.
+        agent_state: Whether the DeepAgents graph is stateful or stateless.
+
+    Returns:
+        The adjusted system prompt.
+    """
+    if agent_state == "stateful":
+        return base_prompt
+    return base_prompt.replace(
+        SYSTEM_PROMPT_MEMORY_LINE,
+        STATELESS_SYSTEM_PROMPT_MEMORY_LINE,
+    )
+
+
 def load_file_config(config_path: str | Path | None = None) -> FileConfig:
     """Load file config.
 
@@ -2580,30 +2605,37 @@ def anthropic_model_supports_adaptive_thinking(model_name: str) -> bool:
     )
 
 
-def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:
+def build_deepagent_backend(
+    *,
+    project_root: Path | None = None,
+    include_memories: bool = True,
+) -> CompositeBackend:
     """Build deepagent backend.
 
     Args:
         project_root: Project root used to resolve local paths.
+        include_memories: Whether to expose the /memories/ store route.
 
     Returns:
         The constructed deepagent backend.
     """
     resolved_project_root = project_root or PROJECT_ROOT
     artifacts_root = deepagent_artifacts_root(resolved_project_root)
+    routes = {
+        deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
+            root_dir=str(artifacts_root),
+            virtual_mode=True,
+        ),
+        "/workspace/": FilesystemBackend(
+            root_dir=str(resolved_project_root),
+            virtual_mode=True,
+        ),
+    }
+    if include_memories:
+        routes["/memories/"] = StoreBackend()
     return CompositeBackend(
         default=StateBackend(),
-        routes={
-            deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
-                root_dir=str(artifacts_root),
-                virtual_mode=True,
-            ),
-            "/workspace/": FilesystemBackend(
-                root_dir=str(resolved_project_root),
-                virtual_mode=True,
-            ),
-            "/memories/": StoreBackend(),
-        },
+        routes=routes,
         artifacts_root=str(artifacts_root),
     )
 
@@ -2967,7 +2999,7 @@ def create_configured_graph(
         tools=sanitize_tools_for_model(config.model_provider, tools) or None,
         system_prompt=compose_rag_system_prompt(
             compose_agent_system_prompt(
-                system_prompt,
+                system_prompt_for_agent_state(system_prompt, config.agent_state),
                 (
                     config.extensions.custom_instruction
                     if apply_custom_instruction
@@ -2983,7 +3015,9 @@ def create_configured_graph(
             source="main-agent",
             project_root=PROJECT_ROOT,
         ),
-        backend=build_deepagent_backend(),
+        backend=build_deepagent_backend(
+            include_memories=config.agent_state == "stateful",
+        ),
         skills=list(config.extensions.skills) or None,
         subagents=subagent_specs or None,
     )
@@ -3283,14 +3317,20 @@ class AgentRuntime:
                     "tools": main_tools or None,
                     "system_prompt": compose_rag_system_prompt(
                         compose_agent_system_prompt(
-                            SYSTEM_PROMPT,
+                            system_prompt_for_agent_state(
+                                SYSTEM_PROMPT,
+                                self.config.agent_state,
+                            ),
                             self.config.extensions.custom_instruction,
                             project_root=self.project_root,
                         ),
                         rag_enabled=rag_tool_enabled,
                     ),
                     "middleware": middleware,
-                    "backend": build_deepagent_backend(project_root=self.project_root),
+                    "backend": build_deepagent_backend(
+                        project_root=self.project_root,
+                        include_memories=self.config.agent_state == "stateful",
+                    ),
                     "skills": list(self.config.extensions.skills) or None,
                     "subagents": subagent_specs or None,
                 }
@@ -3695,4 +3735,7 @@ class AgentRuntime:
         Returns:
             The constructed the deep agent backend for the current runtime settings.
         """
-        return build_deepagent_backend(project_root=self.project_root)
+        return build_deepagent_backend(
+            project_root=self.project_root,
+            include_memories=runtime.config.agent_state == "stateful",
+        )
