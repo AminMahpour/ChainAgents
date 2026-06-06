@@ -3151,7 +3151,10 @@ class AgentRuntime:
         Returns:
             Whether durable persistence is configured.
         """
-        return self.config.persistence_mode == "postgres"
+        return (
+            self.config.agent_state == "stateful"
+            and self.config.persistence_mode == "postgres"
+        )
 
     @property
     def rag_enabled(self) -> bool:
@@ -3206,7 +3209,10 @@ class AgentRuntime:
                 tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
             )
 
-        if not self.config.database_url:
+        if self.config.agent_state == "stateless":
+            self._store = None
+            self._checkpointer = None
+        elif not self.config.database_url:
             self._store = InMemoryStore()
             self._checkpointer = MemorySaver()
         else:

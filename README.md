@@ -62,7 +62,7 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 
 - when set, LangGraph checkpoints and `/memories/` are persisted in Postgres
 - when unset, the app falls back to in-memory persistence for the current process only
-- if `[agent].state = "stateless"`, the agent graph is built without LangGraph checkpoint or store handles even when `DATABASE_URL` is set
+- if `[agent].state = "stateless"`, LangGraph checkpoint and store handles are not opened or passed to the agent graph even when `DATABASE_URL` is set
 
 `DEEPAGENT_CONFIG` is optional:
 

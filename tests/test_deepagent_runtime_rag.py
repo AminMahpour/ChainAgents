@@ -1193,6 +1193,58 @@ def test_agent_runtime_initialize_runs_rag_startup_check(
     assert runtime.rag_status.ready is True
 
 
+def test_agent_runtime_initialize_skips_postgres_state_handles_when_stateless(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify stateless runtime does not open LangGraph Postgres state handles."""
+    config = make_runtime_config(tmp_path)
+    config = dataclasses.replace(
+        config,
+        database_url="postgresql://example.invalid/chainagents",
+        persistence_mode="postgres",
+        agent_state="stateless",
+        extensions=dataclasses.replace(config.extensions, agent_state="stateless"),
+        rag_requested=False,
+        rag=None,
+    )
+
+    def fail_from_conn_string(database_url: str):
+        raise AssertionError(f"Unexpected Postgres state init for {database_url}")
+
+    monkeypatch.setattr(
+        deepagent_runtime.AsyncPostgresStore,
+        "from_conn_string",
+        fail_from_conn_string,
+    )
+    monkeypatch.setattr(
+        deepagent_runtime.AsyncPostgresSaver,
+        "from_conn_string",
+        fail_from_conn_string,
+    )
+
+    runtime = AgentRuntime(config)
+    asyncio.run(runtime._initialize())
+
+    assert runtime._store is None
+    assert runtime._checkpointer is None
+
+
+def test_persistence_enabled_requires_stateful_agent_state(tmp_path: Path) -> None:
+    """Verify stateless mode is not reported as agent persistence enabled."""
+    config = make_runtime_config(tmp_path)
+    config = dataclasses.replace(
+        config,
+        database_url="postgresql://example.invalid/chainagents",
+        persistence_mode="postgres",
+        agent_state="stateless",
+        extensions=dataclasses.replace(config.extensions, agent_state="stateless"),
+    )
+    runtime = AgentRuntime(config)
+
+    assert runtime.persistence_enabled is False
+
+
 def test_get_agent_includes_rag_tool_when_ready(
     tmp_path: Path,
     monkeypatch,
