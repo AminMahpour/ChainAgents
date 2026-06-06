@@ -62,6 +62,7 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 
 - when set, LangGraph checkpoints and `/memories/` are persisted in Postgres
 - when unset, the app falls back to in-memory persistence for the current process only
+- if `[agent].state = "stateless"`, LangGraph checkpoint and store handles are not opened or passed to the agent graph even when `DATABASE_URL` is set
 
 `DEEPAGENT_CONFIG` is optional:
 
@@ -312,6 +313,7 @@ The `[agent]` table configures main-agent runtime behavior:
 
 ```toml
 [agent]
+state = "stateful"
 recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
@@ -319,6 +321,7 @@ mcp_servers = ["repo"]
 
 Notes:
 
+- `state = "stateful"` passes the configured LangGraph store and checkpointer to DeepAgents so thread IDs can continue conversation state. `state = "stateless"` omits those state handles and does not expose `/memories/` when building the agent graph.
 - `recursion_limit` is the LangGraph step limit for one agent run.
 - The built-in default is `100`; this repo's `deepagent.toml` sets it to `200`.
 - `DEEPAGENT_RECURSION_LIMIT` overrides this value when set.
@@ -439,6 +442,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
 [agent]
+state = "stateful"
 recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]
@@ -476,6 +480,7 @@ Supported subagent fields:
 
 Main `[agent]` additions:
 
+- `state`: optional agent state mode. Use `stateful` for checkpointed conversation state, or `stateless` to build the DeepAgents graph without a LangGraph store, checkpointer, or `/memories/` route. Defaults to `stateful`.
 - `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
@@ -658,7 +663,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 ## Workspace Contract
 
 - `/workspace/` maps to this repo on disk.
-- `/memories/` is durable across LangGraph threads only when `DATABASE_URL` is configured.
+- `/memories/` is available in stateful mode and durable across LangGraph threads only when `DATABASE_URL` is configured.
 - any other absolute path is treated as ephemeral scratch space by the deep agent backend.
 
 ## Notes
@@ -667,6 +672,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 - If `DATABASE_URL` is set but authentication is not configured, Chainlit still persists thread records, but they are not browseable from the UI.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.
+- When `[agent].state = "stateless"`, thread IDs still identify requests and MCP/RAG scopes, but the agent graph does not checkpoint conversation state, receive a LangGraph store, or expose `/memories/`.
 - MCP stateful sessions are process-local. They survive tool calls in the same thread, but not an app restart.
 - On startup, the UI shows how many skill sources, MCP servers, custom subagents, and async subagents were loaded from `deepagent.toml`.
 

@@ -40,6 +40,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
 [agent]
+state = "stateful"
 recursion_limit = 200
 skills = ["skills"]
 mcp_servers = ["repo"]

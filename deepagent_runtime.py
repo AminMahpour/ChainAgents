@@ -63,6 +63,7 @@ ReasoningLevel = Literal["low", "medium", "high"]
 DisableStreaming = bool | Literal["tool_calling"]
 ModelThinking = Literal["auto", "adaptive", "disabled"]
 PersistenceMode = Literal["memory", "postgres"]
+AgentStateMode = Literal["stateful", "stateless"]
 DEFAULT_MODEL = "gpt-oss:20b"
 DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
 DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
@@ -71,6 +72,7 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_MODEL_THINKING: ModelThinking = "auto"
+DEFAULT_AGENT_STATE: AgentStateMode = "stateful"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
@@ -93,13 +95,17 @@ OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
     "reasoning_details",
 )
 SUMMARIZATION_STATUS_EVENT_KIND = "summarization_status"
+SYSTEM_PROMPT_MEMORY_LINE = (
+    "- Use `/memories/` for agent memory. Persistence depends on runtime configuration."
+)
+STATELESS_SYSTEM_PROMPT_MEMORY_LINE = "- Agent memory is disabled for this runtime."
 
 SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
 - Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
-- Use `/memories/` for agent memory. Persistence depends on runtime configuration.
+{SYSTEM_PROMPT_MEMORY_LINE}
 - Use any other absolute path only for ephemeral scratch work.
 
 Operating constraints:
@@ -135,6 +141,30 @@ def normalize_reasoning_level(
     if candidate not in {"low", "medium", "high"}:
         return default
     return candidate  # type: ignore[return-value]
+
+
+def normalize_agent_state(value: Any | None) -> AgentStateMode:
+    """Normalize agent state mode.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized agent state mode.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None or str(value).strip() == "":
+        return DEFAULT_AGENT_STATE
+    candidate = str(value).strip().lower().replace("-", "_")
+    if candidate == "stateful":
+        return "stateful"
+    if candidate == "stateless":
+        return "stateless"
+    raise ValueError(
+        "The top-level 'agent.state' config must be 'stateful' or 'stateless'."
+    )
 
 
 def normalize_disable_streaming(value: Any | None) -> DisableStreaming:
@@ -1448,6 +1478,7 @@ class ExtensionsConfig:
         config_path: Path to the config.
         mcp_tool_name_prefix: The MCP tool name prefix value.
         mcp_stateful: The MCP stateful value.
+        agent_state: Whether the DeepAgents graph is stateful or stateless.
         recursion_limit: The recursion limit value.
         mcp_servers: The MCP servers value.
         skills: The skills value.
@@ -1468,6 +1499,7 @@ class ExtensionsConfig:
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
     mcp_stateful: bool = False
+    agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
@@ -1799,6 +1831,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_section.get("recursion_limit"),
         field_name="The top-level 'agent.recursion_limit' config",
     )
+    agent_state = normalize_agent_state(agent_section.get("state"))
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -1973,6 +2006,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
         mcp_stateful=bool(mcp_section.get("stateful", False)),
+        agent_state=agent_state,
         recursion_limit=recursion_limit,
         mcp_servers=mcp_servers or None,
         skills=skill_paths,
@@ -2043,6 +2077,27 @@ def compose_agent_system_prompt(
         f"{instruction}"
     )
     return "\n\n".join(sections)
+
+
+def system_prompt_for_agent_state(
+    base_prompt: str,
+    agent_state: AgentStateMode,
+) -> str:
+    """Return the system prompt adjusted for configured agent state.
+
+    Args:
+        base_prompt: The base prompt value.
+        agent_state: Whether the DeepAgents graph is stateful or stateless.
+
+    Returns:
+        The adjusted system prompt.
+    """
+    if agent_state == "stateful":
+        return base_prompt
+    return base_prompt.replace(
+        SYSTEM_PROMPT_MEMORY_LINE,
+        STATELESS_SYSTEM_PROMPT_MEMORY_LINE,
+    )
 
 
 def load_file_config(config_path: str | Path | None = None) -> FileConfig:
@@ -2142,6 +2197,7 @@ class RuntimeConfig:
         model_temperature: The model temperature value.
         default_reasoning: The default reasoning value.
         persistence_mode: The persistence mode value.
+        agent_state: Whether the DeepAgents graph is stateful or stateless.
         extensions: The extensions value.
         model_repeat_penalty: The model repeat penalty value.
         recursion_limit: The recursion limit value.
@@ -2163,6 +2219,7 @@ class RuntimeConfig:
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     model_repeat_penalty: float | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     rag_requested: bool = False
@@ -2432,6 +2489,7 @@ class RuntimeConfig:
             model_repeat_penalty=model_repeat_penalty,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
+            agent_state=file_config.extensions.agent_state,
             extensions=file_config.extensions,
             recursion_limit=recursion_limit,
             rag_requested=rag_requested,
@@ -2547,30 +2605,37 @@ def anthropic_model_supports_adaptive_thinking(model_name: str) -> bool:
     )
 
 
-def build_deepagent_backend(*, project_root: Path | None = None) -> CompositeBackend:
+def build_deepagent_backend(
+    *,
+    project_root: Path | None = None,
+    include_memories: bool = True,
+) -> CompositeBackend:
     """Build deepagent backend.
 
     Args:
         project_root: Project root used to resolve local paths.
+        include_memories: Whether to expose the /memories/ store route.
 
     Returns:
         The constructed deepagent backend.
     """
     resolved_project_root = project_root or PROJECT_ROOT
     artifacts_root = deepagent_artifacts_root(resolved_project_root)
+    routes = {
+        deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
+            root_dir=str(artifacts_root),
+            virtual_mode=True,
+        ),
+        "/workspace/": FilesystemBackend(
+            root_dir=str(resolved_project_root),
+            virtual_mode=True,
+        ),
+    }
+    if include_memories:
+        routes["/memories/"] = StoreBackend()
     return CompositeBackend(
         default=StateBackend(),
-        routes={
-            deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
-                root_dir=str(artifacts_root),
-                virtual_mode=True,
-            ),
-            "/workspace/": FilesystemBackend(
-                root_dir=str(resolved_project_root),
-                virtual_mode=True,
-            ),
-            "/memories/": StoreBackend(),
-        },
+        routes=routes,
         artifacts_root=str(artifacts_root),
     )
 
@@ -2934,7 +2999,7 @@ def create_configured_graph(
         tools=sanitize_tools_for_model(config.model_provider, tools) or None,
         system_prompt=compose_rag_system_prompt(
             compose_agent_system_prompt(
-                system_prompt,
+                system_prompt_for_agent_state(system_prompt, config.agent_state),
                 (
                     config.extensions.custom_instruction
                     if apply_custom_instruction
@@ -2950,7 +3015,9 @@ def create_configured_graph(
             source="main-agent",
             project_root=PROJECT_ROOT,
         ),
-        backend=build_deepagent_backend(),
+        backend=build_deepagent_backend(
+            include_memories=config.agent_state == "stateful",
+        ),
         skills=list(config.extensions.skills) or None,
         subagents=subagent_specs or None,
     )
@@ -3084,7 +3151,10 @@ class AgentRuntime:
         Returns:
             Whether durable persistence is configured.
         """
-        return self.config.persistence_mode == "postgres"
+        return (
+            self.config.agent_state == "stateful"
+            and self.config.persistence_mode == "postgres"
+        )
 
     @property
     def rag_enabled(self) -> bool:
@@ -3139,7 +3209,10 @@ class AgentRuntime:
                 tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
             )
 
-        if not self.config.database_url:
+        if self.config.agent_state == "stateless":
+            self._store = None
+            self._checkpointer = None
+        elif not self.config.database_url:
             self._store = InMemoryStore()
             self._checkpointer = MemorySaver()
         else:
@@ -3245,24 +3318,34 @@ class AgentRuntime:
                     )
                     for subagent in self.config.extensions.async_subagents
                 )
-                agent = create_deep_agent_with_configured_summarization(
-                    self.config,
-                    model=model,
-                    tools=main_tools or None,
-                    system_prompt=compose_rag_system_prompt(
+                agent_kwargs: dict[str, Any] = {
+                    "model": model,
+                    "tools": main_tools or None,
+                    "system_prompt": compose_rag_system_prompt(
                         compose_agent_system_prompt(
-                            SYSTEM_PROMPT,
+                            system_prompt_for_agent_state(
+                                SYSTEM_PROMPT,
+                                self.config.agent_state,
+                            ),
                             self.config.extensions.custom_instruction,
                             project_root=self.project_root,
                         ),
                         rag_enabled=rag_tool_enabled,
                     ),
-                    middleware=middleware,
-                    backend=build_deepagent_backend(project_root=self.project_root),
-                    store=self.store,
-                    checkpointer=self.checkpointer,
-                    skills=list(self.config.extensions.skills) or None,
-                    subagents=subagent_specs or None,
+                    "middleware": middleware,
+                    "backend": build_deepagent_backend(
+                        project_root=self.project_root,
+                        include_memories=self.config.agent_state == "stateful",
+                    ),
+                    "skills": list(self.config.extensions.skills) or None,
+                    "subagents": subagent_specs or None,
+                }
+                if self.config.agent_state == "stateful":
+                    agent_kwargs["store"] = self.store
+                    agent_kwargs["checkpointer"] = self.checkpointer
+                agent = create_deep_agent_with_configured_summarization(
+                    self.config,
+                    **agent_kwargs,
                 )
                 self._agents[cache_key] = agent
             return agent
@@ -3658,4 +3741,7 @@ class AgentRuntime:
         Returns:
             The constructed the deep agent backend for the current runtime settings.
         """
-        return build_deepagent_backend(project_root=self.project_root)
+        return build_deepagent_backend(
+            project_root=self.project_root,
+            include_memories=runtime.config.agent_state == "stateful",
+        )
