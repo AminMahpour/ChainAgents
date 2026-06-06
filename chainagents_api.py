@@ -50,6 +50,7 @@ class RuntimeStatusResponse(BaseModel):
     model_provider: str
     model_choices: list[str]
     default_reasoning: ReasoningLevel
+    agent_state: str
     recursion_limit: int
     persistence_mode: str
 
@@ -111,6 +112,7 @@ def create_app(runtime: Any | None = None) -> FastAPI:
             model_provider=config.model_provider,
             model_choices=list(config.model_choices),
             default_reasoning=config.default_reasoning,
+            agent_state=config.agent_state,
             recursion_limit=config.recursion_limit,
             persistence_mode=config.persistence_mode,
         )

@@ -61,6 +61,7 @@ class _FakeRuntime:
             model_name="fake-model",
             model_provider="ollama",
             model_choices=("fake-model", "other-model"),
+            agent_state="stateful",
             recursion_limit=100,
             persistence_mode="memory",
         )
@@ -97,6 +98,7 @@ def test_status_reports_runtime_configuration() -> None:
         "model_provider": "ollama",
         "model_choices": ["fake-model", "other-model"],
         "default_reasoning": "medium",
+        "agent_state": "stateful",
         "recursion_limit": 100,
         "persistence_mode": "memory",
     }

@@ -63,6 +63,7 @@ ReasoningLevel = Literal["low", "medium", "high"]
 DisableStreaming = bool | Literal["tool_calling"]
 ModelThinking = Literal["auto", "adaptive", "disabled"]
 PersistenceMode = Literal["memory", "postgres"]
+AgentStateMode = Literal["stateful", "stateless"]
 DEFAULT_MODEL = "gpt-oss:20b"
 DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
 DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
@@ -71,6 +72,7 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_REASONING_LEVEL: ReasoningLevel = "medium"
 DEFAULT_MODEL_THINKING: ModelThinking = "auto"
+DEFAULT_AGENT_STATE: AgentStateMode = "stateful"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
@@ -135,6 +137,30 @@ def normalize_reasoning_level(
     if candidate not in {"low", "medium", "high"}:
         return default
     return candidate  # type: ignore[return-value]
+
+
+def normalize_agent_state(value: Any | None) -> AgentStateMode:
+    """Normalize agent state mode.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized agent state mode.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None or str(value).strip() == "":
+        return DEFAULT_AGENT_STATE
+    candidate = str(value).strip().lower().replace("-", "_")
+    if candidate == "stateful":
+        return "stateful"
+    if candidate == "stateless":
+        return "stateless"
+    raise ValueError(
+        "The top-level 'agent.state' config must be 'stateful' or 'stateless'."
+    )
 
 
 def normalize_disable_streaming(value: Any | None) -> DisableStreaming:
@@ -1448,6 +1474,7 @@ class ExtensionsConfig:
         config_path: Path to the config.
         mcp_tool_name_prefix: The MCP tool name prefix value.
         mcp_stateful: The MCP stateful value.
+        agent_state: Whether the DeepAgents graph is stateful or stateless.
         recursion_limit: The recursion limit value.
         mcp_servers: The MCP servers value.
         skills: The skills value.
@@ -1468,6 +1495,7 @@ class ExtensionsConfig:
     config_path: Path | None
     mcp_tool_name_prefix: bool = True
     mcp_stateful: bool = False
+    agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
@@ -1799,6 +1827,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_section.get("recursion_limit"),
         field_name="The top-level 'agent.recursion_limit' config",
     )
+    agent_state = normalize_agent_state(agent_section.get("state"))
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -1973,6 +2002,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
         mcp_stateful=bool(mcp_section.get("stateful", False)),
+        agent_state=agent_state,
         recursion_limit=recursion_limit,
         mcp_servers=mcp_servers or None,
         skills=skill_paths,
@@ -2142,6 +2172,7 @@ class RuntimeConfig:
         model_temperature: The model temperature value.
         default_reasoning: The default reasoning value.
         persistence_mode: The persistence mode value.
+        agent_state: Whether the DeepAgents graph is stateful or stateless.
         extensions: The extensions value.
         model_repeat_penalty: The model repeat penalty value.
         recursion_limit: The recursion limit value.
@@ -2163,6 +2194,7 @@ class RuntimeConfig:
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     model_repeat_penalty: float | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     rag_requested: bool = False
@@ -2432,6 +2464,7 @@ class RuntimeConfig:
             model_repeat_penalty=model_repeat_penalty,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",
+            agent_state=file_config.extensions.agent_state,
             extensions=file_config.extensions,
             recursion_limit=recursion_limit,
             rag_requested=rag_requested,
@@ -3245,11 +3278,10 @@ class AgentRuntime:
                     )
                     for subagent in self.config.extensions.async_subagents
                 )
-                agent = create_deep_agent_with_configured_summarization(
-                    self.config,
-                    model=model,
-                    tools=main_tools or None,
-                    system_prompt=compose_rag_system_prompt(
+                agent_kwargs: dict[str, Any] = {
+                    "model": model,
+                    "tools": main_tools or None,
+                    "system_prompt": compose_rag_system_prompt(
                         compose_agent_system_prompt(
                             SYSTEM_PROMPT,
                             self.config.extensions.custom_instruction,
@@ -3257,12 +3289,17 @@ class AgentRuntime:
                         ),
                         rag_enabled=rag_tool_enabled,
                     ),
-                    middleware=middleware,
-                    backend=build_deepagent_backend(project_root=self.project_root),
-                    store=self.store,
-                    checkpointer=self.checkpointer,
-                    skills=list(self.config.extensions.skills) or None,
-                    subagents=subagent_specs or None,
+                    "middleware": middleware,
+                    "backend": build_deepagent_backend(project_root=self.project_root),
+                    "skills": list(self.config.extensions.skills) or None,
+                    "subagents": subagent_specs or None,
+                }
+                if self.config.agent_state == "stateful":
+                    agent_kwargs["store"] = self.store
+                    agent_kwargs["checkpointer"] = self.checkpointer
+                agent = create_deep_agent_with_configured_summarization(
+                    self.config,
+                    **agent_kwargs,
                 )
                 self._agents[cache_key] = agent
             return agent

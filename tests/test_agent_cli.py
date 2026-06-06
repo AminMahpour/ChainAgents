@@ -483,6 +483,7 @@ async def test_cli_json_combines_multiple_actions(tmp_path: Path) -> None:
         model_base_url=None,
         default_reasoning="medium",
         model_disable_streaming=False,
+        agent_state="stateful",
         recursion_limit=50,
         persistence_mode="memory",
         extensions=SimpleNamespace(

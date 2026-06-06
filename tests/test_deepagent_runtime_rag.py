@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -952,6 +953,46 @@ recursion_limit = 64
     assert config.extensions.recursion_limit == 64
 
 
+def test_runtime_config_reads_agent_state_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that runtime config reads agent state from TOML."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+state = "stateless"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.agent_state == "stateless"
+    assert config.extensions.agent_state == "stateless"
+
+
+def test_runtime_config_rejects_invalid_agent_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that invalid agent state config is rejected."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+state = "sometimes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="agent.state"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
 def test_runtime_config_env_overrides_recursion_limit(
     tmp_path: Path,
     monkeypatch,
@@ -1264,6 +1305,36 @@ def test_get_agent_passes_deepagents_backend_instance(
     assert isinstance(backend, deepagent_runtime.CompositeBackend)
     assert not callable(backend)
     assert backend.routes["/workspace/"].cwd == tmp_path
+
+
+def test_get_agent_omits_store_and_checkpointer_when_stateless(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify stateless agents do not receive LangGraph state handles."""
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests."""
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    config = make_runtime_config(tmp_path)
+    config = dataclasses.replace(
+        config,
+        agent_state="stateless",
+        extensions=dataclasses.replace(config.extensions, agent_state="stateless"),
+    )
+    runtime = AgentRuntime(config, project_root=tmp_path)
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert "store" not in captured["kwargs"]
+    assert "checkpointer" not in captured["kwargs"]
 
 
 def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(

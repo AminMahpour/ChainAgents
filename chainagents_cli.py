@@ -915,6 +915,7 @@ def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
         "model_base_url": runtime.config.model_base_url,
         "reasoning": runtime.config.default_reasoning,
         "model_disable_streaming": runtime.config.model_disable_streaming,
+        "agent_state": runtime.config.agent_state,
         "recursion_limit": runtime.config.recursion_limit,
         "persistence": runtime.config.persistence_mode,
         "rag": rag_status_payload(runtime.rag_status),
@@ -981,6 +982,7 @@ def print_runtime_status(
         "Disable streaming",
         Text(str(payload["model_disable_streaming"]), "white"),
     )
+    table.add_row("Agent state", Text(str(payload["agent_state"]), "white"))
     table.add_row("Recursion limit", Text(str(payload["recursion_limit"]), "white"))
     table.add_row("Persistence", Text(str(payload["persistence"]), "white"))
     table.add_row("RAG", rag_status_text(payload["rag"]))
