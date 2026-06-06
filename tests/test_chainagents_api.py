@@ -150,6 +150,21 @@ def test_invoke_runs_prompt_through_agent() -> None:
     }
 
 
+def test_invoke_requires_thread_id() -> None:
+    """Verify API callers must provide a thread ID for checkpoint isolation."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/invoke",
+            json={"prompt": "hello"},
+        )
+
+    assert response.status_code == 422
+    assert runtime.requests == []
+
+
 def test_stream_returns_ndjson_agent_events() -> None:
     """Verify the stream endpoint returns normalized agent events as NDJSON."""
     agent = _FakeAgent(
@@ -165,7 +180,7 @@ def test_stream_returns_ndjson_agent_events() -> None:
         with client.stream(
             "POST",
             "/api/agent/stream",
-            json={"prompt": "hello"},
+            json={"prompt": "hello", "thread_id": "thread-1"},
         ) as response:
             lines = [json.loads(line) for line in response.iter_lines()]
 
@@ -181,7 +196,7 @@ def test_stream_returns_ndjson_agent_events() -> None:
             "tool_args_delta": "",
             "tool_result": "",
             "status": "",
-            "thread_id": "api",
+            "thread_id": "thread-1",
             "model": "fake-model",
             "reasoning": "medium",
         },
@@ -195,14 +210,29 @@ def test_stream_returns_ndjson_agent_events() -> None:
             "tool_args_delta": "",
             "tool_result": "",
             "status": "",
-            "thread_id": "api",
+            "thread_id": "thread-1",
             "model": "fake-model",
             "reasoning": "medium",
         },
         {
             "kind": "done",
-            "thread_id": "api",
+            "thread_id": "thread-1",
             "model": "fake-model",
             "reasoning": "medium",
         },
     ]
+
+
+def test_stream_requires_thread_id() -> None:
+    """Verify streamed API runs also require a caller-provided thread ID."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "hello"},
+        )
+
+    assert response.status_code == 422
+    assert runtime.requests == []

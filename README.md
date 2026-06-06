@@ -186,12 +186,13 @@ and CLI entrypoints. Useful endpoints include:
 ```bash
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/api/status
+THREAD_ID="api-$(uuidgen)"
 curl -X POST http://127.0.0.1:8000/api/agent/invoke \
   -H "Content-Type: application/json" \
-  -d '{"prompt":"Summarize this repository","thread_id":"api"}'
+  -d "{\"prompt\":\"Summarize this repository\",\"thread_id\":\"$THREAD_ID\"}"
 curl -N -X POST http://127.0.0.1:8000/api/agent/stream \
   -H "Content-Type: application/json" \
-  -d '{"prompt":"Summarize this repository","thread_id":"api"}'
+  -d "{\"prompt\":\"Summarize this repository\",\"thread_id\":\"$THREAD_ID\"}"
 ```
 
 Run the same underlying agent from a terminal without the Chainlit UI:

@@ -19,7 +19,6 @@ from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
 from deepagent_runtime import AgentRuntime, ReasoningLevel, normalize_reasoning_level
 
 
-DEFAULT_API_THREAD_ID = "api"
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
 
@@ -28,7 +27,7 @@ class AgentRunRequest(BaseModel):
     """HTTP request body for running the agent."""
 
     prompt: str = Field(..., min_length=1)
-    thread_id: str | None = None
+    thread_id: str = Field(..., min_length=1)
     model: str | None = None
     reasoning: ReasoningLevel | None = None
     async_subagent_url: str | None = None
@@ -190,7 +189,7 @@ def _run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
     if not prompt:
         raise HTTPException(status_code=422, detail="prompt must not be blank.")
 
-    thread_id = _optional_text(request.thread_id) or DEFAULT_API_THREAD_ID
+    thread_id = _required_text(request.thread_id, "thread_id")
     model_name = _optional_text(request.model) or runtime.config.model_name
     try:
         reasoning_level = normalize_reasoning_level(
@@ -215,6 +214,13 @@ def _optional_text(value: str | None) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _required_text(value: str, field_name: str) -> str:
+    text = value.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail=f"{field_name} must not be blank.")
+    return text
 
 
 async def _iter_agent_events(
