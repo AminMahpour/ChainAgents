@@ -174,6 +174,26 @@ Start the Chainlit app:
 chainlit run main.py -w
 ```
 
+Start the FastAPI server:
+
+```bash
+uv run chainagents-api --host 127.0.0.1 --port 8000
+```
+
+The API uses the same `deepagent.toml` and environment settings as the Chainlit
+and CLI entrypoints. Useful endpoints include:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/api/status
+curl -X POST http://127.0.0.1:8000/api/agent/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Summarize this repository","thread_id":"api"}'
+curl -N -X POST http://127.0.0.1:8000/api/agent/stream \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Summarize this repository","thread_id":"api"}'
+```
+
 Run the same underlying agent from a terminal without the Chainlit UI:
 
 ```bash
