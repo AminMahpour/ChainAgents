@@ -22,6 +22,10 @@ disable_streaming_for_tool_calls = false
 # endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
 # api_key = ""  # optional when ANTHROPIC_API_KEY or DEEPAGENT_MODEL_API_KEY is set
 
+[langfuse]
+# Set true to attach Langfuse's LangChain callback handler to agent runs.
+enabled = false
+
 [mcp]
 tool_name_prefix = true
 stateful = true

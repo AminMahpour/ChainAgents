@@ -22,7 +22,12 @@ from agent_commands import (
     resolve_runtime_command,
 )
 from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
-from deepagent_runtime import AgentRuntime, ReasoningLevel, normalize_reasoning_level
+from deepagent_runtime import (
+    AgentRuntime,
+    ReasoningLevel,
+    build_langgraph_run_config,
+    normalize_reasoning_level,
+)
 
 
 DEFAULT_TUI_THREAD_ID = "tui"
@@ -349,10 +354,10 @@ class ChainAgentsTuiApp(App[int]):
             mcp_session_id=self.mcp_session_id,
         )
         payload = {"messages": [{"role": "user", "content": prompt}]}
-        config = {
-            "configurable": {"thread_id": self.thread_id},
-            "recursion_limit": self.runtime.config.recursion_limit,
-        }
+        config = build_langgraph_run_config(
+            self.runtime.config,
+            thread_id=self.thread_id,
+        )
         adapter = AgentStreamEventAdapter(prompt=prompt)
         stream = agent.astream_events(
             payload,

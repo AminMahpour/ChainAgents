@@ -33,6 +33,7 @@ from deepagent_runtime import (
     ReasoningLevel,
     RuntimeConfig,
     RuntimeConfigOverrides,
+    build_langgraph_run_config,
     format_model_provider,
     normalize_reasoning_level,
 )
@@ -1289,10 +1290,7 @@ async def run_agent_prompt(
     payload = {
         "messages": [{"role": "user", "content": user_message_content(prompt, photos)}]
     }
-    config = {
-        "configurable": {"thread_id": settings.thread_id},
-        "recursion_limit": runtime.config.recursion_limit,
-    }
+    config = build_langgraph_run_config(runtime.config, thread_id=settings.thread_id)
     renderer = CliEventRenderer(
         prompt=prompt,
         stdout=stdout,

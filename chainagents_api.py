@@ -16,7 +16,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
-from deepagent_runtime import AgentRuntime, ReasoningLevel, normalize_reasoning_level
+from deepagent_runtime import (
+    AgentRuntime,
+    ReasoningLevel,
+    build_langgraph_run_config,
+    normalize_reasoning_level,
+)
 
 
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
@@ -237,10 +242,7 @@ async def _iter_agent_events(
         mcp_session_id=context.mcp_session_id,
     )
     payload = {"messages": [{"role": "user", "content": context.prompt}]}
-    config = {
-        "configurable": {"thread_id": context.thread_id},
-        "recursion_limit": runtime.config.recursion_limit,
-    }
+    config = build_langgraph_run_config(runtime.config, thread_id=context.thread_id)
     adapter = AgentStreamEventAdapter(prompt=context.prompt)
     stream = agent.astream_events(
         payload,

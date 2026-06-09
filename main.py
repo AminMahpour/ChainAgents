@@ -34,6 +34,8 @@ from deepagent_runtime import (
     DEFAULT_REASONING_LEVEL,
     AgentRuntime,
     AppSettings,
+    RuntimeConfig,
+    build_langgraph_run_config,
     format_model_provider,
     normalize_reasoning_level,
 )
@@ -189,16 +191,24 @@ def store_settings(settings: AppSettings) -> None:
     cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
 
 
-def build_langgraph_config(settings: AppSettings, *, recursion_limit: int) -> dict[str, Any]:
+def build_langgraph_config(
+    settings: AppSettings,
+    *,
+    recursion_limit: int,
+    runtime_config: RuntimeConfig | None = None,
+) -> dict[str, Any]:
     """Build the LangGraph run configuration for a Chainlit thread.
 
     Args:
         settings: The settings value.
         recursion_limit: The recursion limit value.
+        runtime_config: Optional resolved runtime config.
 
     Returns:
         A LangGraph configuration dictionary for the thread.
     """
+    if runtime_config is not None:
+        return build_langgraph_run_config(runtime_config, thread_id=settings.thread_id)
     return {
         "configurable": {"thread_id": settings.thread_id},
         "recursion_limit": recursion_limit,
@@ -1340,6 +1350,7 @@ async def on_message(message: cl.Message) -> None:
     config = build_langgraph_config(
         settings,
         recursion_limit=runtime.config.recursion_limit,
+        runtime_config=runtime.config,
     )
     payload = {
         "messages": [
