@@ -1400,6 +1400,23 @@ class ChainlitCommandConfig:
 
 
 @dataclass(frozen=True)
+class ChainlitStarterConfig:
+    """Describe a Chainlit starter prompt exposed at thread start.
+
+    Attributes:
+        label: Starter label shown in the Chainlit UI.
+        message: Message sent when the starter is selected.
+        command: Optional Chainlit command associated with the starter.
+        icon: Optional icon name shown by Chainlit.
+    """
+
+    label: str
+    message: str
+    command: str | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
 class SkillCommandMetadata:
     """Track metadata required to expose a configured skill as a command.
 
@@ -1497,6 +1514,7 @@ class ExtensionsConfig:
         subagents: The subagents value.
         async_subagents: Async subagent configurations available for monitoring.
         chainlit_commands: The chainlit commands value.
+        chainlit_starters: The chainlit starters value.
         chainlit_model_mode_enabled: The chainlit model mode enabled value.
         chainlit_reasoning_mode_enabled: The chainlit reasoning mode enabled value.
         chainlit_startup_status_enabled: The chainlit startup status enabled value.
@@ -1518,6 +1536,7 @@ class ExtensionsConfig:
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
+    chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
     chainlit_model_mode_enabled: bool = True
     chainlit_reasoning_mode_enabled: bool = True
     chainlit_startup_status_enabled: bool = True
@@ -1540,6 +1559,7 @@ class ExtensionsConfig:
             or self.subagents
             or self.async_subagents
             or self.chainlit_commands
+            or self.chainlit_starters
         )
 
 
@@ -1965,6 +1985,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_chainlit_commands = chainlit_section.get("commands", [])
     if not isinstance(raw_chainlit_commands, list):
         raise ValueError("The top-level 'chainlit.commands' config must be an array of tables.")
+    raw_chainlit_starters = chainlit_section.get("starters", [])
+    if not isinstance(raw_chainlit_starters, list):
+        raise ValueError("The top-level 'chainlit.starters' config must be an array of tables.")
     raw_reasoning_mode_enabled = chainlit_section.get("reasoning_mode_enabled", True)
     raw_model_mode_enabled = chainlit_section.get("model_mode_enabled", True)
     raw_startup_status_enabled = chainlit_section.get("startup_status_enabled", True)
@@ -2037,6 +2060,33 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         )
         seen_commands.add(name)
 
+    chainlit_starters: list[ChainlitStarterConfig] = []
+    for index, raw_chainlit_starter in enumerate(raw_chainlit_starters, start=1):
+        if not isinstance(raw_chainlit_starter, dict):
+            raise ValueError(
+                f"Chainlit starter entry #{index} must be a table/object."
+            )
+        label = str(raw_chainlit_starter.get("label", "")).strip()
+        message = str(raw_chainlit_starter.get("message", "")).strip()
+        command = normalize_optional_string(raw_chainlit_starter.get("command"))
+        icon = normalize_optional_string(raw_chainlit_starter.get("icon"))
+        if not label:
+            raise ValueError(
+                f"Chainlit starter entry #{index} must include a non-empty 'label'."
+            )
+        if not message:
+            raise ValueError(
+                f"Chainlit starter '{label}' must include a non-empty 'message'."
+            )
+        chainlit_starters.append(
+            ChainlitStarterConfig(
+                label=label,
+                message=message,
+                command=command,
+                icon=icon,
+            )
+        )
+
     return ExtensionsConfig(
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
@@ -2049,6 +2099,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
         chainlit_commands=tuple(chainlit_commands),
+        chainlit_starters=tuple(chainlit_starters),
         chainlit_model_mode_enabled=raw_model_mode_enabled,
         chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
         chainlit_startup_status_enabled=raw_startup_status_enabled,

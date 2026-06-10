@@ -67,6 +67,11 @@ commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher subagent.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Call MCP filesystem read_file on README.md.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\": \"README.md\"}" },
 ]
+# Starter prompts shown by Chainlit before a message is sent.
+starters = [
+  { label = "Explain this repo", message = "Explain the architecture of this repository and identify the most important files.", command = "ask-researcher", icon = "book-open" },
+  { label = "Review current changes", message = "Review the current working tree changes for bugs, regressions, and missing tests." },
+]
 
 [rag]
 enabled = true

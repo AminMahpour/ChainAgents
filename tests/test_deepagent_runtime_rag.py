@@ -2178,6 +2178,67 @@ commands = [
     assert extensions.chainlit_chronological_ui_enabled is False
 
 
+def test_load_extensions_config_parses_chainlit_starters(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config parses chainlit starters.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+starters = [
+  { label = "Explain repo", message = "Explain this repository.", icon = "book-open" },
+  { label = "Review diff", message = "Review the current changes.", command = "review" }
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert len(extensions.chainlit_starters) == 2
+    assert extensions.chainlit_starters[0].label == "Explain repo"
+    assert extensions.chainlit_starters[0].message == "Explain this repository."
+    assert extensions.chainlit_starters[0].icon == "book-open"
+    assert extensions.chainlit_starters[0].command is None
+    assert extensions.chainlit_starters[1].label == "Review diff"
+    assert extensions.chainlit_starters[1].command == "review"
+    assert extensions.chainlit_starters[1].icon is None
+
+
+def test_load_extensions_config_rejects_invalid_chainlit_starters(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config rejects invalid chainlit starters.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+starters = [
+  { label = "Missing message" }
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="must include a non-empty 'message'"):
+        deepagent_runtime.load_extensions_config()
+
+
 def test_load_extensions_config_parses_summarization_middleware_flag(
     tmp_path: Path,
     monkeypatch,
