@@ -147,6 +147,17 @@ uv sync
 ollama pull gpt-oss:20b
 ```
 
+PDF downloads are rendered with WeasyPrint. `uv sync` installs the Python package,
+but WeasyPrint also needs native rendering libraries. On macOS, install them with:
+
+```bash
+brew install weasyprint
+```
+
+On Linux, install the Pango packages listed in the
+[WeasyPrint installation guide](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation)
+for your distribution before starting the app.
+
 If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
 If you are using Claude through Anthropic, set `[model].provider = "anthropic"` and provide `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY`.
 

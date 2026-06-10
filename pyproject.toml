@@ -17,11 +17,13 @@ dependencies = [
     "langchain-text-splitters>=1.1.2",
     "langgraph>=1.1.0",
     "langgraph-checkpoint-postgres>=1.0.0",
+    "markdown-it-py>=4.0.0",
     "psycopg[binary,pool]>=3.2.0",
     "pytest>=8.3.0",
     "rich>=15.0.0",
     "textual>=6.1.0",
     "uvicorn>=0.44.0",
+    "weasyprint>=69.0",
 ]
 
 [project.scripts]
