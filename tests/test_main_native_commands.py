@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import agent_commands
 import main
 import pytest
+from deepagent_runtime import ChainlitStarterConfig
 
 
 def test_load_chainlit_auth_users_parses_json_map() -> None:
@@ -106,6 +107,63 @@ def test_resolve_native_command_prefers_explicit_slash_text() -> None:
         command_name="summarize",
         raw_args="hello world",
     )
+
+
+def test_build_chainlit_starters_maps_config_to_chainlit_starters() -> None:
+    """Verify that starter config maps to Chainlit Starter objects."""
+    starters = main.build_chainlit_starters(
+        (
+            ChainlitStarterConfig(
+                label="Explain repo",
+                message="Explain this repository.",
+                icon="book-open",
+            ),
+            ChainlitStarterConfig(
+                label="Review diff",
+                message="Review the current changes.",
+                command="review",
+            ),
+        )
+    )
+
+    assert len(starters) == 2
+    assert starters[0].label == "Explain repo"
+    assert starters[0].message == "Explain this repository."
+    assert starters[0].icon == "book-open"
+    assert starters[0].command is None
+    assert starters[1].label == "Review diff"
+    assert starters[1].message == "Review the current changes."
+    assert starters[1].command == "review"
+    assert starters[1].icon is None
+
+
+@pytest.mark.anyio
+async def test_configured_chainlit_starters_reads_current_runtime(monkeypatch) -> None:
+    """Verify that the Chainlit starter callback reads current runtime config."""
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            extensions=SimpleNamespace(
+                chainlit_starters=(
+                    ChainlitStarterConfig(
+                        label="Explain repo",
+                        message="Explain this repository.",
+                    ),
+                )
+            )
+        )
+    )
+
+    async def fail_get_runtime():
+        raise AssertionError("starter callback should not initialize the runtime")
+
+    monkeypatch.setattr(main.AgentRuntime, "current", lambda: runtime)
+    monkeypatch.setattr(main.AgentRuntime, "get", fail_get_runtime)
+
+    starters = await main.configured_chainlit_starters()
+
+    assert len(starters) == 1
+    assert starters[0].label == "Explain repo"
+    assert starters[0].message == "Explain this repository."
 
 
 def test_resolve_native_command_uses_selected_command_input() -> None:

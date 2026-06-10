@@ -9,7 +9,7 @@ import mimetypes
 import os
 import secrets
 import traceback
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ from deepagent_runtime import (
     DEFAULT_REASONING_LEVEL,
     AgentRuntime,
     AppSettings,
+    ChainlitStarterConfig,
     RuntimeConfig,
     build_langgraph_run_config,
     format_model_provider,
@@ -209,6 +210,52 @@ def authenticate_chainlit_user(
 AUTH_USERS = load_chainlit_auth_users()
 AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
 AUTH_ENABLED = bool(AUTH_SECRET and AUTH_USERS)
+
+
+def build_chainlit_starters(
+    starter_configs: Iterable[ChainlitStarterConfig],
+) -> list[cl.Starter]:
+    """Build Chainlit starter objects from runtime config.
+
+    Args:
+        starter_configs: Configured starter definitions.
+
+    Returns:
+        Chainlit starter objects.
+    """
+    return [
+        cl.Starter(
+            label=starter.label,
+            message=starter.message,
+            command=starter.command,
+            icon=starter.icon,
+        )
+        for starter in starter_configs
+    ]
+
+
+@cl.set_starters
+async def configured_chainlit_starters(
+    user: cl.User | None = None,
+    language: str | None = None,
+) -> list[cl.Starter]:
+    """Return configured Chainlit starters.
+
+    Args:
+        user: Authenticated Chainlit user, if any.
+        language: Active UI language, if any.
+
+    Returns:
+        Configured Chainlit starter objects.
+    """
+    _ = (user, language)
+    runtime = AgentRuntime.current()
+    extensions = (
+        runtime.config.extensions
+        if runtime is not None
+        else RuntimeConfig.from_env().extensions
+    )
+    return build_chainlit_starters(extensions.chainlit_starters)
 
 
 def current_chainlit_thread_id() -> str:
@@ -1114,6 +1161,7 @@ async def on_chat_start() -> None:
         f"- Configured commands: `{configured_command_count}`\n"
         f"- Skill-backed commands: `{skill_command_count}`\n"
         f"- Native commands: `{len(runtime.chainlit_commands)}`\n"
+        f"- Starters: `{len(extensions.chainlit_starters)}`\n"
     )
     if runtime.chainlit_commands:
         command_lines = "\n".join(
