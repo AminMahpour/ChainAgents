@@ -194,7 +194,10 @@ def authenticate_chainlit_user(
     configured_password = configured_users.get(username)
     if configured_password is None:
         return None
-    if not secrets.compare_digest(password, configured_password):
+    if not secrets.compare_digest(
+        password.encode("utf-8"),
+        configured_password.encode("utf-8"),
+    ):
         return None
     return cl.User(
         identifier=username,

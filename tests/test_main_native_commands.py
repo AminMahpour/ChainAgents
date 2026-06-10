@@ -77,6 +77,16 @@ def test_authenticate_chainlit_user_accepts_configured_users() -> None:
     assert alice.metadata == {"provider": "credentials"}
 
 
+def test_authenticate_chainlit_user_accepts_non_ascii_password() -> None:
+    """Verify that Chainlit auth supports non-ASCII JSON passwords."""
+    users = {"alice": "påsswörd"}
+
+    user = main.authenticate_chainlit_user("alice", "påsswörd", users)
+
+    assert user is not None
+    assert user.identifier == "alice"
+
+
 def test_authenticate_chainlit_user_rejects_invalid_credentials() -> None:
     """Verify that Chainlit auth rejects unknown users and wrong passwords."""
     users = {"admin": "change-me", "alice": "alice-password"}
