@@ -29,6 +29,7 @@ Highlights
 
 - `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic` with configurable model backends
 - native Chainlit streaming for reasoning, tool calls, and final response
+- optional Langfuse tracing through the LangChain callback handler
 - Chainlit image uploads sent to vision-capable models as photo attachments for OCR or image analysis
 - Chainlit OCR/image uploads accept PNG, JPEG, WEBP, and GIF files
 - config-driven synchronous and async DeepAgents subagents
@@ -56,6 +57,9 @@ export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
 export CHAINLIT_AUTH_USERNAME="admin"
 export CHAINLIT_AUTH_PASSWORD="change-me"
+# export LANGFUSE_PUBLIC_KEY="pk-lf-..."
+# export LANGFUSE_SECRET_KEY="sk-lf-..."
+# export LANGFUSE_BASE_URL="https://cloud.langfuse.com"
 ```
 
 `DATABASE_URL` is optional now:
@@ -306,6 +310,26 @@ Notes:
 - `thinking` controls Anthropic adaptive thinking: `auto` enables it only for known supported Claude models, `adaptive` always sends `thinking = {"type": "adaptive"}`, and `disabled` never sends a thinking parameter.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, `DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_DISABLE_STREAMING`, and `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
+
+## Optional: Enable Langfuse Tracing
+
+Langfuse tracing is disabled by default. To enable it, set your Langfuse
+credentials in the environment and turn on the TOML option:
+
+```bash
+export LANGFUSE_PUBLIC_KEY="pk-lf-..."
+export LANGFUSE_SECRET_KEY="sk-lf-..."
+export LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+```
+
+```toml
+[langfuse]
+enabled = true
+```
+
+When enabled, ChainAgents attaches Langfuse's LangChain callback handler to
+Chainlit, CLI, TUI, and API agent runs. The LangGraph thread ID is also passed
+as the Langfuse session ID.
 
 ## Agent Runtime Config
 

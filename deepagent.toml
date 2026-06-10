@@ -29,6 +29,10 @@ reasoning_effort = "high"
 #thinking = "auto"
 #base_url = "https://api.anthropic.com"
 
+[langfuse]
+# Set true to attach Langfuse's LangChain callback handler to agent runs.
+enabled = false
+
 [mcp]
 tool_name_prefix = false
 stateful = true

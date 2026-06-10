@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
@@ -353,6 +354,182 @@ models = ["gpt-oss:20b", "gemma4:27b"]
 
     assert config.model_name == "gpt-oss:20b"
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
+
+
+def test_runtime_config_reads_langfuse_enabled_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that runtime config reads Langfuse tracing from TOML.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "gpt-oss:20b"
+
+[langfuse]
+enabled = true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.langfuse.enabled is True
+
+
+def test_runtime_config_rejects_non_boolean_langfuse_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify invalid Langfuse tracing config fails clearly.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "gpt-oss:20b"
+
+[langfuse]
+enabled = "yes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="langfuse.enabled"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
+def test_shutdown_langfuse_client_skips_disabled_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify disabled Langfuse tracing does not import or shutdown Langfuse.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    monkeypatch.setitem(sys.modules, "langfuse", None)
+
+    assert (
+        deepagent_runtime.shutdown_langfuse_client(make_runtime_config(tmp_path)) is False
+    )
+
+
+def test_shutdown_langfuse_client_flushes_enabled_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify enabled Langfuse tracing shuts down the shared client.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    shutdown_calls: list[str] = []
+
+    class FakeLangfuseClient:
+        """Represent the Langfuse client singleton."""
+
+        def shutdown(self) -> None:
+            """Record shutdown requests."""
+            shutdown_calls.append("shutdown")
+
+    fake_langfuse = ModuleType("langfuse")
+    fake_langfuse.get_client = lambda: FakeLangfuseClient()
+    monkeypatch.setitem(sys.modules, "langfuse", fake_langfuse)
+    config = dataclasses.replace(
+        make_runtime_config(tmp_path),
+        langfuse=deepagent_runtime.LangfuseConfig(enabled=True),
+    )
+
+    assert deepagent_runtime.shutdown_langfuse_client(config) is True
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_build_langgraph_run_config_attaches_langfuse_callback_handler(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Langfuse tracing adds a LangChain callback to agent runs.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    created_handlers: list[object] = []
+
+    class FakeLangfuseCallbackHandler:
+        """Represent the Langfuse callback handler."""
+
+        def __init__(self) -> None:
+            """Initialize the fake handler."""
+            created_handlers.append(self)
+
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "_import_langfuse_callback_handler",
+        lambda: FakeLangfuseCallbackHandler,
+    )
+    config = dataclasses.replace(
+        make_runtime_config(tmp_path),
+        langfuse=deepagent_runtime.LangfuseConfig(enabled=True),
+    )
+
+    run_config = deepagent_runtime.build_langgraph_run_config(
+        config,
+        thread_id="thread-1",
+    )
+
+    assert run_config["configurable"] == {"thread_id": "thread-1"}
+    assert run_config["recursion_limit"] == config.recursion_limit
+    assert run_config["callbacks"] == created_handlers
+    assert run_config["metadata"]["langfuse_session_id"] == "thread-1"
+    assert "chainagents" in run_config["tags"]
+
+
+def test_build_langgraph_run_config_omits_callbacks_when_langfuse_is_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify disabled Langfuse tracing leaves run config unchanged.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "_import_langfuse_callback_handler",
+        lambda: pytest.fail("disabled Langfuse should not import the callback"),
+        raising=False,
+    )
+
+    run_config = deepagent_runtime.build_langgraph_run_config(
+        make_runtime_config(tmp_path),
+        thread_id="thread-1",
+    )
+
+    assert run_config == {
+        "configurable": {"thread_id": "thread-1"},
+        "recursion_limit": deepagent_runtime.DEFAULT_RECURSION_LIMIT,
+    }
 
 
 def test_runtime_config_disables_streaming_for_tool_calls_from_toml(

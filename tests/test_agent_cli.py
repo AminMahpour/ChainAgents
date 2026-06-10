@@ -114,6 +114,52 @@ recursion_limit = 20
     assert config.rag_requested is False
 
 
+@pytest.mark.anyio
+async def test_async_main_shuts_down_langfuse_after_runtime_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify CLI shutdown flushes Langfuse after the runtime closes.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
+    config = RuntimeConfig.from_env()
+    events: list[str] = []
+
+    class FakeRuntime:
+        """Represent the runtime created by the CLI."""
+
+        async def close(self) -> None:
+            """Record runtime close calls."""
+            events.append("close")
+
+    async def fake_create(runtime_config: RuntimeConfig) -> FakeRuntime:
+        assert runtime_config is config
+        events.append("create")
+        return FakeRuntime()
+
+    async def fake_run_cli(*args, runtime: FakeRuntime, **kwargs) -> int:
+        assert isinstance(runtime, FakeRuntime)
+        events.append("run")
+        return 0
+
+    monkeypatch.setattr(
+        chainagents_cli.RuntimeConfig,
+        "from_env",
+        classmethod(lambda cls, overrides=None: config),
+    )
+    monkeypatch.setattr(chainagents_cli.AgentRuntime, "create", fake_create)
+    monkeypatch.setattr(chainagents_cli, "run_cli", fake_run_cli)
+    monkeypatch.setattr(
+        chainagents_cli,
+        "shutdown_langfuse_client",
+        lambda runtime_config: events.append("shutdown"),
+    )
+
+    assert await chainagents_cli.async_main(["--status"]) == 0
+    assert events == ["create", "run", "close", "shutdown"]
+
+
 def test_cli_endpoint_url_override_supplies_openai_default_query(
     tmp_path: Path,
 ) -> None:

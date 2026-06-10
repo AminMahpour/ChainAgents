@@ -1445,6 +1445,17 @@ class SkillCommandMetadata:
         )
 
 
+@dataclass(frozen=True)
+class LangfuseConfig:
+    """Store Langfuse tracing configuration parsed from TOML.
+
+    Attributes:
+        enabled: Whether to attach the Langfuse LangChain callback handler.
+    """
+
+    enabled: bool = False
+
+
 def virtual_workspace_path_to_local(path_value: str, project_root: Path | None = None) -> str:
     """Convert a virtual workspace path into a local filesystem path.
 
@@ -1572,12 +1583,36 @@ class FileConfig:
     Attributes:
         model: Model name or model object used by the runtime.
         extensions: The extensions value.
+        langfuse: Langfuse tracing configuration.
         rag: The RAG value.
     """
 
     model: ModelDefaults
     extensions: ExtensionsConfig
+    langfuse: LangfuseConfig = LangfuseConfig()
     rag: RagConfig = RagConfig()
+
+
+def parse_langfuse_config(raw_config: dict[str, Any]) -> LangfuseConfig:
+    """Parse Langfuse tracing configuration.
+
+    Args:
+        raw_config: Raw config to process.
+
+    Returns:
+        The parsed Langfuse tracing configuration.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    raw_langfuse = raw_config.get("langfuse", {})
+    if raw_langfuse and not isinstance(raw_langfuse, dict):
+        raise ValueError("The top-level 'langfuse' config must be a table/object.")
+
+    raw_enabled = raw_langfuse.get("enabled", False)
+    if not isinstance(raw_enabled, bool):
+        raise ValueError("The top-level 'langfuse.enabled' config must be a boolean.")
+    return LangfuseConfig(enabled=raw_enabled)
 
 
 def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
@@ -2122,6 +2157,7 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
         return FileConfig(
             model=ModelDefaults(),
             extensions=ExtensionsConfig(config_path=None),
+            langfuse=LangfuseConfig(),
             rag=RagConfig(),
         )
 
@@ -2131,6 +2167,7 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
     return FileConfig(
         model=parse_model_defaults(raw_config),
         extensions=parse_extensions_config(raw_config, resolved_config_path),
+        langfuse=parse_langfuse_config(raw_config),
         rag=parse_rag_config(raw_config, resolved_config_path),
     )
 
@@ -2199,6 +2236,7 @@ class RuntimeConfig:
         persistence_mode: The persistence mode value.
         agent_state: Whether the DeepAgents graph is stateful or stateless.
         extensions: The extensions value.
+        langfuse: Langfuse tracing configuration.
         model_repeat_penalty: The model repeat penalty value.
         recursion_limit: The recursion limit value.
         rag_requested: The RAG requested value.
@@ -2219,6 +2257,7 @@ class RuntimeConfig:
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    langfuse: LangfuseConfig = LangfuseConfig()
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     model_repeat_penalty: float | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
@@ -2491,6 +2530,7 @@ class RuntimeConfig:
             persistence_mode="postgres" if database_url else "memory",
             agent_state=file_config.extensions.agent_state,
             extensions=file_config.extensions,
+            langfuse=file_config.langfuse,
             recursion_limit=recursion_limit,
             rag_requested=rag_requested,
             rag=rag,
@@ -2499,6 +2539,89 @@ class RuntimeConfig:
             model_disable_streaming=model_disable_streaming,
             model_thinking=model_defaults.thinking,
         )
+
+
+def _import_langfuse_callback_handler() -> type[Any]:
+    """Import Langfuse's LangChain callback handler on demand.
+
+    Returns:
+        The Langfuse LangChain callback handler type.
+
+    Raises:
+        RuntimeError: If Langfuse support is enabled but unavailable.
+    """
+    try:
+        from langfuse.langchain import CallbackHandler
+    except ImportError as exc:
+        raise RuntimeError(
+            "Langfuse tracing is enabled but the 'langfuse' package is not installed. "
+            "Run `uv sync` to install project dependencies."
+        ) from exc
+    return CallbackHandler
+
+
+def build_langfuse_callback_handler(config: RuntimeConfig) -> Any | None:
+    """Build a Langfuse callback handler when tracing is enabled.
+
+    Args:
+        config: Configuration object used by the operation.
+
+    Returns:
+        A Langfuse callback handler, or None when disabled.
+    """
+    langfuse = getattr(config, "langfuse", LangfuseConfig())
+    if not langfuse.enabled:
+        return None
+    handler_cls = _import_langfuse_callback_handler()
+    return handler_cls()
+
+
+def shutdown_langfuse_client(config: RuntimeConfig) -> bool:
+    """Shut down Langfuse's buffered client when tracing is enabled.
+
+    Langfuse batches events in background workers, so short-lived CLI processes
+    need an explicit shutdown before process exit to avoid dropping traces.
+
+    Args:
+        config: Configuration object used by the operation.
+
+    Returns:
+        True when Langfuse tracing was enabled and shutdown was requested.
+    """
+    langfuse = getattr(config, "langfuse", LangfuseConfig())
+    if not langfuse.enabled:
+        return False
+
+    from langfuse import get_client
+
+    get_client().shutdown()
+    return True
+
+
+def build_langgraph_run_config(
+    config: RuntimeConfig,
+    *,
+    thread_id: str,
+) -> dict[str, Any]:
+    """Build LangGraph run config shared by all ChainAgents entrypoints.
+
+    Args:
+        config: Configuration object used by the operation.
+        thread_id: Conversation thread identifier.
+
+    Returns:
+        A LangGraph configuration dictionary for the run.
+    """
+    run_config: dict[str, Any] = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": config.recursion_limit,
+    }
+    langfuse_handler = build_langfuse_callback_handler(config)
+    if langfuse_handler is not None:
+        run_config["callbacks"] = [langfuse_handler]
+        run_config["metadata"] = {"langfuse_session_id": thread_id}
+        run_config["tags"] = ["chainagents"]
+    return run_config
 
 
 def build_model(

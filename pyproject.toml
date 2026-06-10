@@ -15,6 +15,7 @@ dependencies = [
     "langchain-ollama>=1.0.1",
     "langchain-openai>=1.1.14",
     "langchain-text-splitters>=1.1.2",
+    "langfuse>=3.0.0",
     "langgraph>=1.1.0",
     "langgraph-checkpoint-postgres>=1.0.0",
     "psycopg[binary,pool]>=3.2.0",
