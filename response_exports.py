@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
-import textwrap
+import sys
+from pathlib import Path
 
 import chainlit as cl
 from chainlit.element import Element, File, Pdf
+from markdown_it import MarkdownIt
 
 
 DOWNLOAD_MARKDOWN_ACTION = "download_response_markdown"
@@ -14,13 +17,87 @@ DOWNLOAD_PDF_ACTION = "download_response_pdf"
 RESPONSE_EXPORTS_SESSION_KEY = "response_exports"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
-PDF_PAGE_WIDTH = 612
-PDF_PAGE_HEIGHT = 792
-PDF_MARGIN = 50
-PDF_FONT_SIZE = 10
-PDF_LINE_HEIGHT = 12
-PDF_MAX_CHARS_PER_LINE = 86
-PDF_MAX_LINES_PER_PAGE = 57
+HOMEBREW_LIBRARY_PATH = Path("/opt/homebrew/lib")
+PDF_EXPORT_DEPENDENCY_ERROR = (
+    "PDF export requires WeasyPrint and its native runtime libraries. "
+    "On macOS, install them with `brew install weasyprint`; on Linux, install "
+    "the Pango packages listed in the WeasyPrint installation guide. Restart "
+    "the app after installing the system libraries."
+)
+PDF_STYLES = """
+@page {
+  size: letter;
+  margin: 0.75in;
+
+  @bottom-center {
+    color: #6b7280;
+    content: "Page " counter(page) " of " counter(pages);
+    font-family: Georgia, "Times New Roman", Times, serif;
+    font-size: 8pt;
+  }
+}
+
+body {
+  color: #111827;
+  font-family: Georgia, "Times New Roman", Times, serif;
+  font-size: 9pt;
+  line-height: 1.5;
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.2;
+  margin: 0 0 0.35em;
+}
+
+p,
+ul,
+ol,
+pre,
+blockquote {
+  margin: 0 0 0.85em;
+}
+
+code,
+pre {
+  font-family: "SFMono-Regular", "Menlo", "Consolas", monospace;
+}
+
+pre {
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  padding: 0.7em;
+  white-space: pre-wrap;
+}
+
+blockquote {
+  border-left: 3px solid #d1d5db;
+  color: #4b5563;
+  padding-left: 0.8em;
+}
+
+table {
+  border-collapse: collapse;
+  margin: 0 0 0.85em;
+  width: 100%;
+}
+
+th,
+td {
+  border: 1px solid #d1d5db;
+  padding: 0.35em 0.5em;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #f3f4f6;
+  font-weight: 600;
+}
+"""
+PDF_MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False}).enable("table")
 
 
 def attach_response_export_actions(
@@ -101,9 +178,15 @@ async def send_pdf_export(action: cl.Action) -> None:
         await _send_export_unavailable_message()
         return
 
+    try:
+        pdf_content = build_pdf_bytes(export["response_text"])
+    except RuntimeError as exc:
+        await cl.Message(content=str(exc), author="System").send()
+        return
+
     element = Pdf(
         name=f"{export['basename']}.pdf",
-        content=build_pdf_bytes(export["response_text"]),
+        content=pdf_content,
         display="inline",
     )
     await _send_export_element(
@@ -185,36 +268,70 @@ def build_pdf_bytes(text: str) -> bytes:
     Returns:
         The constructed pdf bytes.
     """
-    wrapped_lines = _wrap_pdf_lines(text)
-    pages = _chunk_lines(wrapped_lines or [""], PDF_MAX_LINES_PER_PAGE)
+    _prepare_weasyprint_environment()
+    try:
+        from weasyprint import HTML
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(PDF_EXPORT_DEPENDENCY_ERROR) from exc
 
-    font_object_id = 3
-    next_object_id = 4
-    page_object_ids: list[int] = []
-    objects: dict[int, bytes] = {}
+    try:
+        return HTML(
+            string=build_pdf_html_document(text),
+            url_fetcher=_blocked_pdf_url_fetcher,
+        ).write_pdf()
+    except OSError as exc:
+        raise RuntimeError(PDF_EXPORT_DEPENDENCY_ERROR) from exc
 
-    for page_lines in pages:
-        content_object_id = next_object_id
-        page_object_id = next_object_id + 1
-        next_object_id += 2
 
-        content_stream = _build_pdf_content_stream(page_lines)
-        objects[content_object_id] = _pdf_stream_object(content_stream)
-        objects[page_object_id] = (
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PDF_PAGE_WIDTH} {PDF_PAGE_HEIGHT}] "
-            f"/Resources << /Font << /F1 {font_object_id} 0 R >> >> "
-            f"/Contents {content_object_id} 0 R >>"
-        ).encode("latin-1")
-        page_object_ids.append(page_object_id)
+def build_pdf_html_document(text: str) -> str:
+    """Build the HTML document rendered into PDF.
 
-    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
-    kids = " ".join(f"{page_object_id} 0 R" for page_object_id in page_object_ids)
-    objects[2] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_object_ids)} >>".encode(
-        "latin-1"
-    )
-    objects[font_object_id] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"
+    Args:
+        text: Markdown response text to process.
 
-    return _serialize_pdf(objects)
+    Returns:
+        The HTML document rendered by WeasyPrint.
+    """
+    body = PDF_MARKDOWN_RENDERER.render(text.strip() or "\u00a0")
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>{PDF_STYLES}</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def _blocked_pdf_url_fetcher(url: str, *_args: object, **_kwargs: object) -> dict[str, str]:
+    """Reject external resource fetches while rendering response PDFs.
+
+    Args:
+        url: The URL WeasyPrint attempted to fetch.
+        _args: Positional arguments from WeasyPrint.
+        _kwargs: Keyword arguments from WeasyPrint.
+
+    Returns:
+        Nothing; this function always raises.
+    """
+    raise ValueError(f"External resources are disabled for response PDF exports: {url}")
+
+
+def _prepare_weasyprint_environment() -> None:
+    """Set macOS library lookup defaults before importing WeasyPrint."""
+    if sys.platform != "darwin" or not HOMEBREW_LIBRARY_PATH.exists():
+        return
+
+    homebrew_lib = str(HOMEBREW_LIBRARY_PATH)
+    current = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    paths = [path for path in current.split(":") if path]
+    if homebrew_lib in paths:
+        return
+
+    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join([homebrew_lib, *paths])
 
 
 async def _send_export_element(
@@ -292,136 +409,3 @@ def _get_sent_export_elements() -> dict[str, dict[str, Element]]:
         if typed_map:
             normalized[str(message_id)] = typed_map
     return normalized
-
-
-def _wrap_pdf_lines(text: str) -> list[str]:
-    """Wrap plain text into PDF-safe line fragments.
-
-    Args:
-        text: Text content to process.
-
-    Returns:
-        The wrap PDF lines result.
-    """
-    wrapper = textwrap.TextWrapper(
-        width=PDF_MAX_CHARS_PER_LINE,
-        replace_whitespace=False,
-        drop_whitespace=False,
-        break_long_words=True,
-        break_on_hyphens=False,
-    )
-
-    lines: list[str] = []
-    for raw_line in text.splitlines():
-        normalized = raw_line.expandtabs(4).rstrip()
-        safe_line = normalized.encode("latin-1", "replace").decode("latin-1")
-        if not safe_line:
-            lines.append("")
-            continue
-        lines.extend(wrapper.wrap(safe_line) or [""])
-
-    return lines
-
-
-def _chunk_lines(lines: list[str], size: int) -> list[list[str]]:
-    """Group wrapped PDF lines into page-sized chunks.
-
-    Args:
-        lines: The lines value.
-        size: The size value.
-
-    Returns:
-        The chunk lines result.
-    """
-    return [lines[index : index + size] for index in range(0, len(lines), size)] or [[]]
-
-
-def _build_pdf_content_stream(lines: list[str]) -> bytes:
-    """Build a PDF content stream for one page of text.
-
-    Args:
-        lines: The lines value.
-
-    Returns:
-        The constructed a pdf content stream for one page of text.
-    """
-    start_x = PDF_MARGIN
-    start_y = PDF_PAGE_HEIGHT - PDF_MARGIN
-    commands = [
-        "BT",
-        f"/F1 {PDF_FONT_SIZE} Tf",
-        f"{PDF_LINE_HEIGHT} TL",
-        f"{start_x} {start_y} Td",
-    ]
-    for line in lines:
-        commands.append(f"({_escape_pdf_text(line)}) Tj")
-        commands.append("T*")
-    commands.append("ET")
-    return "\n".join(commands).encode("latin-1")
-
-
-def _pdf_stream_object(content: bytes) -> bytes:
-    """Serialize one PDF stream object with its byte length.
-
-    Args:
-        content: Message or document content to process.
-
-    Returns:
-        The PDF stream object result.
-    """
-    header = f"<< /Length {len(content)} >>\nstream\n".encode("latin-1")
-    return header + content + b"\nendstream"
-
-
-def _escape_pdf_text(text: str) -> str:
-    """Escape text for inclusion in PDF string literals.
-
-    Args:
-        text: Text content to process.
-
-    Returns:
-        The escape PDF text result.
-    """
-    return (
-        text.replace("\\", "\\\\")
-        .replace("(", "\\(")
-        .replace(")", "\\)")
-    )
-
-
-def _serialize_pdf(objects: dict[int, bytes]) -> bytes:
-    """Serialize PDF objects, xref table, trailer, and EOF marker.
-
-    Args:
-        objects: The objects value.
-
-    Returns:
-        The serialize PDF result.
-    """
-    object_ids = sorted(objects)
-    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets: dict[int, int] = {}
-
-    for object_id in object_ids:
-        offsets[object_id] = len(pdf)
-        pdf.extend(f"{object_id} 0 obj\n".encode("latin-1"))
-        pdf.extend(objects[object_id])
-        pdf.extend(b"\nendobj\n")
-
-    xref_offset = len(pdf)
-    max_object_id = object_ids[-1] if object_ids else 0
-    pdf.extend(f"xref\n0 {max_object_id + 1}\n".encode("latin-1"))
-    pdf.extend(b"0000000000 65535 f \n")
-    for object_id in range(1, max_object_id + 1):
-        offset = offsets.get(object_id, 0)
-        generation = "00000"
-        in_use = "n" if object_id in offsets else "f"
-        pdf.extend(f"{offset:010d} {generation} {in_use} \n".encode("latin-1"))
-
-    pdf.extend(
-        (
-            f"trailer\n<< /Size {max_object_id + 1} /Root 1 0 R >>\n"
-            f"startxref\n{xref_offset}\n%%EOF\n"
-        ).encode("latin-1")
-    )
-    return bytes(pdf)
