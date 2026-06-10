@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import mimetypes
 import os
 import secrets
 import traceback
+from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -110,10 +112,103 @@ VISION_IMAGE_MIME_ALIASES = {
     "image/x-png": "image/png",
 }
 GENERIC_UPLOAD_MIME_TYPES = {"", "application/octet-stream"}
-AUTH_USERNAME = os.getenv("CHAINLIT_AUTH_USERNAME", "").strip()
-AUTH_PASSWORD = os.getenv("CHAINLIT_AUTH_PASSWORD", "").strip()
+
+
+def load_chainlit_auth_users(
+    *,
+    raw_users: str | None = None,
+    legacy_username: str | None = None,
+    legacy_password: str | None = None,
+) -> dict[str, str]:
+    """Load Chainlit password users from environment-compatible values.
+
+    Args:
+        raw_users: JSON object mapping usernames to passwords.
+        legacy_username: Single-user username fallback.
+        legacy_password: Single-user password fallback.
+
+    Returns:
+        A mapping of usernames to passwords.
+
+    Raises:
+        ValueError: If CHAINLIT_AUTH_USERS is set but invalid.
+    """
+    if raw_users is None:
+        raw_users = os.getenv("CHAINLIT_AUTH_USERS", "")
+    raw_users = raw_users.strip()
+    if raw_users:
+        try:
+            parsed_users = json.loads(raw_users)
+        except json.JSONDecodeError as exc:
+            raise ValueError("CHAINLIT_AUTH_USERS must contain valid JSON") from exc
+
+        if not isinstance(parsed_users, dict):
+            raise ValueError(
+                "CHAINLIT_AUTH_USERS must be a JSON object mapping usernames to passwords"
+            )
+
+        auth_users: dict[str, str] = {}
+        for username, password in parsed_users.items():
+            if not isinstance(username, str) or not username.strip():
+                raise ValueError(
+                    "CHAINLIT_AUTH_USERS usernames must be non-empty strings"
+                )
+            if not isinstance(password, str) or not password:
+                raise ValueError(
+                    "CHAINLIT_AUTH_USERS passwords must be non-empty strings"
+                )
+            auth_users[username] = password
+
+        if not auth_users:
+            raise ValueError("CHAINLIT_AUTH_USERS must define at least one user")
+        return auth_users
+
+    if legacy_username is None:
+        legacy_username = os.getenv("CHAINLIT_AUTH_USERNAME", "")
+    if legacy_password is None:
+        legacy_password = os.getenv("CHAINLIT_AUTH_PASSWORD", "")
+
+    legacy_username = legacy_username.strip()
+    legacy_password = legacy_password.strip()
+    if legacy_username and legacy_password:
+        return {legacy_username: legacy_password}
+    return {}
+
+
+def authenticate_chainlit_user(
+    username: str,
+    password: str,
+    auth_users: Mapping[str, str] | None = None,
+) -> cl.User | None:
+    """Authenticate a Chainlit user from configured password settings.
+
+    Args:
+        username: The username value.
+        password: The password value.
+        auth_users: Optional configured users mapping.
+
+    Returns:
+        A Chainlit user when credentials match, otherwise None.
+    """
+    configured_users = AUTH_USERS if auth_users is None else auth_users
+    configured_password = configured_users.get(username)
+    if configured_password is None:
+        return None
+    if not secrets.compare_digest(
+        password.encode("utf-8"),
+        configured_password.encode("utf-8"),
+    ):
+        return None
+    return cl.User(
+        identifier=username,
+        display_name=username,
+        metadata={"provider": "credentials"},
+    )
+
+
+AUTH_USERS = load_chainlit_auth_users()
 AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
-AUTH_ENABLED = bool(AUTH_SECRET and AUTH_USERNAME and AUTH_PASSWORD)
+AUTH_ENABLED = bool(AUTH_SECRET and AUTH_USERS)
 
 
 def current_chainlit_thread_id() -> str:
@@ -890,17 +985,7 @@ if AUTH_ENABLED:
         Returns:
             The password auth callback result.
         """
-        if not (
-            secrets.compare_digest(username, AUTH_USERNAME)
-            and secrets.compare_digest(password, AUTH_PASSWORD)
-        ):
-            return None
-
-        return cl.User(
-            identifier=AUTH_USERNAME,
-            display_name=AUTH_USERNAME,
-            metadata={"provider": "credentials"},
-        )
+        return authenticate_chainlit_user(username, password)
 
 
 async def get_runtime_or_notify() -> AgentRuntime | None:
@@ -1004,7 +1089,11 @@ async def on_chat_start() -> None:
     history_line = (
         "- History bar: enabled for authenticated users\n"
         if runtime.persistence_enabled and AUTH_ENABLED
-        else "- History bar: disabled; set `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` to enable native Chainlit history\n"
+        else (
+            "- History bar: disabled; set `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, "
+            "and `CHAINLIT_AUTH_USERS` (or legacy `CHAINLIT_AUTH_USERNAME` / "
+            "`CHAINLIT_AUTH_PASSWORD`) to enable native Chainlit history\n"
+        )
     )
     extensions = runtime.config.extensions
     configured_command_count = len(extensions.chainlit_commands)

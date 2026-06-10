@@ -55,8 +55,7 @@ export DEEPAGENT_RECURSION_LIMIT="200"
 # export ANTHROPIC_API_KEY="required-for-provider-anthropic-unless-DEEPAGENT_MODEL_API_KEY-is-set"
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
-export CHAINLIT_AUTH_USERNAME="admin"
-export CHAINLIT_AUTH_PASSWORD="change-me"
+export CHAINLIT_AUTH_USERS='{"admin":"change-me","alice":"alice-password"}'
 # export LANGFUSE_PUBLIC_KEY="pk-lf-..."
 # export LANGFUSE_SECRET_KEY="sk-lf-..."
 # export LANGFUSE_BASE_URL="https://cloud.langfuse.com"
@@ -88,11 +87,13 @@ export CHAINLIT_AUTH_PASSWORD="change-me"
 - it controls the maximum LangGraph steps for a single agent run
 - raise it when long tool-heavy Deep Agent runs hit `GraphRecursionError`
 
-`CHAINLIT_AUTH_SECRET`, `CHAINLIT_AUTH_USERNAME`, and `CHAINLIT_AUTH_PASSWORD` are optional:
+`CHAINLIT_AUTH_SECRET` and Chainlit user credentials are optional:
 
-- when all three are set, the app enables Chainlit password authentication
+- when `CHAINLIT_AUTH_SECRET` and `CHAINLIT_AUTH_USERS` are set, the app enables Chainlit password authentication for each configured user
+- `CHAINLIT_AUTH_USERS` must be a JSON object mapping usernames to passwords, e.g. `{"admin":"change-me","alice":"alice-password"}`
+- the legacy `CHAINLIT_AUTH_USERNAME` and `CHAINLIT_AUTH_PASSWORD` pair still works for a single user when `CHAINLIT_AUTH_USERS` is unset
 - together with `DATABASE_URL`, that unlocks the native Chainlit history bar and chat resume UI
-- when they are unset, the app stays unauthenticated and the history bar remains unavailable
+- when auth credentials are unset, the app stays unauthenticated and the history bar remains unavailable
 
 ## Optional: Install Postgres
 
@@ -131,11 +132,18 @@ This app includes a simple password-based auth callback driven by environment va
 
 ```bash
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
+export CHAINLIT_AUTH_USERS='{"admin":"change-me","alice":"alice-password"}'
+```
+
+For compatibility, a single user can still be configured with:
+
+```bash
+export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
 export CHAINLIT_AUTH_USERNAME="admin"
 export CHAINLIT_AUTH_PASSWORD="change-me"
 ```
 
-With both `DATABASE_URL` and the `CHAINLIT_AUTH_*` variables set:
+With `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, and either `CHAINLIT_AUTH_USERS` or the legacy username/password pair set:
 
 - users can sign in through Chainlit's native auth screen
 - the history sidebar can list and reopen prior chats
@@ -703,7 +711,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 
 ## Notes
 
-- Native Chainlit history is available when both `DATABASE_URL` and the `CHAINLIT_AUTH_*` variables are configured.
+- Native Chainlit history is available when `DATABASE_URL`, `CHAINLIT_AUTH_SECRET`, and either `CHAINLIT_AUTH_USERS` or the legacy username/password pair are configured.
 - If `DATABASE_URL` is set but authentication is not configured, Chainlit still persists thread records, but they are not browseable from the UI.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.

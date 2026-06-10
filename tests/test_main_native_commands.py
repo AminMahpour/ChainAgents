@@ -9,6 +9,92 @@ import main
 import pytest
 
 
+def test_load_chainlit_auth_users_parses_json_map() -> None:
+    """Verify that Chainlit auth can load multiple users from JSON."""
+    users = main.load_chainlit_auth_users(
+        raw_users='{"admin":"change-me","alice":"alice-password"}',
+    )
+
+    assert users == {"admin": "change-me", "alice": "alice-password"}
+
+
+def test_load_chainlit_auth_users_uses_legacy_credentials() -> None:
+    """Verify that legacy single-user Chainlit auth settings still work."""
+    users = main.load_chainlit_auth_users(
+        raw_users="",
+        legacy_username="admin",
+        legacy_password="change-me",
+    )
+
+    assert users == {"admin": "change-me"}
+
+
+def test_load_chainlit_auth_users_prefers_json_over_legacy_credentials() -> None:
+    """Verify that CHAINLIT_AUTH_USERS takes precedence over legacy settings."""
+    users = main.load_chainlit_auth_users(
+        raw_users='{"alice":"alice-password"}',
+        legacy_username="admin",
+        legacy_password="change-me",
+    )
+
+    assert users == {"alice": "alice-password"}
+
+
+@pytest.mark.parametrize(
+    ("raw_users", "message"),
+    (
+        ("not-json", "must contain valid JSON"),
+        ('["admin"]', "must be a JSON object"),
+        ("{}", "must define at least one user"),
+        ('{"":"password"}', "usernames must be non-empty strings"),
+        ('{"admin":123}', "passwords must be non-empty strings"),
+        ('{"admin":""}', "passwords must be non-empty strings"),
+    ),
+)
+def test_load_chainlit_auth_users_rejects_invalid_json_map(
+    raw_users: str,
+    message: str,
+) -> None:
+    """Verify that invalid Chainlit auth user config fails clearly."""
+    with pytest.raises(ValueError, match=message):
+        main.load_chainlit_auth_users(raw_users=raw_users)
+
+
+def test_authenticate_chainlit_user_accepts_configured_users() -> None:
+    """Verify that Chainlit auth accepts any configured user."""
+    users = {"admin": "change-me", "alice": "alice-password"}
+
+    admin = main.authenticate_chainlit_user("admin", "change-me", users)
+    alice = main.authenticate_chainlit_user("alice", "alice-password", users)
+
+    assert admin is not None
+    assert admin.identifier == "admin"
+    assert admin.display_name == "admin"
+    assert admin.metadata == {"provider": "credentials"}
+    assert alice is not None
+    assert alice.identifier == "alice"
+    assert alice.display_name == "alice"
+    assert alice.metadata == {"provider": "credentials"}
+
+
+def test_authenticate_chainlit_user_accepts_non_ascii_password() -> None:
+    """Verify that Chainlit auth supports non-ASCII JSON passwords."""
+    users = {"alice": "påsswörd"}
+
+    user = main.authenticate_chainlit_user("alice", "påsswörd", users)
+
+    assert user is not None
+    assert user.identifier == "alice"
+
+
+def test_authenticate_chainlit_user_rejects_invalid_credentials() -> None:
+    """Verify that Chainlit auth rejects unknown users and wrong passwords."""
+    users = {"admin": "change-me", "alice": "alice-password"}
+
+    assert main.authenticate_chainlit_user("admin", "wrong", users) is None
+    assert main.authenticate_chainlit_user("unknown", "change-me", users) is None
+
+
 def test_resolve_native_command_prefers_explicit_slash_text() -> None:
     """Verify that resolve native command prefers explicit slash text."""
     parsed = agent_commands.resolve_native_command(
