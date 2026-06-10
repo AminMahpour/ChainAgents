@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
@@ -412,6 +413,54 @@ enabled = "yes"
 
     with pytest.raises(ValueError, match="langfuse.enabled"):
         deepagent_runtime.RuntimeConfig.from_env()
+
+
+def test_shutdown_langfuse_client_skips_disabled_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify disabled Langfuse tracing does not import or shutdown Langfuse.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    monkeypatch.setitem(sys.modules, "langfuse", None)
+
+    assert (
+        deepagent_runtime.shutdown_langfuse_client(make_runtime_config(tmp_path)) is False
+    )
+
+
+def test_shutdown_langfuse_client_flushes_enabled_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify enabled Langfuse tracing shuts down the shared client.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    shutdown_calls: list[str] = []
+
+    class FakeLangfuseClient:
+        """Represent the Langfuse client singleton."""
+
+        def shutdown(self) -> None:
+            """Record shutdown requests."""
+            shutdown_calls.append("shutdown")
+
+    fake_langfuse = ModuleType("langfuse")
+    fake_langfuse.get_client = lambda: FakeLangfuseClient()
+    monkeypatch.setitem(sys.modules, "langfuse", fake_langfuse)
+    config = dataclasses.replace(
+        make_runtime_config(tmp_path),
+        langfuse=deepagent_runtime.LangfuseConfig(enabled=True),
+    )
+
+    assert deepagent_runtime.shutdown_langfuse_client(config) is True
+    assert shutdown_calls == ["shutdown"]
 
 
 def test_build_langgraph_run_config_attaches_langfuse_callback_handler(

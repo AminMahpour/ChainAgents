@@ -2576,6 +2576,28 @@ def build_langfuse_callback_handler(config: RuntimeConfig) -> Any | None:
     return handler_cls()
 
 
+def shutdown_langfuse_client(config: RuntimeConfig) -> bool:
+    """Shut down Langfuse's buffered client when tracing is enabled.
+
+    Langfuse batches events in background workers, so short-lived CLI processes
+    need an explicit shutdown before process exit to avoid dropping traces.
+
+    Args:
+        config: Configuration object used by the operation.
+
+    Returns:
+        True when Langfuse tracing was enabled and shutdown was requested.
+    """
+    langfuse = getattr(config, "langfuse", LangfuseConfig())
+    if not langfuse.enabled:
+        return False
+
+    from langfuse import get_client
+
+    get_client().shutdown()
+    return True
+
+
 def build_langgraph_run_config(
     config: RuntimeConfig,
     *,

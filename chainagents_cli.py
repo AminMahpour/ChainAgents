@@ -34,6 +34,7 @@ from deepagent_runtime import (
     RuntimeConfig,
     RuntimeConfigOverrides,
     build_langgraph_run_config,
+    shutdown_langfuse_client,
     format_model_provider,
     normalize_reasoning_level,
 )
@@ -1548,7 +1549,10 @@ async def async_main(argv: list[str] | None = None) -> int:
             parser=parser,
         )
     finally:
-        await runtime.close()
+        try:
+            await runtime.close()
+        finally:
+            shutdown_langfuse_client(config)
 
 
 def main(argv: list[str] | None = None) -> int:
