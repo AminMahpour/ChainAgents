@@ -32,6 +32,7 @@ from agent_commands import (
 )
 from async_task_notifications import AsyncTaskNotifier, async_subagent_url_override
 from chainlit_bridge import ChainlitEventBridge, RunTaskList
+from chainlit_persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
 from deepagent_runtime import (
     DEFAULT_REASONING_LEVEL,
     AgentRuntime,
@@ -210,6 +211,14 @@ def authenticate_chainlit_user(
 AUTH_USERS = load_chainlit_auth_users()
 AUTH_SECRET = os.getenv("CHAINLIT_AUTH_SECRET", "").strip()
 AUTH_ENABLED = bool(AUTH_SECRET and AUTH_USERS)
+
+
+if chainlit_data_layer_enabled():
+
+    @cl.data_layer
+    def configured_chainlit_data_layer():
+        """Return the Postgres-backed Chainlit data layer with schema bootstrap."""
+        return create_chainlit_data_layer()
 
 
 def build_chainlit_starters(
