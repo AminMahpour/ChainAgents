@@ -122,7 +122,8 @@ Notes:
 
 - The Compose file lives at [compose.yaml](compose.yaml) and creates a persistent `postgres-data` volume.
 - If you already have Postgres installed locally, create an empty database and set `DATABASE_URL` to that instance instead.
-- No separate migration step is required for this app. On startup it calls the LangGraph Postgres store and checkpointer `setup()` routines automatically.
+- No separate migration step is required for this app. On startup it calls the LangGraph Postgres store/checkpointer `setup()` routines and creates any missing Chainlit persistence tables (`"User"`, `"Thread"`, `"Step"`, `"Feedback"`, and `"Element"`) automatically.
+- If you manage the Chainlit schema externally, set `CHAINLIT_SCHEMA_BOOTSTRAP=false` before launching the app to skip the automatic Chainlit table bootstrap.
 
 ## Optional: Enable Native Chainlit History
 
