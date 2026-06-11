@@ -43,11 +43,22 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
 cwd = "."
 
+[mcp.servers.docling]
+transport = "stdio"
+command = "uvx"
+args = ["--from=docling-mcp", "docling-mcp-server","--transport", "stdio"]
+
+[mcp.servers.scrapling]
+transport = "stdio"
+command = "scrapling"
+args = [ "mcp"]
+
+
 [agent]
 state = "stateful"
 recursion_limit = 200
 skills = ["skills"]
-mcp_servers = ["repo"]
+mcp_servers = ["docling", "scrapling"]
 # Legacy flag retained for compatibility; DeepAgents provides summarization.
 summarization_middleware_enabled = true
 # Token thresholds tune DeepAgents' built-in summarizer.
