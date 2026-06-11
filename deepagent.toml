@@ -47,7 +47,7 @@ cwd = "."
 state = "stateful"
 recursion_limit = 200
 skills = ["skills"]
-mcp_servers = ["repo"]
+mcp_servers = []
 # Legacy flag retained for compatibility; DeepAgents provides summarization.
 summarization_middleware_enabled = true
 # Token thresholds tune DeepAgents' built-in summarizer.

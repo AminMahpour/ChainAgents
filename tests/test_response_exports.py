@@ -74,12 +74,61 @@ def test_build_pdf_html_document_renders_pipe_tables() -> None:
     assert "border-collapse" in html
 
 
+def test_build_pdf_html_document_rewrites_unicode_subscripts_and_superscripts() -> None:
+    """Verify that PDF exports avoid font-dependent subscript/superscript glyphs."""
+    html = response_exports.build_pdf_html_document(
+        "H₂O, CO₂, x², 10⁻³ mol L⁻¹, C₆H₁₂O₆"
+    )
+
+    assert "H<sub>2</sub>O" in html
+    assert "CO<sub>2</sub>" in html
+    assert "x<sup>2</sup>" in html
+    assert "10<sup>-3</sup>" in html
+    assert "L<sup>-1</sup>" in html
+    assert "C<sub>6</sub>H<sub>12</sub>O<sub>6</sub>" in html
+    assert "₂" not in html
+    assert "²" not in html
+    assert "⁻" not in html
+
+
+def test_build_pdf_html_document_removes_pdf_hostile_unicode() -> None:
+    """Verify that invalid/replacement codepoints do not leak into PDF HTML."""
+    html = response_exports.build_pdf_html_document("bad�\udcff\ufeff\x00text")
+
+    assert "bad?? text" in html
+    assert "�" not in html
+    assert "\udcff" not in html
+    assert "\ufeff" not in html
+    assert "\x00" not in html
+
+
+def test_build_pdf_html_document_repairs_common_mojibake() -> None:
+    """Verify common UTF-8-as-Windows-1252 artifacts are repaired for PDFs."""
+    html = response_exports.build_pdf_html_document("Hâ‚‚O and xÂ²")
+
+    assert "H<sub>2</sub>O" in html
+    assert "x<sup>2</sup>" in html
+    assert "â" not in html
+    assert "Â" not in html
+
+
+def test_build_pdf_html_document_repairs_mojibake_with_unicode_text() -> None:
+    """Verify mojibake repair still works when surrounding text is Unicode."""
+    html = response_exports.build_pdf_html_document("Δ sample: Hâ‚‚O and xÂ²")
+
+    assert "Δ sample: H<sub>2</sub>O" in html
+    assert "x<sup>2</sup>" in html
+    assert "â" not in html
+    assert "Â" not in html
+
+
 def test_build_pdf_html_document_uses_compact_body_text() -> None:
     """Verify that PDF exports use compact body text."""
     html = response_exports.build_pdf_html_document("compact")
 
     assert "font-size: 9pt;" in html
-    assert 'font-family: Georgia, "Times New Roman", Times, serif;' in html
+    assert 'font-family: Georgia, "Times New Roman", "Noto Serif", "DejaVu Serif",' in html
+    assert '"Liberation Serif", Times, serif;' in html
 
 
 def test_build_pdf_html_document_adds_page_number_footer() -> None:
