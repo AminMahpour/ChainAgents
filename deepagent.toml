@@ -59,11 +59,7 @@ summarization_keep_tokens = 10000
 enabled = true
 # Omit model to reuse the selected ChainAgents chat model for grading.
 # model = "anthropic:claude-haiku-4-5"
- rubric = """
- - The answer addresses every part of the user request.
- - The answer includes a concise verification summary.
- """
-# rubric_file = "prompts/grading-rubric.md"
+rubric_file = "prompts/scientific-rubric.md"
 # system_prompt = "Grade the agent response against the configured rubric."
 # system_prompt_file = "prompts/grading-system-prompt.md"
 # max_iterations = 3
@@ -85,23 +81,23 @@ model = "nomic-embed-text"
 base_url = "http://10.0.1.152:11434"
 
 # Async subagent backed by the local LangGraph Agent Protocol server.
-[[async_subagents]]
-name = "async-researcher"
-description = "Runs longer research jobs in the background, such as reading documentation or running code analysis tools."
-graph_id = "async-researcher"
-url = "http://127.0.0.1:2024"
+#[[async_subagents]]
+#name = "async-researcher"
+#description = "Runs longer research jobs in the background, such as reading documentation or running code analysis tools."
+#graph_id = "async-researcher"
+#url = "http://127.0.0.1:2024"
 
 # If you run only the co-deployed langgraph.json setup, omit url for ASGI transport.
 # In Chainlit, set url here or use CHAINLIT_ASYNC_SUBAGENT_URL for HTTP transport.
 #url = "https://researcher-deployment.langsmith.dev"
 #headers = { Authorization = "Bearer ${RESEARCHER_TOKEN}" }
 
-[[subagents]]
-name = "repo-researcher"
-description = "Researches the current repository, explains architecture, and identifies the right files to change."
-system_prompt_file = "prompts/repo-researcher.md"
-skills = ["skills"]
-mcp_servers = ["repo"]
+#[[subagents]]
+#name = "repo-researcher"
+#description = "Researches the current repository, explains architecture, and identifies the right files to change."
+#system_prompt_file = "prompts/repo-researcher.md"
+#skills = ["skills"]
+#mcp_servers = ["repo"]
 
 [chainlit]
 # Set false to hide model selection in chat settings and Modes.
@@ -115,8 +111,10 @@ chronological_ui_enabled = false
 # reasoning/tool steps as a final Chainlit step.
 final_response_position = "bottom"
 commands = [
-  { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
-  { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
+
+ # { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
+ # { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
+
   { name = "summarize", description = "Apply a prompt template.", target = "prompt", value = "Summarize the input", template = "Summarize this:\n{input}" }
 ]
 starters = [
