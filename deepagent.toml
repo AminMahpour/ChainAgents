@@ -95,6 +95,9 @@ reasoning_mode_enabled = true
 # Set false to hide the initial startup status message ("Workspace agent ready...").
 startup_status_enabled = false
 chronological_ui_enabled = false
+# top: render the answer as the Chainlit message body; bottom: render it after
+# reasoning/tool steps as a final Chainlit step.
+final_response_position = "bottom"
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },

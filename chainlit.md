@@ -4,7 +4,9 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 
 ## Available Surfaces
 
-- Final assistant response streams into the main chat message.
+- Final assistant response streams into the main chat message by default, or
+  renders after reasoning/tool steps when `[chainlit].final_response_position`
+  is set to `"bottom"`.
 - Raw model reasoning is shown in Chain of Thought steps.
 - Tool calls and tool outputs are rendered as native Chainlit tool steps.
 - Each completed assistant response includes Markdown and WeasyPrint-backed PDF download buttons.
@@ -33,6 +35,8 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 
 - Use `deepagent.toml` to add skills, MCP servers, custom subagents, and async subagents.
 - Use `[chainlit].commands` in `deepagent.toml` to add slash commands that can rewrite prompts, delegate to configured subagents, or invoke MCP tools directly.
+- Use `[chainlit].final_response_position = "bottom"` to show the final answer
+  below Chainlit reasoning and tool-call steps.
 - Each sync subagent can have its own `skills` and `mcp_servers`.
 - Async subagents are Agent Protocol background jobs configured with `graph_id` and optional `url`/`headers`.
 - Omit async subagent `url` only when running the co-deployed graphs from `langgraph.json`; Chainlit-only runs need an HTTP `url`.

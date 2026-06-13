@@ -1490,6 +1490,7 @@ async def on_message(message: cl.Message) -> None:
         prompt=agent_prompt,
         run_task_list=run_task_list,
         chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
+        final_response_position=runtime.config.extensions.chainlit_final_response_position,
     )
     await bridge.start()
 

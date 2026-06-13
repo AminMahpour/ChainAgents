@@ -61,6 +61,9 @@ model_mode_enabled = true
 reasoning_mode_enabled = true
 # Set false to disable the initial startup status message in chat.
 startup_status_enabled = true
+# top: render the answer as the Chainlit message body; bottom: render it after
+# reasoning/tool steps as a final Chainlit step.
+final_response_position = "top"
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },

@@ -214,6 +214,16 @@ class _Step:
         self.update_count += 1
 
 
+class _ToolMessage:
+    """Provide an internal helper for completed tool messages."""
+
+    type = "tool"
+    name = "read_file"
+    tool_call_id = "call-1"
+    status = "success"
+    content = '{"ok": true}'
+
+
 @pytest.fixture(autouse=True)
 def _patch_chainlit_tasks(monkeypatch) -> None:
     """Patch Chainlit task classes with local test doubles.
@@ -295,6 +305,60 @@ async def test_response_message_is_created_on_finish_after_reasoning_steps(monke
     ]
     assert task_list.tasks[-1].status == _TaskStatus.DONE
     assert task_list.tasks[-1].forId == _Message.instances[0].id
+
+
+@pytest.mark.anyio
+async def test_bottom_response_position_renders_final_response_after_steps(
+    monkeypatch,
+) -> None:
+    """Verify bottom response placement renders the final answer after run steps."""
+    task_list = _TaskList()
+    run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
+    export_calls: list[dict[str, Any]] = []
+    bridge = ChainlitEventBridge(
+        prompt="hello",
+        run_task_list=run_task_list,
+        final_response_position="bottom",
+    )
+
+    async def send_export_actions(*args: Any, **kwargs: Any) -> None:
+        """Capture bottom response export action requests."""
+        export_calls.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(
+        chainlit_bridge,
+        "send_response_export_actions",
+        send_export_actions,
+    )
+
+    await bridge.start()
+    await bridge._stream_reasoning("main-agent", "thinking")
+    await bridge._stream_tool_call(
+        "main-agent",
+        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    )
+    await bridge._complete_tool_step("main-agent", _ToolMessage())
+    await bridge._stream_response("Final answer")
+    await bridge.finish()
+
+    assert _Message.instances == []
+    assert [step.name for step in _Step.instances] == [
+        "main-agent reasoning",
+        "main-agent · read_file",
+        "final response",
+    ]
+    assert _Step.instances[-1].type == "llm"
+    assert _Step.instances[-1].output == "Final answer"
+    assert _Step.instances[-1].send_count == 1
+    assert _Step.instances[-1].update_count == 1
+    assert task_list.tasks[-1].status == _TaskStatus.DONE
+    assert task_list.tasks[-1].forId == _Step.instances[-1].id
+    assert export_calls == [
+        {
+            "args": (_Step.instances[-1],),
+            "kwargs": {"prompt": "hello", "response_text": "Final answer"},
+        }
+    ]
 
 
 @pytest.mark.anyio

@@ -7,6 +7,7 @@ import re
 import sys
 import unicodedata
 from pathlib import Path
+from typing import Any
 
 import chainlit as cl
 from chainlit.element import Element, File, Pdf
@@ -251,29 +252,72 @@ def attach_response_export_actions(
         prompt: The prompt value.
         response_text: The response text value.
     """
-    message_id = str(getattr(message, "id", "") or "").strip()
-    if not message_id or not response_text.strip():
+    _, actions = _response_export_actions(
+        message,
+        prompt=prompt,
+        response_text=response_text,
+    )
+    if not actions:
         return
 
+    message.actions = actions
+
+
+async def send_response_export_actions(
+    target: Any,
+    *,
+    prompt: str,
+    response_text: str,
+) -> None:
+    """Send response export actions for a Chainlit target.
+
+    Args:
+        target: Chainlit object with an id to attach actions to.
+        prompt: The prompt value.
+        response_text: The response text value.
+    """
+    target_id, actions = _response_export_actions(
+        target,
+        prompt=prompt,
+        response_text=response_text,
+    )
+    if not target_id or not actions:
+        return
+
+    for action in actions:
+        await action.send(for_id=target_id)
+
+
+def _response_export_actions(
+    target: Any,
+    *,
+    prompt: str,
+    response_text: str,
+) -> tuple[str, list[cl.Action]]:
+    """Register response export data and build its action buttons."""
+    target_id = str(getattr(target, "id", "") or "").strip()
+    if not target_id or not response_text.strip():
+        return "", []
+
     exports = _get_response_exports()
-    exports[message_id] = {
+    exports[target_id] = {
         "prompt": prompt,
         "response_text": response_text,
-        "basename": suggested_export_basename(prompt, message_id),
+        "basename": suggested_export_basename(prompt, target_id),
     }
     cl.user_session.set(RESPONSE_EXPORTS_SESSION_KEY, exports)
 
-    message.actions = [
+    return target_id, [
         cl.Action(
             name=DOWNLOAD_MARKDOWN_ACTION,
-            payload={"response_id": message_id},
+            payload={"response_id": target_id},
             label="Markdown",
             tooltip="Download this response as Markdown.",
             icon="download",
         ),
         cl.Action(
             name=DOWNLOAD_PDF_ACTION,
-            payload={"response_id": message_id},
+            payload={"response_id": target_id},
             label="PDF",
             tooltip="Download this response as a PDF.",
             icon="download",

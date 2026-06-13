@@ -9,13 +9,13 @@ import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import chainlit as cl
 from chainlit.utils import utc_now
 
 from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
-from response_exports import attach_response_export_actions
+from response_exports import attach_response_export_actions, send_response_export_actions
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
 RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
@@ -31,6 +31,7 @@ LANGGRAPH_STREAM_MODES = {
     "tasks",
     "debug",
 }
+FinalResponsePosition = Literal["top", "bottom"]
 
 
 def load_auto_collapse_delay_seconds() -> float:
@@ -874,6 +875,7 @@ class ChainlitEventBridge:
         run_task_list: RunTaskList | None = None,
         *,
         chronological_ui_enabled: bool = True,
+        final_response_position: FinalResponsePosition = "top",
     ) -> None:
         """Initialize the chainlit event bridge instance.
 
@@ -881,10 +883,12 @@ class ChainlitEventBridge:
             prompt: The prompt value.
             run_task_list: The run task list value.
             chronological_ui_enabled: The chronological UI enabled value.
+            final_response_position: Where to render the final response.
         """
         self.prompt = prompt
         self.run_task_list = run_task_list
         self.response_message: cl.Message | None = None
+        self.response_step: cl.Step | None = None
         self.response_buffer = ""
         self.pending_response_stream = ""
         self.response_task_started = False
@@ -898,6 +902,7 @@ class ChainlitEventBridge:
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
         self.chronological_ui_enabled = chronological_ui_enabled
+        self.final_response_position = final_response_position
 
     async def start(self) -> None:
         """Start the chainlit event bridge."""
@@ -1242,7 +1247,10 @@ class ChainlitEventBridge:
             self.response_task_started = True
         self.response_buffer += delta
         self.pending_response_stream += delta
-        if not self.chronological_ui_enabled:
+        if (
+            not self.chronological_ui_enabled
+            and self.final_response_position == "top"
+        ):
             if self.response_message is None:
                 self.response_message = await cl.Message(content="").send()
             await self._flush_response_stream()
@@ -1250,6 +1258,10 @@ class ChainlitEventBridge:
     async def _send_final_response_message(self) -> None:
         """Send the buffered final response as a Chainlit message."""
         if not self.response_buffer:
+            return
+
+        if self.final_response_position == "bottom":
+            await self._send_final_response_step()
             return
 
         if self.response_message is None:
@@ -1270,6 +1282,32 @@ class ChainlitEventBridge:
             response_text=self.response_buffer,
         )
         await self.response_message.update()
+
+    async def _send_final_response_step(self) -> None:
+        """Send the buffered final response as the last Chainlit step."""
+        if self.response_step is None:
+            self.response_step = cl.Step(
+                name="final response",
+                type="llm",
+                default_open=True,
+            )
+            self.response_step.start = utc_now()
+            await self.response_step.send()
+
+        self.response_step.output = self.response_buffer
+        self.response_step.end = utc_now()
+        await self.response_step.update()
+        await send_response_export_actions(
+            self.response_step,
+            prompt=self.prompt,
+            response_text=self.response_buffer,
+        )
+
+        if self.run_task_list is not None:
+            await self.run_task_list.mark_response_started(
+                for_id=getattr(self.response_step, "id", None)
+            )
+            self.response_task_started = True
 
     def _should_flush_response_stream(self) -> bool:
         """Return whether buffered response text should be flushed now.
