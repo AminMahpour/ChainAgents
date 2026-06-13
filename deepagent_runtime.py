@@ -65,6 +65,7 @@ ModelThinking = Literal["auto", "adaptive", "disabled"]
 PersistenceMode = Literal["memory", "postgres"]
 AgentStateMode = Literal["stateful", "stateless"]
 RubricFailurePolicy = Literal["allow", "warn", "block"]
+ChainlitFinalResponsePosition = Literal["top", "bottom"]
 DEFAULT_MODEL = "gpt-oss:20b"
 DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
 DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
@@ -79,6 +80,7 @@ DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 DEFAULT_RUBRIC_MAX_ITERATIONS = 3
 DEFAULT_RUBRIC_FAILURE_POLICY: RubricFailurePolicy = "allow"
+DEFAULT_CHAINLIT_FINAL_RESPONSE_POSITION: ChainlitFinalResponsePosition = "top"
 MAX_RUBRIC_ITERATIONS = 20
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
@@ -168,6 +170,33 @@ def normalize_agent_state(value: Any | None) -> AgentStateMode:
         return "stateless"
     raise ValueError(
         "The top-level 'agent.state' config must be 'stateful' or 'stateless'."
+    )
+
+
+def normalize_chainlit_final_response_position(
+    value: Any | None,
+) -> ChainlitFinalResponsePosition:
+    """Normalize where Chainlit should render final responses.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized Chainlit final response position.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None:
+        return DEFAULT_CHAINLIT_FINAL_RESPONSE_POSITION
+    candidate = str(value).strip().lower().replace("-", "_")
+    if not candidate:
+        return DEFAULT_CHAINLIT_FINAL_RESPONSE_POSITION
+    if candidate in {"top", "bottom"}:
+        return candidate  # type: ignore[return-value]
+    raise ValueError(
+        "The top-level 'chainlit.final_response_position' config must be "
+        "'top' or 'bottom'."
     )
 
 
@@ -1603,6 +1632,7 @@ class ExtensionsConfig:
         chainlit_reasoning_mode_enabled: The chainlit reasoning mode enabled value.
         chainlit_startup_status_enabled: The chainlit startup status enabled value.
         chainlit_chronological_ui_enabled: The chainlit chronological UI enabled value.
+        chainlit_final_response_position: The chainlit final response position value.
         summarization_middleware_enabled: The summarization middleware enabled value.
         summarization_trigger_tokens: The summarization trigger tokens value.
         summarization_keep_tokens: The summarization keep tokens value.
@@ -1626,6 +1656,9 @@ class ExtensionsConfig:
     chainlit_reasoning_mode_enabled: bool = True
     chainlit_startup_status_enabled: bool = True
     chainlit_chronological_ui_enabled: bool = True
+    chainlit_final_response_position: ChainlitFinalResponsePosition = (
+        DEFAULT_CHAINLIT_FINAL_RESPONSE_POSITION
+    )
     summarization_middleware_enabled: bool = False
     summarization_trigger_tokens: int | None = None
     summarization_keep_tokens: int | None = None
@@ -2218,6 +2251,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_model_mode_enabled = chainlit_section.get("model_mode_enabled", True)
     raw_startup_status_enabled = chainlit_section.get("startup_status_enabled", True)
     raw_chronological_ui_enabled = chainlit_section.get("chronological_ui_enabled", True)
+    chainlit_final_response_position = normalize_chainlit_final_response_position(
+        chainlit_section.get("final_response_position")
+    )
     if not isinstance(raw_reasoning_mode_enabled, bool):
         raise ValueError(
             "The top-level 'chainlit.reasoning_mode_enabled' config must be a boolean."
@@ -2330,6 +2366,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
         chainlit_startup_status_enabled=raw_startup_status_enabled,
         chainlit_chronological_ui_enabled=raw_chronological_ui_enabled,
+        chainlit_final_response_position=chainlit_final_response_position,
         summarization_middleware_enabled=raw_summarization_middleware_enabled,
         summarization_trigger_tokens=raw_summarization_trigger_tokens,
         summarization_keep_tokens=raw_summarization_keep_tokens,

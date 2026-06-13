@@ -584,6 +584,9 @@ reasoning_mode_enabled = true
 startup_status_enabled = true
 # Set false to keep legacy non-chronological streaming order in Chainlit.
 chronological_ui_enabled = true
+# top: render the answer as the Chainlit message body; bottom: render it after
+# reasoning/tool steps as a final Chainlit step.
+final_response_position = "top"
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },
   { name = "repo-readme", description = "Run an MCP tool directly.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\":\"README.md\"}" },
@@ -608,6 +611,7 @@ Notes:
 - `[chainlit].reasoning_mode_enabled = false` hides the Reasoning mode group and ignores per-message reasoning overrides from UI modes.
 - `[chainlit].startup_status_enabled = false` disables the initial startup status message that summarizes runtime configuration.
 - `[chainlit].chronological_ui_enabled = false` disables chronological UI ordering so response tokens stream immediately and reasoning steps are not force-rolled at tool boundaries.
+- `[chainlit].final_response_position = "bottom"` renders the final answer as the last Chainlit `llm` step, after reasoning and tool steps. Both positions attach Markdown and PDF download actions to the final answer.
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.
 - For `mcp_tool`, user command arguments must be valid JSON, e.g. `/repo-readme {"path":"README.md"}`.

@@ -13,6 +13,22 @@ import pytest
 import response_exports
 
 
+class FakeUserSession:
+    """Provide a small Chainlit user session test double."""
+
+    def __init__(self, values: dict[str, Any] | None = None) -> None:
+        """Initialize the fake user session."""
+        self.values = values or {}
+
+    def get(self, key: str) -> Any:
+        """Return a stored session value."""
+        return self.values.get(key)
+
+    def set(self, key: str, value: Any) -> None:
+        """Store a session value."""
+        self.values[key] = value
+
+
 def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
     """Verify that PDF exports are rendered through WeasyPrint."""
     html_calls: list[dict[str, Any]] = []
@@ -227,3 +243,62 @@ async def test_send_pdf_export_reports_generation_errors(monkeypatch) -> None:
     assert len(sent_messages) == 1
     assert sent_messages[0].author == "System"
     assert "PDF export requires WeasyPrint native libraries" in sent_messages[0].content
+
+
+@pytest.mark.anyio
+async def test_send_response_export_actions_attaches_downloads_to_step(
+    monkeypatch,
+) -> None:
+    """Verify export actions can be sent for a non-message Chainlit target."""
+    sent_actions: list[dict[str, Any]] = []
+    user_session = FakeUserSession()
+
+    class FakeAction:
+        def __init__(
+            self,
+            *,
+            name: str,
+            payload: dict[str, str],
+            label: str,
+            tooltip: str,
+            icon: str,
+        ) -> None:
+            self.name = name
+            self.payload = payload
+            self.label = label
+            self.tooltip = tooltip
+            self.icon = icon
+
+        async def send(self, for_id: str) -> None:
+            sent_actions.append(
+                {
+                    "for_id": for_id,
+                    "name": self.name,
+                    "payload": self.payload,
+                    "label": self.label,
+                    "tooltip": self.tooltip,
+                    "icon": self.icon,
+                }
+            )
+
+    monkeypatch.setattr(response_exports.cl, "user_session", user_session)
+    monkeypatch.setattr(response_exports.cl, "Action", FakeAction)
+
+    target = SimpleNamespace(id="step-1")
+
+    await response_exports.send_response_export_actions(
+        target,
+        prompt="hello",
+        response_text="Final answer",
+    )
+
+    exports = user_session.values[response_exports.RESPONSE_EXPORTS_SESSION_KEY]
+    assert exports["step-1"]["prompt"] == "hello"
+    assert exports["step-1"]["response_text"] == "Final answer"
+    assert len(sent_actions) == 2
+    assert {action["name"] for action in sent_actions} == {
+        response_exports.DOWNLOAD_MARKDOWN_ACTION,
+        response_exports.DOWNLOAD_PDF_ACTION,
+    }
+    assert {action["label"] for action in sent_actions} == {"Markdown", "PDF"}
+    assert {action["for_id"] for action in sent_actions} == {"step-1"}

@@ -2227,6 +2227,7 @@ model_mode_enabled = false
 reasoning_mode_enabled = false
 startup_status_enabled = false
 chronological_ui_enabled = false
+final_response_position = "bottom"
 commands = [
   { name = "ask-researcher", description = "Delegate to subagent", target = "subagent", value = "repo-researcher" },
   { name = "run-tool", description = "Call MCP tool", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo" },
@@ -2247,6 +2248,7 @@ commands = [
     assert extensions.chainlit_reasoning_mode_enabled is False
     assert extensions.chainlit_startup_status_enabled is False
     assert extensions.chainlit_chronological_ui_enabled is False
+    assert extensions.chainlit_final_response_position == "bottom"
 
 
 def test_load_extensions_config_parses_chainlit_starters(
@@ -2624,6 +2626,30 @@ chronological_ui_enabled = "sometimes"
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
     with pytest.raises(ValueError, match="chronological_ui_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_invalid_final_response_position(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config rejects invalid response position values.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+final_response_position = "middle"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="final_response_position"):
         deepagent_runtime.load_extensions_config()
 
 
