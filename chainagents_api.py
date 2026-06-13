@@ -19,6 +19,8 @@ from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
 from deepagent_runtime import (
     AgentRuntime,
     ReasoningLevel,
+    apply_rubric_failure_policy,
+    build_agent_input_payload,
     build_langgraph_run_config,
     normalize_reasoning_level,
 )
@@ -58,6 +60,7 @@ class RuntimeStatusResponse(BaseModel):
     agent_state: str
     recursion_limit: int
     persistence_mode: str
+    rubric_grading: bool
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,7 @@ def create_app(runtime: Any | None = None) -> FastAPI:
     async def status(request: Request) -> RuntimeStatusResponse:
         active_runtime = _runtime_from_request(request)
         config = active_runtime.config
+        rubric = getattr(getattr(config, "extensions", None), "rubric", None)
         return RuntimeStatusResponse(
             model=config.model_name,
             model_provider=config.model_provider,
@@ -120,6 +124,7 @@ def create_app(runtime: Any | None = None) -> FastAPI:
             agent_state=config.agent_state,
             recursion_limit=config.recursion_limit,
             persistence_mode=config.persistence_mode,
+            rubric_grading=bool(getattr(rubric, "enabled", False)),
         )
 
     @app.post("/api/agent/invoke", response_model=AgentRunResponse)
@@ -130,17 +135,28 @@ def create_app(runtime: Any | None = None) -> FastAPI:
         active_runtime = _runtime_from_request(request)
         context = _run_context(active_runtime, payload)
         response_parts: list[str] = []
+        rubric_status: str | None = None
+        rubric_explanation: str | None = None
         try:
             async for event in _iter_agent_events(active_runtime, context):
                 if event.kind == "response_delta":
                     response_parts.append(event.text)
+                elif event.kind == "rubric_evaluation":
+                    rubric_status = event.status
+                    rubric_explanation = event.text
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             raise _agent_error(exc) from exc
+        finalized = apply_rubric_failure_policy(
+            active_runtime.config,
+            response="".join(response_parts),
+            status=rubric_status,
+            explanation=rubric_explanation,
+        )
 
         return AgentRunResponse(
-            response="".join(response_parts),
+            response=finalized.response,
             thread_id=context.thread_id,
             model=context.model_name,
             reasoning=context.reasoning_level,
@@ -155,9 +171,44 @@ def create_app(runtime: Any | None = None) -> FastAPI:
         context = _run_context(active_runtime, payload)
 
         async def lines() -> AsyncIterator[str]:
+            response_parts: list[str] = []
+            rubric_status: str | None = None
+            rubric_explanation: str | None = None
             try:
                 async for event in _iter_agent_events(active_runtime, context):
+                    if event.kind == "response_delta":
+                        response_parts.append(event.text)
+                    elif event.kind == "rubric_evaluation":
+                        rubric_status = event.status
+                        rubric_explanation = event.text
                     yield _json_line(_event_payload(event, context))
+                finalized = apply_rubric_failure_policy(
+                    active_runtime.config,
+                    response="".join(response_parts),
+                    status=rubric_status,
+                    explanation=rubric_explanation,
+                )
+                if finalized.notice:
+                    yield _json_line(
+                        {
+                            "kind": "response_delta",
+                            "source": "main-agent",
+                            "text": (
+                                finalized.notice
+                                if finalized.blocked
+                                else f"\n\n{finalized.notice}"
+                            ),
+                            "tool_call_id": "",
+                            "tool_name": "",
+                            "tool_args": "",
+                            "tool_args_delta": "",
+                            "tool_result": "",
+                            "status": "",
+                            "thread_id": context.thread_id,
+                            "model": context.model_name,
+                            "reasoning": context.reasoning_level,
+                        }
+                    )
                 yield _json_line(
                     {
                         "kind": "done",
@@ -241,7 +292,10 @@ async def _iter_agent_events(
         async_subagent_url_override=context.async_subagent_url,
         mcp_session_id=context.mcp_session_id,
     )
-    payload = {"messages": [{"role": "user", "content": context.prompt}]}
+    payload = build_agent_input_payload(
+        runtime.config,
+        messages=[{"role": "user", "content": context.prompt}],
+    )
     config = build_langgraph_run_config(runtime.config, thread_id=context.thread_id)
     adapter = AgentStreamEventAdapter(prompt=context.prompt)
     stream = agent.astream_events(

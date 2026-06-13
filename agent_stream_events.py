@@ -13,6 +13,7 @@ StreamEventKind = Literal[
     "tool_call",
     "tool_result",
     "summarization_status",
+    "rubric_evaluation",
 ]
 
 LANGGRAPH_STREAM_MODES = {
@@ -25,6 +26,7 @@ LANGGRAPH_STREAM_MODES = {
     "debug",
 }
 SUMMARIZATION_STATUS_KIND = "summarization_status"
+RUBRIC_EVALUATION_END_TYPE = "rubric_evaluation_end"
 ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 
 
@@ -314,6 +316,15 @@ class AgentStreamEventAdapter:
         data = part.get("data")
         if not isinstance(data, dict):
             return []
+        if data.get("type") == RUBRIC_EVALUATION_END_TYPE:
+            return [
+                AgentStreamEvent(
+                    kind="rubric_evaluation",
+                    source="main-agent",
+                    status=str(data.get("result") or "").strip(),
+                    text=str(data.get("explanation") or "").strip(),
+                )
+            ]
         if data.get("kind") != SUMMARIZATION_STATUS_KIND:
             return []
 

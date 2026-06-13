@@ -290,6 +290,31 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_adds_configured_rubric_to_agent_payload() -> None:
+    """Verify configured rubrics are passed through TUI agent invocations."""
+    agent = _FakeAgent([])
+    runtime = _FakeRuntime(agent)
+    runtime.config.extensions = SimpleNamespace(
+        rubric=SimpleNamespace(
+            enabled=True,
+            rubric="- The answer satisfies the configured TUI rubric.",
+        )
+    )
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = "hello"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert agent.payload == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "rubric": "- The answer satisfies the configured TUI rubric.",
+    }
+
+
+@pytest.mark.anyio
 async def test_tui_renders_assistant_response_as_markdown_widget() -> None:
     agent = _FakeAgent(
         [

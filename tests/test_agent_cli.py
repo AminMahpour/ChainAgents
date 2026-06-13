@@ -342,10 +342,11 @@ class _FakeRagRuntime:
 class _CaptureAgent:
     """Provide a test double for capture agent."""
 
-    def __init__(self) -> None:
+    def __init__(self, events: list[dict[str, object]] | None = None) -> None:
         """Initialize the capture agent instance."""
         self.payload = None
         self.config = None
+        self.events = events or []
 
     def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
         """Yield fake stream events for CLI renderer tests.
@@ -369,8 +370,8 @@ class _CaptureAgent:
             Yields:
                 Values produced by events.
             """
-            if False:
-                yield None
+            for event in self.events:
+                yield event
 
         return events()
 
@@ -474,6 +475,77 @@ async def test_cli_photo_attaches_image_content_to_agent_payload(tmp_path: Path)
         {"type": "text", "text": "Describe this scene"},
         {"type": "image_url", "image_url": {"url": expected_image_url}},
     ]
+
+
+@pytest.mark.anyio
+async def test_cli_adds_configured_rubric_to_agent_payload() -> None:
+    """Verify configured rubrics are passed through CLI agent invocations."""
+    args = chainagents_cli.parse_args(["--prompt", "hello", "--no-stream"])
+    runtime = _FakePromptRuntime()
+    runtime.config.extensions = SimpleNamespace(
+        rubric=SimpleNamespace(
+            enabled=True,
+            rubric="- The answer satisfies the configured CLI rubric.",
+        )
+    )
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        args,
+        prompt="hello",
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    assert runtime.agent.payload == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "rubric": "- The answer satisfies the configured CLI rubric.",
+    }
+
+
+@pytest.mark.anyio
+async def test_cli_blocks_response_when_rubric_policy_blocks_failure() -> None:
+    """Verify CLI JSON response is replaced when rubric block policy fires."""
+    args = chainagents_cli.parse_args(["--prompt", "hello", "--no-stream", "--json"])
+    runtime = _FakePromptRuntime()
+    runtime.agent = _CaptureAgent(
+        [
+            _raw_event(((), "messages", (_Token("Draft answer"), {}))),
+            _raw_event(
+                (
+                    "custom",
+                    {
+                        "type": "rubric_evaluation_end",
+                        "result": "needs_revision",
+                        "explanation": "Missing citations.",
+                    },
+                )
+            ),
+        ]
+    )
+    runtime.config.extensions = SimpleNamespace(
+        rubric=SimpleNamespace(
+            enabled=True,
+            rubric="- The answer cites sources.",
+            on_failure="block",
+        )
+    )
+    stdout = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        args,
+        prompt="hello",
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    payload = json.loads(stdout.getvalue())
+    assert "Draft answer" not in payload["response"]
+    assert "Rubric grading did not approve" in payload["response"]
+    assert "needs_revision" in payload["response"]
 
 
 @pytest.mark.anyio
@@ -583,6 +655,11 @@ class _Token:
             content: Message or document content to process.
         """
         self.content = content
+
+
+def _raw_event(chunk: object) -> dict[str, object]:
+    """Build a raw LangGraph stream event."""
+    return {"event": "on_chain_stream", "data": {"chunk": chunk}}
 
 
 class _AnthropicThinkingToken:

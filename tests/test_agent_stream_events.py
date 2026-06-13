@@ -281,6 +281,32 @@ def test_adapter_streams_summarization_status_events() -> None:
     ]
 
 
+def test_adapter_streams_rubric_evaluation_events() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    events = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                "custom",
+                {
+                    "type": "rubric_evaluation_end",
+                    "result": "needs_revision",
+                    "explanation": "Missing citations.",
+                },
+            )
+        )
+    )
+
+    assert events == [
+        AgentStreamEvent(
+            kind="rubric_evaluation",
+            source="main-agent",
+            status="needs_revision",
+            text="Missing citations.",
+        )
+    ]
+
+
 def test_adapter_ignores_nested_chain_events() -> None:
     adapter = AgentStreamEventAdapter(prompt="hello")
 

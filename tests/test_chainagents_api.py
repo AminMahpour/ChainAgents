@@ -101,6 +101,7 @@ def test_status_reports_runtime_configuration() -> None:
         "agent_state": "stateful",
         "recursion_limit": 100,
         "persistence_mode": "memory",
+        "rubric_grading": False,
     }
 
 
@@ -150,6 +151,71 @@ def test_invoke_runs_prompt_through_agent() -> None:
         "configurable": {"thread_id": "thread-1"},
         "recursion_limit": 100,
     }
+
+
+def test_invoke_adds_configured_rubric_to_agent_payload() -> None:
+    """Verify configured rubrics are passed through API agent invocations."""
+    agent = _FakeAgent([])
+    runtime = _FakeRuntime(agent)
+    runtime.config.extensions = SimpleNamespace(
+        rubric=SimpleNamespace(
+            enabled=True,
+            rubric="- The answer satisfies the configured API rubric.",
+        )
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/invoke",
+            json={"prompt": "hello", "thread_id": "thread-1"},
+        )
+
+    assert response.status_code == 200
+    assert agent.payload == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "rubric": "- The answer satisfies the configured API rubric.",
+    }
+
+
+def test_invoke_blocks_response_when_rubric_policy_blocks_failure() -> None:
+    """Verify API invoke replaces the response when rubric block policy fires."""
+    agent = _FakeAgent(
+        [
+            _raw_event(((), "messages", (_Token("Draft answer"), {}))),
+            _raw_event(
+                (
+                    "custom",
+                    {
+                        "type": "rubric_evaluation_end",
+                        "result": "needs_revision",
+                        "explanation": "Missing citations.",
+                    },
+                )
+            ),
+        ]
+    )
+    runtime = _FakeRuntime(agent)
+    runtime.config.extensions = SimpleNamespace(
+        rubric=SimpleNamespace(
+            enabled=True,
+            rubric="- The answer cites sources.",
+            on_failure="block",
+        )
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/invoke",
+            json={"prompt": "hello", "thread_id": "thread-1"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "Draft answer" not in body["response"]
+    assert "Rubric grading did not approve" in body["response"]
+    assert "needs_revision" in body["response"]
 
 
 def test_invoke_requires_thread_id() -> None:

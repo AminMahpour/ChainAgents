@@ -32,6 +32,7 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 ## Optional Extensions
 
 - Use `deepagent.toml` to add skills, MCP servers, custom subagents, and async subagents.
+- Use `[agent.rubric]` in `deepagent.toml` to enable DeepAgents rubric grading for each user-facing agent response; `on_failure` can allow, warn, or block non-satisfied outcomes.
 - Use `[chainlit].commands` in `deepagent.toml` to add slash commands that can rewrite prompts, delegate to configured subagents, or invoke MCP tools directly.
 - Each sync subagent can have its own `skills` and `mcp_servers`.
 - Async subagents are Agent Protocol background jobs configured with `graph_id` and optional `url`/`headers`.

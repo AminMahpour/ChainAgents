@@ -39,6 +39,8 @@ from deepagent_runtime import (
     AppSettings,
     ChainlitStarterConfig,
     RuntimeConfig,
+    apply_rubric_failure_policy,
+    build_agent_input_payload,
     build_langgraph_run_config,
     format_model_provider,
     normalize_reasoning_level,
@@ -1498,8 +1500,9 @@ async def on_message(message: cl.Message) -> None:
         recursion_limit=runtime.config.recursion_limit,
         runtime_config=runtime.config,
     )
-    payload = {
-        "messages": [
+    payload = build_agent_input_payload(
+        runtime.config,
+        messages=[
             {
                 "role": "user",
                 "content": chainlit_user_message_content(
@@ -1507,8 +1510,8 @@ async def on_message(message: cl.Message) -> None:
                     image_parts=uploaded_image_parts,
                 ),
             }
-        ]
-    }
+        ],
+    )
     stream = agent.astream_events(
         payload,
         config=config,
@@ -1538,6 +1541,19 @@ async def on_message(message: cl.Message) -> None:
     finally:
         with suppress(Exception):
             await stream.aclose()
+
+    finalized = apply_rubric_failure_policy(
+        runtime.config,
+        response=bridge.response_buffer,
+        status=bridge.rubric_status,
+        explanation=bridge.rubric_explanation,
+    )
+    if finalized.notice:
+        if bridge.response_message is None:
+            bridge.response_buffer = finalized.response
+            bridge.pending_response_stream = finalized.response
+        else:
+            await cl.Message(content=finalized.notice, author="System").send()
 
     await bridge.finish()
     if async_task_notifier is not None:

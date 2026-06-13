@@ -32,6 +32,7 @@ Highlights
 - optional Langfuse tracing through the LangChain callback handler
 - Chainlit image uploads sent to vision-capable models as photo attachments for OCR or image analysis
 - Chainlit OCR/image uploads accept PNG, JPEG, WEBP, and GIF files
+- optional DeepAgents rubric grading with LLM-as-a-judge revision loops
 - config-driven synchronous and async DeepAgents subagents
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
@@ -532,6 +533,36 @@ Main `[agent]` additions:
 - `summarization_trigger_tokens`: optional positive integer token threshold for DeepAgents' built-in summarization middleware.
 - `summarization_keep_tokens`: optional positive integer token budget to keep after DeepAgents summarizes conversation history.
 - Legacy `summarization_middleware_enabled` entries are still parsed for compatibility, but ChainAgents no longer injects a second summarization middleware.
+
+Optional grading rubrics:
+
+```toml
+[agent.rubric]
+enabled = true
+# Omit model to reuse the selected ChainAgents chat model for grading.
+# model = "anthropic:claude-haiku-4-5"
+rubric = """
+- The answer addresses every part of the user request.
+- The answer cites repository files when making code claims.
+- The answer includes a concise verification summary.
+"""
+# rubric_file = "prompts/grading-rubric.md"
+# system_prompt = "Grade the agent response against the configured rubric."
+# system_prompt_file = "prompts/grading-system-prompt.md"
+max_iterations = 3
+# allow: keep current behavior; warn: append a notice; block: replace final response
+on_failure = "allow"
+```
+
+When enabled, ChainAgents adds DeepAgents `RubricMiddleware` to the main agent and passes the configured rubric on each CLI, API, Chainlit, and TUI invocation. `max_iterations` must be between `1` and `20`, matching DeepAgents' documented cap. Rubric middleware is only attached to the main agent; sync subagents keep their normal middleware stack.
+
+`on_failure` controls what ChainAgents does when the final rubric evaluation is not `satisfied`:
+
+- `allow`: keep the model response unchanged.
+- `warn`: keep the model response and append a rubric failure notice.
+- `block`: replace the final response with a rubric failure notice.
+
+The policy is applied after the agent run finishes. For live streaming surfaces, provisional response tokens may already have been displayed before the final rubric result is known; the policy still controls the final accumulated response and emits a final notice when needed.
 
 ## Chainlit Native Commands
 

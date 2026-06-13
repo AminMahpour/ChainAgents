@@ -25,6 +25,8 @@ from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
 from deepagent_runtime import (
     AgentRuntime,
     ReasoningLevel,
+    apply_rubric_failure_policy,
+    build_agent_input_payload,
     build_langgraph_run_config,
     normalize_reasoning_level,
 )
@@ -155,6 +157,8 @@ class ChainAgentsTuiApp(App[int]):
         self.reasoning_entries: list[tuple[str, str]] = []
         self.reasoning_entry_indexes: dict[str, int] = {}
         self.tool_entries: list[str] = []
+        self.rubric_status: str | None = None
+        self.rubric_explanation: str | None = None
         self.command_help_text = ""
         self.command_help_visible = False
         self.visible_command_names: list[str] = []
@@ -346,6 +350,8 @@ class ChainAgentsTuiApp(App[int]):
         return prompt if prompt.strip() else None
 
     async def _stream_agent_prompt(self, prompt: str) -> None:
+        self.rubric_status = None
+        self.rubric_explanation = None
         agent = await self.runtime.get_agent(
             self.reasoning_level,
             model_name=self.model_name,
@@ -353,7 +359,10 @@ class ChainAgentsTuiApp(App[int]):
             async_subagent_url_override=self.async_subagent_url,
             mcp_session_id=self.mcp_session_id,
         )
-        payload = {"messages": [{"role": "user", "content": prompt}]}
+        payload = build_agent_input_payload(
+            self.runtime.config,
+            messages=[{"role": "user", "content": prompt}],
+        )
         config = build_langgraph_run_config(
             self.runtime.config,
             thread_id=self.thread_id,
@@ -378,6 +387,23 @@ class ChainAgentsTuiApp(App[int]):
         finally:
             with suppress(Exception):
                 await stream.aclose()
+        finalized = apply_rubric_failure_policy(
+            self.runtime.config,
+            response=(
+                self.conversation_entries[-1][1]
+                if self.conversation_entries
+                and self.conversation_entries[-1][0] == "Assistant"
+                else ""
+            ),
+            status=self.rubric_status,
+            explanation=self.rubric_explanation,
+        )
+        if finalized.notice:
+            await self._append_response_delta(
+                finalized.notice
+                if finalized.blocked
+                else f"\n\n{finalized.notice}"
+            )
 
     async def _handle_stream_event(self, event: AgentStreamEvent) -> None:
         if event.kind == "response_delta":
@@ -414,6 +440,9 @@ class ChainAgentsTuiApp(App[int]):
             self._append_tool_entry(
                 f"{event.source} summarization {event.status}: {event.text}"
             )
+        elif event.kind == "rubric_evaluation":
+            self.rubric_status = event.status
+            self.rubric_explanation = event.text
 
     async def _append_conversation(self, role: str, text: str) -> None:
         self.conversation_entries.append((role, text))

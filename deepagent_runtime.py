@@ -23,7 +23,7 @@ from langchain_warning_filters import install_langchain_warning_filters
 
 install_langchain_warning_filters()
 
-from deepagents import AsyncSubAgent, create_deep_agent
+from deepagents import AsyncSubAgent, RubricMiddleware, create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
@@ -64,6 +64,7 @@ DisableStreaming = bool | Literal["tool_calling"]
 ModelThinking = Literal["auto", "adaptive", "disabled"]
 PersistenceMode = Literal["memory", "postgres"]
 AgentStateMode = Literal["stateful", "stateless"]
+RubricFailurePolicy = Literal["allow", "warn", "block"]
 DEFAULT_MODEL = "gpt-oss:20b"
 DEFAULT_MODEL_PROVIDER: ModelProvider = "ollama"
 DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1"
@@ -76,6 +77,9 @@ DEFAULT_AGENT_STATE: AgentStateMode = "stateful"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
+DEFAULT_RUBRIC_MAX_ITERATIONS = 3
+DEFAULT_RUBRIC_FAILURE_POLICY: RubricFailurePolicy = "allow"
+MAX_RUBRIC_ITERATIONS = 20
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 AGENTS_MD_FILENAME = "AGENTS.md"
@@ -1127,6 +1131,40 @@ def create_deep_agent_with_configured_summarization(
             deepagents_graph.create_summarization_middleware = original_factory
 
 
+def build_rubric_middleware(
+    *,
+    config: RuntimeConfig,
+    reasoning_level: ReasoningLevel,
+    model_name: str | None = None,
+) -> AgentMiddleware[Any, Any, Any] | None:
+    """Build DeepAgents rubric middleware when configured.
+
+    Args:
+        config: Configuration object used by the operation.
+        reasoning_level: The reasoning level value.
+        model_name: The selected main-agent model name.
+
+    Returns:
+        The constructed rubric middleware, or None when disabled.
+    """
+    rubric = config.extensions.rubric
+    if not rubric.enabled:
+        return None
+
+    kwargs: dict[str, Any] = {
+        "model": rubric.model
+        or build_model(
+            config,
+            reasoning_level,
+            model_name=model_name,
+        ),
+        "max_iterations": rubric.max_iterations,
+    }
+    if rubric.system_prompt:
+        kwargs["system_prompt"] = rubric.system_prompt
+    return RubricMiddleware(**kwargs)
+
+
 def build_agent_middleware(
     *,
     config: RuntimeConfig | None = None,
@@ -1153,6 +1191,14 @@ def build_agent_middleware(
     middleware: list[AgentMiddleware[Any, Any, Any]] = [
         ToolExecutionResilienceMiddleware(project_root=project_root)
     ]
+    if config is not None and reasoning_level is not None and source == "main-agent":
+        rubric_middleware = build_rubric_middleware(
+            config=config,
+            reasoning_level=reasoning_level,
+            model_name=model_name,
+        )
+        if rubric_middleware is not None:
+            middleware.append(rubric_middleware)
     return middleware
 
 
@@ -1473,6 +1519,44 @@ class LangfuseConfig:
     enabled: bool = False
 
 
+@dataclass(frozen=True)
+class RubricFinalResponse:
+    """Store response text after applying rubric failure policy.
+
+    Attributes:
+        response: Final response text after applying the configured policy.
+        notice: Rubric failure notice, if one was produced.
+        status: Last rubric evaluation status, if observed.
+        blocked: Whether the original response was replaced.
+    """
+
+    response: str
+    notice: str | None = None
+    status: str | None = None
+    blocked: bool = False
+
+
+@dataclass(frozen=True)
+class RubricConfig:
+    """Store runtime grading rubric configuration parsed from TOML.
+
+    Attributes:
+        enabled: Whether to attach DeepAgents RubricMiddleware.
+        rubric: Rubric text passed on agent invocation state.
+        model: Optional grader model string accepted by RubricMiddleware.
+        system_prompt: Optional custom grading system prompt.
+        max_iterations: Maximum grader revision loop iterations.
+        on_failure: Policy applied when grading ends without satisfied status.
+    """
+
+    enabled: bool = False
+    rubric: str | None = None
+    model: str | None = None
+    system_prompt: str | None = None
+    max_iterations: int = DEFAULT_RUBRIC_MAX_ITERATIONS
+    on_failure: RubricFailurePolicy = DEFAULT_RUBRIC_FAILURE_POLICY
+
+
 def virtual_workspace_path_to_local(path_value: str, project_root: Path | None = None) -> str:
     """Convert a virtual workspace path into a local filesystem path.
 
@@ -1522,6 +1606,7 @@ class ExtensionsConfig:
         summarization_middleware_enabled: The summarization middleware enabled value.
         summarization_trigger_tokens: The summarization trigger tokens value.
         summarization_keep_tokens: The summarization keep tokens value.
+        rubric: The grading rubric configuration value.
         custom_instruction: The custom instruction value.
     """
 
@@ -1544,6 +1629,7 @@ class ExtensionsConfig:
     summarization_middleware_enabled: bool = False
     summarization_trigger_tokens: int | None = None
     summarization_keep_tokens: int | None = None
+    rubric: RubricConfig = RubricConfig()
     custom_instruction: str | None = None
 
     @property
@@ -1560,6 +1646,7 @@ class ExtensionsConfig:
             or self.async_subagents
             or self.chainlit_commands
             or self.chainlit_starters
+            or self.rubric.enabled
         )
 
 
@@ -1633,6 +1720,144 @@ def parse_langfuse_config(raw_config: dict[str, Any]) -> LangfuseConfig:
     if not isinstance(raw_enabled, bool):
         raise ValueError("The top-level 'langfuse.enabled' config must be a boolean.")
     return LangfuseConfig(enabled=raw_enabled)
+
+
+def _read_config_text_file(path_value: str, base_dir: Path, field_name: str) -> str:
+    """Read a configured text file relative to the config file directory.
+
+    Args:
+        path_value: Relative or absolute path value from TOML.
+        base_dir: Directory containing the config file.
+        field_name: Config field name used in error messages.
+
+    Returns:
+        The stripped file contents.
+
+    Raises:
+        ValueError: If the file cannot be read or is empty.
+    """
+    path = resolve_local_path(path_value, base_dir)
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(
+            f"The top-level '{field_name}' config file could not be read: {path}."
+        ) from exc
+    if not text:
+        raise ValueError(f"The top-level '{field_name}' config file must not be empty.")
+    return text
+
+
+def parse_rubric_config(
+    agent_section: dict[str, Any],
+    *,
+    base_dir: Path,
+) -> RubricConfig:
+    """Parse DeepAgents grading rubric configuration.
+
+    Args:
+        agent_section: Raw [agent] config table.
+        base_dir: Directory containing the config file.
+
+    Returns:
+        The parsed rubric configuration.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    raw_rubric = agent_section.get("rubric", {})
+    if not raw_rubric:
+        return RubricConfig()
+    if not isinstance(raw_rubric, dict):
+        raise ValueError("The top-level 'agent.rubric' config must be a table/object.")
+
+    raw_enabled = raw_rubric.get("enabled", False)
+    if not isinstance(raw_enabled, bool):
+        raise ValueError(
+            "The top-level 'agent.rubric.enabled' config must be a boolean."
+        )
+
+    inline_rubric = normalize_optional_string(raw_rubric.get("rubric"))
+    rubric_file = normalize_optional_string(raw_rubric.get("rubric_file"))
+    if inline_rubric and rubric_file:
+        raise ValueError(
+            "The top-level 'agent.rubric' config cannot define both "
+            "'rubric' and 'rubric_file'."
+        )
+    rubric = (
+        _read_config_text_file(rubric_file, base_dir, "agent.rubric.rubric_file")
+        if rubric_file
+        else inline_rubric
+    )
+
+    inline_system_prompt = normalize_optional_string(raw_rubric.get("system_prompt"))
+    system_prompt_file = normalize_optional_string(raw_rubric.get("system_prompt_file"))
+    if inline_system_prompt and system_prompt_file:
+        raise ValueError(
+            "The top-level 'agent.rubric' config cannot define both "
+            "'system_prompt' and 'system_prompt_file'."
+        )
+    system_prompt = (
+        _read_config_text_file(
+            system_prompt_file,
+            base_dir,
+            "agent.rubric.system_prompt_file",
+        )
+        if system_prompt_file
+        else inline_system_prompt
+    )
+
+    raw_max_iterations = raw_rubric.get(
+        "max_iterations",
+        DEFAULT_RUBRIC_MAX_ITERATIONS,
+    )
+    if (
+        not isinstance(raw_max_iterations, int)
+        or raw_max_iterations <= 0
+        or raw_max_iterations > MAX_RUBRIC_ITERATIONS
+    ):
+        raise ValueError(
+            "The top-level 'agent.rubric.max_iterations' config must be an "
+            f"integer from 1 to {MAX_RUBRIC_ITERATIONS}."
+        )
+    if raw_enabled and not rubric:
+        raise ValueError(
+            "The top-level 'agent.rubric.rubric' config must be set when "
+            "agent.rubric.enabled is true."
+        )
+    on_failure = normalize_rubric_failure_policy(raw_rubric.get("on_failure"))
+
+    return RubricConfig(
+        enabled=raw_enabled,
+        rubric=rubric,
+        model=normalize_optional_string(raw_rubric.get("model")),
+        system_prompt=system_prompt,
+        max_iterations=raw_max_iterations,
+        on_failure=on_failure,
+    )
+
+
+def normalize_rubric_failure_policy(value: Any | None) -> RubricFailurePolicy:
+    """Normalize rubric failure policy.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized rubric failure policy.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None or str(value).strip() == "":
+        return DEFAULT_RUBRIC_FAILURE_POLICY
+    candidate = str(value).strip().lower().replace("-", "_")
+    if candidate in {"allow", "warn", "block"}:
+        return candidate  # type: ignore[return-value]
+    raise ValueError(
+        "The top-level 'agent.rubric.on_failure' config must be one of "
+        "'allow', 'warn', or 'block'."
+    )
 
 
 def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
@@ -1902,6 +2127,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     )
     raw_summarization_trigger_tokens = agent_section.get("summarization_trigger_tokens")
     raw_summarization_keep_tokens = agent_section.get("summarization_keep_tokens")
+    rubric = parse_rubric_config(agent_section, base_dir=base_dir)
     if not isinstance(raw_summarization_middleware_enabled, bool):
         raise ValueError(
             "The top-level 'agent.summarization_middleware_enabled' config must be a boolean."
@@ -2107,6 +2333,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         summarization_middleware_enabled=raw_summarization_middleware_enabled,
         summarization_trigger_tokens=raw_summarization_trigger_tokens,
         summarization_keep_tokens=raw_summarization_keep_tokens,
+        rubric=rubric,
         custom_instruction=custom_instruction,
     )
 
@@ -2673,6 +2900,114 @@ def build_langgraph_run_config(
         run_config["metadata"] = {"langfuse_session_id": thread_id}
         run_config["tags"] = ["chainagents"]
     return run_config
+
+
+def configured_invocation_rubric(config: Any) -> str | None:
+    """Return the configured invocation rubric text, if enabled.
+
+    Args:
+        config: Runtime configuration or test double to inspect.
+
+    Returns:
+        Configured rubric text or None.
+    """
+    extensions = getattr(config, "extensions", None)
+    rubric = getattr(extensions, "rubric", None)
+    if not bool(getattr(rubric, "enabled", False)):
+        return None
+    text = getattr(rubric, "rubric", None)
+    if not isinstance(text, str):
+        return None
+    return text.strip() or None
+
+
+def build_agent_input_payload(
+    config: Any,
+    *,
+    messages: list[Any],
+) -> dict[str, Any]:
+    """Build DeepAgents input state for a ChainAgents invocation.
+
+    Args:
+        config: Runtime configuration or test double to inspect.
+        messages: Message payload passed to the agent.
+
+    Returns:
+        DeepAgents input state containing messages and optional rubric.
+    """
+    payload: dict[str, Any] = {"messages": messages}
+    rubric = configured_invocation_rubric(config)
+    if rubric is not None:
+        payload["rubric"] = rubric
+    return payload
+
+
+def _rubric_config(config: Any) -> Any:
+    """Return the rubric config object from a runtime config-like value."""
+    return getattr(getattr(config, "extensions", None), "rubric", None)
+
+
+def _rubric_failure_notice(*, status: str, explanation: str, blocked: bool) -> str:
+    """Build a user-facing notice for non-satisfied rubric outcomes."""
+    action = "blocked" if blocked else "flagged"
+    lines = [
+        f"Rubric grading did not approve this response, so ChainAgents {action} it.",
+        "",
+        f"Rubric status: `{status}`.",
+    ]
+    if explanation.strip():
+        lines.extend(["", explanation.strip()])
+    return "\n".join(lines)
+
+
+def apply_rubric_failure_policy(
+    config: Any,
+    *,
+    response: str,
+    status: str | None,
+    explanation: str | None = None,
+) -> RubricFinalResponse:
+    """Apply configured rubric failure policy to final response text.
+
+    Args:
+        config: Runtime configuration or test double to inspect.
+        response: Response text generated by the agent.
+        status: Last rubric evaluation status observed from stream events.
+        explanation: Last rubric evaluation explanation.
+
+    Returns:
+        Response text after applying the configured rubric failure policy.
+    """
+    rubric = _rubric_config(config)
+    policy = getattr(rubric, "on_failure", DEFAULT_RUBRIC_FAILURE_POLICY)
+    normalized_status = str(status or "").strip()
+    if (
+        not bool(getattr(rubric, "enabled", False))
+        or policy == "allow"
+        or not normalized_status
+        or normalized_status == "satisfied"
+    ):
+        return RubricFinalResponse(response=response, status=normalized_status or None)
+
+    blocked = policy == "block"
+    notice = _rubric_failure_notice(
+        status=normalized_status,
+        explanation=str(explanation or ""),
+        blocked=blocked,
+    )
+    if blocked:
+        return RubricFinalResponse(
+            response=notice,
+            notice=notice,
+            status=normalized_status,
+            blocked=True,
+        )
+    return RubricFinalResponse(
+        response=f"{response.rstrip()}\n\n{notice}" if response.strip() else notice,
+        notice=notice,
+        status=normalized_status,
+        blocked=False,
+    )
 
 
 def build_model(

@@ -890,6 +890,8 @@ class ChainlitEventBridge:
         self.response_task_started = False
         self.last_response_flush_at = 0.0
         self.response_streamed_from_messages = False
+        self.rubric_status: str | None = None
+        self.rubric_explanation: str | None = None
         self.stream_adapter = AgentStreamEventAdapter(prompt=prompt)
         self.reasoning_steps: dict[str, cl.Step] = {}
         self.reasoning_buffers: dict[str, str] = {}
@@ -928,6 +930,9 @@ class ChainlitEventBridge:
             await self._complete_tool_event(event)
         elif event.kind == "summarization_status":
             await self._stream_summarization_status_event(event)
+        elif event.kind == "rubric_evaluation":
+            self.rubric_status = event.status
+            self.rubric_explanation = event.text
 
     async def _update_todos_from_update_part(self, part: dict[str, Any]) -> None:
         """Refresh Chainlit task list todos from a LangGraph update part."""

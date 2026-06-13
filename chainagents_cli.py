@@ -33,6 +33,8 @@ from deepagent_runtime import (
     ReasoningLevel,
     RuntimeConfig,
     RuntimeConfigOverrides,
+    apply_rubric_failure_policy,
+    build_agent_input_payload,
     build_langgraph_run_config,
     shutdown_langfuse_client,
     format_model_provider,
@@ -674,6 +676,8 @@ class CliEventRenderer:
         self.show_reasoning = show_reasoning
         self.show_tools = show_tools
         self.response_buffer = ""
+        self.rubric_status: str | None = None
+        self.rubric_explanation: str | None = None
         self.stream_adapter = AgentStreamEventAdapter(prompt=prompt)
         self.reasoning_line_source: str | None = None
         self.stdout_console = cli_console(stdout)
@@ -700,6 +704,9 @@ class CliEventRenderer:
             self._complete_tool_event(event)
         elif event.kind == "summarization_status":
             self._stream_summarization_status(event)
+        elif event.kind == "rubric_evaluation":
+            self.rubric_status = event.status
+            self.rubric_explanation = event.text
 
     def finish(self) -> str:
         """Finish the CLI event renderer.
@@ -909,6 +916,7 @@ def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
         The constructed the json payload for cli runtime status output.
     """
     extensions = runtime.config.extensions
+    rubric = getattr(extensions, "rubric", None)
     return {
         "model_provider": runtime.config.model_provider,
         "model_provider_label": format_model_provider(runtime.config.model_provider),
@@ -920,6 +928,7 @@ def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
         "agent_state": runtime.config.agent_state,
         "recursion_limit": runtime.config.recursion_limit,
         "persistence": runtime.config.persistence_mode,
+        "rubric_grading": bool(getattr(rubric, "enabled", False)),
         "rag": rag_status_payload(runtime.rag_status),
         "extensions_config": str(extensions.config_path) if extensions.config_path else None,
         "skill_sources": list(extensions.skills),
@@ -987,6 +996,7 @@ def print_runtime_status(
     table.add_row("Agent state", Text(str(payload["agent_state"]), "white"))
     table.add_row("Recursion limit", Text(str(payload["recursion_limit"]), "white"))
     table.add_row("Persistence", Text(str(payload["persistence"]), "white"))
+    table.add_row("Rubric grading", Text(str(payload["rubric_grading"]), "white"))
     table.add_row("RAG", rag_status_text(payload["rag"]))
     table.add_row("Commands", Text(str(len(payload["commands"])), "bold cyan"))
     cli_console(stdout).print(
@@ -1288,9 +1298,10 @@ async def run_agent_prompt(
         async_subagent_url_override=args.async_subagent_url,
         mcp_session_id=args.mcp_session_id,
     )
-    payload = {
-        "messages": [{"role": "user", "content": user_message_content(prompt, photos)}]
-    }
+    payload = build_agent_input_payload(
+        runtime.config,
+        messages=[{"role": "user", "content": user_message_content(prompt, photos)}],
+    )
     config = build_langgraph_run_config(runtime.config, thread_id=settings.thread_id)
     renderer = CliEventRenderer(
         prompt=prompt,
@@ -1331,6 +1342,15 @@ async def run_agent_prompt(
         with suppress(Exception):
             await stream.aclose()
 
+    finalized = apply_rubric_failure_policy(
+        runtime.config,
+        response=renderer.response_buffer,
+        status=renderer.rubric_status,
+        explanation=renderer.rubric_explanation,
+    )
+    if finalized.notice and args.stream and not args.json_output:
+        print(finalized.notice, file=stderr)
+    renderer.response_buffer = finalized.response
     response = renderer.finish()
     if args.json_output:
         payload = {

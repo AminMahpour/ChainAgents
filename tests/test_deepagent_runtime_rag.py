@@ -1669,6 +1669,77 @@ def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
     )
 
 
+def test_get_agent_attaches_configured_rubric_middleware_to_main_agent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify rubric middleware is attached to the main Deep Agent only."""
+    captured: dict[str, object] = {}
+    rubric_middleware_args: list[dict[str, object]] = []
+
+    class CapturingRubricMiddleware(deepagent_runtime.AgentMiddleware):
+        """Capture rubric middleware construction arguments."""
+
+        def __init__(self, **kwargs) -> None:
+            rubric_middleware_args.append(kwargs)
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests."""
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "RubricMiddleware",
+        CapturingRubricMiddleware,
+        raising=False,
+    )
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    rubric = deepagent_runtime.RubricConfig(
+        enabled=True,
+        rubric="- The answer cites the repository files used.",
+        model="anthropic:claude-haiku-4-5",
+        system_prompt="Grade responses against the configured rubric.",
+        max_iterations=4,
+    )
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                rubric=rubric,
+                subagents=(
+                    SubagentConfig(
+                        name="repo-researcher",
+                        description="Researches the repo",
+                        system_prompt="Do research",
+                    ),
+                ),
+            ),
+        )
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert rubric_middleware_args == [
+        {
+            "model": "anthropic:claude-haiku-4-5",
+            "system_prompt": "Grade responses against the configured rubric.",
+            "max_iterations": 4,
+        }
+    ]
+    middleware = captured["kwargs"]["middleware"]
+    assert any(isinstance(item, CapturingRubricMiddleware) for item in middleware)
+    subagent_middleware = captured["kwargs"]["subagents"][0]["middleware"]
+    assert not any(
+        isinstance(item, CapturingRubricMiddleware)
+        for item in subagent_middleware
+    )
+
+
 def test_get_agent_with_summarization_subagent_does_not_duplicate_middleware(
     tmp_path: Path,
     monkeypatch,
@@ -2266,6 +2337,173 @@ summarization_keep_tokens = 2400
     assert extensions.summarization_middleware_enabled is True
     assert extensions.summarization_trigger_tokens == 6000
     assert extensions.summarization_keep_tokens == 2400
+
+
+def test_load_extensions_config_parses_rubric_settings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config parses rubric settings."""
+    rubric_path = tmp_path / "rubric.md"
+    rubric_path.write_text("- The answer includes a test plan.\n", encoding="utf-8")
+    system_prompt_path = tmp_path / "grader.md"
+    system_prompt_path.write_text(
+        "Grade responses against the configured rubric.",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent.rubric]
+enabled = true
+model = "anthropic:claude-haiku-4-5"
+system_prompt_file = "grader.md"
+rubric_file = "rubric.md"
+max_iterations = 5
+on_failure = "block"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.rubric.enabled is True
+    assert extensions.rubric.model == "anthropic:claude-haiku-4-5"
+    assert extensions.rubric.system_prompt == (
+        "Grade responses against the configured rubric."
+    )
+    assert extensions.rubric.rubric == "- The answer includes a test plan."
+    assert extensions.rubric.max_iterations == 5
+    assert extensions.rubric.on_failure == "block"
+
+
+def test_load_extensions_config_rejects_invalid_rubric_settings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify invalid rubric settings fail during config load."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent.rubric]
+enabled = true
+rubric = "- The answer is complete."
+max_iterations = 21
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="agent.rubric.max_iterations"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_invalid_rubric_failure_policy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify invalid rubric failure policies fail during config load."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent.rubric]
+enabled = true
+rubric = "- The answer is complete."
+on_failure = "retry-forever"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="agent.rubric.on_failure"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_build_agent_input_payload_adds_configured_rubric(
+    tmp_path: Path,
+) -> None:
+    """Verify configured rubrics are passed on DeepAgents invocation state."""
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(
+            config_path=None,
+            rubric=deepagent_runtime.RubricConfig(
+                enabled=True,
+                rubric="- The response includes citations.",
+            ),
+        ),
+    )
+
+    payload = deepagent_runtime.build_agent_input_payload(
+        config,
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert payload == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "rubric": "- The response includes citations.",
+    }
+
+
+def test_apply_rubric_failure_policy_blocks_unsatisfied_response(
+    tmp_path: Path,
+) -> None:
+    """Verify block policy replaces unsatisfied rubric responses."""
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(
+            config_path=None,
+            rubric=deepagent_runtime.RubricConfig(
+                enabled=True,
+                rubric="- The response includes citations.",
+                on_failure="block",
+            ),
+        ),
+    )
+
+    finalized = deepagent_runtime.apply_rubric_failure_policy(
+        config,
+        response="Draft answer without citations.",
+        status="needs_revision",
+        explanation="The answer did not cite repository files.",
+    )
+
+    assert finalized.blocked is True
+    assert finalized.response == finalized.notice
+    assert "Draft answer without citations." not in finalized.response
+    assert "needs_revision" in finalized.response
+    assert "did not cite repository files" in finalized.response
+
+
+def test_apply_rubric_failure_policy_warns_on_unsatisfied_response(
+    tmp_path: Path,
+) -> None:
+    """Verify warn policy keeps the response and appends a rubric notice."""
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(
+            config_path=None,
+            rubric=deepagent_runtime.RubricConfig(
+                enabled=True,
+                rubric="- The response includes citations.",
+                on_failure="warn",
+            ),
+        ),
+    )
+
+    finalized = deepagent_runtime.apply_rubric_failure_policy(
+        config,
+        response="Draft answer without citations.",
+        status="grader_error",
+        explanation="Grader timed out.",
+    )
+
+    assert finalized.blocked is False
+    assert finalized.response.startswith("Draft answer without citations.")
+    assert finalized.notice is not None
+    assert finalized.notice in finalized.response
+    assert "grader_error" in finalized.notice
 
 
 def test_load_extensions_config_rejects_non_boolean_summarization_middleware_flag(

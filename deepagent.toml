@@ -54,6 +54,22 @@ summarization_middleware_enabled = true
 summarization_trigger_tokens = 150000
 summarization_keep_tokens = 10000
 
+[agent.rubric]
+# Set true to have DeepAgents grade and revise each response against a rubric.
+enabled = true
+# Omit model to reuse the selected ChainAgents chat model for grading.
+# model = "anthropic:claude-haiku-4-5"
+ rubric = """
+ - The answer addresses every part of the user request.
+ - The answer includes a concise verification summary.
+ """
+# rubric_file = "prompts/grading-rubric.md"
+# system_prompt = "Grade the agent response against the configured rubric."
+# system_prompt_file = "prompts/grading-system-prompt.md"
+# max_iterations = 3
+# on_failure controls non-satisfied grading outcomes: allow, warn, or block.
+on_failure = "allow"
+
 [rag]
 enabled = true
 persist_directory = ".rag"
