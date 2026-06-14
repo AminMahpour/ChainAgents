@@ -28,8 +28,8 @@ dependencies = [
 ]
 
 [project.scripts]
-chainagents = "chainagents_cli:main"
-chainagents-api = "chainagents_api:main"
+chainagents = "chainagents.interfaces.cli.app:main"
+chainagents-api = "chainagents.interfaces.api.app:main"
 
 [build-system]
 requires = ["setuptools>=69"]
@@ -52,6 +52,9 @@ py-modules = [
     "rag_runtime",
     "response_exports",
 ]
+
+[tool.setuptools.packages.find]
+include = ["chainagents*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

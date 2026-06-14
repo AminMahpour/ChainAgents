@@ -1,29 +1,10 @@
-"""Expose configured LangGraph agents for Agent Server deployment."""
+"""Compatibility wrapper for the moved LangGraph app exports."""
 
 from __future__ import annotations
 
-import os
+import sys as _sys
 
-from deepagent_runtime import SYSTEM_PROMPT, create_configured_graph
+from chainagents.langgraph import app as _module
 
+_sys.modules[__name__] = _module
 
-os.environ.pop("__LANGGRAPH_DEFER_LOOPBACK_TRANSPORT", None)
-
-ASYNC_RESEARCHER_PROMPT = """
-You are an async research subagent.
-
-Focus on longer background research and codebase analysis tasks. Return concise
-findings with concrete file paths or sources when relevant.
-""".strip()
-
-
-supervisor = create_configured_graph(
-    include_async_subagents=True,
-    system_prompt=SYSTEM_PROMPT,
-    apply_custom_instruction=True,
-)
-
-async_researcher = create_configured_graph(
-    include_async_subagents=False,
-    system_prompt=ASYNC_RESEARCHER_PROMPT,
-)

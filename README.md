@@ -706,7 +706,7 @@ Current scope of this config support:
 - it supports Deep Agents built-in tool surface plus config-driven skills and MCP tools
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
-- if you need custom Python tools, extend [deepagent_runtime.py](deepagent_runtime.py)
+- if you need custom Python tools, extend [chainagents/runtime/core.py](chainagents/runtime/core.py)
 
 See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 
