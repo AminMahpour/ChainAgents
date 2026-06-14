@@ -1517,6 +1517,8 @@ class ExtensionsConfig:
         chainlit_starters: The chainlit starters value.
         chainlit_model_mode_enabled: The chainlit model mode enabled value.
         chainlit_reasoning_mode_enabled: The chainlit reasoning mode enabled value.
+        chainlit_reasoning_steps_enabled: The chainlit reasoning steps enabled value.
+        chainlit_tool_steps_enabled: The chainlit tool steps enabled value.
         chainlit_startup_status_enabled: The chainlit startup status enabled value.
         chainlit_chronological_ui_enabled: The chainlit chronological UI enabled value.
         summarization_middleware_enabled: The summarization middleware enabled value.
@@ -1539,6 +1541,8 @@ class ExtensionsConfig:
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
     chainlit_model_mode_enabled: bool = True
     chainlit_reasoning_mode_enabled: bool = True
+    chainlit_reasoning_steps_enabled: bool = True
+    chainlit_tool_steps_enabled: bool = True
     chainlit_startup_status_enabled: bool = True
     chainlit_chronological_ui_enabled: bool = True
     summarization_middleware_enabled: bool = False
@@ -1989,12 +1993,22 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     if not isinstance(raw_chainlit_starters, list):
         raise ValueError("The top-level 'chainlit.starters' config must be an array of tables.")
     raw_reasoning_mode_enabled = chainlit_section.get("reasoning_mode_enabled", True)
+    raw_reasoning_steps_enabled = chainlit_section.get("reasoning_steps_enabled", True)
+    raw_tool_steps_enabled = chainlit_section.get("tool_steps_enabled", True)
     raw_model_mode_enabled = chainlit_section.get("model_mode_enabled", True)
     raw_startup_status_enabled = chainlit_section.get("startup_status_enabled", True)
     raw_chronological_ui_enabled = chainlit_section.get("chronological_ui_enabled", True)
     if not isinstance(raw_reasoning_mode_enabled, bool):
         raise ValueError(
             "The top-level 'chainlit.reasoning_mode_enabled' config must be a boolean."
+        )
+    if not isinstance(raw_reasoning_steps_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.reasoning_steps_enabled' config must be a boolean."
+        )
+    if not isinstance(raw_tool_steps_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.tool_steps_enabled' config must be a boolean."
         )
     if not isinstance(raw_model_mode_enabled, bool):
         raise ValueError(
@@ -2102,6 +2116,8 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         chainlit_starters=tuple(chainlit_starters),
         chainlit_model_mode_enabled=raw_model_mode_enabled,
         chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
+        chainlit_reasoning_steps_enabled=raw_reasoning_steps_enabled,
+        chainlit_tool_steps_enabled=raw_tool_steps_enabled,
         chainlit_startup_status_enabled=raw_startup_status_enabled,
         chainlit_chronological_ui_enabled=raw_chronological_ui_enabled,
         summarization_middleware_enabled=raw_summarization_middleware_enabled,

@@ -540,7 +540,7 @@ class ToolStepState:
 
     call_id: str
     source: str
-    step: cl.Step
+    step: cl.Step | None
     name: str = "tool"
     arg_chunks: list[str] = field(default_factory=list)
 
@@ -560,26 +560,55 @@ class RunTaskList:
     MAIN_REASONING_KEY = "reasoning:main-agent"
     RESPONSE_KEY = "response"
 
-    def __init__(self, task_list: cl.TaskList) -> None:
+    def __init__(
+        self,
+        task_list: cl.TaskList,
+        *,
+        reasoning_steps_enabled: bool = True,
+        tool_steps_enabled: bool = True,
+    ) -> None:
         """Initialize the run task list instance.
 
         Args:
             task_list: The task list value.
+            reasoning_steps_enabled: Whether to show reasoning task entries.
+            tool_steps_enabled: Whether to show tool task entries.
         """
         self.task_list = task_list
+        self.reasoning_steps_enabled = reasoning_steps_enabled
+        self.tool_steps_enabled = tool_steps_enabled
         self.using_todos = False
         self.tasks_by_key: dict[str, cl.Task] = {}
         self.task_order: list[str] = []
         self.response_for_id: str | None = None
 
     @classmethod
-    async def create(cls) -> RunTaskList:
+    async def create(
+        cls,
+        *,
+        reasoning_steps_enabled: bool = True,
+        tool_steps_enabled: bool = True,
+    ) -> RunTaskList:
         """Create the run task list.
 
         Returns:
             The created the run task list.
         """
-        return cls(cl.TaskList(status="Ready"))
+        return cls(
+            cl.TaskList(status="Ready"),
+            reasoning_steps_enabled=reasoning_steps_enabled,
+            tool_steps_enabled=tool_steps_enabled,
+        )
+
+    def configure(
+        self,
+        *,
+        reasoning_steps_enabled: bool,
+        tool_steps_enabled: bool,
+    ) -> None:
+        """Update task visibility flags from the current runtime config."""
+        self.reasoning_steps_enabled = reasoning_steps_enabled
+        self.tool_steps_enabled = tool_steps_enabled
 
     async def show_ready(self) -> None:
         """Show the task list before the first stream event arrives."""
@@ -595,12 +624,18 @@ class RunTaskList:
         """
         self._reset_dynamic_tasks()
         self.response_for_id = response_for_id
-        self._ensure_task(
-            self.MAIN_REASONING_KEY,
-            "main-agent reasoning",
-            cl.TaskStatus.RUNNING,
-        )
-        await self._sync()
+        if self.reasoning_steps_enabled:
+            self._ensure_task(
+                self.MAIN_REASONING_KEY,
+                "main-agent reasoning",
+                cl.TaskStatus.RUNNING,
+            )
+            await self._sync()
+            return
+
+        self.task_list.tasks = []
+        self.task_list.status = "Running..."
+        await self.task_list.send()
 
     async def mark_reasoning(self, source: str, for_id: str | None = None) -> None:
         """Mark reasoning activity on the task list.
@@ -609,7 +644,7 @@ class RunTaskList:
             source: The source value.
             for_id: For identifier.
         """
-        if self.using_todos:
+        if self.using_todos or not self.reasoning_steps_enabled:
             return
         key = self._reasoning_key(source)
         self._ensure_task(
@@ -634,7 +669,7 @@ class RunTaskList:
             title: The title value.
             for_id: For identifier.
         """
-        if self.using_todos:
+        if self.using_todos or not self.tool_steps_enabled:
             return
         self._finish_running_reasoning()
         self._ensure_task(
@@ -661,7 +696,7 @@ class RunTaskList:
             for_id: For identifier.
             failed: The failed value.
         """
-        if self.using_todos:
+        if self.using_todos or not self.tool_steps_enabled:
             return
         key = self._tool_key(call_id)
         title = title or "tool"
@@ -874,6 +909,8 @@ class ChainlitEventBridge:
         run_task_list: RunTaskList | None = None,
         *,
         chronological_ui_enabled: bool = True,
+        reasoning_steps_enabled: bool = True,
+        tool_steps_enabled: bool = True,
     ) -> None:
         """Initialize the chainlit event bridge instance.
 
@@ -881,6 +918,8 @@ class ChainlitEventBridge:
             prompt: The prompt value.
             run_task_list: The run task list value.
             chronological_ui_enabled: The chronological UI enabled value.
+            reasoning_steps_enabled: Whether to show reasoning steps.
+            tool_steps_enabled: Whether to show tool steps.
         """
         self.prompt = prompt
         self.run_task_list = run_task_list
@@ -898,6 +937,8 @@ class ChainlitEventBridge:
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
         self.chronological_ui_enabled = chronological_ui_enabled
+        self.reasoning_steps_enabled = reasoning_steps_enabled
+        self.tool_steps_enabled = tool_steps_enabled
 
     async def start(self) -> None:
         """Start the chainlit event bridge."""
@@ -1109,16 +1150,18 @@ class ChainlitEventBridge:
 
         state = self.tool_steps.get(event.tool_call_id)
         if state is None:
-            step = cl.Step(
-                name=f"{event.source} tool",
-                type="tool",
-                default_open=True,
-                show_input="json",
-                language="json",
-            )
-            step.start = utc_now()
-            step.output = "Running..."
-            await step.send()
+            step: cl.Step | None = None
+            if self.tool_steps_enabled:
+                step = cl.Step(
+                    name=f"{event.source} tool",
+                    type="tool",
+                    default_open=True,
+                    show_input="json",
+                    language="json",
+                )
+                step.start = utc_now()
+                step.output = "Running..."
+                await step.send()
             state = ToolStepState(
                 call_id=event.tool_call_id,
                 source=event.source,
@@ -1128,7 +1171,8 @@ class ChainlitEventBridge:
 
         if event.tool_name:
             state.name = event.tool_name
-            state.step.name = f"{event.source} · {state.name}"
+            if state.step is not None:
+                state.step.name = f"{event.source} · {state.name}"
 
         if event.tool_args:
             state.arg_chunks = [event.tool_args]
@@ -1141,27 +1185,30 @@ class ChainlitEventBridge:
             await self.run_task_list.mark_tool_started(
                 state.call_id,
                 tool_task_title(event.source, state.name, event.tool_args),
-                for_id=getattr(state.step, "id", None),
+                for_id=getattr(state.step, "id", None) if state.step is not None else None,
             )
 
-        rendered_input = state.rendered_input
-        if rendered_input:
-            state.step.input = rendered_input
-        await state.step.update()
+        if state.step is not None:
+            rendered_input = state.rendered_input
+            if rendered_input:
+                state.step.input = rendered_input
+            await state.step.update()
 
     async def _complete_tool_event(self, event: AgentStreamEvent) -> None:
         """Render a normalized completed tool call event."""
         state = self._resolve_tool_step_from_event(event)
         if state is None:
-            step = cl.Step(
-                name=f"{event.source} · {event.tool_name or 'tool'}",
-                type="tool",
-                default_open=True,
-                show_input="json",
-                language="json",
-            )
-            step.start = utc_now()
-            await step.send()
+            step: cl.Step | None = None
+            if self.tool_steps_enabled:
+                step = cl.Step(
+                    name=f"{event.source} · {event.tool_name or 'tool'}",
+                    type="tool",
+                    default_open=True,
+                    show_input="json",
+                    language="json",
+                )
+                step.start = utc_now()
+                await step.send()
             state = ToolStepState(
                 call_id=event.tool_call_id or event.source,
                 source=event.source,
@@ -1171,19 +1218,21 @@ class ChainlitEventBridge:
 
         if event.tool_name:
             state.name = event.tool_name
-            state.step.name = f"{event.source} · {state.name}"
-        if not state.step.input:
-            state.step.input = state.rendered_input
-        state.step.output = pretty_data(event.tool_result)
-        state.step.end = utc_now()
-        await state.step.update()
-        self._schedule_step_auto_collapse(state.step)
+            if state.step is not None:
+                state.step.name = f"{event.source} · {state.name}"
+        if state.step is not None:
+            if not state.step.input:
+                state.step.input = state.rendered_input
+            state.step.output = pretty_data(event.tool_result)
+            state.step.end = utc_now()
+            await state.step.update()
+            self._schedule_step_auto_collapse(state.step)
 
         if self.run_task_list is not None:
             await self.run_task_list.mark_tool_finished(
                 state.call_id,
                 title=tool_task_title(event.source, state.name, "".join(state.arg_chunks)),
-                for_id=getattr(state.step, "id", None),
+                for_id=getattr(state.step, "id", None) if state.step is not None else None,
                 failed=event.status.lower() == "error",
             )
         if state.name == "write_todos" and self.run_task_list is not None:
@@ -1202,6 +1251,10 @@ class ChainlitEventBridge:
         previous = self.reasoning_buffers.get(source, "")
         delta = text[len(previous) :] if text.startswith(previous) else text
         if not delta:
+            return
+
+        if not self.reasoning_steps_enabled:
+            self.reasoning_buffers[source] = previous + delta
             return
 
         step = self.reasoning_steps.get(source)
@@ -1308,23 +1361,26 @@ class ChainlitEventBridge:
         call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
         state = self.tool_steps.get(call_id)
         if state is None:
-            step = cl.Step(
-                name=f"{source} tool",
-                type="tool",
-                default_open=True,
-                show_input="json",
-                language="json",
-            )
-            step.start = utc_now()
-            step.output = "Running..."
-            await step.send()
+            step: cl.Step | None = None
+            if self.tool_steps_enabled:
+                step = cl.Step(
+                    name=f"{source} tool",
+                    type="tool",
+                    default_open=True,
+                    show_input="json",
+                    language="json",
+                )
+                step.start = utc_now()
+                step.output = "Running..."
+                await step.send()
             state = ToolStepState(call_id=call_id, source=source, step=step)
             self.tool_steps[call_id] = state
 
         tool_name = chunk.get("name")
         if tool_name:
             state.name = str(tool_name)
-            state.step.name = f"{source} · {state.name}"
+            if state.step is not None:
+                state.step.name = f"{source} · {state.name}"
 
         arg_chunk = chunk.get("args")
         if arg_chunk:
@@ -1338,13 +1394,14 @@ class ChainlitEventBridge:
             await self.run_task_list.mark_tool_started(
                 call_id,
                 tool_task_title(source, state.name, "".join(state.arg_chunks)),
-                for_id=getattr(state.step, "id", None),
+                for_id=getattr(state.step, "id", None) if state.step is not None else None,
             )
 
-        rendered_input = state.rendered_input
-        if rendered_input:
-            state.step.input = rendered_input
-        await state.step.update()
+        if state.step is not None:
+            rendered_input = state.rendered_input
+            if rendered_input:
+                state.step.input = rendered_input
+            await state.step.update()
 
     async def _complete_tool_step(self, source: str, tool_message: Any) -> None:
         """Finish the Chainlit step associated with a completed tool call.
@@ -1355,15 +1412,17 @@ class ChainlitEventBridge:
         """
         state = self._resolve_tool_step(source, tool_message)
         if state is None:
-            step = cl.Step(
-                name=f"{source} · {getattr(tool_message, 'name', 'tool')}",
-                type="tool",
-                default_open=True,
-                show_input="json",
-                language="json",
-            )
-            step.start = utc_now()
-            await step.send()
+            step: cl.Step | None = None
+            if self.tool_steps_enabled:
+                step = cl.Step(
+                    name=f"{source} · {getattr(tool_message, 'name', 'tool')}",
+                    type="tool",
+                    default_open=True,
+                    show_input="json",
+                    language="json",
+                )
+                step.start = utc_now()
+                await step.send()
             state = ToolStepState(
                 call_id=str(getattr(tool_message, "tool_call_id", getattr(tool_message, "id", source))),
                 source=source,
@@ -1371,17 +1430,18 @@ class ChainlitEventBridge:
                 name=str(getattr(tool_message, "name", "tool")),
             )
 
-        if not state.step.input:
-            state.step.input = state.rendered_input
-        state.step.output = pretty_data(getattr(tool_message, "content", ""))
-        state.step.end = utc_now()
-        await state.step.update()
-        self._schedule_step_auto_collapse(state.step)
+        if state.step is not None:
+            if not state.step.input:
+                state.step.input = state.rendered_input
+            state.step.output = pretty_data(getattr(tool_message, "content", ""))
+            state.step.end = utc_now()
+            await state.step.update()
+            self._schedule_step_auto_collapse(state.step)
         if self.run_task_list is not None:
             await self.run_task_list.mark_tool_finished(
                 state.call_id,
                 title=tool_task_title(source, state.name, "".join(state.arg_chunks)),
-                for_id=getattr(state.step, "id", None),
+                for_id=getattr(state.step, "id", None) if state.step is not None else None,
                 failed=str(getattr(tool_message, "status", "")).lower() == "error",
             )
         if state.name == "write_todos" and self.run_task_list is not None:
@@ -1491,6 +1551,8 @@ class ChainlitEventBridge:
     async def _close_all_open_steps(self) -> None:
         """Close all Chainlit steps that remain open at run completion."""
         for state in list(self.tool_steps.values()):
+            if state.step is None:
+                continue
             if not state.step.output:
                 state.step.output = "Finished without a streamed tool result."
             if not state.step.end:

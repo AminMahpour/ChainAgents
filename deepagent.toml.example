@@ -59,6 +59,10 @@ summarization_keep_tokens = 2400
 model_mode_enabled = true
 # Set false to disable per-message reasoning overrides from the Modes picker.
 reasoning_mode_enabled = true
+# Set false to hide streamed reasoning step panels and reasoning task entries.
+reasoning_steps_enabled = true
+# Set false to hide streamed tool step panels and tool task entries.
+tool_steps_enabled = true
 # Set false to disable the initial startup status message in chat.
 startup_status_enabled = true
 # Native slash commands available from the Chainlit composer.

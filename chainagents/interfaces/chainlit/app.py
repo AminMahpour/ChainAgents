@@ -1057,7 +1057,11 @@ async def get_runtime_or_notify() -> AgentRuntime | None:
         return None
 
 
-async def get_run_task_list() -> RunTaskList:
+async def get_run_task_list(
+    *,
+    reasoning_steps_enabled: bool = True,
+    tool_steps_enabled: bool = True,
+) -> RunTaskList:
     """Return the per-session Chainlit run task list.
 
     Returns:
@@ -1065,9 +1069,16 @@ async def get_run_task_list() -> RunTaskList:
     """
     run_task_list = cl.user_session.get(SESSION_TASK_LIST_KEY)
     if isinstance(run_task_list, RunTaskList):
+        run_task_list.configure(
+            reasoning_steps_enabled=reasoning_steps_enabled,
+            tool_steps_enabled=tool_steps_enabled,
+        )
         return run_task_list
 
-    run_task_list = await RunTaskList.create()
+    run_task_list = await RunTaskList.create(
+        reasoning_steps_enabled=reasoning_steps_enabled,
+        tool_steps_enabled=tool_steps_enabled,
+    )
     cl.user_session.set(SESSION_TASK_LIST_KEY, run_task_list)
     return run_task_list
 
@@ -1118,7 +1129,11 @@ async def on_chat_start() -> None:
         return
     store_mcp_session_id()
     await publish_native_commands(runtime)
-    run_task_list = await get_run_task_list()
+    extensions = runtime.config.extensions
+    run_task_list = await get_run_task_list(
+        reasoning_steps_enabled=extensions.chainlit_reasoning_steps_enabled,
+        tool_steps_enabled=extensions.chainlit_tool_steps_enabled,
+    )
     await run_task_list.show_ready()
     settings = AppSettings(
         model_name=runtime.config.model_name,
@@ -1151,7 +1166,6 @@ async def on_chat_start() -> None:
             "`CHAINLIT_AUTH_PASSWORD`) to enable native Chainlit history\n"
         )
     )
-    extensions = runtime.config.extensions
     configured_command_count = len(extensions.chainlit_commands)
     skill_command_count = sum(
         1 for command in runtime.chainlit_commands if command.target == "skill"
@@ -1217,7 +1231,11 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     mcp_session_id = store_mcp_session_id()
     await publish_native_commands(runtime)
 
-    run_task_list = await get_run_task_list()
+    extensions = runtime.config.extensions
+    run_task_list = await get_run_task_list(
+        reasoning_steps_enabled=extensions.chainlit_reasoning_steps_enabled,
+        tool_steps_enabled=extensions.chainlit_tool_steps_enabled,
+    )
     await run_task_list.show_ready()
 
     metadata = thread.get("metadata") or {}
@@ -1393,7 +1411,11 @@ async def on_message(message: cl.Message) -> None:
         model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     )
     mcp_session_id = current_mcp_session_id()
-    run_task_list = await get_run_task_list()
+    extensions = runtime.config.extensions
+    run_task_list = await get_run_task_list(
+        reasoning_steps_enabled=extensions.chainlit_reasoning_steps_enabled,
+        tool_steps_enabled=extensions.chainlit_tool_steps_enabled,
+    )
     uploaded_files = message_uploaded_rag_files(message)
     uploaded_image_parts = message_uploaded_image_parts(message)
     uploaded_image_names = message_uploaded_image_names(message)
@@ -1490,6 +1512,8 @@ async def on_message(message: cl.Message) -> None:
         prompt=agent_prompt,
         run_task_list=run_task_list,
         chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
+        reasoning_steps_enabled=runtime.config.extensions.chainlit_reasoning_steps_enabled,
+        tool_steps_enabled=runtime.config.extensions.chainlit_tool_steps_enabled,
     )
     await bridge.start()
 

@@ -592,6 +592,10 @@ Example:
 model_mode_enabled = true
 # Set false to disable per-message reasoning overrides from the Modes picker.
 reasoning_mode_enabled = true
+# Set false to hide streamed reasoning step panels and reasoning task entries.
+reasoning_steps_enabled = true
+# Set false to hide streamed tool step panels and tool task entries.
+tool_steps_enabled = true
 # Set false to hide the initial startup status message ("Workspace agent ready...").
 startup_status_enabled = true
 # Set false to keep legacy non-chronological streaming order in Chainlit.
@@ -618,6 +622,8 @@ Notes:
 - The `[chainlit]` table for native commands belongs in `deepagent.toml`, alongside `[model]`, `[agent]`, `[mcp]`, `[[subagents]]`, and `[[async_subagents]]`.
 - `[chainlit].model_mode_enabled = false` hides the Model selector in chat settings and the Model mode group, and ignores per-message model overrides from UI modes.
 - `[chainlit].reasoning_mode_enabled = false` hides the Reasoning mode group and ignores per-message reasoning overrides from UI modes.
+- `[chainlit].reasoning_steps_enabled = false` hides streamed reasoning `cl.Step` panels and reasoning task-list entries while preserving model reasoning settings.
+- `[chainlit].tool_steps_enabled = false` hides streamed tool `cl.Step` panels and tool task-list entries while preserving tool execution.
 - `[chainlit].startup_status_enabled = false` disables the initial startup status message that summarizes runtime configuration.
 - `[chainlit].chronological_ui_enabled = false` disables chronological UI ordering so response tokens stream immediately and reasoning steps are not force-rolled at tool boundaries.
 - Command `name` is invoked as `/<name>` and must be unique.

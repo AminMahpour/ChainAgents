@@ -214,6 +214,26 @@ class _Step:
         self.update_count += 1
 
 
+class _ToolMessage:
+    """Provide an internal helper for a completed tool message."""
+
+    type = "tool"
+
+    def __init__(
+        self,
+        *,
+        name: str = "read_file",
+        tool_call_id: str = "call-1",
+        content: str = "tool result",
+        status: str = "",
+    ) -> None:
+        """Initialize the tool message instance."""
+        self.name = name
+        self.tool_call_id = tool_call_id
+        self.content = content
+        self.status = status
+
+
 @pytest.fixture(autouse=True)
 def _patch_chainlit_tasks(monkeypatch) -> None:
     """Patch Chainlit task classes with local test doubles.
@@ -379,6 +399,50 @@ async def test_non_chronological_mode_keeps_reasoning_step_open_across_tool_call
         "main-agent · read_file",
     ]
     assert _Step.instances[0].tokens == ["first thought", " second thought"]
+
+
+@pytest.mark.anyio
+async def test_bridge_can_hide_reasoning_and_tool_ui_elements(monkeypatch) -> None:
+    """Verify that hidden reasoning and tool UI still streams the final response.
+
+    Args:
+        monkeypatch: The monkeypatch value.
+    """
+    task_list = _TaskList()
+    run_task_list = RunTaskList(
+        task_list,  # type: ignore[arg-type]
+        reasoning_steps_enabled=False,
+        tool_steps_enabled=False,
+    )
+    bridge = ChainlitEventBridge(
+        prompt="hello",
+        run_task_list=run_task_list,
+        reasoning_steps_enabled=False,
+        tool_steps_enabled=False,
+    )
+    monkeypatch.setattr(
+        chainlit_bridge,
+        "attach_response_export_actions",
+        lambda *args, **kwargs: None,
+    )
+
+    await bridge.start()
+    assert task_list.status == "Running..."
+    assert task_list.tasks == []
+
+    await bridge._stream_reasoning("main-agent", "first thought")
+    await bridge._stream_tool_call(
+        "main-agent",
+        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    )
+    await bridge._complete_tool_step("main-agent", _ToolMessage())
+    await bridge._stream_response("Final answer")
+    await bridge.finish()
+
+    assert _Step.instances == []
+    assert len(_Message.instances) == 1
+    assert _Message.instances[0].content == "Final answer"
+    assert [task.title for task in task_list.tasks] == ["final response"]
 
 
 @pytest.mark.anyio
