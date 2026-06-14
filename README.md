@@ -258,6 +258,49 @@ base URL, endpoint URL, API key, temperature, persistence, MCP session scope,
 async subagent URL, RAG controls, photo attachments, streaming, reasoning traces,
 tool traces, and JSON output.
 
+## Project Structure
+
+Core Python code lives under the `chainagents/` package. The root-level Python
+files are compatibility wrappers and entrypoints so existing imports and commands
+continue to work.
+
+```text
+chainagents/
+  runtime/              Core DeepAgents runtime, model setup, config parsing,
+                        MCP/tool loading, persistence backends, and Langfuse.
+  interfaces/
+    chainlit/           Chainlit callbacks, UI bridge, auth, persistence,
+                        uploads, async task notifications, and chat settings.
+    cli/                Terminal CLI parser, status output, command execution,
+                        upload handling, and event rendering.
+    tui/                Full-screen Textual terminal UI.
+    api/                FastAPI application, request schemas, and streaming API.
+  events/               Shared LangGraph stream normalization used by all
+                        interfaces.
+  commands/             Native slash-command parsing and dispatch helpers.
+  rag/                  Workspace documentation RAG config, index, uploads,
+                        and search tool.
+  exports/              Markdown and PDF response export helpers.
+  langgraph/            Agent Server graph exports.
+  util/                 Shared utility helpers.
+```
+
+Runtime assets stay at the repository root because they are user/configuration
+content rather than importable Python package code:
+
+- `deepagent.toml` and `deepagent.toml.example`: model, agent, MCP, RAG,
+  Chainlit, Langfuse, and subagent configuration.
+- `skills/`: Deep Agents skill sources referenced from TOML as `skills`.
+- `prompts/`: prompt files referenced by configured subagents.
+- `public/` and `.chainlit/`: Chainlit static assets and native Chainlit config.
+- `tests/`: regression tests for runtime, interfaces, RAG, exports, and events.
+
+Compatibility wrappers such as `main.py`, `deepagent_runtime.py`,
+`chainlit_bridge.py`, `chainagents_cli.py`, `chainagents_api.py`,
+`rag_runtime.py`, and `response_exports.py` import the moved package modules.
+Prefer new code under `chainagents/`, but keep the wrappers until external users
+no longer rely on the old import paths.
+
 ## Model Config
 
 You can keep the model defaults in `deepagent.toml`:
@@ -549,6 +592,10 @@ Example:
 model_mode_enabled = true
 # Set false to disable per-message reasoning overrides from the Modes picker.
 reasoning_mode_enabled = true
+# Set false to hide streamed reasoning step panels and reasoning task entries.
+reasoning_steps_enabled = true
+# Set false to hide streamed tool step panels and tool task entries.
+tool_steps_enabled = true
 # Set false to hide the initial startup status message ("Workspace agent ready...").
 startup_status_enabled = true
 # Set false to keep legacy non-chronological streaming order in Chainlit.
@@ -575,6 +622,8 @@ Notes:
 - The `[chainlit]` table for native commands belongs in `deepagent.toml`, alongside `[model]`, `[agent]`, `[mcp]`, `[[subagents]]`, and `[[async_subagents]]`.
 - `[chainlit].model_mode_enabled = false` hides the Model selector in chat settings and the Model mode group, and ignores per-message model overrides from UI modes.
 - `[chainlit].reasoning_mode_enabled = false` hides the Reasoning mode group and ignores per-message reasoning overrides from UI modes.
+- `[chainlit].reasoning_steps_enabled = false` hides streamed reasoning `cl.Step` panels and reasoning task-list entries while preserving model reasoning settings.
+- `[chainlit].tool_steps_enabled = false` hides streamed tool `cl.Step` panels and tool task-list entries while preserving tool execution.
 - `[chainlit].startup_status_enabled = false` disables the initial startup status message that summarizes runtime configuration.
 - `[chainlit].chronological_ui_enabled = false` disables chronological UI ordering so response tokens stream immediately and reasoning steps are not force-rolled at tool boundaries.
 - Command `name` is invoked as `/<name>` and must be unique.
@@ -706,7 +755,7 @@ Current scope of this config support:
 - it supports Deep Agents built-in tool surface plus config-driven skills and MCP tools
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
-- if you need custom Python tools, extend [deepagent_runtime.py](deepagent_runtime.py)
+- if you need custom Python tools, extend [chainagents/runtime/core.py](chainagents/runtime/core.py)
 
 See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 

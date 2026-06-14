@@ -2154,6 +2154,8 @@ system_prompt = "Do research"
 [chainlit]
 model_mode_enabled = false
 reasoning_mode_enabled = false
+reasoning_steps_enabled = false
+tool_steps_enabled = false
 startup_status_enabled = false
 chronological_ui_enabled = false
 commands = [
@@ -2174,6 +2176,8 @@ commands = [
     assert extensions.chainlit_commands[2].template == "Rewrite: {input}"
     assert extensions.chainlit_model_mode_enabled is False
     assert extensions.chainlit_reasoning_mode_enabled is False
+    assert extensions.chainlit_reasoning_steps_enabled is False
+    assert extensions.chainlit_tool_steps_enabled is False
     assert extensions.chainlit_startup_status_enabled is False
     assert extensions.chainlit_chronological_ui_enabled is False
 
@@ -2362,6 +2366,54 @@ reasoning_mode_enabled = "no"
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
     with pytest.raises(ValueError, match="reasoning_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_reasoning_steps_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config rejects non boolean reasoning steps flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+reasoning_steps_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="reasoning_steps_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_tool_steps_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config rejects non boolean tool steps flag.
+
+    Args:
+        tmp_path: Path to the tmp.
+        monkeypatch: The monkeypatch value.
+    """
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+tool_steps_enabled = "no"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="tool_steps_enabled"):
         deepagent_runtime.load_extensions_config()
 
 

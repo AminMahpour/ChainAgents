@@ -34,10 +34,10 @@ jobs:
         run: uv sync --locked
 
       - name: Validate Python imports
-        run: uv run python -c "import chainlit_bridge, deepagent_runtime, main"
+        run: uv run python -c "import chainagents.runtime, chainagents.interfaces.cli.app, chainlit_bridge, deepagent_runtime, main"
 
       - name: Byte-compile application modules
-        run: uv run python -m compileall main.py deepagent_runtime.py chainlit_bridge.py rag_runtime.py
+        run: uv run python -m compileall chainagents main.py langgraph_app.py deepagent_runtime.py chainlit_bridge.py rag_runtime.py
 
       - name: Run tests
         run: uv run pytest
@@ -45,7 +45,7 @@ jobs:
       - name: Validate extension config
         run: |
           uv run python - <<'PY'
-          from deepagent_runtime import load_extensions_config
+          from chainagents.runtime import load_extensions_config
 
           config = load_extensions_config()
           print(
