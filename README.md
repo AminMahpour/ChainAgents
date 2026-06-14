@@ -258,6 +258,49 @@ base URL, endpoint URL, API key, temperature, persistence, MCP session scope,
 async subagent URL, RAG controls, photo attachments, streaming, reasoning traces,
 tool traces, and JSON output.
 
+## Project Structure
+
+Core Python code lives under the `chainagents/` package. The root-level Python
+files are compatibility wrappers and entrypoints so existing imports and commands
+continue to work.
+
+```text
+chainagents/
+  runtime/              Core DeepAgents runtime, model setup, config parsing,
+                        MCP/tool loading, persistence backends, and Langfuse.
+  interfaces/
+    chainlit/           Chainlit callbacks, UI bridge, auth, persistence,
+                        uploads, async task notifications, and chat settings.
+    cli/                Terminal CLI parser, status output, command execution,
+                        upload handling, and event rendering.
+    tui/                Full-screen Textual terminal UI.
+    api/                FastAPI application, request schemas, and streaming API.
+  events/               Shared LangGraph stream normalization used by all
+                        interfaces.
+  commands/             Native slash-command parsing and dispatch helpers.
+  rag/                  Workspace documentation RAG config, index, uploads,
+                        and search tool.
+  exports/              Markdown and PDF response export helpers.
+  langgraph/            Agent Server graph exports.
+  util/                 Shared utility helpers.
+```
+
+Runtime assets stay at the repository root because they are user/configuration
+content rather than importable Python package code:
+
+- `deepagent.toml` and `deepagent.toml.example`: model, agent, MCP, RAG,
+  Chainlit, Langfuse, and subagent configuration.
+- `skills/`: Deep Agents skill sources referenced from TOML as `skills`.
+- `prompts/`: prompt files referenced by configured subagents.
+- `public/` and `.chainlit/`: Chainlit static assets and native Chainlit config.
+- `tests/`: regression tests for runtime, interfaces, RAG, exports, and events.
+
+Compatibility wrappers such as `main.py`, `deepagent_runtime.py`,
+`chainlit_bridge.py`, `chainagents_cli.py`, `chainagents_api.py`,
+`rag_runtime.py`, and `response_exports.py` import the moved package modules.
+Prefer new code under `chainagents/`, but keep the wrappers until external users
+no longer rely on the old import paths.
+
 ## Model Config
 
 You can keep the model defaults in `deepagent.toml`:
