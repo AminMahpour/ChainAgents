@@ -449,14 +449,20 @@ def toml_scalar(value: Any) -> str:
 
 def toml_section_ranges(lines: list[str]) -> dict[str, tuple[int, int]]:
     """Return line ranges for non-array TOML sections."""
-    headers: list[tuple[str, int]] = []
+    headers: list[tuple[str | None, int]] = []
     for index, line in enumerate(lines):
-        match = re.match(r"^\s*\[([^\[\]]+)]\s*(?:#.*)?$", line)
-        if match:
-            headers.append((match.group(1).strip(), index))
+        array_match = re.match(r"^\s*\[\[([^\[\]]+)]]\s*(?:#.*)?$", line)
+        if array_match:
+            headers.append((None, index))
+            continue
+        table_match = re.match(r"^\s*\[([^\[\]]+)]\s*(?:#.*)?$", line)
+        if table_match:
+            headers.append((table_match.group(1).strip(), index))
 
     ranges: dict[str, tuple[int, int]] = {}
     for offset, (section, start) in enumerate(headers):
+        if section is None:
+            continue
         end = headers[offset + 1][1] if offset + 1 < len(headers) else len(lines)
         ranges[section] = (start, end)
     return ranges

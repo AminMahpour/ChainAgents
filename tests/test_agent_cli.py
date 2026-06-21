@@ -146,6 +146,71 @@ startup_status_enabled = false
     assert parsed["chainlit"]["startup_status_enabled"] is True
 
 
+def test_configure_command_stops_section_at_array_table(tmp_path: Path) -> None:
+    """Verify array-of-table headers bound scalar section updates."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[rag.embedding]
+provider = "openai_compatible"
+# model = "text-embedding-3-small"
+# base_url = "http://127.0.0.1:11434"
+
+[[async_subagents]]
+name = "async-researcher"
+description = "Runs longer research jobs."
+graph_id = "async-researcher"
+url = "http://127.0.0.1:2024"
+
+[[subagents]]
+name = "repo-researcher"
+description = "Researches the current repository."
+system_prompt_file = "prompts/repo-researcher.md"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    answers = "\n".join(
+        [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "text-embedding-3-large",
+            "http://127.0.0.1:1234/v1",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+
+    import tomllib
+
+    written = config_path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(written)
+    assert parsed["rag"]["embedding"]["model"] == "text-embedding-3-large"
+    assert parsed["rag"]["embedding"]["base_url"] == "http://127.0.0.1:1234/v1"
+    assert "model" not in parsed["async_subagents"][0]
+    assert "base_url" not in parsed["async_subagents"][0]
+
+
 def test_configure_command_appends_missing_sections(tmp_path: Path) -> None:
     """Verify the interactive config command appends missing TOML sections."""
     config_path = tmp_path / "deepagent.toml"
