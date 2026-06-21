@@ -255,6 +255,77 @@ def test_configure_command_reprompts_invalid_choice(tmp_path: Path) -> None:
     assert "Choose one of" in stderr.getvalue()
 
 
+@pytest.mark.anyio
+async def test_run_cli_configure_honors_deepagent_config_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify configure writes the runtime env config path."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    config_path = project_root / "prod.toml"
+    config_path.write_text("[model]\nname = \"prod-model\"\n", encoding="utf-8")
+    cwd = tmp_path / "workdir"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(chainagents_cli, "PROJECT_ROOT", project_root, raising=False)
+    monkeypatch.setenv("DEEPAGENT_CONFIG", "prod.toml")
+    args = chainagents_cli.parse_args(["--configure"])
+
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=object(),
+        stdin=io.StringIO("\n".join([""] * len(chainagents_cli.CONFIGURE_PROMPTS))),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    assert config_path.exists()
+    assert not (cwd / "deepagent.toml").exists()
+
+    import tomllib
+
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["name"] == "prod-model"
+    assert parsed["agent"]["state"] == "stateful"
+
+
+@pytest.mark.anyio
+async def test_run_cli_configure_resolves_relative_config_against_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify relative --config paths use runtime path resolution."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    config_path = project_root / "custom.toml"
+    config_path.write_text("[model]\nname = \"custom-model\"\n", encoding="utf-8")
+    cwd = project_root / "subdir"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(chainagents_cli, "PROJECT_ROOT", project_root, raising=False)
+    args = chainagents_cli.parse_args(["--configure", "--config", "custom.toml"])
+
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=object(),
+        stdin=io.StringIO("\n".join([""] * len(chainagents_cli.CONFIGURE_PROMPTS))),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    assert config_path.exists()
+    assert not (cwd / "custom.toml").exists()
+
+    import tomllib
+
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["name"] == "custom-model"
+    assert parsed["agent"]["state"] == "stateful"
+
+
 def test_runtime_overrides_from_cli_args_take_precedence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

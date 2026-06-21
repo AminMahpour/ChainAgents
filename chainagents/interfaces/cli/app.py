@@ -8,6 +8,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import os
 import re
 import sys
 import tomllib
@@ -33,6 +34,8 @@ from chainagents.commands.native import (
 from chainagents.runtime import (
     AgentRuntime,
     AppSettings,
+    DEFAULT_EXTENSIONS_CONFIG,
+    PROJECT_ROOT,
     ReasoningLevel,
     RuntimeConfig,
     RuntimeConfigOverrides,
@@ -40,6 +43,7 @@ from chainagents.runtime import (
     shutdown_langfuse_client,
     format_model_provider,
     normalize_reasoning_level,
+    resolve_local_path,
 )
 from chainagents.rag.runtime import RagStatus, RagUploadResult, UploadedRagFile
 
@@ -60,7 +64,6 @@ LANGGRAPH_STREAM_MODES = {
 CLI_PANEL_BOX = box.HEAVY
 CLI_TABLE_BOX = box.SIMPLE_HEAVY
 CLI_PANEL_PADDING = (0, 1)
-DEFAULT_CONFIG_PATH = "deepagent.toml"
 
 
 @dataclass(frozen=True)
@@ -506,6 +509,19 @@ def apply_toml_updates(
                 ranges = toml_section_ranges(lines)
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def resolve_configure_config_path(config_path: str | Path | None) -> Path:
+    """Resolve the config path that the interactive command should edit."""
+    config_name = (
+        str(config_path).strip()
+        if config_path is not None
+        else os.getenv("DEEPAGENT_CONFIG", DEFAULT_EXTENSIONS_CONFIG).strip()
+    )
+    return resolve_local_path(
+        config_name or DEFAULT_EXTENSIONS_CONFIG,
+        PROJECT_ROOT,
+    )
 
 
 def run_configure_command(
@@ -1753,7 +1769,7 @@ async def run_cli(
     """
     if args.configure:
         return run_configure_command(
-            config_path=Path(args.config or DEFAULT_CONFIG_PATH),
+            config_path=resolve_configure_config_path(args.config),
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,
@@ -1889,7 +1905,7 @@ async def async_main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.configure:
         return run_configure_command(
-            config_path=Path(args.config or DEFAULT_CONFIG_PATH),
+            config_path=resolve_configure_config_path(args.config),
             stdin=sys.stdin,
             stdout=sys.stdout,
             stderr=sys.stderr,
