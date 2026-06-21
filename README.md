@@ -244,6 +244,7 @@ Useful CLI examples:
 
 ```bash
 uv run chainagents --status --no-rag
+uv run chainagents --configure
 uv run chainagents --tui --reasoning high
 uv run chainagents --list-commands
 uv run chainagents --command ask-researcher --prompt "Find the config entrypoints"

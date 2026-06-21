@@ -156,6 +156,9 @@ uv run chainagents --tui
 # Check agent status
 uv run chainagents --status
 
+# Configure deepagent.toml interactively
+uv run chainagents --configure
+
 # List available commands
 uv run chainagents --list-commands
 

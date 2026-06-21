@@ -45,6 +45,151 @@ def test_cli_parses_prompt_and_runtime_flags() -> None:
     assert args.json_output is True
 
 
+def test_cli_parses_configure_flag() -> None:
+    """Verify that CLI parses the interactive configuration flag."""
+    args = chainagents_cli.parse_args(["--configure", "--config", "custom.toml"])
+
+    assert args.configure is True
+    assert args.config == "custom.toml"
+
+
+def test_configure_command_updates_known_toml_values(tmp_path: Path) -> None:
+    """Verify the interactive config command updates known TOML values."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+# Keep this comment.
+provider = "ollama"
+base_url = "http://old.example:11434"
+name = "old-model"
+temperature = 0.1
+reasoning_effort = "low"
+
+[agent]
+state = "stateful"
+recursion_limit = 20
+
+[rag]
+enabled = false
+
+[rag.embedding]
+provider = "auto"
+
+[langfuse]
+enabled = false
+
+[chainlit]
+model_mode_enabled = false
+reasoning_mode_enabled = false
+reasoning_steps_enabled = false
+tool_steps_enabled = false
+startup_status_enabled = false
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    answers = "\n".join(
+        [
+            "openai_compatible",
+            "http://127.0.0.1:1234/v1",
+            "local-model",
+            "high",
+            "0.2",
+            "stateless",
+            "250",
+            "yes",
+            "openai_compatible",
+            "text-embedding-3-large",
+            "http://127.0.0.1:1234/v1",
+            "yes",
+            "yes",
+            "no",
+            "yes",
+            "no",
+            "yes",
+        ]
+    )
+    stdout = io.StringIO()
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    written = config_path.read_text(encoding="utf-8")
+    assert "# Keep this comment." in written
+    assert 'provider = "openai_compatible"' in written
+    assert 'name = "local-model"' in written
+    assert "Configuration written" in stdout.getvalue()
+
+    import tomllib
+
+    parsed = tomllib.loads(written)
+    assert parsed["model"]["base_url"] == "http://127.0.0.1:1234/v1"
+    assert parsed["model"]["temperature"] == 0.2
+    assert parsed["model"]["reasoning_effort"] == "high"
+    assert parsed["agent"]["state"] == "stateless"
+    assert parsed["agent"]["recursion_limit"] == 250
+    assert parsed["rag"]["enabled"] is True
+    assert parsed["rag"]["embedding"]["provider"] == "openai_compatible"
+    assert parsed["rag"]["embedding"]["model"] == "text-embedding-3-large"
+    assert parsed["rag"]["embedding"]["base_url"] == "http://127.0.0.1:1234/v1"
+    assert parsed["langfuse"]["enabled"] is True
+    assert parsed["chainlit"]["model_mode_enabled"] is True
+    assert parsed["chainlit"]["reasoning_mode_enabled"] is False
+    assert parsed["chainlit"]["reasoning_steps_enabled"] is True
+    assert parsed["chainlit"]["tool_steps_enabled"] is False
+    assert parsed["chainlit"]["startup_status_enabled"] is True
+
+
+def test_configure_command_appends_missing_sections(tmp_path: Path) -> None:
+    """Verify the interactive config command appends missing TOML sections."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text("[model]\nname = \"old-model\"\n", encoding="utf-8")
+    answers = "\n".join([""] * 17)
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    import tomllib
+
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["provider"] == "ollama"
+    assert parsed["model"]["name"] == "old-model"
+    assert parsed["agent"]["state"] == "stateful"
+    assert parsed["rag"]["enabled"] is False
+    assert parsed["rag"]["embedding"]["provider"] == "auto"
+    assert parsed["langfuse"]["enabled"] is False
+    assert parsed["chainlit"]["startup_status_enabled"] is True
+
+
+def test_configure_command_reprompts_invalid_choice(tmp_path: Path) -> None:
+    """Verify the interactive config command validates choices."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text("", encoding="utf-8")
+    answers = "\n".join(["bad-provider", "ollama", *([""] * 16)])
+    stderr = io.StringIO()
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 0
+    assert "Choose one of" in stderr.getvalue()
+
+
 def test_runtime_overrides_from_cli_args_take_precedence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
