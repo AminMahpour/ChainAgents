@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
+
+def dependency_name(requirement: str) -> str:
+    """Return the normalized package name from a dependency requirement."""
+    for delimiter in ("[", ">", "=", "<"):
+        requirement = requirement.split(delimiter, 1)[0]
+    return requirement.strip()
+
 
 def test_package_imports_expose_preferred_runtime_and_interface_paths() -> None:
     """Verify that new package paths expose the public reorganization surface."""
@@ -46,3 +56,14 @@ def test_legacy_imports_alias_moved_modules() -> None:
     assert agent_commands.__name__ == "chainagents.commands.native"
     assert chainlit_persistence.__name__ == "chainagents.interfaces.chainlit.persistence"
 
+
+def test_default_dependencies_do_not_include_chromadb() -> None:
+    """Verify default dependencies avoid the vulnerable ChromaDB stack."""
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    dependency_names = {
+        dependency_name(requirement)
+        for requirement in project["project"]["dependencies"]
+    }
+
+    assert "chromadb" not in dependency_names
+    assert "langchain-chroma" not in dependency_names
