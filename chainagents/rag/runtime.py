@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.tools import BaseTool, tool
 from langchain_ollama import OllamaEmbeddings
@@ -42,8 +42,10 @@ RAG_MANIFEST_VERSION = 1
 RAG_COLLECTION_NAME = "workspace_docs"
 RAG_UPLOADS_DIRECTORY_NAME = "uploads"
 RAG_UPLOAD_FILES_DIRECTORY_NAME = "files"
-RAG_UPLOAD_COLLECTION_DIRECTORY_NAME = "chroma"
+RAG_UPLOAD_COLLECTION_DIRECTORY_NAME = "vectorstore"
 RAG_UPLOAD_MANIFEST_FILENAME = "manifest.json"
+VECTOR_STORE_DIRECTORY_NAME = "vectorstore"
+VECTOR_STORE_INDEX_FILENAME = "index.json"
 ALLOWED_RAG_UPLOAD_EXTENSIONS = (
     ".csv",
     ".json",
@@ -80,6 +82,166 @@ def compose_rag_system_prompt(base_prompt: str, *, rag_enabled: bool) -> str:
     if not rag_enabled:
         return base_prompt
     return f"{base_prompt.rstrip()}\n{RAG_SYSTEM_PROMPT_SUFFIX}"
+
+
+class JsonVectorStore:
+    """Persist and search embedded documents with a JSON index."""
+
+    def __init__(
+        self,
+        *,
+        embedding_function: Any,
+        persist_directory: str | Path,
+        entries: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Initialize the JSON vector store.
+
+        Args:
+            embedding_function: Embeddings provider used for queries.
+            persist_directory: Directory that stores the JSON index.
+            entries: Existing index entries.
+        """
+        self.embedding_function = embedding_function
+        self.persist_directory = Path(persist_directory)
+        self.index_path = self.persist_directory / VECTOR_STORE_INDEX_FILENAME
+        self._entries = entries or []
+
+    @classmethod
+    def from_documents(
+        cls,
+        *,
+        documents: list[Document],
+        embedding: Any,
+        persist_directory: str | Path,
+    ) -> "JsonVectorStore":
+        """Build and persist a vector store from documents.
+
+        Args:
+            documents: Documents to index.
+            embedding: Embeddings provider used to embed the documents.
+            persist_directory: Directory that stores the JSON index.
+
+        Returns:
+            The persisted vector store.
+        """
+        texts = [document.page_content for document in documents]
+        vectors = embedding.embed_documents(texts) if texts else []
+        if len(vectors) != len(documents):
+            raise ValueError("Embedding provider returned an unexpected document count.")
+
+        entries = [
+            {
+                "embedding": cls._coerce_vector(vector),
+                "metadata": dict(document.metadata),
+                "page_content": document.page_content,
+            }
+            for document, vector in zip(documents, vectors, strict=True)
+        ]
+        store = cls(
+            embedding_function=embedding,
+            persist_directory=persist_directory,
+            entries=entries,
+        )
+        store.persist()
+        return store
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        embedding_function: Any,
+        persist_directory: str | Path,
+    ) -> "JsonVectorStore":
+        """Load a vector store from a JSON index.
+
+        Args:
+            embedding_function: Embeddings provider used for queries.
+            persist_directory: Directory containing the JSON index.
+
+        Returns:
+            The loaded vector store.
+        """
+        persist_path = Path(persist_directory)
+        index_path = persist_path / VECTOR_STORE_INDEX_FILENAME
+        if not index_path.exists():
+            raise FileNotFoundError(f"Vector store index does not exist: {index_path}")
+        with index_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        raw_entries = payload.get("documents", []) if isinstance(payload, dict) else []
+        if not isinstance(raw_entries, list):
+            raise ValueError("Vector store index is invalid.")
+
+        entries = [
+            {
+                "embedding": cls._coerce_vector(entry.get("embedding", [])),
+                "metadata": dict(entry.get("metadata", {})),
+                "page_content": str(entry.get("page_content", "")),
+            }
+            for entry in raw_entries
+            if isinstance(entry, dict)
+        ]
+        return cls(
+            embedding_function=embedding_function,
+            persist_directory=persist_path,
+            entries=entries,
+        )
+
+    @staticmethod
+    def index_exists(persist_directory: str | Path) -> bool:
+        """Return whether a persisted JSON index exists."""
+        return (Path(persist_directory) / VECTOR_STORE_INDEX_FILENAME).exists()
+
+    def persist(self) -> None:
+        """Persist the vector store index."""
+        self.persist_directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "documents": self._entries,
+            "version": RAG_MANIFEST_VERSION,
+        }
+        with self.index_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+
+    def similarity_search_with_relevance_scores(
+        self,
+        query: str,
+        *,
+        k: int,
+    ) -> list[tuple[Document, float]]:
+        """Return the top matching documents scored by cosine similarity."""
+        if not self._entries or k <= 0:
+            return []
+
+        query_vector = self._coerce_vector(self.embedding_function.embed_query(query))
+        scored_entries = [
+            (
+                Document(
+                    page_content=str(entry["page_content"]),
+                    metadata=dict(entry["metadata"]),
+                ),
+                self._cosine_similarity(query_vector, entry["embedding"]),
+            )
+            for entry in self._entries
+        ]
+        return sorted(scored_entries, key=lambda item: item[1], reverse=True)[:k]
+
+    @staticmethod
+    def _coerce_vector(vector: Sequence[Any]) -> list[float]:
+        return [float(value) for value in vector]
+
+    @staticmethod
+    def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+        if len(left) != len(right) or not left:
+            return 0.0
+
+        dot_product = sum(
+            left_value * right_value
+            for left_value, right_value in zip(left, right)
+        )
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if left_norm == 0 or right_norm == 0:
+            return 0.0
+        return dot_product / (left_norm * right_norm)
 
 
 def normalize_rag_embedding_provider(
@@ -623,12 +785,12 @@ class WorkspaceDocsRAG:
         self.config = config
         self.project_root = project_root.resolve()
         self.persist_directory = config.persist_directory.resolve()
-        self.collection_directory = self.persist_directory / "chroma"
+        self.collection_directory = self.persist_directory / VECTOR_STORE_DIRECTORY_NAME
         self.manifest_path = self.persist_directory / "manifest.json"
         self.uploads_root = self.persist_directory / RAG_UPLOADS_DIRECTORY_NAME
         self._lock = threading.RLock()
-        self._vectorstore: Chroma | None = None
-        self._uploaded_vectorstores: dict[str, Chroma] = {}
+        self._vectorstore: JsonVectorStore | None = None
+        self._uploaded_vectorstores: dict[str, JsonVectorStore] = {}
         self._status = RagStatus.unavailable(
             reason="Knowledge index has not been initialized yet.",
             persist_directory=self.persist_directory,
@@ -809,23 +971,14 @@ class WorkspaceDocsRAG:
 
         shutil.rmtree(self.collection_directory, ignore_errors=True)
         self.manifest_path.unlink(missing_ok=True)
-        self.collection_directory.mkdir(parents=True, exist_ok=True)
         self.persist_directory.mkdir(parents=True, exist_ok=True)
 
         embeddings = self._build_embeddings()
-        if chunks:
-            self._vectorstore = Chroma.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-                collection_name=self.config.collection_name,
-                persist_directory=str(self.collection_directory),
-            )
-        else:
-            self._vectorstore = Chroma(
-                collection_name=self.config.collection_name,
-                embedding_function=embeddings,
-                persist_directory=str(self.collection_directory),
-            )
+        self._vectorstore = JsonVectorStore.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            persist_directory=self.collection_directory,
+        )
 
         manifest = self._build_manifest(
             source_paths,
@@ -914,7 +1067,7 @@ class WorkspaceDocsRAG:
         manifest = self._read_manifest_locked()
         if manifest is None:
             return False
-        if not self.collection_directory.exists():
+        if not JsonVectorStore.index_exists(self.collection_directory):
             return False
         current_signature = self._signature_for_paths(
             self.discover_source_paths(),
@@ -935,7 +1088,7 @@ class WorkspaceDocsRAG:
             persist_directory=self.persist_directory,
         )
 
-    def _load_vectorstore_locked(self) -> Chroma:
+    def _load_vectorstore_locked(self) -> JsonVectorStore:
         """Load vectorstore locked.
 
         Returns:
@@ -943,10 +1096,9 @@ class WorkspaceDocsRAG:
         """
         if self._vectorstore is not None:
             return self._vectorstore
-        self._vectorstore = Chroma(
-            collection_name=self.config.collection_name,
+        self._vectorstore = JsonVectorStore.load(
             embedding_function=self._build_embeddings(),
-            persist_directory=str(self.collection_directory),
+            persist_directory=self.collection_directory,
         )
         return self._vectorstore
 
@@ -1154,21 +1306,12 @@ class WorkspaceDocsRAG:
         )
         chunks = self._split_documents(documents)
 
-        collection_directory.mkdir(parents=True, exist_ok=True)
         embeddings = self._build_embeddings()
-        if chunks:
-            store = Chroma.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-                collection_name=self._thread_upload_collection_name(thread_id),
-                persist_directory=str(collection_directory),
-            )
-        else:
-            store = Chroma(
-                collection_name=self._thread_upload_collection_name(thread_id),
-                embedding_function=embeddings,
-                persist_directory=str(collection_directory),
-            )
+        store = JsonVectorStore.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            persist_directory=collection_directory,
+        )
 
         self._uploaded_vectorstores[thread_id] = store
         manifest = self._build_manifest(
@@ -1212,7 +1355,7 @@ class WorkspaceDocsRAG:
 
     def _search_store_locked(
         self,
-        store: Chroma,
+        store: JsonVectorStore,
         query: str,
         *,
         limit: int,
@@ -1255,7 +1398,7 @@ class WorkspaceDocsRAG:
             return False
 
         collection_directory = self._thread_upload_collection_directory(thread_id)
-        if not collection_directory.exists():
+        if not JsonVectorStore.index_exists(collection_directory):
             return False
 
         files_directory = self._thread_upload_files_directory(thread_id)
@@ -1266,7 +1409,7 @@ class WorkspaceDocsRAG:
         )
         return manifest.get("signature") == current_signature
 
-    def _load_thread_upload_store_locked(self, thread_id: str) -> Chroma:
+    def _load_thread_upload_store_locked(self, thread_id: str) -> JsonVectorStore:
         """Load thread upload store locked.
 
         Args:
@@ -1279,10 +1422,9 @@ class WorkspaceDocsRAG:
         if store is not None:
             return store
 
-        store = Chroma(
-            collection_name=self._thread_upload_collection_name(thread_id),
+        store = JsonVectorStore.load(
             embedding_function=self._build_embeddings(),
-            persist_directory=str(self._thread_upload_collection_directory(thread_id)),
+            persist_directory=self._thread_upload_collection_directory(thread_id),
         )
         self._uploaded_vectorstores[thread_id] = store
         return store
@@ -1330,17 +1472,6 @@ class WorkspaceDocsRAG:
             The thread upload manifest path.
         """
         return self._thread_upload_root(thread_id) / RAG_UPLOAD_MANIFEST_FILENAME
-
-    def _thread_upload_collection_name(self, thread_id: str) -> str:
-        """Return the thread upload collection name.
-
-        Args:
-            thread_id: Conversation thread identifier.
-
-        Returns:
-            The thread upload collection name.
-        """
-        return f"{self.config.collection_name}_{self._normalize_thread_id(thread_id)}"
 
     def _normalize_thread_id(self, thread_id: str) -> str:
         """Normalize thread ID.

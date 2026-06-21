@@ -1,10 +1,12 @@
 [model]
 provider = "ollama"
-base_url = "http://10.0.1.152:11434"
+#base_url = "http://10.0.1.152:11434"
+base_url = "http://127.0.0.1:11434"
 temperature = 0.3
 repeat_penalty = 1.1
 
-name = "qwen3.6:35b-a3b-mtp-q4_K_M"
+#name = "qwen3.6:35b-a3b-mtp-q4_K_M"
+name = "qwen3.6:35b-a3b-nvfp4"
 #models = ["gpt-oss:20b", "gemma4:26b", "qwen3.6:27b"]
 
 reasoning_effort = "high"
@@ -66,7 +68,7 @@ top_k = 4
 [rag.embedding]
 provider = "ollama"
 model = "nomic-embed-text"
-base_url = "http://10.0.1.152:11434"
+base_url = "http://127.0.0.1:11434"
 
 # Async subagent backed by the local LangGraph Agent Protocol server.
 [[async_subagents]]
