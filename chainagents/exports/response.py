@@ -378,6 +378,15 @@ def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) ->
     if not path_text:
         return None
 
+    absolute_candidate = Path(path_text)
+    if absolute_candidate.is_absolute():
+        resolved_absolute = _resolve_existing_project_file(
+            absolute_candidate,
+            project_root=project_root,
+        )
+        if resolved_absolute is not None:
+            return resolved_absolute
+
     if path_text == "/workspace":
         return None
     if path_text.startswith("/workspace/"):
@@ -391,6 +400,11 @@ def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) ->
         if not candidate.is_absolute():
             candidate = project_root / candidate
 
+    return _resolve_existing_project_file(candidate, project_root=project_root)
+
+
+def _resolve_existing_project_file(candidate: Path, *, project_root: Path) -> Path | None:
+    """Resolve one candidate path if it is an existing file under project_root."""
     try:
         resolved = candidate.resolve()
     except OSError:

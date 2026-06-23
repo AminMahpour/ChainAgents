@@ -38,6 +38,27 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
     assert [element.mime for element in elements] == ["text/csv", "image/png"]
 
 
+def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts(
+    monkeypatch,
+) -> None:
+    """Verify absolute artifact paths under /workspace are not remapped twice."""
+    project_root = Path("/workspace/ChainAgents")
+    artifact_path = project_root / ".files" / "deepagent" / "plot.png"
+
+    def fake_is_file(path: Path) -> bool:
+        return path == artifact_path
+
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+
+    elements = response_exports.generated_file_elements_from_text(
+        "Created `/workspace/ChainAgents/.files/deepagent/plot.png`.",
+        project_root=project_root,
+    )
+
+    assert [element.name for element in elements] == ["plot.png"]
+    assert [element.path for element in elements] == [artifact_path.as_posix()]
+
+
 def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
     tmp_path: Path,
 ) -> None:
