@@ -77,7 +77,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/outputs")
 AGENTS_MD_FILENAME = "AGENTS.md"
 logger = logging.getLogger(__name__)
 _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
@@ -105,6 +105,7 @@ You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
 - Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
+- Write downloadable generated files under `/workspace/.files/outputs/`.
 {SYSTEM_PROMPT_MEMORY_LINE}
 - Use any other absolute path only for ephemeral scratch work.
 

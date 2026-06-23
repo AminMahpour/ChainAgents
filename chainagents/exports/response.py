@@ -20,7 +20,7 @@ DOWNLOAD_PDF_ACTION = "download_response_pdf"
 RESPONSE_EXPORTS_SESSION_KEY = "response_exports"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
-DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+GENERATED_OUTPUTS_DIRECTORY = Path(".files/outputs")
 MAX_GENERATED_FILE_ATTACHMENTS = 12
 HOMEBREW_LIBRARY_PATH = Path("/opt/homebrew/lib")
 PDF_EXPORT_DEPENDENCY_ERROR = (
@@ -31,7 +31,7 @@ PDF_EXPORT_DEPENDENCY_ERROR = (
 )
 GENERATED_FILE_PATH_RE = re.compile(
     r"(?P<path>"
-    r"(?:/workspace/|\.files/deepagent/|/[^`'\"<>\s)]*/\.files/deepagent/)"
+    r"(?:/workspace/|\.files/outputs/|/[^`'\"<>\s)]*/\.files/outputs/)"
     r"[^`'\"<>\s)]*"
     r")"
 )
@@ -391,9 +391,9 @@ def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) ->
         return None
     if path_text.startswith("/workspace/"):
         candidate = project_root / path_text.removeprefix("/workspace/")
-    elif path_text == DEEPAGENT_ARTIFACTS_DIRECTORY.as_posix():
+    elif path_text == GENERATED_OUTPUTS_DIRECTORY.as_posix():
         return None
-    elif path_text.startswith(f"{DEEPAGENT_ARTIFACTS_DIRECTORY.as_posix()}/"):
+    elif path_text.startswith(f"{GENERATED_OUTPUTS_DIRECTORY.as_posix()}/"):
         candidate = project_root / path_text
     else:
         candidate = Path(path_text)

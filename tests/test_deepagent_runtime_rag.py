@@ -1212,6 +1212,9 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     artifacts_root = deepagent_artifacts_root()
     offloaded_path = f"{deepagent_artifacts_route_prefix()}large_tool_results/tool-call-1"
 
+    assert artifacts_root == tmp_path / ".files" / "outputs"
+    assert offloaded_path.startswith(f"{tmp_path.as_posix()}/.files/outputs/")
+
     write_result = backend.write(offloaded_path, "tool output")
 
     assert write_result.error is None

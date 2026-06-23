@@ -19,14 +19,14 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
 ) -> None:
     """Verify generated response file paths become downloadable Chainlit files."""
     report_path = tmp_path / "reports" / "summary.csv"
-    chart_path = tmp_path / ".files" / "deepagent" / "charts" / "plot.png"
+    chart_path = tmp_path / ".files" / "outputs" / "charts" / "plot.png"
     report_path.parent.mkdir(parents=True)
     chart_path.parent.mkdir(parents=True)
     report_path.write_text("name,value\nalpha,1\n", encoding="utf-8")
     chart_path.write_bytes(b"\x89PNG\r\n")
 
     elements = response_exports.generated_file_elements_from_text(
-        "Created `/workspace/reports/summary.csv` and `.files/deepagent/charts/plot.png`.",
+        "Created `/workspace/reports/summary.csv` and `.files/outputs/charts/plot.png`.",
         project_root=tmp_path,
     )
 
@@ -43,7 +43,7 @@ def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts
 ) -> None:
     """Verify absolute artifact paths under /workspace are not remapped twice."""
     project_root = Path("/workspace/ChainAgents")
-    artifact_path = project_root / ".files" / "deepagent" / "plot.png"
+    artifact_path = project_root / ".files" / "outputs" / "plot.png"
 
     def fake_is_file(path: Path) -> bool:
         return path == artifact_path
@@ -51,7 +51,7 @@ def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts
     monkeypatch.setattr(Path, "is_file", fake_is_file)
 
     elements = response_exports.generated_file_elements_from_text(
-        "Created `/workspace/ChainAgents/.files/deepagent/plot.png`.",
+        "Created `/workspace/ChainAgents/.files/outputs/plot.png`.",
         project_root=project_root,
     )
 
