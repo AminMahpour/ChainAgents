@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import tomllib
 from collections.abc import Awaitable, Callable
@@ -78,6 +79,7 @@ DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 DEFAULT_AGENT_MEMORY_NAMESPACE = "filesystem"
 DEFAULT_AGENT_MEMORY_FILES = ("/memories/AGENTS.md",)
+AGENT_MEMORY_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 GENERATED_OUTPUTS_DIRECTORY = Path(".files/outputs")
@@ -194,9 +196,11 @@ def normalize_agent_memory_namespace(value: Any | None) -> str:
         raise ValueError(
             "The top-level 'agent.memory_namespace' config must be a non-empty string."
         )
-    if "*" in candidate:
+    if AGENT_MEMORY_NAMESPACE_RE.fullmatch(candidate) is None:
         raise ValueError(
-            "The top-level 'agent.memory_namespace' config cannot contain '*'."
+            "The top-level 'agent.memory_namespace' config may only contain "
+            "alphanumeric characters, hyphens, underscores, dots, @, +, colons, "
+            "and tildes."
         )
     return candidate
 

@@ -1223,6 +1223,10 @@ memory_files = []
     (
         ('memory_namespace = ""', "agent.memory_namespace"),
         ('memory_namespace = "agent-*"', "agent.memory_namespace"),
+        ('memory_namespace = "agent namespace"', "agent.memory_namespace"),
+        ('memory_namespace = "agent/namespace"', "agent.memory_namespace"),
+        ('memory_namespace = "agent?namespace"', "agent.memory_namespace"),
+        ('memory_namespace = "agent[namespace]"', "agent.memory_namespace"),
         ('memory_files = "/memories/AGENTS.md"', "agent.memory_files"),
         ('memory_files = ["memories/AGENTS.md"]', "agent.memory_files"),
         ('memory_files = ["/workspace/AGENTS.md"]', "agent.memory_files"),
