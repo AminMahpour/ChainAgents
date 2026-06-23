@@ -30,6 +30,8 @@ from deepagent_runtime import (
     build_deepagent_backend,
     deepagent_artifacts_root,
     deepagent_artifacts_route_prefix,
+    generated_outputs_root,
+    generated_outputs_route_prefix,
     virtual_workspace_path_to_local,
 )
 from rag_runtime import (
@@ -1212,8 +1214,8 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     artifacts_root = deepagent_artifacts_root()
     offloaded_path = f"{deepagent_artifacts_route_prefix()}large_tool_results/tool-call-1"
 
-    assert artifacts_root == tmp_path / ".files" / "outputs"
-    assert offloaded_path.startswith(f"{tmp_path.as_posix()}/.files/outputs/")
+    assert artifacts_root == tmp_path / ".files" / "deepagent"
+    assert offloaded_path.startswith(f"{tmp_path.as_posix()}/.files/deepagent/")
 
     write_result = backend.write(offloaded_path, "tool output")
 
@@ -1229,6 +1231,36 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     assert read_result.error is None
     assert read_result.file_data is not None
     assert read_result.file_data["content"] == "tool output"
+
+
+def test_build_deepagent_backend_routes_generated_outputs_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify downloadable generated outputs use a separate filesystem route."""
+    monkeypatch.setattr(deepagent_runtime, "PROJECT_ROOT", tmp_path)
+
+    backend = deepagent_runtime.build_deepagent_backend()
+    outputs_root = generated_outputs_root()
+    output_path = f"{generated_outputs_route_prefix()}reports/result.txt"
+
+    assert outputs_root == tmp_path / ".files" / "outputs"
+    assert output_path.startswith(f"{tmp_path.as_posix()}/.files/outputs/")
+    assert backend.artifacts_root == (tmp_path / ".files" / "deepagent").as_posix()
+
+    write_result = backend.write(output_path, "downloadable output")
+
+    assert write_result.error is None
+    assert write_result.path == output_path
+    assert (outputs_root / "reports" / "result.txt").read_text(
+        encoding="utf-8"
+    ) == "downloadable output"
+
+    read_result = backend.read(output_path)
+
+    assert read_result.error is None
+    assert read_result.file_data is not None
+    assert read_result.file_data["content"] == "downloadable output"
 
 
 def test_tool_execution_resilience_middleware_returns_error_tool_message() -> None:
