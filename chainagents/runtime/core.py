@@ -57,6 +57,10 @@ from chainagents.rag.runtime import (
     parse_rag_config,
     resolve_rag_config,
 )
+from chainagents.runtime.reflection import (
+    ReflectionConfig,
+    normalize_reflection_config,
+)
 
 
 ModelProvider = Literal["ollama", "openai_compatible", "anthropic"]
@@ -1607,6 +1611,7 @@ class ExtensionsConfig:
         agent_state: Whether the DeepAgents graph is stateful or stateless.
         agent_memory_namespace: Shared StoreBackend namespace for /memories/.
         agent_memory_files: Startup memory files loaded into the agent prompt.
+        agent_reflection: Correction reflection workflow configuration.
         recursion_limit: The recursion limit value.
         mcp_servers: The MCP servers value.
         skills: The skills value.
@@ -1633,6 +1638,7 @@ class ExtensionsConfig:
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     agent_memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE
     agent_memory_files: tuple[str, ...] = DEFAULT_AGENT_MEMORY_FILES
+    agent_reflection: ReflectionConfig = ReflectionConfig()
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
@@ -1997,6 +2003,10 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_section.get("memory_namespace")
     )
     agent_memory_files = normalize_agent_memory_files(agent_section.get("memory_files"))
+    agent_reflection = normalize_reflection_config(
+        agent_section.get("reflection"),
+        agent_state=agent_state,
+    )
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -2214,6 +2224,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_state=agent_state,
         agent_memory_namespace=agent_memory_namespace,
         agent_memory_files=agent_memory_files,
+        agent_reflection=agent_reflection,
         recursion_limit=recursion_limit,
         mcp_servers=mcp_servers or None,
         skills=skill_paths,

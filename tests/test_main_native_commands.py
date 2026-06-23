@@ -8,6 +8,7 @@ import agent_commands
 import main
 import pytest
 from deepagent_runtime import AppSettings, ChainlitStarterConfig
+from chainagents.runtime.reflection import ReflectionProposal
 
 
 def test_load_chainlit_auth_users_parses_json_map() -> None:
@@ -611,6 +612,175 @@ class _DummyMessage:
             The sent message or element.
         """
         return None
+
+
+@pytest.mark.anyio
+async def test_ask_to_save_reflection_lesson_uses_ask_action_message(
+    monkeypatch,
+) -> None:
+    """Verify Chainlit reflection confirmation uses AskActionMessage."""
+    captured: dict[str, object] = {}
+    saved: dict[str, object] = {}
+
+    class _AskActionMessage:
+        """Capture AskActionMessage construction and return Save."""
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def send(self):
+            return {"payload": {"value": "save"}}
+
+    async def fake_save_reflection_lesson(**kwargs):
+        saved.update(kwargs)
+
+    monkeypatch.setattr(main.cl, "AskActionMessage", _AskActionMessage)
+    monkeypatch.setattr(main, "save_reflection_lesson", fake_save_reflection_lesson)
+
+    proposal = ReflectionProposal(
+        reason="correction",
+        memory_file="/memories/AGENTS.md",
+        lesson="- Correction: remember the generated output directory.",
+        trigger="That was wrong.",
+    )
+    settings = AppSettings(
+        model_name="fake-model",
+        reasoning_level="medium",
+        thread_id="thread-1",
+    )
+
+    await main.ask_to_save_reflection_lesson(
+        runtime=SimpleNamespace(),
+        settings=settings,
+        proposal=proposal,
+        reasoning_level="high",
+        model_name="other-model",
+        async_url_override="http://async.example",
+        mcp_session_id="mcp-session",
+    )
+
+    assert "Correction reflection" in str(captured["content"])
+    actions = captured["actions"]
+    assert [action.payload["value"] for action in actions] == ["save", "dismiss"]
+    assert saved["proposal"] == proposal
+    assert saved["settings"] == settings
+    assert saved["reasoning_level"] == "high"
+    assert saved["model_name"] == "other-model"
+    assert saved["async_url_override"] == "http://async.example"
+    assert saved["mcp_session_id"] == "mcp-session"
+
+
+@pytest.mark.anyio
+async def test_ask_to_save_reflection_lesson_dismiss_does_not_save(
+    monkeypatch,
+) -> None:
+    """Verify Chainlit reflection dismissal does not write memory."""
+    saved = False
+
+    class _AskActionMessage:
+        """Return Dismiss from AskActionMessage."""
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def send(self):
+            return {"payload": {"value": "dismiss"}}
+
+    async def fake_save_reflection_lesson(**kwargs):
+        nonlocal saved
+        saved = True
+
+    monkeypatch.setattr(main.cl, "AskActionMessage", _AskActionMessage)
+    monkeypatch.setattr(main, "save_reflection_lesson", fake_save_reflection_lesson)
+
+    await main.ask_to_save_reflection_lesson(
+        runtime=SimpleNamespace(),
+        settings=AppSettings(
+            model_name="fake-model",
+            reasoning_level="medium",
+            thread_id="thread-1",
+        ),
+        proposal=ReflectionProposal(
+            reason="correction",
+            memory_file="/memories/AGENTS.md",
+            lesson="- Correction: remember the generated output directory.",
+            trigger="That was wrong.",
+        ),
+        reasoning_level="medium",
+        model_name="fake-model",
+        async_url_override=None,
+        mcp_session_id=None,
+    )
+
+    assert saved is False
+
+
+@pytest.mark.anyio
+async def test_save_reflection_lesson_invokes_agent_in_reflection_thread(
+    monkeypatch,
+) -> None:
+    """Verify confirmed reflections are saved by a hidden agent run."""
+    captured: dict[str, object] = {}
+
+    class _Agent:
+        async def ainvoke(self, payload, *, config):
+            captured["payload"] = payload
+            captured["config"] = config
+            return {"messages": []}
+
+    class _Runtime:
+        config = SimpleNamespace(recursion_limit=100)
+
+        async def get_agent(self, *args, **kwargs):
+            captured["agent_args"] = args
+            captured["agent_kwargs"] = kwargs
+            return _Agent()
+
+    messages: list[_DummyMessage] = []
+
+    class _Message(_DummyMessage):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            messages.append(self)
+
+    monkeypatch.setattr(main.cl, "Message", _Message)
+
+    proposal = ReflectionProposal(
+        reason="correction",
+        memory_file="/memories/AGENTS.md",
+        lesson="- Correction: remember the generated output directory.",
+        trigger="That was wrong.",
+    )
+
+    await main.save_reflection_lesson(
+        runtime=_Runtime(),
+        settings=AppSettings(
+            model_name="fake-model",
+            reasoning_level="medium",
+            thread_id="thread-1",
+        ),
+        proposal=proposal,
+        reasoning_level="high",
+        model_name="other-model",
+        async_url_override=None,
+        mcp_session_id="mcp-session",
+    )
+
+    assert captured["agent_args"] == ("high",)
+    assert captured["agent_kwargs"] == {
+        "model_name": "other-model",
+        "thread_id": "thread-1:reflection",
+        "async_subagent_url_override": None,
+        "mcp_session_id": "mcp-session",
+    }
+    assert captured["config"] == {
+        "configurable": {"thread_id": "thread-1:reflection"},
+        "recursion_limit": 100,
+    }
+    prompt = captured["payload"]["messages"][0]["content"]
+    assert "Target memory file: /memories/AGENTS.md" in prompt
+    assert "Lessons learned from corrections" in prompt
+    assert messages[-1].kwargs["content"] == "Saved lesson to `/memories/AGENTS.md`."
 
 
 @pytest.mark.anyio

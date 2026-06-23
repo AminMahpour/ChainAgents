@@ -60,6 +60,14 @@ mcp_servers = ["repo"]
 summarization_trigger_tokens = 6000
 summarization_keep_tokens = 2400
 
+[agent.reflection]
+# Set true to propose compact lessons after corrections or unrecovered tool failures.
+# Chainlit asks before saving; CLI, TUI, and API only surface proposals.
+enabled = false
+memory_file = "/memories/AGENTS.md"
+max_lesson_chars = 700
+tool_failure_mode = "unrecovered"
+
 [chainlit]
 # Set false to hide model selection in chat settings and Modes.
 model_mode_enabled = true

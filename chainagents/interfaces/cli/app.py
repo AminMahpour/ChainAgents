@@ -25,6 +25,11 @@ from rich.table import Table
 from rich.text import Text
 
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.runtime.reflection import (
+    ReflectionCollector,
+    ReflectionProposal,
+    format_reflection_proposal,
+)
 from chainagents.commands.native import (
     dumps_tool_result,
     parse_native_command,
@@ -1012,6 +1017,7 @@ class CliEventRenderer:
         json_output: bool,
         show_reasoning: bool,
         show_tools: bool,
+        reflection_collector: ReflectionCollector | None = None,
     ) -> None:
         """Initialize the CLI event renderer instance.
 
@@ -1023,6 +1029,7 @@ class CliEventRenderer:
             json_output: The JSON output value.
             show_reasoning: The show reasoning value.
             show_tools: The show tools value.
+            reflection_collector: Optional collector for memory proposals.
         """
         self.prompt = prompt
         self.stdout = stdout
@@ -1033,6 +1040,7 @@ class CliEventRenderer:
         self.show_tools = show_tools
         self.response_buffer = ""
         self.stream_adapter = AgentStreamEventAdapter(prompt=prompt)
+        self.reflection_collector = reflection_collector
         self.reasoning_line_source: str | None = None
         self.stdout_console = cli_console(stdout)
         self.stderr_console = cli_console(stderr)
@@ -1048,6 +1056,8 @@ class CliEventRenderer:
 
     def _handle_stream_event(self, event: AgentStreamEvent) -> None:
         """Render one normalized agent stream event."""
+        if self.reflection_collector is not None:
+            self.reflection_collector.record_event(event)
         if event.kind == "response_delta":
             self._stream_response_delta(event.text)
         elif event.kind == "reasoning_delta":
@@ -1075,6 +1085,30 @@ class CliEventRenderer:
         if self.response_buffer:
             self.stdout_console.print(Text(self.response_buffer, style="bright_white"))
         return self.response_buffer
+
+    def mark_run_failed(self, exc: BaseException) -> None:
+        """Record that the streamed run failed."""
+        if self.reflection_collector is not None:
+            self.reflection_collector.mark_run_failed(exc)
+
+    def reflection_proposal(self) -> ReflectionProposal | None:
+        """Return a reflection proposal after the run completes."""
+        if self.reflection_collector is None:
+            return None
+        return self.reflection_collector.build_proposal()
+
+    def print_reflection_proposal(self, proposal: ReflectionProposal) -> None:
+        """Print a reflection proposal to stderr for human CLI users."""
+        if self.json_output:
+            return
+        self._close_reasoning_line()
+        self.stderr_console.print(
+            cli_panel(
+                Text(format_reflection_proposal(proposal), style="white"),
+                title="Reflection Proposal",
+                border_style="cyan",
+            )
+        )
 
     def _stream_summarization_status(self, event: AgentStreamEvent) -> None:
         """Render a summarization status update."""
@@ -1658,6 +1692,10 @@ async def run_agent_prompt(
         json_output=args.json_output,
         show_reasoning=args.show_reasoning,
         show_tools=args.show_tools,
+        reflection_collector=ReflectionCollector.from_runtime_config(
+            runtime.config,
+            prompt=prompt,
+        ),
     )
     stream = agent.astream_events(
         payload,
@@ -1681,6 +1719,10 @@ async def run_agent_prompt(
     except Exception as exc:
         with suppress(Exception):
             await stream.aclose()
+        renderer.mark_run_failed(exc)
+        proposal = renderer.reflection_proposal()
+        if proposal is not None:
+            renderer.print_reflection_proposal(proposal)
         print(f"{type(exc).__name__}: {exc}", file=stderr)
         if args.show_tools or args.show_reasoning:
             print(traceback.format_exc(limit=10), file=stderr)
@@ -1690,6 +1732,9 @@ async def run_agent_prompt(
             await stream.aclose()
 
     response = renderer.finish()
+    proposal = renderer.reflection_proposal()
+    if proposal is not None:
+        renderer.print_reflection_proposal(proposal)
     if args.json_output:
         payload = {
             "response": response,
@@ -1697,6 +1742,8 @@ async def run_agent_prompt(
             "model": settings.model_name,
             "reasoning": settings.reasoning_level,
         }
+        if proposal is not None:
+            payload["reflection_proposal"] = proposal.to_payload()
         if emit_json:
             print(json.dumps(payload, indent=2, sort_keys=True), file=stdout)
             return 0

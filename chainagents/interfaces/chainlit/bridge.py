@@ -15,6 +15,7 @@ import chainlit as cl
 from chainlit.utils import utc_now
 
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.runtime.reflection import ReflectionCollector, ReflectionProposal
 from chainagents.exports.response import attach_response_export_actions
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
@@ -944,6 +945,7 @@ class ChainlitEventBridge:
         chronological_ui_enabled: bool = True,
         reasoning_steps_enabled: bool = True,
         tool_steps_enabled: bool = True,
+        reflection_collector: ReflectionCollector | None = None,
     ) -> None:
         """Initialize the chainlit event bridge instance.
 
@@ -953,6 +955,7 @@ class ChainlitEventBridge:
             chronological_ui_enabled: The chronological UI enabled value.
             reasoning_steps_enabled: Whether to show reasoning steps.
             tool_steps_enabled: Whether to show tool steps.
+            reflection_collector: Optional collector for post-run memory proposals.
         """
         self.prompt = prompt
         self.run_task_list = run_task_list
@@ -973,6 +976,7 @@ class ChainlitEventBridge:
         self.chronological_ui_enabled = chronological_ui_enabled
         self.reasoning_steps_enabled = reasoning_steps_enabled
         self.tool_steps_enabled = tool_steps_enabled
+        self.reflection_collector = reflection_collector
 
     async def start(self) -> None:
         """Start the chainlit event bridge."""
@@ -993,6 +997,8 @@ class ChainlitEventBridge:
 
     async def _handle_stream_event(self, event: AgentStreamEvent) -> None:
         """Render one normalized agent stream event."""
+        if self.reflection_collector is not None:
+            self.reflection_collector.record_event(event)
         if event.kind == "response_delta":
             await self._stream_response(event.text)
         elif event.kind == "reasoning_delta":
@@ -1049,6 +1055,8 @@ class ChainlitEventBridge:
             exc: The exc value.
             details: The details value.
         """
+        if self.reflection_collector is not None:
+            self.reflection_collector.mark_run_failed(exc)
         await self._close_all_open_steps()
         if self.run_task_list is not None:
             await self.run_task_list.fail()
@@ -1056,6 +1064,12 @@ class ChainlitEventBridge:
             step.input = self.prompt
             step.output = details
         await cl.Message(content=f"{type(exc).__name__}: {exc}", author="System").send()
+
+    def reflection_proposal(self) -> ReflectionProposal | None:
+        """Return the reflection proposal for the completed run, if any."""
+        if self.reflection_collector is None:
+            return None
+        return self.reflection_collector.build_proposal()
 
     async def _handle_message_chunk(self, part: dict[str, Any]) -> None:
         """Handle message chunk.

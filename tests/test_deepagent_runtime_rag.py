@@ -1218,6 +1218,124 @@ memory_files = []
     assert config.extensions.agent_memory_files == ()
 
 
+def test_runtime_config_defaults_reflection_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify reflection is disabled unless explicitly configured."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.extensions.agent_reflection.enabled is False
+    assert config.extensions.agent_reflection.memory_file == "/memories/AGENTS.md"
+    assert config.extensions.agent_reflection.max_lesson_chars == 700
+    assert config.extensions.agent_reflection.tool_failure_mode == "unrecovered"
+
+
+def test_runtime_config_reads_reflection_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify reflection config is parsed from [agent.reflection]."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+state = "stateful"
+
+[agent.reflection]
+enabled = true
+memory_file = "/memories/AGENTS.md"
+max_lesson_chars = 512
+tool_failure_mode = "unrecovered"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.extensions.agent_reflection.enabled is True
+    assert config.extensions.agent_reflection.memory_file == "/memories/AGENTS.md"
+    assert config.extensions.agent_reflection.max_lesson_chars == 512
+    assert config.extensions.agent_reflection.tool_failure_mode == "unrecovered"
+
+
+@pytest.mark.parametrize(
+    ("agent_config", "message"),
+    (
+        ('reflection = "yes"', "agent.reflection"),
+        (
+            '[agent.reflection]\nenabled = "yes"',
+            "agent.reflection.enabled",
+        ),
+        (
+            '[agent.reflection]\nenabled = true\nmemory_file = "memories/AGENTS.md"',
+            "agent.reflection.memory_file",
+        ),
+        (
+            '[agent.reflection]\nenabled = true\nmemory_file = "/workspace/AGENTS.md"',
+            "agent.reflection.memory_file",
+        ),
+        (
+            '[agent.reflection]\nenabled = true\nmax_lesson_chars = 0',
+            "agent.reflection.max_lesson_chars",
+        ),
+        (
+            '[agent.reflection]\nenabled = true\ntool_failure_mode = "all"',
+            "agent.reflection.tool_failure_mode",
+        ),
+    ),
+)
+def test_runtime_config_rejects_invalid_reflection_config(
+    tmp_path: Path,
+    monkeypatch,
+    agent_config: str,
+    message: str,
+) -> None:
+    """Verify invalid reflection config fails clearly."""
+    config_path = tmp_path / "deepagent.toml"
+    if agent_config.startswith("[agent.reflection]"):
+        toml = f"[agent]\nstate = \"stateful\"\n\n{agent_config}"
+    else:
+        toml = f"[agent]\n{agent_config}"
+    config_path.write_text(toml, encoding="utf-8")
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match=message):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
+def test_runtime_config_rejects_reflection_when_stateless(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify reflection writes require stateful agent memory."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+state = "stateless"
+
+[agent.reflection]
+enabled = true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="agent.reflection.enabled"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
 @pytest.mark.parametrize(
     ("agent_config", "message"),
     (
