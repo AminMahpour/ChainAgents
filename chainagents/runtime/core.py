@@ -3253,11 +3253,15 @@ class AppSettings:
         reasoning_level: The reasoning level value.
         thread_id: Conversation thread identifier.
         model_name: The model name value.
+        show_reasoning_stream: Whether to show streamed reasoning UI.
+        show_tool_calls: Whether to show streamed tool-call UI.
     """
 
     reasoning_level: ReasoningLevel
     thread_id: str
     model_name: str
+    show_reasoning_stream: bool = True
+    show_tool_calls: bool = True
 
 
 class AgentRuntime:
