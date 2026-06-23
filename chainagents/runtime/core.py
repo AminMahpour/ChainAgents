@@ -78,6 +78,7 @@ DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+GENERATED_OUTPUTS_DIRECTORY = Path(".files/outputs")
 AGENTS_MD_FILENAME = "AGENTS.md"
 logger = logging.getLogger(__name__)
 _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
@@ -105,6 +106,7 @@ You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
 - Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
+- Write downloadable generated files under `/workspace/.files/outputs/`, which maps to `{PROJECT_ROOT / GENERATED_OUTPUTS_DIRECTORY}`.
 {SYSTEM_PROMPT_MEMORY_LINE}
 - Use any other absolute path only for ephemeral scratch work.
 
@@ -701,6 +703,31 @@ def deepagent_artifacts_route_prefix(project_root: Path | None = None) -> str:
         The URL route prefix for stored tool artifacts.
     """
     return f"{deepagent_artifacts_root(project_root).as_posix().rstrip('/')}/"
+
+
+def generated_outputs_root(project_root: Path | None = None) -> Path:
+    """Return the local directory used for downloadable generated outputs.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The local directory used for downloadable generated outputs.
+    """
+    root = (project_root or PROJECT_ROOT).resolve()
+    return root / GENERATED_OUTPUTS_DIRECTORY
+
+
+def generated_outputs_route_prefix(project_root: Path | None = None) -> str:
+    """Return the URL route prefix for downloadable generated outputs.
+
+    Args:
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The URL route prefix for downloadable generated outputs.
+    """
+    return f"{generated_outputs_root(project_root).as_posix().rstrip('/')}/"
 
 
 def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
@@ -2811,9 +2838,14 @@ def build_deepagent_backend(
     """
     resolved_project_root = project_root or PROJECT_ROOT
     artifacts_root = deepagent_artifacts_root(resolved_project_root)
+    outputs_root = generated_outputs_root(resolved_project_root)
     routes = {
         deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
             root_dir=str(artifacts_root),
+            virtual_mode=True,
+        ),
+        generated_outputs_route_prefix(resolved_project_root): FilesystemBackend(
+            root_dir=str(outputs_root),
             virtual_mode=True,
         ),
         "/workspace/": FilesystemBackend(

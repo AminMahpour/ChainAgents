@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import os
+from pathlib import Path
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,75 @@ from typing import Any
 import pytest
 
 import response_exports
+
+
+def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
+    tmp_path: Path,
+) -> None:
+    """Verify generated response file paths become downloadable Chainlit files."""
+    report_path = tmp_path / "reports" / "summary.csv"
+    chart_path = tmp_path / ".files" / "outputs" / "charts" / "plot.png"
+    report_path.parent.mkdir(parents=True)
+    chart_path.parent.mkdir(parents=True)
+    report_path.write_text("name,value\nalpha,1\n", encoding="utf-8")
+    chart_path.write_bytes(b"\x89PNG\r\n")
+
+    elements = response_exports.generated_file_elements_from_text(
+        "Created `/workspace/reports/summary.csv` and `.files/outputs/charts/plot.png`.",
+        project_root=tmp_path,
+    )
+
+    assert [element.name for element in elements] == ["summary.csv", "plot.png"]
+    assert [element.path for element in elements] == [
+        report_path.as_posix(),
+        chart_path.as_posix(),
+    ]
+    assert [element.mime for element in elements] == ["text/csv", "image/png"]
+
+
+def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts(
+    monkeypatch,
+) -> None:
+    """Verify absolute artifact paths under /workspace are not remapped twice."""
+    project_root = Path("/workspace/ChainAgents")
+    artifact_path = project_root / ".files" / "outputs" / "plot.png"
+
+    def fake_is_file(path: Path) -> bool:
+        return path == artifact_path
+
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+
+    elements = response_exports.generated_file_elements_from_text(
+        "Created `/workspace/ChainAgents/.files/outputs/plot.png`.",
+        project_root=project_root,
+    )
+
+    assert [element.name for element in elements] == ["plot.png"]
+    assert [element.path for element in elements] == [artifact_path.as_posix()]
+
+
+def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
+    tmp_path: Path,
+) -> None:
+    """Verify only existing generated files under allowed routes are downloadable."""
+    directory_path = tmp_path / "reports"
+    directory_path.mkdir()
+    outside_path = tmp_path.parent / "outside.txt"
+    outside_path.write_text("secret", encoding="utf-8")
+
+    elements = response_exports.generated_file_elements_from_text(
+        "\n".join(
+            [
+                "`/workspace/reports`",
+                "`/workspace/missing.txt`",
+                "`/workspace/../outside.txt`",
+                outside_path.as_posix(),
+            ]
+        ),
+        project_root=tmp_path,
+    )
+
+    assert elements == []
 
 
 def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
