@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import agent_commands
 import main
 import pytest
-from deepagent_runtime import ChainlitStarterConfig
+from deepagent_runtime import AppSettings, ChainlitStarterConfig
 
 
 def test_load_chainlit_auth_users_parses_json_map() -> None:
@@ -59,6 +59,66 @@ def test_load_chainlit_auth_users_rejects_invalid_json_map(
     """Verify that invalid Chainlit auth user config fails clearly."""
     with pytest.raises(ValueError, match=message):
         main.load_chainlit_auth_users(raw_users=raw_users)
+
+
+def test_settings_payload_includes_stream_visibility_toggles() -> None:
+    """Verify stream visibility toggles are persisted with chat settings."""
+    settings = AppSettings(
+        model_name="gpt-oss:20b",
+        reasoning_level="medium",
+        thread_id="thread-1",
+        show_reasoning_stream=True,
+        show_tool_calls=False,
+    )
+
+    assert main.settings_payload(settings) == {
+        "model_name": "gpt-oss:20b",
+        "reasoning_level": "medium",
+        "thread_id": "thread-1",
+        "show_reasoning_stream": True,
+        "show_tool_calls": False,
+    }
+
+
+def test_coerce_settings_reads_stream_visibility_toggles() -> None:
+    """Verify raw Chainlit settings include stream visibility toggles."""
+    settings = main.coerce_settings(
+        {
+            "model_name": "gpt-oss:20b",
+            "reasoning_level": "high",
+            "thread_id": "thread-1",
+            "show_reasoning_stream": False,
+            "show_tool_calls": False,
+        },
+        default_model_name="gpt-oss:20b",
+        available_models=("gpt-oss:20b",),
+    )
+
+    assert settings.show_reasoning_stream is False
+    assert settings.show_tool_calls is False
+
+
+def test_build_chat_settings_includes_stream_visibility_switches() -> None:
+    """Verify Chainlit settings expose reasoning and tool-call stream toggles."""
+    chat_settings = main.build_chat_settings(
+        AppSettings(
+            model_name="gpt-oss:20b",
+            reasoning_level="medium",
+            thread_id="thread-1",
+            show_reasoning_stream=False,
+            show_tool_calls=True,
+        ),
+        available_models=("gpt-oss:20b",),
+    )
+
+    inputs_by_id = {
+        input_widget.id: input_widget for input_widget in chat_settings.inputs
+    }
+
+    assert inputs_by_id["show_reasoning_stream"].type == "switch"
+    assert inputs_by_id["show_reasoning_stream"].initial is False
+    assert inputs_by_id["show_tool_calls"].type == "switch"
+    assert inputs_by_id["show_tool_calls"].initial is True
 
 
 def test_authenticate_chainlit_user_accepts_configured_users() -> None:

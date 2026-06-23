@@ -98,7 +98,7 @@ reasoning_mode_enabled = true
 # Set false to hide streamed reasoning step panels and reasoning task entries.
 reasoning_steps_enabled = true
 # Set false to hide streamed tool step panels and tool task entries.
-tool_steps_enabled = true
+tool_steps_enabled = false
 # Set false to hide the initial startup status message ("Workspace agent ready...").
 startup_status_enabled = false
 chronological_ui_enabled = false

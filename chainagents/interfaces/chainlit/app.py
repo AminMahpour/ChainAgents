@@ -19,7 +19,7 @@ from chainagents.util.langchain_warnings import install_langchain_warning_filter
 install_langchain_warning_filters()
 
 import chainlit as cl
-from chainlit.input_widget import Select, TextInput
+from chainlit.input_widget import Select, Switch, TextInput
 from chainlit.types import ThreadDict
 
 from chainagents.commands.native import (
@@ -317,7 +317,7 @@ def current_mcp_session_id() -> str:
     return store_mcp_session_id()
 
 
-def settings_payload(settings: AppSettings) -> dict[str, str]:
+def settings_payload(settings: AppSettings) -> dict[str, Any]:
     """Build a serializable payload from Chainlit chat settings.
 
     Args:
@@ -330,6 +330,8 @@ def settings_payload(settings: AppSettings) -> dict[str, str]:
         "model_name": settings.model_name,
         "reasoning_level": settings.reasoning_level,
         "thread_id": settings.thread_id,
+        "show_reasoning_stream": settings.show_reasoning_stream,
+        "show_tool_calls": settings.show_tool_calls,
     }
 
 
@@ -766,6 +768,22 @@ def resolve_model_name(
     return default
 
 
+def coerce_bool_setting(value: Any | None, *, default: bool) -> bool:
+    """Coerce a raw Chainlit setting value into a boolean."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, int | float) and value in (0, 1):
+        return bool(value)
+    candidate = str(value).strip().lower()
+    if candidate in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if candidate in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
 def build_chat_settings(
     settings: AppSettings,
     *,
@@ -814,6 +832,18 @@ def build_chat_settings(
                     "Defaults to the current Chainlit thread. Override it only if you want "
                     "to point this chat at a different persisted LangGraph thread."
                 ),
+            ),
+            Switch(
+                id="show_reasoning_stream",
+                label="Show Reasoning Stream",
+                initial=settings.show_reasoning_stream,
+                description="Show streamed reasoning panels and reasoning task entries.",
+            ),
+            Switch(
+                id="show_tool_calls",
+                label="Show Tool Calls",
+                initial=settings.show_tool_calls,
+                description="Show streamed tool-call panels and tool task entries.",
             ),
         ]
     )
@@ -928,6 +958,8 @@ def coerce_settings(
     *,
     default_model_name: str,
     available_models: tuple[str, ...],
+    show_reasoning_stream_default: bool = True,
+    show_tool_calls_default: bool = True,
 ) -> AppSettings:
     """Coerce settings.
 
@@ -935,6 +967,8 @@ def coerce_settings(
         raw_settings: Raw settings to process.
         default_model_name: The default model name value.
         available_models: The available models value.
+        show_reasoning_stream_default: Default reasoning stream visibility.
+        show_tool_calls_default: Default tool-call visibility.
 
     Returns:
         The coerced value.
@@ -950,6 +984,14 @@ def coerce_settings(
             ),
             reasoning_level=normalize_reasoning_level(raw_settings.reasoning_level),
             thread_id=raw_settings.thread_id,
+            show_reasoning_stream=coerce_bool_setting(
+                getattr(raw_settings, "show_reasoning_stream", None),
+                default=show_reasoning_stream_default,
+            ),
+            show_tool_calls=coerce_bool_setting(
+                getattr(raw_settings, "show_tool_calls", None),
+                default=show_tool_calls_default,
+            ),
         )
     model_name = resolve_model_name(
         raw_settings.get("model_name"),
@@ -968,6 +1010,14 @@ def coerce_settings(
         model_name=model_name,
         reasoning_level=reasoning_level,
         thread_id=thread_id.strip(),
+        show_reasoning_stream=coerce_bool_setting(
+            raw_settings.get("show_reasoning_stream"),
+            default=show_reasoning_stream_default,
+        ),
+        show_tool_calls=coerce_bool_setting(
+            raw_settings.get("show_tool_calls"),
+            default=show_tool_calls_default,
+        ),
     )
 
 
@@ -1130,16 +1180,18 @@ async def on_chat_start() -> None:
     store_mcp_session_id()
     await publish_native_commands(runtime)
     extensions = runtime.config.extensions
-    run_task_list = await get_run_task_list(
-        reasoning_steps_enabled=extensions.chainlit_reasoning_steps_enabled,
-        tool_steps_enabled=extensions.chainlit_tool_steps_enabled,
-    )
-    await run_task_list.show_ready()
     settings = AppSettings(
         model_name=runtime.config.model_name,
         reasoning_level=runtime.config.default_reasoning,
         thread_id=current_chainlit_thread_id(),
+        show_reasoning_stream=extensions.chainlit_reasoning_steps_enabled,
+        show_tool_calls=extensions.chainlit_tool_steps_enabled,
     )
+    run_task_list = await get_run_task_list(
+        reasoning_steps_enabled=settings.show_reasoning_stream,
+        tool_steps_enabled=settings.show_tool_calls,
+    )
+    await run_task_list.show_ready()
     store_settings(settings)
     await publish_modes(
         settings,
@@ -1232,12 +1284,6 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     await publish_native_commands(runtime)
 
     extensions = runtime.config.extensions
-    run_task_list = await get_run_task_list(
-        reasoning_steps_enabled=extensions.chainlit_reasoning_steps_enabled,
-        tool_steps_enabled=extensions.chainlit_tool_steps_enabled,
-    )
-    await run_task_list.show_ready()
-
     metadata = thread.get("metadata") or {}
     raw_settings = (
         metadata.get(SESSION_SETTINGS_KEY) if isinstance(metadata, dict) else None
@@ -1246,7 +1292,14 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         raw_settings,
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
+        show_reasoning_stream_default=extensions.chainlit_reasoning_steps_enabled,
+        show_tool_calls_default=extensions.chainlit_tool_steps_enabled,
     )
+    run_task_list = await get_run_task_list(
+        reasoning_steps_enabled=settings.show_reasoning_stream,
+        tool_steps_enabled=settings.show_tool_calls,
+    )
+    await run_task_list.show_ready()
     store_settings(settings)
     await publish_modes(
         settings,
@@ -1291,8 +1344,18 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         raw_settings,
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
+        show_reasoning_stream_default=(
+            runtime.config.extensions.chainlit_reasoning_steps_enabled
+        ),
+        show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
     )
     store_settings(settings)
+    run_task_list = cl.user_session.get(SESSION_TASK_LIST_KEY)
+    if isinstance(run_task_list, RunTaskList):
+        run_task_list.configure(
+            reasoning_steps_enabled=settings.show_reasoning_stream,
+            tool_steps_enabled=settings.show_tool_calls,
+        )
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1365,6 +1428,10 @@ async def upload_rag_file(action: cl.Action) -> None:
         cl.user_session.get(SESSION_SETTINGS_KEY),
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
+        show_reasoning_stream_default=(
+            runtime.config.extensions.chainlit_reasoning_steps_enabled
+        ),
+        show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
     )
     uploads = await ask_for_rag_upload()
     if not uploads:
@@ -1398,6 +1465,10 @@ async def on_message(message: cl.Message) -> None:
         cl.user_session.get(SESSION_SETTINGS_KEY),
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
+        show_reasoning_stream_default=(
+            runtime.config.extensions.chainlit_reasoning_steps_enabled
+        ),
+        show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
     )
     effective_reasoning_level = resolve_reasoning_level_for_message(
         message,
@@ -1411,10 +1482,9 @@ async def on_message(message: cl.Message) -> None:
         model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     )
     mcp_session_id = current_mcp_session_id()
-    extensions = runtime.config.extensions
     run_task_list = await get_run_task_list(
-        reasoning_steps_enabled=extensions.chainlit_reasoning_steps_enabled,
-        tool_steps_enabled=extensions.chainlit_tool_steps_enabled,
+        reasoning_steps_enabled=settings.show_reasoning_stream,
+        tool_steps_enabled=settings.show_tool_calls,
     )
     uploaded_files = message_uploaded_rag_files(message)
     uploaded_image_parts = message_uploaded_image_parts(message)
@@ -1512,8 +1582,8 @@ async def on_message(message: cl.Message) -> None:
         prompt=agent_prompt,
         run_task_list=run_task_list,
         chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
-        reasoning_steps_enabled=runtime.config.extensions.chainlit_reasoning_steps_enabled,
-        tool_steps_enabled=runtime.config.extensions.chainlit_tool_steps_enabled,
+        reasoning_steps_enabled=settings.show_reasoning_stream,
+        tool_steps_enabled=settings.show_tool_calls,
     )
     await bridge.start()
 
