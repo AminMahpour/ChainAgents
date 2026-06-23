@@ -49,6 +49,8 @@ cwd = "."
 [agent]
 state = "stateful"
 recursion_limit = 200
+memory_namespace = "filesystem"
+memory_files = ["/memories/AGENTS.md"]
 skills = ["skills"]
 mcp_servers = []
 # Legacy flag retained for compatibility; DeepAgents provides summarization.
