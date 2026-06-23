@@ -76,6 +76,8 @@ DEFAULT_AGENT_STATE: AgentStateMode = "stateful"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
+DEFAULT_AGENT_MEMORY_NAMESPACE = "filesystem"
+DEFAULT_AGENT_MEMORY_FILES = ("/memories/AGENTS.md",)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 GENERATED_OUTPUTS_DIRECTORY = Path(".files/outputs")
@@ -167,6 +169,71 @@ def normalize_agent_state(value: Any | None) -> AgentStateMode:
     raise ValueError(
         "The top-level 'agent.state' config must be 'stateful' or 'stateless'."
     )
+
+
+def normalize_agent_memory_namespace(value: Any | None) -> str:
+    """Normalize the shared agent memory namespace.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized agent memory namespace.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None:
+        return DEFAULT_AGENT_MEMORY_NAMESPACE
+    if not isinstance(value, str):
+        raise ValueError(
+            "The top-level 'agent.memory_namespace' config must be a non-empty string."
+        )
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError(
+            "The top-level 'agent.memory_namespace' config must be a non-empty string."
+        )
+    if "*" in candidate:
+        raise ValueError(
+            "The top-level 'agent.memory_namespace' config cannot contain '*'."
+        )
+    return candidate
+
+
+def normalize_agent_memory_files(value: Any | None) -> tuple[str, ...]:
+    """Normalize startup memory files loaded by DeepAgents.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized memory file paths.
+
+    Raises:
+        ValueError: If the supplied value is invalid.
+    """
+    if value is None:
+        return DEFAULT_AGENT_MEMORY_FILES
+    if not isinstance(value, list):
+        raise ValueError(
+            "The top-level 'agent.memory_files' config must be an array of /memories/ paths."
+        )
+
+    memory_files: list[str] = []
+    for index, raw_path in enumerate(value, start=1):
+        if not isinstance(raw_path, str):
+            raise ValueError(
+                f"The top-level 'agent.memory_files' entry #{index} must be a string."
+            )
+        memory_path = raw_path.strip()
+        if not memory_path.startswith("/memories/") or memory_path == "/memories/":
+            raise ValueError(
+                "The top-level 'agent.memory_files' entries must be absolute "
+                "/memories/ file paths."
+            )
+        memory_files.append(memory_path)
+    return tuple(memory_files)
 
 
 def normalize_disable_streaming(value: Any | None) -> DisableStreaming:
@@ -1534,6 +1601,8 @@ class ExtensionsConfig:
         mcp_tool_name_prefix: The MCP tool name prefix value.
         mcp_stateful: The MCP stateful value.
         agent_state: Whether the DeepAgents graph is stateful or stateless.
+        agent_memory_namespace: Shared StoreBackend namespace for /memories/.
+        agent_memory_files: Startup memory files loaded into the agent prompt.
         recursion_limit: The recursion limit value.
         mcp_servers: The MCP servers value.
         skills: The skills value.
@@ -1558,6 +1627,8 @@ class ExtensionsConfig:
     mcp_tool_name_prefix: bool = True
     mcp_stateful: bool = False
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
+    agent_memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE
+    agent_memory_files: tuple[str, ...] = DEFAULT_AGENT_MEMORY_FILES
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
@@ -1918,6 +1989,10 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         field_name="The top-level 'agent.recursion_limit' config",
     )
     agent_state = normalize_agent_state(agent_section.get("state"))
+    agent_memory_namespace = normalize_agent_memory_namespace(
+        agent_section.get("memory_namespace")
+    )
+    agent_memory_files = normalize_agent_memory_files(agent_section.get("memory_files"))
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -2133,6 +2208,8 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
         mcp_stateful=bool(mcp_section.get("stateful", False)),
         agent_state=agent_state,
+        agent_memory_namespace=agent_memory_namespace,
+        agent_memory_files=agent_memory_files,
         recursion_limit=recursion_limit,
         mcp_servers=mcp_servers or None,
         skills=skill_paths,
@@ -2826,12 +2903,14 @@ def build_deepagent_backend(
     *,
     project_root: Path | None = None,
     include_memories: bool = True,
+    memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE,
 ) -> CompositeBackend:
     """Build deepagent backend.
 
     Args:
         project_root: Project root used to resolve local paths.
         include_memories: Whether to expose the /memories/ store route.
+        memory_namespace: Shared StoreBackend namespace for /memories/.
 
     Returns:
         The constructed deepagent backend.
@@ -2854,7 +2933,9 @@ def build_deepagent_backend(
         ),
     }
     if include_memories:
-        routes["/memories/"] = StoreBackend()
+        routes["/memories/"] = StoreBackend(
+            namespace=lambda _runtime: (memory_namespace,)
+        )
     return CompositeBackend(
         default=StateBackend(),
         routes=routes,
@@ -3184,6 +3265,20 @@ def build_graph_subagent_specs(
     return subagent_specs
 
 
+def stateful_agent_memory_files(config: RuntimeConfig) -> list[str] | None:
+    """Return startup memory files for stateful agents.
+
+    Args:
+        config: Configuration object used by the operation.
+
+    Returns:
+        The configured memory file paths, or None when startup memory is disabled.
+    """
+    if config.agent_state != "stateful" or not config.extensions.agent_memory_files:
+        return None
+    return list(config.extensions.agent_memory_files)
+
+
 def create_configured_graph(
     *,
     include_async_subagents: bool,
@@ -3215,11 +3310,10 @@ def create_configured_graph(
     else:
         if config.rag_requested and config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
-    return create_deep_agent_with_configured_summarization(
-        config,
-        model=build_model(config, config.default_reasoning),
-        tools=sanitize_tools_for_model(config.model_provider, tools) or None,
-        system_prompt=compose_rag_system_prompt(
+    agent_kwargs: dict[str, Any] = {
+        "model": build_model(config, config.default_reasoning),
+        "tools": sanitize_tools_for_model(config.model_provider, tools) or None,
+        "system_prompt": compose_rag_system_prompt(
             compose_agent_system_prompt(
                 system_prompt_for_agent_state(system_prompt, config.agent_state),
                 (
@@ -3231,18 +3325,23 @@ def create_configured_graph(
             ),
             rag_enabled=config.rag is not None,
         ),
-        middleware=build_agent_middleware(
+        "middleware": build_agent_middleware(
             config=config,
             reasoning_level=config.default_reasoning,
             source="main-agent",
             project_root=PROJECT_ROOT,
         ),
-        backend=build_deepagent_backend(
+        "backend": build_deepagent_backend(
             include_memories=config.agent_state == "stateful",
+            memory_namespace=config.extensions.agent_memory_namespace,
         ),
-        skills=list(config.extensions.skills) or None,
-        subagents=subagent_specs or None,
-    )
+        "skills": list(config.extensions.skills) or None,
+        "subagents": subagent_specs or None,
+    }
+    memory_files = stateful_agent_memory_files(config)
+    if memory_files is not None:
+        agent_kwargs["memory"] = memory_files
+    return create_deep_agent_with_configured_summarization(config, **agent_kwargs)
 
 
 @dataclass(frozen=True)
@@ -3562,10 +3661,14 @@ class AgentRuntime:
                     "backend": build_deepagent_backend(
                         project_root=self.project_root,
                         include_memories=self.config.agent_state == "stateful",
+                        memory_namespace=self.config.extensions.agent_memory_namespace,
                     ),
                     "skills": list(self.config.extensions.skills) or None,
                     "subagents": subagent_specs or None,
                 }
+                memory_files = stateful_agent_memory_files(self.config)
+                if memory_files is not None:
+                    agent_kwargs["memory"] = memory_files
                 if self.config.agent_state == "stateful":
                     agent_kwargs["store"] = self.store
                     agent_kwargs["checkpointer"] = self.checkpointer
@@ -3970,4 +4073,5 @@ class AgentRuntime:
         return build_deepagent_backend(
             project_root=self.project_root,
             include_memories=runtime.config.agent_state == "stateful",
+            memory_namespace=runtime.config.extensions.agent_memory_namespace,
         )

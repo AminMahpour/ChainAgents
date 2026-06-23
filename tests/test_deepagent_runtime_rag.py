@@ -1153,6 +1153,102 @@ state = "stateless"
     assert config.extensions.agent_state == "stateless"
 
 
+def test_runtime_config_defaults_agent_scoped_memory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify agent-scoped memory defaults preserve legacy namespace behavior."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.extensions.agent_memory_namespace == "filesystem"
+    assert config.extensions.agent_memory_files == ("/memories/AGENTS.md",)
+
+
+def test_runtime_config_reads_agent_scoped_memory_from_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify agent memory namespace and startup files are configurable."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+memory_namespace = "repo-agent"
+memory_files = ["/memories/AGENTS.md", "/memories/preferences.md"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.extensions.agent_memory_namespace == "repo-agent"
+    assert config.extensions.agent_memory_files == (
+        "/memories/AGENTS.md",
+        "/memories/preferences.md",
+    )
+
+
+def test_runtime_config_allows_empty_agent_memory_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify memory_files = [] disables startup memory loading."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+memory_files = []
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.extensions.agent_memory_files == ()
+
+
+@pytest.mark.parametrize(
+    ("agent_config", "message"),
+    (
+        ('memory_namespace = ""', "agent.memory_namespace"),
+        ('memory_namespace = "agent-*"', "agent.memory_namespace"),
+        ('memory_files = "/memories/AGENTS.md"', "agent.memory_files"),
+        ('memory_files = ["memories/AGENTS.md"]', "agent.memory_files"),
+        ('memory_files = ["/workspace/AGENTS.md"]', "agent.memory_files"),
+    ),
+)
+def test_runtime_config_rejects_invalid_agent_memory_config(
+    tmp_path: Path,
+    monkeypatch,
+    agent_config: str,
+    message: str,
+) -> None:
+    """Verify invalid agent memory config fails clearly."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        f"""
+[agent]
+{agent_config}
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match=message):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
 def test_runtime_config_rejects_invalid_agent_state(
     tmp_path: Path,
     monkeypatch,
@@ -1261,6 +1357,20 @@ def test_build_deepagent_backend_routes_generated_outputs_separately(
     assert read_result.error is None
     assert read_result.file_data is not None
     assert read_result.file_data["content"] == "downloadable output"
+
+
+def test_build_deepagent_backend_uses_explicit_agent_memory_namespace(
+    tmp_path: Path,
+) -> None:
+    """Verify /memories/ uses an explicit agent-scoped store namespace."""
+    backend = deepagent_runtime.build_deepagent_backend(
+        project_root=tmp_path,
+        memory_namespace="repo-agent",
+    )
+
+    memory_backend = backend.routes["/memories/"]
+
+    assert memory_backend._namespace(None) == ("repo-agent",)  # noqa: SLF001
 
 
 def test_tool_execution_resilience_middleware_returns_error_tool_message() -> None:
@@ -1571,6 +1681,72 @@ def test_get_agent_passes_deepagents_backend_instance(
     assert backend.routes["/workspace/"].cwd == tmp_path
 
 
+def test_get_agent_passes_agent_memory_files_when_stateful(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify stateful agents load configured long-term memory files."""
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests."""
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    extensions = ExtensionsConfig(
+        config_path=None,
+        agent_memory_namespace="repo-agent",
+        agent_memory_files=("/memories/AGENTS.md", "/memories/preferences.md"),
+    )
+    runtime = AgentRuntime(
+        make_runtime_config(tmp_path, extensions=extensions),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert captured["kwargs"]["memory"] == [
+        "/memories/AGENTS.md",
+        "/memories/preferences.md",
+    ]
+
+
+def test_get_agent_omits_memory_when_stateful_memory_files_empty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify stateful agents can keep /memories/ without startup memory files."""
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests."""
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    extensions = ExtensionsConfig(
+        config_path=None,
+        agent_memory_namespace="repo-agent",
+        agent_memory_files=(),
+    )
+    runtime = AgentRuntime(
+        make_runtime_config(tmp_path, extensions=extensions),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert "memory" not in captured["kwargs"]
+    assert "/memories/" in captured["kwargs"]["backend"].routes
+
+
 def test_get_agent_omits_store_and_checkpointer_when_stateless(
     tmp_path: Path,
     monkeypatch,
@@ -1632,6 +1808,7 @@ def test_get_agent_disables_memories_backend_and_prompt_when_stateless(
     assert "/memories/" not in backend.routes
     assert "/memories/" not in system_prompt
     assert "Agent memory is disabled for this runtime." in system_prompt
+    assert "memory" not in captured["kwargs"]
 
 
 def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(

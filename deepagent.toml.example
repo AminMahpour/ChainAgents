@@ -43,6 +43,12 @@ url = "http://localhost:8000/mcp"
 [agent]
 state = "stateful"
 # A repo-root AGENTS.md file is loaded automatically into the main agent prompt.
+# Agent-scoped DeepAgents memory is shared across all threads using this namespace.
+# The default preserves existing store-backed /memories/ data from older configs.
+memory_namespace = "filesystem"
+# These /memories/ files are loaded into the DeepAgents startup memory prompt.
+# Set memory_files = [] to keep the /memories/ route without startup memory loading.
+memory_files = ["/memories/AGENTS.md"]
 # Relative skill source paths are resolved from this file and mapped to /workspace/...
 # This directory should contain one or more skill folders, each with its own SKILL.md.
 skills = ["skills"]

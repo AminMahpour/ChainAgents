@@ -403,6 +403,8 @@ The `[agent]` table configures main-agent runtime behavior:
 [agent]
 state = "stateful"
 recursion_limit = 200
+memory_namespace = "filesystem"
+memory_files = ["/memories/AGENTS.md"]
 skills = ["skills"]
 mcp_servers = ["repo"]
 ```
@@ -414,6 +416,8 @@ Notes:
 - The built-in default is `100`; this repo's `deepagent.toml` sets it to `200`.
 - `DEEPAGENT_RECURSION_LIMIT` overrides this value when set.
 - Increase it for long tool-heavy runs that hit `GraphRecursionError`; lower it if you want runaway loops to stop sooner.
+- `memory_namespace` is the shared agent-scoped StoreBackend namespace for `/memories/`. The default is `filesystem` to preserve existing memory data from earlier configs.
+- `memory_files` lists `/memories/` files DeepAgents loads into the startup memory prompt. The default is `["/memories/AGENTS.md"]`; set it to `[]` to keep the memory route without startup memory loading.
 
 ## Optional: Enable Workspace Docs RAG
 
@@ -570,6 +574,8 @@ Main `[agent]` additions:
 
 - `state`: optional agent state mode. Use `stateful` for checkpointed conversation state, or `stateless` to build the DeepAgents graph without a LangGraph store, checkpointer, or `/memories/` route. Defaults to `stateful`.
 - `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
+- `memory_namespace`: optional non-empty namespace for agent-scoped `/memories/` storage. Defaults to `filesystem`.
+- `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
 - DeepAgents provides its own summarization middleware in the main agent and sync subagents.
@@ -763,7 +769,7 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 ## Workspace Contract
 
 - `/workspace/` maps to this repo on disk.
-- `/memories/` is available in stateful mode and durable across LangGraph threads only when `DATABASE_URL` is configured.
+- `/memories/` is available in stateful mode under the configured agent-scoped namespace and durable across LangGraph threads only when `DATABASE_URL` is configured.
 - any other absolute path is treated as ephemeral scratch space by the deep agent backend.
 
 ## Notes
