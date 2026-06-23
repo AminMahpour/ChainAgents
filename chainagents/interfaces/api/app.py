@@ -22,6 +22,7 @@ from chainagents.runtime import (
     build_langgraph_run_config,
     normalize_reasoning_level,
 )
+from chainagents.runtime.reflection import ReflectionCollector
 
 
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
@@ -155,9 +156,28 @@ def create_app(runtime: Any | None = None) -> FastAPI:
         context = _run_context(active_runtime, payload)
 
         async def lines() -> AsyncIterator[str]:
+            reflection_collector = ReflectionCollector.from_runtime_config(
+                active_runtime.config,
+                prompt=context.prompt,
+            )
             try:
-                async for event in _iter_agent_events(active_runtime, context):
+                async for event in _iter_agent_events(
+                    active_runtime,
+                    context,
+                    reflection_collector=reflection_collector,
+                ):
                     yield _json_line(_event_payload(event, context))
+                proposal = reflection_collector.build_proposal()
+                if proposal is not None:
+                    yield _json_line(
+                        {
+                            "kind": "reflection_proposal",
+                            "proposal": proposal.to_payload(),
+                            "thread_id": context.thread_id,
+                            "model": context.model_name,
+                            "reasoning": context.reasoning_level,
+                        }
+                    )
                 yield _json_line(
                     {
                         "kind": "done",
@@ -169,6 +189,18 @@ def create_app(runtime: Any | None = None) -> FastAPI:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                reflection_collector.mark_run_failed(exc)
+                proposal = reflection_collector.build_proposal()
+                if proposal is not None:
+                    yield _json_line(
+                        {
+                            "kind": "reflection_proposal",
+                            "proposal": proposal.to_payload(),
+                            "thread_id": context.thread_id,
+                            "model": context.model_name,
+                            "reasoning": context.reasoning_level,
+                        }
+                    )
                 yield _json_line(
                     {
                         "kind": "error",
@@ -233,6 +265,8 @@ def _required_text(value: str, field_name: str) -> str:
 async def _iter_agent_events(
     runtime: Any,
     context: AgentRunContext,
+    *,
+    reflection_collector: ReflectionCollector | None = None,
 ) -> AsyncIterator[AgentStreamEvent]:
     agent = await runtime.get_agent(
         context.reasoning_level,
@@ -255,6 +289,8 @@ async def _iter_agent_events(
     try:
         async for raw_event in stream:
             for event in adapter.events_from_raw_event(raw_event):
+                if reflection_collector is not None:
+                    reflection_collector.record_event(event)
                 yield event
     finally:
         with suppress(Exception):

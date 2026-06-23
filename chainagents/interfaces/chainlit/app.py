@@ -38,10 +38,17 @@ from chainagents.runtime import (
     AgentRuntime,
     AppSettings,
     ChainlitStarterConfig,
+    ReasoningLevel,
     RuntimeConfig,
     build_langgraph_run_config,
     format_model_provider,
     normalize_reasoning_level,
+)
+from chainagents.runtime.reflection import (
+    ReflectionCollector,
+    ReflectionProposal,
+    format_reflection_proposal,
+    reflection_save_prompt,
 )
 from chainagents.rag.runtime import UploadedRagFile
 from chainagents.exports.response import (
@@ -58,6 +65,8 @@ SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_MCP_SESSION_ID_KEY = "mcp_session_id"
 REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
 UPLOAD_RAG_FILE_ACTION = "upload_rag_file"
+REFLECTION_SAVE_ACTION = "save_reflection_lesson"
+REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
 RAG_UPLOAD_ACCEPT = {
     "text/plain": [
         ".csv",
@@ -405,6 +414,98 @@ def rag_actions() -> list[cl.Action]:
         Chainlit action buttons for RAG workflows.
     """
     return [build_rag_action(), build_upload_rag_action()]
+
+
+def reflection_actions() -> list[cl.Action]:
+    """Return Chainlit actions for reflection confirmation."""
+    return [
+        cl.Action(
+            name=REFLECTION_SAVE_ACTION,
+            payload={"value": "save"},
+            label="Save lesson",
+            tooltip="Ask the agent to save this lesson into long-term memory.",
+            icon="save",
+        ),
+        cl.Action(
+            name=REFLECTION_DISMISS_ACTION,
+            payload={"value": "dismiss"},
+            label="Dismiss",
+            tooltip="Do not save this reflection lesson.",
+            icon="x",
+        ),
+    ]
+
+
+async def ask_to_save_reflection_lesson(
+    *,
+    runtime: AgentRuntime,
+    settings: AppSettings,
+    proposal: ReflectionProposal,
+    reasoning_level: ReasoningLevel,
+    model_name: str,
+    async_url_override: str | None,
+    mcp_session_id: str | None,
+) -> None:
+    """Ask the Chainlit user whether to save a reflection lesson."""
+    response = await cl.AskActionMessage(
+        content=format_reflection_proposal(proposal),
+        actions=reflection_actions(),
+        author="System",
+        timeout=90,
+        raise_on_timeout=False,
+    ).send()
+    if not response:
+        return
+    payload = response.get("payload") if isinstance(response, dict) else None
+    if not isinstance(payload, dict) or payload.get("value") != "save":
+        return
+    await save_reflection_lesson(
+        runtime=runtime,
+        settings=settings,
+        proposal=proposal,
+        reasoning_level=reasoning_level,
+        model_name=model_name,
+        async_url_override=async_url_override,
+        mcp_session_id=mcp_session_id,
+    )
+
+
+async def save_reflection_lesson(
+    *,
+    runtime: AgentRuntime,
+    settings: AppSettings,
+    proposal: ReflectionProposal,
+    reasoning_level: ReasoningLevel,
+    model_name: str,
+    async_url_override: str | None,
+    mcp_session_id: str | None,
+) -> None:
+    """Ask the configured agent to save a confirmed reflection lesson."""
+    reflection_thread_id = f"{settings.thread_id}:reflection"
+    agent = await runtime.get_agent(
+        reasoning_level,
+        model_name=model_name,
+        thread_id=reflection_thread_id,
+        async_subagent_url_override=async_url_override,
+        mcp_session_id=mcp_session_id,
+    )
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": reflection_save_prompt(proposal),
+            }
+        ]
+    }
+    config = build_langgraph_run_config(
+        runtime.config,
+        thread_id=reflection_thread_id,
+    )
+    await agent.ainvoke(payload, config=config)
+    await cl.Message(
+        content=f"Saved lesson to `{proposal.memory_file}`.",
+        author="System",
+    ).send()
 
 
 def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
@@ -1584,6 +1685,10 @@ async def on_message(message: cl.Message) -> None:
         chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
+        reflection_collector=ReflectionCollector.from_runtime_config(
+            runtime.config,
+            prompt=agent_prompt,
+        ),
     )
     await bridge.start()
 
@@ -1628,12 +1733,35 @@ async def on_message(message: cl.Message) -> None:
         details = traceback.format_exc(limit=10)
         with suppress(Exception):
             await bridge.fail(exc, details)
+        proposal = bridge.reflection_proposal()
+        if proposal is not None:
+            with suppress(Exception):
+                await ask_to_save_reflection_lesson(
+                    runtime=runtime,
+                    settings=settings,
+                    proposal=proposal,
+                    reasoning_level=effective_reasoning_level,
+                    model_name=effective_model_name,
+                    async_url_override=async_url_override,
+                    mcp_session_id=mcp_session_id,
+                )
         return
     finally:
         with suppress(Exception):
             await stream.aclose()
 
     await bridge.finish()
+    proposal = bridge.reflection_proposal()
+    if proposal is not None:
+        await ask_to_save_reflection_lesson(
+            runtime=runtime,
+            settings=settings,
+            proposal=proposal,
+            reasoning_level=effective_reasoning_level,
+            model_name=effective_model_name,
+            async_url_override=async_url_override,
+            mcp_session_id=mcp_session_id,
+        )
     if async_task_notifier is not None:
         with suppress(Exception):
             await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)

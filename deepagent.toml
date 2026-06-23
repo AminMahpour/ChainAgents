@@ -59,6 +59,12 @@ summarization_middleware_enabled = true
 summarization_trigger_tokens = 150000
 summarization_keep_tokens = 10000
 
+[agent.reflection]
+enabled = true
+memory_file = "/memories/AGENTS.md"
+max_lesson_chars = 700
+tool_failure_mode = "unrecovered"
+
 [rag]
 enabled = true
 persist_directory = ".rag"

@@ -22,6 +22,10 @@ from chainagents.commands.native import (
     resolve_runtime_command,
 )
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.runtime.reflection import (
+    ReflectionCollector,
+    format_reflection_proposal,
+)
 from chainagents.runtime import (
     AgentRuntime,
     PROJECT_ROOT,
@@ -360,6 +364,10 @@ class ChainAgentsTuiApp(App[int]):
             thread_id=self.thread_id,
         )
         adapter = AgentStreamEventAdapter(prompt=prompt)
+        reflection_collector = ReflectionCollector.from_runtime_config(
+            self.runtime.config,
+            prompt=prompt,
+        )
         stream = agent.astream_events(
             payload,
             config=config,
@@ -368,6 +376,7 @@ class ChainAgentsTuiApp(App[int]):
             subgraphs=True,
         )
 
+        stream_error: Exception | None = None
         try:
             while True:
                 try:
@@ -375,10 +384,20 @@ class ChainAgentsTuiApp(App[int]):
                 except StopAsyncIteration:
                     break
                 for stream_event in adapter.events_from_raw_event(event):
+                    reflection_collector.record_event(stream_event)
                     await self._handle_stream_event(stream_event)
+        except Exception as exc:
+            stream_error = exc
+            reflection_collector.mark_run_failed(exc)
         finally:
             with suppress(Exception):
                 await stream.aclose()
+
+        proposal = reflection_collector.build_proposal()
+        if proposal is not None:
+            self._append_tool_entry(format_reflection_proposal(proposal))
+        if stream_error is not None:
+            raise stream_error
 
     async def _handle_stream_event(self, event: AgentStreamEvent) -> None:
         if event.kind == "response_delta":

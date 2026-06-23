@@ -407,6 +407,12 @@ memory_namespace = "filesystem"
 memory_files = ["/memories/AGENTS.md"]
 skills = ["skills"]
 mcp_servers = ["repo"]
+
+[agent.reflection]
+enabled = true
+memory_file = "/memories/AGENTS.md"
+max_lesson_chars = 700
+tool_failure_mode = "unrecovered"
 ```
 
 Notes:
@@ -418,6 +424,7 @@ Notes:
 - Increase it for long tool-heavy runs that hit `GraphRecursionError`; lower it if you want runaway loops to stop sooner.
 - `memory_namespace` is the shared agent-scoped StoreBackend namespace for `/memories/`. The default is `filesystem` to preserve existing memory data from earlier configs. Use only letters, numbers, hyphens, underscores, dots, `@`, `+`, colons, and tildes.
 - `memory_files` lists `/memories/` files DeepAgents loads into the startup memory prompt. The default is `["/memories/AGENTS.md"]`; set it to `[]` to keep the memory route without startup memory loading.
+- `[agent.reflection]` is opt-in. When enabled for stateful agents, ChainAgents proposes a compact lesson for `memory_file` after correction phrases such as "that was wrong" or after unrecovered tool failures. Chainlit asks with Save/Dismiss before writing through the agent; CLI, TUI, and API expose the proposal without mutating memory.
 
 ## Optional: Enable Workspace Docs RAG
 
@@ -576,6 +583,7 @@ Main `[agent]` additions:
 - `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
 - `memory_namespace`: optional non-empty namespace for agent-scoped `/memories/` storage. Defaults to `filesystem`; allowed characters are letters, numbers, `-`, `_`, `.`, `@`, `+`, `:`, and `~`.
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
+- `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
 - DeepAgents provides its own summarization middleware in the main agent and sync subagents.
