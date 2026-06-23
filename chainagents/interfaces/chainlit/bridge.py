@@ -68,6 +68,14 @@ def load_auto_collapse_delay_seconds() -> float:
 
 AUTO_COLLAPSE_DELAY_SECONDS = load_auto_collapse_delay_seconds()
 ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
+GENERATED_FILE_TOOL_SUFFIXES = ("write_file", "edit_file", "create_file")
+GENERATED_FILE_PATH_ARG_KEYS = (
+    "path",
+    "file_path",
+    "destination",
+    "dest",
+    "output_path",
+)
 
 
 def stringify_content(value: Any) -> str:
@@ -472,6 +480,31 @@ def tool_task_title(source: str, tool_name: str, raw_args: str) -> str:
                 return f"{source}: {titled}" if source != "main-agent" else titled
 
     return f"{source}: {name}" if source != "main-agent" else name
+
+
+def generated_file_paths_from_tool_args(tool_name: str, raw_args: str) -> tuple[str, ...]:
+    """Return generated file paths captured from write-style tool arguments."""
+    name = tool_name.strip().lower()
+    if not any(name.endswith(suffix) for suffix in GENERATED_FILE_TOOL_SUFFIXES):
+        return ()
+
+    parsed = parse_tool_args(raw_args)
+    if not isinstance(parsed, dict):
+        return ()
+
+    paths: list[str] = []
+    for key in GENERATED_FILE_PATH_ARG_KEYS:
+        value = parsed.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+        elif isinstance(value, list):
+            paths.extend(
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            )
+
+    return tuple(dict.fromkeys(paths))
 
 
 def is_assistant_message(message: Any) -> bool:
@@ -934,6 +967,7 @@ class ChainlitEventBridge:
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
         self.summarization_steps: dict[str, cl.Step] = {}
+        self.generated_file_paths: list[str] = []
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
         self.chronological_ui_enabled = chronological_ui_enabled
@@ -1235,6 +1269,8 @@ class ChainlitEventBridge:
                 for_id=getattr(state.step, "id", None) if state.step is not None else None,
                 failed=event.status.lower() == "error",
             )
+        if event.status.lower() != "error":
+            self._record_generated_file_paths(state.name, "".join(state.arg_chunks))
         if state.name == "write_todos" and self.run_task_list is not None:
             todos = todos_from_tool_message_content(event.tool_result)
             if todos:
@@ -1321,6 +1357,7 @@ class ChainlitEventBridge:
             self.response_message,
             prompt=self.prompt,
             response_text=self.response_buffer,
+            generated_file_paths=tuple(self.generated_file_paths),
         )
         await self.response_message.update()
 
@@ -1444,11 +1481,19 @@ class ChainlitEventBridge:
                 for_id=getattr(state.step, "id", None) if state.step is not None else None,
                 failed=str(getattr(tool_message, "status", "")).lower() == "error",
             )
+        if str(getattr(tool_message, "status", "")).lower() != "error":
+            self._record_generated_file_paths(state.name, "".join(state.arg_chunks))
         if state.name == "write_todos" and self.run_task_list is not None:
             todos = todos_from_tool_message_content(getattr(tool_message, "content", ""))
             if todos:
                 await self.run_task_list.update_todos(todos)
         self.tool_steps.pop(state.call_id, None)
+
+    def _record_generated_file_paths(self, tool_name: str, raw_args: str) -> None:
+        """Remember generated file paths from a completed tool call."""
+        for path in generated_file_paths_from_tool_args(tool_name, raw_args):
+            if path not in self.generated_file_paths:
+                self.generated_file_paths.append(path)
 
     async def _close_reasoning_step(self, source: str) -> None:
         """Close one active Chainlit reasoning step.

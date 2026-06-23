@@ -1,0 +1,21 @@
+id,first_name,last_name,email,age,city,state,join_date,annual_salary,department
+1,John,Doe,john.doe@example.com,32,New York,NY,2021-03-15,75000,Engineering
+2,Jane,Smith,jane.smith@example.com,28,San Francisco,CA,2022-01-10,82000,Engineering
+3,Bob,Johnson,bob.johnson@example.com,45,Chicago,IL,2019-07-22,95000,Management
+4,Alice,Williams,alice.williams@example.com,36,Austin,TX,2020-11-05,78000,Marketing
+5,Charlie,Brown,charlie.brown@example.com,29,Seattle,WA,2023-02-18,71000,Engineering
+6,Diana,Prince,diana.prince@example.com,38,Boston,MA,2018-09-30,105000,Management
+7,Edward,Norton,edward.norton@example.com,41,Denver,CO,2020-04-12,88000,Sales
+8,Fiona,Gale,fiona.gale@example.com,26,Portland,OR,2023-06-01,65000,Marketing
+9,George,Lucas,george.lucas@example.com,50,Miami,FL,2017-01-20,115000,Management
+10,Hannah,Montana,hannah.montana@example.com,31,Atlanta,GA,2021-08-14,73000,Sales
+11,Ivan,Petrov,ivan.petrov@example.com,34,Minneapolis,MN,2022-05-25,79000,Engineering
+12,Julia,Roberts,julia.roberts@example.com,43,Los Angeles,CA,2019-12-09,98000,Marketing
+13,Kevin,Hart,kevin.hart@example.com,39,Phoenix,AZ,2020-07-17,85000,Sales
+14,Laura,Croft,laura.croft@example.com,27,Nashville,TN,2023-09-05,67000,Engineering
+15,Mike,Tyson,mike.tyson@example.com,47,Detroit,MI,2018-03-28,110000,Management
+16,Nancy,Drew,nancy.drew@example.com,33,Philadelphia,PA,2021-11-22,76000,Sales
+17,Oscar,Wilde,oscar.wilde@example.com,30,San Diego,CA,2022-08-10,72000,Marketing
+18,Patricia,Arquette,patricia.arquette@example.com,44,Charlotte,NC,2019-05-15,92000,Engineering
+19,Quinn,Hughes,quinn.hughes@example.com,25,Columbus,OH,2023-11-30,63000,Sales
+20,Rachel,Green,rachel.green@example.com,37,Dallas,TX,2020-02-14,81000,Marketing

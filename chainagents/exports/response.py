@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import mimetypes
 import os
 import re
 import sys
 import unicodedata
+from collections.abc import Iterable
 from pathlib import Path
 
 import chainlit as cl
@@ -18,6 +20,8 @@ DOWNLOAD_PDF_ACTION = "download_response_pdf"
 RESPONSE_EXPORTS_SESSION_KEY = "response_exports"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
+DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
+MAX_GENERATED_FILE_ATTACHMENTS = 12
 HOMEBREW_LIBRARY_PATH = Path("/opt/homebrew/lib")
 PDF_EXPORT_DEPENDENCY_ERROR = (
     "PDF export requires WeasyPrint and its native runtime libraries. "
@@ -25,6 +29,13 @@ PDF_EXPORT_DEPENDENCY_ERROR = (
     "the Pango packages listed in the WeasyPrint installation guide. Restart "
     "the app after installing the system libraries."
 )
+GENERATED_FILE_PATH_RE = re.compile(
+    r"(?P<path>"
+    r"(?:/workspace/|\.files/deepagent/|/[^`'\"<>\s)]*/\.files/deepagent/)"
+    r"[^`'\"<>\s)]*"
+    r")"
+)
+GENERATED_FILE_TRAILING_PUNCTUATION = ".,;:!?"
 PDF_STYLES = """
 @page {
   size: letter;
@@ -243,6 +254,8 @@ def attach_response_export_actions(
     *,
     prompt: str,
     response_text: str,
+    generated_file_paths: Iterable[str | Path] = (),
+    project_root: Path | None = None,
 ) -> None:
     """Attach response export actions.
 
@@ -250,6 +263,8 @@ def attach_response_export_actions(
         message: Chainlit message or LangChain message to process.
         prompt: The prompt value.
         response_text: The response text value.
+        generated_file_paths: Local, workspace, or artifact paths created during the run.
+        project_root: Project root used to resolve virtual workspace paths.
     """
     message_id = str(getattr(message, "id", "") or "").strip()
     if not message_id or not response_text.strip():
@@ -279,6 +294,137 @@ def attach_response_export_actions(
             icon="download",
         ),
     ]
+
+    generated_elements = generated_file_elements_from_text(
+        response_text,
+        generated_file_paths=generated_file_paths,
+        project_root=project_root,
+    )
+    if generated_elements:
+        existing_elements = list(getattr(message, "elements", []) or [])
+        message.elements = [*existing_elements, *generated_elements]
+
+
+def generated_file_elements_from_text(
+    text: str,
+    *,
+    generated_file_paths: Iterable[str | Path] = (),
+    project_root: Path | None = None,
+) -> list[File]:
+    """Return Chainlit file elements for generated files mentioned in text.
+
+    Args:
+        text: Response text that may mention generated file paths.
+        generated_file_paths: Additional file paths captured from successful tool calls.
+        project_root: Project root used to resolve virtual workspace paths.
+
+    Returns:
+        Downloadable Chainlit file elements for safe, existing generated files.
+    """
+    raw_paths = [
+        str(path)
+        for path in generated_file_paths
+        if str(path).strip()
+    ]
+    raw_paths.extend(
+        match.group("path")
+        for match in GENERATED_FILE_PATH_RE.finditer(text)
+        if match.group("path").strip()
+    )
+
+    return generated_file_elements_from_paths(raw_paths, project_root=project_root)
+
+
+def generated_file_elements_from_paths(
+    raw_paths: Iterable[str | Path],
+    *,
+    project_root: Path | None = None,
+) -> list[File]:
+    """Return Chainlit file elements for existing files under allowed routes.
+
+    Args:
+        raw_paths: Candidate generated file paths.
+        project_root: Project root used to resolve virtual workspace paths.
+
+    Returns:
+        Downloadable Chainlit file elements.
+    """
+    root = (project_root or Path.cwd()).resolve()
+    elements: list[File] = []
+    seen: set[Path] = set()
+    for raw_path in raw_paths:
+        path = _resolve_generated_file_path(raw_path, project_root=root)
+        if path is None or path in seen:
+            continue
+        seen.add(path)
+        mime_type, _encoding = mimetypes.guess_type(path.name)
+        elements.append(
+            File(
+                thread_id=_current_chainlit_thread_id(),
+                name=path.name,
+                path=path.as_posix(),
+                display="inline",
+                mime=mime_type,
+            )
+        )
+        if len(elements) >= MAX_GENERATED_FILE_ATTACHMENTS:
+            break
+    return elements
+
+
+def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) -> Path | None:
+    """Resolve one generated file path if it points to a safe existing file."""
+    path_text = _clean_generated_file_path(raw_path)
+    if not path_text:
+        return None
+
+    if path_text == "/workspace":
+        return None
+    if path_text.startswith("/workspace/"):
+        candidate = project_root / path_text.removeprefix("/workspace/")
+    elif path_text == DEEPAGENT_ARTIFACTS_DIRECTORY.as_posix():
+        return None
+    elif path_text.startswith(f"{DEEPAGENT_ARTIFACTS_DIRECTORY.as_posix()}/"):
+        candidate = project_root / path_text
+    else:
+        candidate = Path(path_text)
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+
+    if not _is_relative_to(resolved, project_root):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _clean_generated_file_path(raw_path: str | Path) -> str:
+    """Normalize one generated file path token from tool args or Markdown text."""
+    return str(raw_path).strip().strip("`'\"<>[]()").rstrip(
+        GENERATED_FILE_TRAILING_PUNCTUATION
+    )
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    """Return whether path is inside parent."""
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _current_chainlit_thread_id() -> str:
+    """Return the active Chainlit thread ID when one is available."""
+    try:
+        return str(cl.context.session.thread_id)
+    except Exception:
+        return ""
 
 
 async def send_markdown_export(action: cl.Action) -> None:

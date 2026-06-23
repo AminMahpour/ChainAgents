@@ -318,6 +318,45 @@ async def test_response_message_is_created_on_finish_after_reasoning_steps(monke
 
 
 @pytest.mark.anyio
+async def test_final_response_receives_generated_file_paths_from_write_tool(
+    monkeypatch,
+) -> None:
+    """Verify successful file writes are offered as final-response downloads."""
+    captured: dict[str, Any] = {}
+
+    def capture_export_actions(_message: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    bridge = ChainlitEventBridge(prompt="create a report")
+    monkeypatch.setattr(
+        chainlit_bridge,
+        "attach_response_export_actions",
+        capture_export_actions,
+    )
+
+    await bridge._stream_tool_call(
+        "main-agent",
+        {
+            "id": "call-1",
+            "name": "write_file",
+            "args": '{"path": "/workspace/reports/summary.csv"}',
+        },
+    )
+    await bridge._complete_tool_step(
+        "main-agent",
+        _ToolMessage(
+            name="write_file",
+            tool_call_id="call-1",
+            content="Wrote /workspace/reports/summary.csv",
+        ),
+    )
+    await bridge._stream_response("Created `/workspace/reports/summary.csv`.")
+    await bridge.finish()
+
+    assert captured["generated_file_paths"] == ("/workspace/reports/summary.csv",)
+
+
+@pytest.mark.anyio
 async def test_reasoning_after_tool_call_starts_a_new_chronological_step() -> None:
     """Verify that reasoning after tool call starts a new chronological step."""
     bridge = ChainlitEventBridge(prompt="hello")
