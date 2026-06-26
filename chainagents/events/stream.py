@@ -414,7 +414,6 @@ class AgentStreamEventAdapter:
 
         if old_id in self.tool_call_started:
             self.tool_call_started.remove(old_id)
-            self.tool_call_started.add(new_id)
 
     def _tool_result_event(
         self,
