@@ -435,6 +435,7 @@ def test_adapter_starts_real_tool_call_id_after_synthetic_id_migration() -> None
             kind="tool_call",
             source="main-agent",
             tool_call_id="call-1",
+            previous_tool_call_id="main-agent:0",
             tool_name="read_file",
             tool_args='{"path":"README.md"}',
             tool_args_delta='DME.md"}',

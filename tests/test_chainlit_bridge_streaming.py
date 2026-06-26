@@ -444,6 +444,78 @@ async def test_tool_call_input_accumulates_chunks_by_index_when_id_is_missing() 
 
 
 @pytest.mark.anyio
+async def test_tool_call_step_rekeys_when_real_id_replaces_synthetic_id() -> None:
+    """Verify Chainlit keeps one tool step when a real id arrives later."""
+    task_list = _TaskList()
+    run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
+    bridge = ChainlitEventBridge(prompt="hello", run_task_list=run_task_list)
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {
+                                "index": 0,
+                                "name": "read_file",
+                                "args": "{",
+                            }
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
+    )
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {
+                                "id": "call-1",
+                                "index": 0,
+                                "args": '"path":"README.md"}',
+                            }
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
+    )
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (_ToolMessage(tool_call_id="call-1", content="file contents"), {}),
+                )
+            },
+        }
+    )
+
+    assert len(_Step.instances) == 1
+    assert _Step.instances[0].name == "main-agent · read_file"
+    assert _Step.instances[0].input == '{\n  "path": "README.md"\n}'
+    assert _Step.instances[0].output == "file contents"
+    assert _Step.instances[0].end is not None
+    assert [task.title for task in task_list.tasks] == ["read_file: README.md"]
+    assert task_list.tasks[0].status == _TaskStatus.DONE
+    assert task_list.tasks[0].forId == _Step.instances[0].id
+
+
+@pytest.mark.anyio
 async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> None:
     """Verify that response stream buffers fast chunks until finish.
 
