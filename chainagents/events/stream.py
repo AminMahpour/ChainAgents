@@ -431,7 +431,7 @@ class AgentStreamEventAdapter:
             return None
         self.completed_tool_results.add(result_key)
 
-        return AgentStreamEvent(
+        event = AgentStreamEvent(
             kind="tool_result",
             source=source,
             tool_call_id=str(
@@ -443,6 +443,8 @@ class AgentStreamEventAdapter:
             tool_result=content,
             status=status,
         )
+        self._clear_tool_call_state(event.tool_call_id)
+        return event
 
     @staticmethod
     def _tool_result_key(
@@ -460,3 +462,15 @@ class AgentStreamEventAdapter:
         if stable_id:
             return (source, "id", stable_id)
         return (source, name, content)
+
+    def _clear_tool_call_state(self, call_id: str) -> None:
+        """Clear streamed tool-call buffers after the matching result arrives."""
+        if not call_id:
+            return
+
+        self.tool_names.pop(call_id, None)
+        self.tool_args_buffers.pop(call_id, None)
+        self.tool_call_started.discard(call_id)
+        for index_key, mapped_call_id in list(self.tool_call_ids_by_index.items()):
+            if mapped_call_id == call_id:
+                self.tool_call_ids_by_index.pop(index_key, None)
