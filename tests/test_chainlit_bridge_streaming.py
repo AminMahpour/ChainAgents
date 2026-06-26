@@ -234,6 +234,18 @@ class _ToolMessage:
         self.status = status
 
 
+class _ToolCallChunkToken:
+    """Provide an internal helper for streamed tool call chunks."""
+
+    type = "AIMessageChunk"
+    content = ""
+    additional_kwargs: dict[str, str] = {}
+
+    def __init__(self, chunk: dict[str, Any]) -> None:
+        """Initialize the token with one tool-call chunk."""
+        self.tool_call_chunks = [chunk]
+
+
 @pytest.fixture(autouse=True)
 def _patch_chainlit_tasks(monkeypatch) -> None:
     """Patch Chainlit task classes with local test doubles.
@@ -376,6 +388,59 @@ async def test_reasoning_after_tool_call_starts_a_new_chronological_step() -> No
     assert _Step.instances[0].tokens == ["first thought"]
     assert _Step.instances[0].end is not None
     assert _Step.instances[2].tokens == [" second thought"]
+
+
+@pytest.mark.anyio
+async def test_tool_call_input_accumulates_chunks_by_index_when_id_is_missing() -> None:
+    """Verify Chainlit tool steps keep complete args when later chunks omit ids."""
+    bridge = ChainlitEventBridge(prompt="hello")
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {
+                                "id": "call-1",
+                                "index": 0,
+                                "name": "read_file",
+                                "args": "{",
+                            }
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
+    )
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {
+                                "index": 0,
+                                "args": '"path":"README.md"}',
+                            }
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
+    )
+
+    assert len(_Step.instances) == 1
+    assert _Step.instances[0].name == "main-agent · read_file"
+    assert _Step.instances[0].input == '{\n  "path": "README.md"\n}'
 
 
 @pytest.mark.anyio

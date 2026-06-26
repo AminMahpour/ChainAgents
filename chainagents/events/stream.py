@@ -216,6 +216,7 @@ class AgentStreamEventAdapter:
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_names: dict[str, str] = {}
         self.tool_args_buffers: dict[str, str] = {}
+        self.tool_call_ids_by_index: dict[tuple[str, str], str] = {}
         self.tool_call_started: set[str] = set()
         self.completed_tool_results: set[tuple[str, str, str]] = set()
 
@@ -348,7 +349,7 @@ class AgentStreamEventAdapter:
         return AgentStreamEvent(kind="reasoning_delta", source=source, text=delta)
 
     def _tool_call_event(self, source: str, chunk: dict[str, Any]) -> AgentStreamEvent:
-        call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
+        call_id = self._tool_call_id(source, chunk)
         tool_name = str(chunk.get("name") or self.tool_names.get(call_id) or "tool")
         self.tool_names[call_id] = tool_name
 
@@ -371,6 +372,46 @@ class AgentStreamEventAdapter:
             tool_args_delta=args_delta_text,
             status=status,
         )
+
+    def _tool_call_id(self, source: str, chunk: dict[str, Any]) -> str:
+        """Return a stable call id for streamed tool chunks."""
+        raw_index = chunk.get("index")
+        index = str(raw_index if raw_index is not None else "0")
+        index_key = (source, index)
+        raw_id = chunk.get("id")
+        if raw_id:
+            call_id = str(raw_id)
+            existing_id = self.tool_call_ids_by_index.get(index_key)
+            if existing_id and existing_id != call_id:
+                self._merge_tool_call_state(existing_id, call_id)
+            self.tool_call_ids_by_index[index_key] = call_id
+            return call_id
+
+        existing_id = self.tool_call_ids_by_index.get(index_key)
+        if existing_id:
+            return existing_id
+
+        call_id = f"{source}:{index}"
+        self.tool_call_ids_by_index[index_key] = call_id
+        return call_id
+
+    def _merge_tool_call_state(self, old_id: str, new_id: str) -> None:
+        """Move buffered state from a synthetic chunk id onto the real call id."""
+        old_name = self.tool_names.pop(old_id, "")
+        if old_name and new_id not in self.tool_names:
+            self.tool_names[new_id] = old_name
+
+        old_args = self.tool_args_buffers.pop(old_id, "")
+        if old_args:
+            new_args = self.tool_args_buffers.get(new_id, "")
+            if not new_args:
+                self.tool_args_buffers[new_id] = old_args
+            elif not new_args.startswith(old_args):
+                self.tool_args_buffers[new_id] = old_args + new_args
+
+        if old_id in self.tool_call_started:
+            self.tool_call_started.remove(old_id)
+            self.tool_call_started.add(new_id)
 
     def _tool_result_event(
         self,
