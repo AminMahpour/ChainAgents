@@ -236,6 +236,214 @@ def test_adapter_accumulates_tool_call_arguments_and_deduplicates_results() -> N
     assert duplicate_result == []
 
 
+def test_adapter_reuses_tool_call_index_after_completed_result() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    first = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "id": "call-1",
+                            "index": 0,
+                            "name": "read_file",
+                            "args": '{"path":"one.md"}',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+    result = adapter.events_from_raw_event(
+        _raw_event(((), "messages", (_ToolMessage("first result"), {})))
+    )
+    second = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "id": "call-2",
+                            "index": 0,
+                            "name": "read_file",
+                            "args": '{"path":"two.md"}',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+
+    assert first == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-1",
+            tool_name="read_file",
+            tool_args='{"path":"one.md"}',
+            tool_args_delta='{"path":"one.md"}',
+            status="start",
+        )
+    ]
+    assert result == [
+        AgentStreamEvent(
+            kind="tool_result",
+            source="main-agent",
+            tool_call_id="call-1",
+            tool_name="read_file",
+            tool_result="first result",
+            status="success",
+        )
+    ]
+    assert second == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-2",
+            tool_name="read_file",
+            tool_args='{"path":"two.md"}',
+            tool_args_delta='{"path":"two.md"}',
+            status="start",
+        )
+    ]
+
+
+def test_adapter_treats_id_bearing_tool_calls_without_index_independently() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    first = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "id": "call-1",
+                            "name": "read_file",
+                            "args": '{"path":"one.md"}',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+    second = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "id": "call-2",
+                            "name": "read_file",
+                            "args": '{"path":"two.md"}',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+
+    assert first == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-1",
+            tool_name="read_file",
+            tool_args='{"path":"one.md"}',
+            tool_args_delta='{"path":"one.md"}',
+            status="start",
+        )
+    ]
+    assert second == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-2",
+            tool_name="read_file",
+            tool_args='{"path":"two.md"}',
+            tool_args_delta='{"path":"two.md"}',
+            status="start",
+        )
+    ]
+
+
+def test_adapter_starts_real_tool_call_id_after_synthetic_id_migration() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    synthetic_start = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "index": 0,
+                            "name": "read_file",
+                            "args": '{"path":"REA',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+    real_id_start = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "id": "call-1",
+                            "index": 0,
+                            "args": 'DME.md"}',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+
+    assert synthetic_start == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="main-agent:0",
+            tool_name="read_file",
+            tool_args='{"path":"REA',
+            tool_args_delta='{"path":"REA',
+            status="start",
+        )
+    ]
+    assert real_id_start == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-1",
+            previous_tool_call_id="main-agent:0",
+            tool_name="read_file",
+            tool_args='{"path":"README.md"}',
+            tool_args_delta='DME.md"}',
+            status="start",
+        )
+    ]
+
+
 def test_adapter_uses_update_chunks_for_non_streamed_final_response() -> None:
     adapter = AgentStreamEventAdapter(prompt="hello")
     human = SimpleNamespace(type="human", content="hello")

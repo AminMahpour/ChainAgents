@@ -714,6 +714,30 @@ class RunTaskList:
         )
         await self._sync()
 
+    def migrate_tool_call(self, old_call_id: str, new_call_id: str) -> None:
+        """Move an active tool task from a synthetic id to the real call id."""
+        if (
+            not old_call_id
+            or not new_call_id
+            or old_call_id == new_call_id
+            or self.using_todos
+            or not self.tool_steps_enabled
+        ):
+            return
+
+        old_key = self._tool_key(old_call_id)
+        new_key = self._tool_key(new_call_id)
+        if new_key in self.tasks_by_key:
+            return
+
+        task = self.tasks_by_key.pop(old_key, None)
+        if task is None:
+            return
+
+        self.tasks_by_key[new_key] = task
+        self.task_order = [new_key if key == old_key else key for key in self.task_order]
+        self._rebuild_tasks()
+
     async def mark_tool_finished(
         self,
         call_id: str,
@@ -1197,6 +1221,16 @@ class ChainlitEventBridge:
             await self._close_reasoning_step(event.source)
 
         state = self.tool_steps.get(event.tool_call_id)
+        if state is None and event.previous_tool_call_id:
+            state = self.tool_steps.pop(event.previous_tool_call_id, None)
+            if state is not None:
+                state.call_id = event.tool_call_id
+                self.tool_steps[event.tool_call_id] = state
+                if self.run_task_list is not None:
+                    self.run_task_list.migrate_tool_call(
+                        event.previous_tool_call_id,
+                        event.tool_call_id,
+                    )
         if state is None:
             step: cl.Step | None = None
             if self.tool_steps_enabled:

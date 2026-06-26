@@ -36,6 +36,7 @@ class AgentStreamEvent:
     source: str
     text: str = ""
     tool_call_id: str = ""
+    previous_tool_call_id: str = ""
     tool_name: str = ""
     tool_args: str = ""
     tool_args_delta: str = ""
@@ -216,6 +217,8 @@ class AgentStreamEventAdapter:
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_names: dict[str, str] = {}
         self.tool_args_buffers: dict[str, str] = {}
+        self.tool_call_ids_by_index: dict[tuple[str, str], str] = {}
+        self.previous_tool_call_ids: dict[str, str] = {}
         self.tool_call_started: set[str] = set()
         self.completed_tool_results: set[tuple[str, str, str]] = set()
 
@@ -348,7 +351,8 @@ class AgentStreamEventAdapter:
         return AgentStreamEvent(kind="reasoning_delta", source=source, text=delta)
 
     def _tool_call_event(self, source: str, chunk: dict[str, Any]) -> AgentStreamEvent:
-        call_id = str(chunk.get("id") or f"{source}:{chunk.get('index', '0')}")
+        call_id = self._tool_call_id(source, chunk)
+        previous_call_id = self.previous_tool_call_ids.pop(call_id, "")
         tool_name = str(chunk.get("name") or self.tool_names.get(call_id) or "tool")
         self.tool_names[call_id] = tool_name
 
@@ -366,11 +370,55 @@ class AgentStreamEventAdapter:
             kind="tool_call",
             source=source,
             tool_call_id=call_id,
+            previous_tool_call_id=previous_call_id,
             tool_name=tool_name,
             tool_args=self.tool_args_buffers.get(call_id, ""),
             tool_args_delta=args_delta_text,
             status=status,
         )
+
+    def _tool_call_id(self, source: str, chunk: dict[str, Any]) -> str:
+        """Return a stable call id for streamed tool chunks."""
+        raw_index = chunk.get("index")
+        raw_id = chunk.get("id")
+        if raw_id:
+            call_id = str(raw_id)
+            if raw_index is None:
+                return call_id
+            index_key = (source, str(raw_index))
+            existing_id = self.tool_call_ids_by_index.get(index_key)
+            if existing_id and existing_id != call_id:
+                self.previous_tool_call_ids[call_id] = existing_id
+                self._merge_tool_call_state(existing_id, call_id)
+            self.tool_call_ids_by_index[index_key] = call_id
+            return call_id
+
+        index = str(raw_index if raw_index is not None else "0")
+        index_key = (source, index)
+        existing_id = self.tool_call_ids_by_index.get(index_key)
+        if existing_id:
+            return existing_id
+
+        call_id = f"{source}:{index}"
+        self.tool_call_ids_by_index[index_key] = call_id
+        return call_id
+
+    def _merge_tool_call_state(self, old_id: str, new_id: str) -> None:
+        """Move buffered state from a synthetic chunk id onto the real call id."""
+        old_name = self.tool_names.pop(old_id, "")
+        if old_name and new_id not in self.tool_names:
+            self.tool_names[new_id] = old_name
+
+        old_args = self.tool_args_buffers.pop(old_id, "")
+        if old_args:
+            new_args = self.tool_args_buffers.get(new_id, "")
+            if not new_args:
+                self.tool_args_buffers[new_id] = old_args
+            elif not new_args.startswith(old_args):
+                self.tool_args_buffers[new_id] = old_args + new_args
+
+        if old_id in self.tool_call_started:
+            self.tool_call_started.remove(old_id)
 
     def _tool_result_event(
         self,
@@ -390,7 +438,7 @@ class AgentStreamEventAdapter:
             return None
         self.completed_tool_results.add(result_key)
 
-        return AgentStreamEvent(
+        event = AgentStreamEvent(
             kind="tool_result",
             source=source,
             tool_call_id=str(
@@ -402,6 +450,8 @@ class AgentStreamEventAdapter:
             tool_result=content,
             status=status,
         )
+        self._clear_tool_call_state(event.tool_call_id)
+        return event
 
     @staticmethod
     def _tool_result_key(
@@ -419,3 +469,16 @@ class AgentStreamEventAdapter:
         if stable_id:
             return (source, "id", stable_id)
         return (source, name, content)
+
+    def _clear_tool_call_state(self, call_id: str) -> None:
+        """Clear streamed tool-call buffers after the matching result arrives."""
+        if not call_id:
+            return
+
+        self.tool_names.pop(call_id, None)
+        self.tool_args_buffers.pop(call_id, None)
+        self.previous_tool_call_ids.pop(call_id, None)
+        self.tool_call_started.discard(call_id)
+        for index_key, mapped_call_id in list(self.tool_call_ids_by_index.items()):
+            if mapped_call_id == call_id:
+                self.tool_call_ids_by_index.pop(index_key, None)
