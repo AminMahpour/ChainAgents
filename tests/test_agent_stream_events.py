@@ -315,6 +315,70 @@ def test_adapter_reuses_tool_call_index_after_completed_result() -> None:
     ]
 
 
+def test_adapter_treats_id_bearing_tool_calls_without_index_independently() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    first = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "id": "call-1",
+                            "name": "read_file",
+                            "args": '{"path":"one.md"}',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+    second = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                (),
+                "messages",
+                (
+                    _ToolCallChunkToken(
+                        {
+                            "id": "call-2",
+                            "name": "read_file",
+                            "args": '{"path":"two.md"}',
+                        }
+                    ),
+                    {},
+                ),
+            )
+        )
+    )
+
+    assert first == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-1",
+            tool_name="read_file",
+            tool_args='{"path":"one.md"}',
+            tool_args_delta='{"path":"one.md"}',
+            status="start",
+        )
+    ]
+    assert second == [
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-2",
+            tool_name="read_file",
+            tool_args='{"path":"two.md"}',
+            tool_args_delta='{"path":"two.md"}',
+            status="start",
+        )
+    ]
+
+
 def test_adapter_uses_update_chunks_for_non_streamed_final_response() -> None:
     adapter = AgentStreamEventAdapter(prompt="hello")
     human = SimpleNamespace(type="human", content="hello")

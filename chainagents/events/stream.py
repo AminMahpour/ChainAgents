@@ -376,17 +376,20 @@ class AgentStreamEventAdapter:
     def _tool_call_id(self, source: str, chunk: dict[str, Any]) -> str:
         """Return a stable call id for streamed tool chunks."""
         raw_index = chunk.get("index")
-        index = str(raw_index if raw_index is not None else "0")
-        index_key = (source, index)
         raw_id = chunk.get("id")
         if raw_id:
             call_id = str(raw_id)
+            if raw_index is None:
+                return call_id
+            index_key = (source, str(raw_index))
             existing_id = self.tool_call_ids_by_index.get(index_key)
             if existing_id and existing_id != call_id:
                 self._merge_tool_call_state(existing_id, call_id)
             self.tool_call_ids_by_index[index_key] = call_id
             return call_id
 
+        index = str(raw_index if raw_index is not None else "0")
+        index_key = (source, index)
         existing_id = self.tool_call_ids_by_index.get(index_key)
         if existing_id:
             return existing_id
