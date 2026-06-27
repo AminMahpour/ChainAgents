@@ -554,6 +554,14 @@ description = "Researches the codebase and produces concise implementation guida
 system_prompt_file = "prompts/repo-researcher.md"
 skills = ["skills/research"]
 mcp_servers = ["repo"]
+nested_subagents = ["reviewer"]
+
+[[subagents.subagents]]
+name = "repo-planner"
+description = "Turns repository findings into an implementation plan."
+system_prompt = "Use repository context to produce a concise implementation plan."
+skills = ["skills/research"]
+mcp_servers = ["repo"]
 
 [[subagents]]
 name = "reviewer"
@@ -576,6 +584,14 @@ Supported subagent fields:
 - `skills`: optional list of skill source paths for that subagent
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional model override
+- `nested_subagents`: optional list of top-level sync subagent names exposed as children of this subagent
+- `[[subagents.subagents]]`: optional inline private sync child subagents under a parent subagent
+
+Nested subagents are synchronous only. Use `[[subagents.subagents]]` for children
+that should only be available to the parent, or `nested_subagents = ["name"]` to
+reuse a top-level sync subagent as a child while keeping it visible to the main
+agent. Async Agent Protocol subagents remain top-level `[[async_subagents]]`
+entries.
 
 Main `[agent]` additions:
 
@@ -759,6 +775,7 @@ Notes:
 
 - `mcp_servers` on `[agent]` attaches those MCP tools to the main agent.
 - `mcp_servers` on `[[subagents]]` attaches those MCP tools only to that subagent.
+- `mcp_servers` on `[[subagents.subagents]]` attaches those MCP tools only to that nested child subagent.
 - Skills and MCP servers are independent. You can use neither, either, or both on any subagent.
 - Relative `cwd` values are resolved from the location of `deepagent.toml`.
 - `tool_name_prefix = true` is recommended when multiple MCP servers expose overlapping tool names.

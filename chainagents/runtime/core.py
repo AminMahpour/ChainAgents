@@ -1394,6 +1394,8 @@ class SubagentConfig:
         skills: The skills value.
         mcp_servers: The MCP servers value.
         model: Model name or model object used by the runtime.
+        nested_subagent_names: Top-level sync subagent names exposed to this subagent.
+        subagents: Inline private sync subagents exposed to this subagent.
     """
 
     name: str
@@ -1402,6 +1404,8 @@ class SubagentConfig:
     skills: tuple[str, ...] = ()
     mcp_servers: tuple[str, ...] = ()
     model: str | None = None
+    nested_subagent_names: tuple[str, ...] = ()
+    subagents: tuple["SubagentConfig", ...] = ()
 
     def to_deepagents_spec(
         self,
@@ -1906,6 +1910,7 @@ def parse_sync_subagent_config(
     index: int,
     base_dir: Path,
     mcp_servers: dict[str, dict[str, Any]],
+    parent_name: str | None = None,
 ) -> SubagentConfig:
     """Parse sync subagent config.
 
@@ -1914,6 +1919,7 @@ def parse_sync_subagent_config(
         index: The index value.
         base_dir: The base dir value.
         mcp_servers: The MCP servers value.
+        parent_name: Parent subagent name for nested entries.
 
     Returns:
         The parsed sync subagent config.
@@ -1926,6 +1932,11 @@ def parse_sync_subagent_config(
     if not name or not description:
         raise ValueError(
             f"Subagent entry #{index} must include non-empty 'name' and 'description'."
+        )
+    if parent_name and "graph_id" in raw_subagent:
+        raise ValueError(
+            f"Subagent '{parent_name}' nested async subagents are not supported; "
+            f"nested subagent '{name or index}' defines 'graph_id'."
         )
 
     inline_prompt = raw_subagent.get("system_prompt")
@@ -1961,6 +1972,31 @@ def parse_sync_subagent_config(
                 f"Defined servers: {sorted(mcp_servers)}"
             )
 
+    nested_subagent_names = normalize_required_string_list(
+        raw_subagent.get("nested_subagents", []),
+        field_name=f"subagent '{name}' nested_subagents",
+    )
+    raw_nested_subagents = raw_subagent.get("subagents", [])
+    if not isinstance(raw_nested_subagents, list):
+        raise ValueError(
+            f"Subagent '{name}' nested 'subagents' config must be an array of tables."
+        )
+    nested_subagents: list[SubagentConfig] = []
+    for nested_index, raw_nested_subagent in enumerate(raw_nested_subagents, start=1):
+        if not isinstance(raw_nested_subagent, dict):
+            raise ValueError(
+                f"Subagent '{name}' nested subagent entry #{nested_index} must be a table/object."
+            )
+        nested_subagents.append(
+            parse_sync_subagent_config(
+                raw_nested_subagent,
+                index=nested_index,
+                base_dir=base_dir,
+                mcp_servers=mcp_servers,
+                parent_name=name,
+            )
+        )
+
     model = str(raw_subagent.get("model", "")).strip() or None
     return SubagentConfig(
         name=name,
@@ -1969,7 +2005,102 @@ def parse_sync_subagent_config(
         skills=subagent_skill_paths,
         mcp_servers=raw_subagent_mcp_servers,
         model=model,
+        nested_subagent_names=nested_subagent_names,
+        subagents=tuple(nested_subagents),
     )
+
+
+def normalize_required_string_list(
+    value: Any,
+    *,
+    field_name: str,
+) -> tuple[str, ...]:
+    """Normalize a config field that must be a list of non-empty strings."""
+    if not isinstance(value, list):
+        raise ValueError(f"'{field_name}' must be a list of strings.")
+
+    items: list[str] = []
+    for index, raw_item in enumerate(value, start=1):
+        item = str(raw_item).strip()
+        if not item:
+            raise ValueError(
+                f"'{field_name}' entry #{index} must be a non-empty string."
+            )
+        items.append(item)
+    return tuple(items)
+
+
+def validate_subagent_names(
+    subagents: tuple[SubagentConfig, ...],
+    async_subagents: tuple[AsyncSubagentConfig, ...],
+) -> None:
+    """Validate top-level subagent name uniqueness across sync and async specs."""
+    seen_names: set[str] = set()
+    for subagent in (*subagents, *async_subagents):
+        if subagent.name in seen_names:
+            raise ValueError(
+                f"Top-level subagent name '{subagent.name}' is defined more than once."
+            )
+        seen_names.add(subagent.name)
+
+
+def validate_nested_subagent_references(
+    subagents: tuple[SubagentConfig, ...],
+) -> None:
+    """Validate nested sync subagent references and cycles."""
+    registry = {subagent.name: subagent for subagent in subagents}
+    for subagent in subagents:
+        validate_nested_subagent_reference_tree(
+            subagent,
+            registry=registry,
+            path=(subagent.name,),
+        )
+
+
+def validate_nested_subagent_reference_tree(
+    subagent: SubagentConfig,
+    *,
+    registry: dict[str, SubagentConfig],
+    path: tuple[str, ...],
+) -> None:
+    """Validate one subagent's direct children and referenced descendants."""
+    direct_child_names: set[str] = set()
+    for child in subagent.subagents:
+        if child.name in direct_child_names:
+            raise ValueError(
+                f"Subagent '{subagent.name}' has duplicate nested child subagent "
+                f"'{child.name}'."
+            )
+        direct_child_names.add(child.name)
+
+    for referenced_name in subagent.nested_subagent_names:
+        if referenced_name not in registry:
+            raise ValueError(
+                f"Subagent '{subagent.name}' references unknown nested subagent "
+                f"'{referenced_name}'. Defined subagents: {sorted(registry)}"
+            )
+        if referenced_name in direct_child_names:
+            raise ValueError(
+                f"Subagent '{subagent.name}' has duplicate nested child subagent "
+                f"'{referenced_name}'."
+            )
+        if referenced_name in path:
+            cycle = " -> ".join((*path, referenced_name))
+            raise ValueError(f"nested subagent cycle detected: {cycle}")
+        direct_child_names.add(referenced_name)
+
+    for child in subagent.subagents:
+        validate_nested_subagent_reference_tree(
+            child,
+            registry=registry,
+            path=(*path, child.name),
+        )
+    for referenced_name in subagent.nested_subagent_names:
+        validate_nested_subagent_reference_tree(
+            registry[referenced_name],
+            registry=registry,
+            path=(*path, referenced_name),
+        )
 
 
 def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> ExtensionsConfig:
@@ -2097,6 +2228,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
                 source_name="Async subagent",
             )
         )
+
+    validate_subagent_names(tuple(subagents), tuple(async_subagents))
+    validate_nested_subagent_references(tuple(subagents))
 
     chainlit_section = raw_config.get("chainlit", {})
     if chainlit_section and not isinstance(chainlit_section, dict):
@@ -3247,28 +3381,119 @@ def tool_supports_openai_compatible_schema(tool: Any) -> bool:
     return isinstance(parameters, dict) and parameters.get("type") == "object"
 
 
+def nested_child_subagents(
+    subagent: SubagentConfig,
+    registry: dict[str, SubagentConfig],
+) -> tuple[SubagentConfig, ...]:
+    """Return inline and referenced nested child subagents in config order."""
+    return (
+        *subagent.subagents,
+        *(registry[name] for name in subagent.nested_subagent_names),
+    )
+
+
+def has_nested_child_subagents(subagent: SubagentConfig) -> bool:
+    """Return whether a sync subagent exposes child subagents."""
+    return bool(subagent.subagents or subagent.nested_subagent_names)
+
+
+def build_static_sync_subagent_spec(
+    config: RuntimeConfig,
+    subagent: SubagentConfig,
+    *,
+    registry: dict[str, SubagentConfig],
+    backend: Any,
+    inherited_tools: list[Any],
+    reasoning_level: ReasoningLevel,
+    inherited_model_name: str,
+    project_root: Path | None,
+) -> dict[str, Any]:
+    """Build a sync subagent spec for configured graph creation."""
+    effective_model_name = subagent.model or inherited_model_name
+    effective_tools = list(inherited_tools)
+    middleware = build_agent_middleware(
+        config=config,
+        reasoning_level=reasoning_level,
+        model_name=effective_model_name,
+        source=subagent.name,
+        project_root=project_root,
+    )
+    if not has_nested_child_subagents(subagent):
+        return subagent.to_deepagents_spec(middleware=middleware)
+
+    child_specs = [
+        build_static_sync_subagent_spec(
+            config,
+            child,
+            registry=registry,
+            backend=backend,
+            inherited_tools=effective_tools,
+            reasoning_level=reasoning_level,
+            inherited_model_name=effective_model_name,
+            project_root=project_root,
+        )
+        for child in nested_child_subagents(subagent, registry)
+    ]
+    runnable_kwargs: dict[str, Any] = {
+        "model": build_model(
+            config,
+            reasoning_level,
+            model_name=effective_model_name,
+        ),
+        "tools": effective_tools or None,
+        "system_prompt": subagent.system_prompt,
+        "middleware": middleware,
+        "backend": backend,
+        "skills": list(subagent.skills) or None,
+        "subagents": child_specs or None,
+    }
+    runnable = create_deep_agent_with_configured_summarization(
+        config,
+        **runnable_kwargs,
+    )
+    return {
+        "name": subagent.name,
+        "description": subagent.description,
+        "runnable": runnable,
+    }
+
+
 def build_graph_subagent_specs(
     config: RuntimeConfig,
     *,
     include_async_subagents: bool,
+    backend: Any | None = None,
+    project_root: Path | None = None,
+    inherited_tools: list[Any] | None = None,
 ) -> list[Any]:
     """Build graph subagent specs.
 
     Args:
         config: Configuration object used by the operation.
         include_async_subagents: Whether to include async subagents.
+        backend: DeepAgents backend shared with compiled nested subgraphs.
+        project_root: Project root used to resolve runtime middleware context.
+        inherited_tools: Tools inherited from the graph that owns these subagents.
 
     Returns:
         The constructed graph subagent specs.
     """
+    registry = {subagent.name: subagent for subagent in config.extensions.subagents}
+    resolved_backend = backend or build_deepagent_backend(
+        project_root=project_root,
+        include_memories=config.agent_state == "stateful",
+        memory_namespace=config.extensions.agent_memory_namespace,
+    )
     subagent_specs: list[Any] = [
-        subagent.to_deepagents_spec(
-            middleware=build_agent_middleware(
-                config=config,
-                reasoning_level=config.default_reasoning,
-                model_name=subagent.model,
-                source=subagent.name,
-            )
+        build_static_sync_subagent_spec(
+            config,
+            subagent,
+            registry=registry,
+            backend=resolved_backend,
+            inherited_tools=list(inherited_tools or []),
+            reasoning_level=config.default_reasoning,
+            inherited_model_name=config.model_name,
+            project_root=project_root,
         )
         for subagent in config.extensions.subagents
     ]
@@ -3311,9 +3536,9 @@ def create_configured_graph(
         The created configured graph.
     """
     config = RuntimeConfig.from_env()
-    subagent_specs = build_graph_subagent_specs(
-        config,
-        include_async_subagents=include_async_subagents,
+    backend = build_deepagent_backend(
+        include_memories=config.agent_state == "stateful",
+        memory_namespace=config.extensions.agent_memory_namespace,
     )
     tools: list[Any] = []
     if config.rag is not None:
@@ -3325,9 +3550,17 @@ def create_configured_graph(
     else:
         if config.rag_requested and config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
+    main_tools = sanitize_tools_for_model(config.model_provider, tools)
+    subagent_specs = build_graph_subagent_specs(
+        config,
+        include_async_subagents=include_async_subagents,
+        backend=backend,
+        project_root=PROJECT_ROOT,
+        inherited_tools=main_tools,
+    )
     agent_kwargs: dict[str, Any] = {
         "model": build_model(config, config.default_reasoning),
-        "tools": sanitize_tools_for_model(config.model_provider, tools) or None,
+        "tools": main_tools or None,
         "system_prompt": compose_rag_system_prompt(
             compose_agent_system_prompt(
                 system_prompt_for_agent_state(system_prompt, config.agent_state),
@@ -3346,10 +3579,7 @@ def create_configured_graph(
             source="main-agent",
             project_root=PROJECT_ROOT,
         ),
-        "backend": build_deepagent_backend(
-            include_memories=config.agent_state == "stateful",
-            memory_namespace=config.extensions.agent_memory_namespace,
-        ),
+        "backend": backend,
         "skills": list(config.extensions.skills) or None,
         "subagents": subagent_specs or None,
     }
@@ -3577,6 +3807,108 @@ class AgentRuntime:
         elif self.config.rag_requested and self.config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", self.config.rag_error)
 
+    async def _build_runtime_subagent_specs(
+        self,
+        *,
+        reasoning_level: ReasoningLevel,
+        selected_model: str,
+        backend: Any,
+        inherited_tools: list[Any],
+        thread_id: str | None,
+        mcp_session_id: str | None,
+    ) -> list[Any]:
+        """Build top-level sync subagent specs for a runtime context."""
+        registry = {
+            subagent.name: subagent for subagent in self.config.extensions.subagents
+        }
+        return [
+            await self._build_runtime_sync_subagent_spec(
+                subagent,
+                registry=registry,
+                reasoning_level=reasoning_level,
+                inherited_model_name=selected_model,
+                backend=backend,
+                inherited_tools=inherited_tools,
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+            )
+            for subagent in self.config.extensions.subagents
+        ]
+
+    async def _build_runtime_sync_subagent_spec(
+        self,
+        subagent: SubagentConfig,
+        *,
+        registry: dict[str, SubagentConfig],
+        reasoning_level: ReasoningLevel,
+        inherited_model_name: str,
+        backend: Any,
+        inherited_tools: list[Any],
+        thread_id: str | None,
+        mcp_session_id: str | None,
+    ) -> dict[str, Any]:
+        """Build one sync subagent spec, compiling it when it has children."""
+        effective_model_name = subagent.model or inherited_model_name
+        own_tools = sanitize_tools_for_model(
+            self.config.model_provider,
+            await self._get_mcp_tools(
+                subagent.mcp_servers,
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+            ),
+        )
+        effective_tools = own_tools or list(inherited_tools)
+        middleware = build_agent_middleware(
+            config=self.config,
+            reasoning_level=reasoning_level,
+            model_name=effective_model_name,
+            source=subagent.name,
+            project_root=self.project_root,
+        )
+        if not has_nested_child_subagents(subagent):
+            return subagent.to_deepagents_spec(
+                tools=own_tools,
+                middleware=middleware,
+            )
+
+        child_specs = [
+            await self._build_runtime_sync_subagent_spec(
+                child,
+                registry=registry,
+                reasoning_level=reasoning_level,
+                inherited_model_name=effective_model_name,
+                backend=backend,
+                inherited_tools=effective_tools,
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+            )
+            for child in nested_child_subagents(subagent, registry)
+        ]
+        runnable_kwargs: dict[str, Any] = {
+            "model": self._build_model(
+                reasoning_level,
+                model_name=effective_model_name,
+            ),
+            "tools": effective_tools or None,
+            "system_prompt": subagent.system_prompt,
+            "middleware": middleware,
+            "backend": backend,
+            "skills": list(subagent.skills) or None,
+            "subagents": child_specs or None,
+        }
+        if self.config.agent_state == "stateful":
+            runnable_kwargs["store"] = self.store
+            runnable_kwargs["checkpointer"] = self.checkpointer
+        runnable = create_deep_agent_with_configured_summarization(
+            self.config,
+            **runnable_kwargs,
+        )
+        return {
+            "name": subagent.name,
+            "description": subagent.description,
+            "runnable": runnable,
+        }
+
     async def get_agent(
         self,
         reasoning_level: ReasoningLevel,
@@ -3632,26 +3964,19 @@ class AgentRuntime:
                     source="main-agent",
                     project_root=self.project_root,
                 )
-                subagent_specs: list[Any] = [
-                    subagent.to_deepagents_spec(
-                        tools=sanitize_tools_for_model(
-                            self.config.model_provider,
-                            await self._get_mcp_tools(
-                                subagent.mcp_servers,
-                                thread_id=thread_id,
-                                mcp_session_id=mcp_session_id,
-                            ),
-                        ),
-                        middleware=build_agent_middleware(
-                            config=self.config,
-                            reasoning_level=reasoning_level,
-                            model_name=subagent.model or selected_model,
-                            source=subagent.name,
-                            project_root=self.project_root,
-                        ),
-                    )
-                    for subagent in self.config.extensions.subagents
-                ]
+                backend = build_deepagent_backend(
+                    project_root=self.project_root,
+                    include_memories=self.config.agent_state == "stateful",
+                    memory_namespace=self.config.extensions.agent_memory_namespace,
+                )
+                subagent_specs = await self._build_runtime_subagent_specs(
+                    reasoning_level=reasoning_level,
+                    selected_model=selected_model,
+                    backend=backend,
+                    inherited_tools=main_tools,
+                    thread_id=thread_id,
+                    mcp_session_id=mcp_session_id,
+                )
                 subagent_specs.extend(
                     subagent.to_deepagents_spec(
                         url_override=async_subagent_url_override,
@@ -3673,11 +3998,7 @@ class AgentRuntime:
                         rag_enabled=rag_tool_enabled,
                     ),
                     "middleware": middleware,
-                    "backend": build_deepagent_backend(
-                        project_root=self.project_root,
-                        include_memories=self.config.agent_state == "stateful",
-                        memory_namespace=self.config.extensions.agent_memory_namespace,
-                    ),
+                    "backend": backend,
                     "skills": list(self.config.extensions.skills) or None,
                     "subagents": subagent_specs or None,
                 }

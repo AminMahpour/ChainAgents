@@ -121,7 +121,15 @@ description = "Researches the codebase and produces concise implementation guida
 system_prompt_file = "prompts/repo-researcher.md"
 skills = ["skills/research"]
 mcp_servers = ["repo", "docs"]
+nested_subagents = ["reviewer"]
 # model = "gpt-oss:20b"
+
+[[subagents.subagents]]
+name = "repo-planner"
+description = "Turns repository findings into an implementation plan."
+system_prompt = "Use repository context to produce a concise implementation plan."
+skills = ["skills/research"]
+mcp_servers = ["repo"]
 
 [[subagents]]
 name = "reviewer"
