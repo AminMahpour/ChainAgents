@@ -407,6 +407,8 @@ memory_namespace = "filesystem"
 memory_files = ["/memories/AGENTS.md"]
 skills = ["skills"]
 mcp_servers = ["repo"]
+# custom_instruction = "Always ask clarifying questions before editing files."
+# custom_instruction_file = "prompts/main-agent.md"
 
 [agent.reflection]
 enabled = true
@@ -424,6 +426,8 @@ Notes:
 - Increase it for long tool-heavy runs that hit `GraphRecursionError`; lower it if you want runaway loops to stop sooner.
 - `memory_namespace` is the shared agent-scoped StoreBackend namespace for `/memories/`. The default is `filesystem` to preserve existing memory data from earlier configs. Use only letters, numbers, hyphens, underscores, dots, `@`, `+`, colons, and tildes.
 - `memory_files` lists `/memories/` files DeepAgents loads into the startup memory prompt. The default is `["/memories/AGENTS.md"]`; set it to `[]` to keep the memory route without startup memory loading.
+- `custom_instruction` appends an inline instruction to the **main/supervisor** agent system prompt.
+- `custom_instruction_file` loads that appended instruction from a UTF-8 text file. Relative paths are resolved from the active `deepagent.toml`; use either `custom_instruction` or `custom_instruction_file`, not both.
 - `[agent.reflection]` is opt-in. When enabled for stateful agents, ChainAgents proposes a compact lesson for `memory_file` after correction phrases such as "that was wrong" or after unrecovered tool failures. Chainlit asks with Save/Dismiss before writing through the agent; CLI, TUI, and API expose the proposal without mutating memory.
 
 ## Optional: Enable Workspace Docs RAG
@@ -602,6 +606,7 @@ Main `[agent]` additions:
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
+- `custom_instruction_file`: optional UTF-8 text file loaded as the main-agent custom instruction. Relative paths resolve from the active `deepagent.toml`. This is mutually exclusive with `custom_instruction`.
 - DeepAgents provides its own summarization middleware in the main agent and sync subagents.
 - `summarization_trigger_tokens`: optional positive integer token threshold for DeepAgents' built-in summarization middleware.
 - `summarization_keep_tokens`: optional positive integer token budget to keep after DeepAgents summarizes conversation history.

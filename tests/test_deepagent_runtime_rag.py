@@ -2775,6 +2775,55 @@ starters = [
     assert extensions.chainlit_starters[1].icon is None
 
 
+def test_load_extensions_config_parses_agent_custom_instruction_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify main-agent custom instructions can be loaded from a file."""
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    instruction_path = prompts_dir / "main-agent.md"
+    instruction_path.write_text(
+        "\nPrefer precise answers from local code.\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+custom_instruction_file = "prompts/main-agent.md"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.custom_instruction == "Prefer precise answers from local code."
+
+
+def test_load_extensions_config_rejects_ambiguous_agent_custom_instruction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify inline and file-based main-agent instructions are mutually exclusive."""
+    instruction_path = tmp_path / "main-agent.md"
+    instruction_path.write_text("Prefer local code.", encoding="utf-8")
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent]
+custom_instruction = "Prefer direct answers."
+custom_instruction_file = "main-agent.md"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="custom_instruction_file"):
+        deepagent_runtime.load_extensions_config()
+
+
 def test_load_extensions_config_rejects_invalid_chainlit_starters(
     tmp_path: Path,
     monkeypatch,
