@@ -2220,6 +2220,125 @@ def test_get_agent_builds_compiled_subagents_for_nested_sync_subagents(
     assert ("reviewer-mcp",) in mcp_tool_calls
 
 
+def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify compiled nested parents keep inherited main-agent tools."""
+    created_graphs: list[SimpleNamespace] = []
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture every DeepAgents graph creation call."""
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "build_model",
+        lambda config, reasoning_level, *, model_name=None: (
+            f"model:{model_name or config.model_name}:{reasoning_level}"
+        ),
+    )
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                subagents=(
+                    SubagentConfig(
+                        name="manager",
+                        description="Coordinates specialist agents.",
+                        system_prompt="Manage the work.",
+                        subagents=(
+                            SubagentConfig(
+                                name="reviewer",
+                                description="Reviews manager output.",
+                                system_prompt="Review privately.",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    async def fake_build_main_tools(*, thread_id=None, mcp_session_id=None):
+        """Return a visible inherited main-agent tool."""
+        return [SimpleNamespace(name="main-tool")]
+
+    runtime._build_main_tools = fake_build_main_tools  # type: ignore[assignment]
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert len(created_graphs) == 2
+    manager_kwargs = created_graphs[0].kwargs
+    assert manager_kwargs["tools"][0].name == "main-tool"
+    assert "tools" not in manager_kwargs["subagents"][0]
+
+
+def test_build_graph_subagent_specs_preserves_static_inherited_tools_for_compiled_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify static compiled parents keep inherited graph tools."""
+    created_graphs: list[SimpleNamespace] = []
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture every DeepAgents graph creation call."""
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "build_model",
+        lambda config, reasoning_level, *, model_name=None: (
+            f"model:{model_name or config.model_name}:{reasoning_level}"
+        ),
+    )
+
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(
+            config_path=None,
+            subagents=(
+                SubagentConfig(
+                    name="manager",
+                    description="Coordinates specialist agents.",
+                    system_prompt="Manage the work.",
+                    subagents=(
+                        SubagentConfig(
+                            name="reviewer",
+                            description="Reviews manager output.",
+                            system_prompt="Review privately.",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    specs = deepagent_runtime.build_graph_subagent_specs(
+        config,
+        include_async_subagents=False,
+        backend=object(),
+        project_root=tmp_path,
+        inherited_tools=[SimpleNamespace(name="static-tool")],
+    )
+
+    assert specs[0]["runnable"] is created_graphs[0]
+    manager_kwargs = created_graphs[0].kwargs
+    assert manager_kwargs["tools"][0].name == "static-tool"
+    assert "tools" not in manager_kwargs["subagents"][0]
+
+
 def test_summarization_status_middleware_emits_stream_events() -> None:
     """Verify that summarization status middleware emits stream events."""
     events: list[dict[str, str]] = []

@@ -3403,12 +3403,14 @@ def build_static_sync_subagent_spec(
     *,
     registry: dict[str, SubagentConfig],
     backend: Any,
+    inherited_tools: list[Any],
     reasoning_level: ReasoningLevel,
     inherited_model_name: str,
     project_root: Path | None,
 ) -> dict[str, Any]:
     """Build a sync subagent spec for configured graph creation."""
     effective_model_name = subagent.model or inherited_model_name
+    effective_tools = list(inherited_tools)
     middleware = build_agent_middleware(
         config=config,
         reasoning_level=reasoning_level,
@@ -3425,6 +3427,7 @@ def build_static_sync_subagent_spec(
             child,
             registry=registry,
             backend=backend,
+            inherited_tools=effective_tools,
             reasoning_level=reasoning_level,
             inherited_model_name=effective_model_name,
             project_root=project_root,
@@ -3437,7 +3440,7 @@ def build_static_sync_subagent_spec(
             reasoning_level,
             model_name=effective_model_name,
         ),
-        "tools": None,
+        "tools": effective_tools or None,
         "system_prompt": subagent.system_prompt,
         "middleware": middleware,
         "backend": backend,
@@ -3461,6 +3464,7 @@ def build_graph_subagent_specs(
     include_async_subagents: bool,
     backend: Any | None = None,
     project_root: Path | None = None,
+    inherited_tools: list[Any] | None = None,
 ) -> list[Any]:
     """Build graph subagent specs.
 
@@ -3469,6 +3473,7 @@ def build_graph_subagent_specs(
         include_async_subagents: Whether to include async subagents.
         backend: DeepAgents backend shared with compiled nested subgraphs.
         project_root: Project root used to resolve runtime middleware context.
+        inherited_tools: Tools inherited from the graph that owns these subagents.
 
     Returns:
         The constructed graph subagent specs.
@@ -3485,6 +3490,7 @@ def build_graph_subagent_specs(
             subagent,
             registry=registry,
             backend=resolved_backend,
+            inherited_tools=list(inherited_tools or []),
             reasoning_level=config.default_reasoning,
             inherited_model_name=config.model_name,
             project_root=project_root,
@@ -3534,12 +3540,6 @@ def create_configured_graph(
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
     )
-    subagent_specs = build_graph_subagent_specs(
-        config,
-        include_async_subagents=include_async_subagents,
-        backend=backend,
-        project_root=PROJECT_ROOT,
-    )
     tools: list[Any] = []
     if config.rag is not None:
         tools.append(
@@ -3550,9 +3550,17 @@ def create_configured_graph(
     else:
         if config.rag_requested and config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
+    main_tools = sanitize_tools_for_model(config.model_provider, tools)
+    subagent_specs = build_graph_subagent_specs(
+        config,
+        include_async_subagents=include_async_subagents,
+        backend=backend,
+        project_root=PROJECT_ROOT,
+        inherited_tools=main_tools,
+    )
     agent_kwargs: dict[str, Any] = {
         "model": build_model(config, config.default_reasoning),
-        "tools": sanitize_tools_for_model(config.model_provider, tools) or None,
+        "tools": main_tools or None,
         "system_prompt": compose_rag_system_prompt(
             compose_agent_system_prompt(
                 system_prompt_for_agent_state(system_prompt, config.agent_state),
@@ -3805,6 +3813,7 @@ class AgentRuntime:
         reasoning_level: ReasoningLevel,
         selected_model: str,
         backend: Any,
+        inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> list[Any]:
@@ -3819,6 +3828,7 @@ class AgentRuntime:
                 reasoning_level=reasoning_level,
                 inherited_model_name=selected_model,
                 backend=backend,
+                inherited_tools=inherited_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
             )
@@ -3833,12 +3843,13 @@ class AgentRuntime:
         reasoning_level: ReasoningLevel,
         inherited_model_name: str,
         backend: Any,
+        inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> dict[str, Any]:
         """Build one sync subagent spec, compiling it when it has children."""
         effective_model_name = subagent.model or inherited_model_name
-        tools = sanitize_tools_for_model(
+        own_tools = sanitize_tools_for_model(
             self.config.model_provider,
             await self._get_mcp_tools(
                 subagent.mcp_servers,
@@ -3846,6 +3857,7 @@ class AgentRuntime:
                 mcp_session_id=mcp_session_id,
             ),
         )
+        effective_tools = own_tools or list(inherited_tools)
         middleware = build_agent_middleware(
             config=self.config,
             reasoning_level=reasoning_level,
@@ -3855,7 +3867,7 @@ class AgentRuntime:
         )
         if not has_nested_child_subagents(subagent):
             return subagent.to_deepagents_spec(
-                tools=tools,
+                tools=own_tools,
                 middleware=middleware,
             )
 
@@ -3866,6 +3878,7 @@ class AgentRuntime:
                 reasoning_level=reasoning_level,
                 inherited_model_name=effective_model_name,
                 backend=backend,
+                inherited_tools=effective_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
             )
@@ -3876,7 +3889,7 @@ class AgentRuntime:
                 reasoning_level,
                 model_name=effective_model_name,
             ),
-            "tools": tools or None,
+            "tools": effective_tools or None,
             "system_prompt": subagent.system_prompt,
             "middleware": middleware,
             "backend": backend,
@@ -3960,6 +3973,7 @@ class AgentRuntime:
                     reasoning_level=reasoning_level,
                     selected_model=selected_model,
                     backend=backend,
+                    inherited_tools=main_tools,
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
