@@ -2115,6 +2115,111 @@ def test_get_agent_applies_configured_deepagents_summarization_thresholds(
     assert {item["keep"] for item in created_summarizers} == {("tokens", 2000)}
 
 
+def test_get_agent_builds_compiled_subagents_for_nested_sync_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify nested sync subagents are compiled into child DeepAgents graphs."""
+    created_graphs: list[SimpleNamespace] = []
+    mcp_tool_calls: list[tuple[str, ...]] = []
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture every DeepAgents graph creation call."""
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    def fake_build_model(config, reasoning_level, *, model_name=None):
+        """Return a visible model marker for graph-construction assertions."""
+        return f"model:{model_name or config.model_name}:{reasoning_level}"
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                mcp_servers={
+                    "manager-mcp": {"transport": "stdio", "command": "npx", "args": []},
+                    "private-mcp": {"transport": "stdio", "command": "npx", "args": []},
+                    "reviewer-mcp": {"transport": "stdio", "command": "npx", "args": []},
+                },
+                subagents=(
+                    SubagentConfig(
+                        name="manager",
+                        description="Coordinates specialist agents.",
+                        system_prompt="Manage the work.",
+                        skills=("/workspace/manager-skills/",),
+                        mcp_servers=("manager-mcp",),
+                        model="manager-model",
+                        nested_subagent_names=("reviewer",),
+                        subagents=(
+                            SubagentConfig(
+                                name="private-reviewer",
+                                description="Reviews manager output.",
+                                system_prompt="Review privately.",
+                                skills=("/workspace/private-skills/",),
+                                mcp_servers=("private-mcp",),
+                            ),
+                        ),
+                    ),
+                    SubagentConfig(
+                        name="reviewer",
+                        description="Reviews output.",
+                        system_prompt="Review publicly.",
+                        mcp_servers=("reviewer-mcp",),
+                    ),
+                ),
+            ),
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    async def fake_get_mcp_tools(
+        server_names,
+        *,
+        thread_id=None,
+        mcp_session_id=None,
+    ):
+        """Return visible fake MCP tools for each requested server tuple."""
+        mcp_tool_calls.append(tuple(server_names))
+        if not server_names:
+            return []
+        return [SimpleNamespace(name=f"tools:{','.join(server_names)}")]
+
+    runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert len(created_graphs) == 2
+    manager_kwargs = created_graphs[0].kwargs
+    main_kwargs = created_graphs[1].kwargs
+
+    top_level_specs = main_kwargs["subagents"]
+    assert [spec["name"] for spec in top_level_specs] == ["manager", "reviewer"]
+    assert top_level_specs[0]["description"] == "Coordinates specialist agents."
+    assert top_level_specs[0]["runnable"] is created_graphs[0]
+    assert "runnable" not in top_level_specs[1]
+
+    assert manager_kwargs["model"] == "model:manager-model:medium"
+    assert manager_kwargs["system_prompt"] == "Manage the work."
+    assert manager_kwargs["skills"] == ["/workspace/manager-skills/"]
+    assert manager_kwargs["tools"][0].name == "tools:manager-mcp"
+
+    nested_specs = manager_kwargs["subagents"]
+    assert [spec["name"] for spec in nested_specs] == ["private-reviewer", "reviewer"]
+    assert nested_specs[0]["skills"] == ["/workspace/private-skills/"]
+    assert nested_specs[0]["tools"][0].name == "tools:private-mcp"
+    assert nested_specs[1]["tools"][0].name == "tools:reviewer-mcp"
+    assert ("manager-mcp",) in mcp_tool_calls
+    assert ("private-mcp",) in mcp_tool_calls
+    assert ("reviewer-mcp",) in mcp_tool_calls
+
+
 def test_summarization_status_middleware_emits_stream_events() -> None:
     """Verify that summarization status middleware emits stream events."""
     events: list[dict[str, str]] = []
@@ -2796,6 +2901,193 @@ model_mode_enabled = "no"
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
     with pytest.raises(ValueError, match="model_mode_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_parses_inline_nested_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify inline nested sync subagents are parsed under their parent."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[mcp.servers.repo]
+transport = "stdio"
+command = "npx"
+args = ["server"]
+
+[[subagents]]
+name = "manager"
+description = "Coordinates specialist agents."
+system_prompt = "Manage the work."
+
+[[subagents.subagents]]
+name = "private-reviewer"
+description = "Reviews manager output."
+system_prompt = "Review the work."
+skills = ["/workspace/private-reviewer"]
+mcp_servers = ["repo"]
+model = "gpt-oss:120b"
+
+[[subagents]]
+name = "public-reviewer"
+description = "Reviews top-level output."
+system_prompt = "Review top-level work."
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    manager = extensions.subagents[0]
+    assert manager.name == "manager"
+    assert manager.nested_subagent_names == ()
+    assert len(manager.subagents) == 1
+    private_reviewer = manager.subagents[0]
+    assert private_reviewer.name == "private-reviewer"
+    assert private_reviewer.skills == ("/workspace/private-reviewer/",)
+    assert private_reviewer.mcp_servers == ("repo",)
+    assert private_reviewer.model == "gpt-oss:120b"
+    assert extensions.subagents[1].name == "public-reviewer"
+
+
+def test_load_extensions_config_parses_nested_subagent_references(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify top-level sync subagents can be reused as nested children."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[[subagents]]
+name = "manager"
+description = "Coordinates specialist agents."
+system_prompt = "Manage the work."
+nested_subagents = ["reviewer"]
+
+[[subagents]]
+name = "reviewer"
+description = "Reviews output."
+system_prompt = "Review the work."
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.subagents[0].name == "manager"
+    assert extensions.subagents[0].nested_subagent_names == ("reviewer",)
+    assert extensions.subagents[0].subagents == ()
+
+
+def test_load_extensions_config_rejects_unknown_nested_subagent_reference(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify missing nested subagent references fail at config load."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[[subagents]]
+name = "manager"
+description = "Coordinates specialist agents."
+system_prompt = "Manage the work."
+nested_subagents = ["missing-reviewer"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="unknown nested subagent 'missing-reviewer'"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_nested_subagent_reference_cycles(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify nested subagent references cannot create delegation cycles."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[[subagents]]
+name = "manager"
+description = "Coordinates specialist agents."
+system_prompt = "Manage the work."
+nested_subagents = ["reviewer"]
+
+[[subagents]]
+name = "reviewer"
+description = "Reviews output."
+system_prompt = "Review the work."
+nested_subagents = ["manager"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="nested subagent cycle"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_duplicate_nested_child_names(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify a parent cannot expose two direct children with the same name."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[[subagents]]
+name = "manager"
+description = "Coordinates specialist agents."
+system_prompt = "Manage the work."
+nested_subagents = ["reviewer"]
+
+[[subagents.subagents]]
+name = "reviewer"
+description = "Private reviewer."
+system_prompt = "Review privately."
+
+[[subagents]]
+name = "reviewer"
+description = "Public reviewer."
+system_prompt = "Review publicly."
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="duplicate nested child subagent 'reviewer'"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_nested_async_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify nested subagents are limited to synchronous subagent configs."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[[subagents]]
+name = "manager"
+description = "Coordinates specialist agents."
+system_prompt = "Manage the work."
+
+[[subagents.subagents]]
+name = "remote-reviewer"
+description = "Remote reviewer."
+graph_id = "reviewer"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="nested async subagents are not supported"):
         deepagent_runtime.load_extensions_config()
 
 
