@@ -1633,7 +1633,7 @@ class ExtensionsConfig:
         summarization_middleware_enabled: The summarization middleware enabled value.
         summarization_trigger_tokens: The summarization trigger tokens value.
         summarization_keep_tokens: The summarization keep tokens value.
-        custom_instruction: The custom instruction value.
+        custom_instruction: Inline or file-loaded main-agent custom instruction.
     """
 
     config_path: Path | None
@@ -2103,6 +2103,28 @@ def validate_nested_subagent_reference_tree(
         )
 
 
+def parse_agent_custom_instruction(
+    agent_section: dict[str, Any],
+    base_dir: Path,
+) -> str | None:
+    """Parse inline or file-based main-agent custom instruction."""
+    custom_instruction = normalize_optional_string(
+        agent_section.get("custom_instruction")
+    )
+    custom_instruction_file = normalize_optional_string(
+        agent_section.get("custom_instruction_file")
+    )
+    if custom_instruction and custom_instruction_file:
+        raise ValueError(
+            "The top-level 'agent' config cannot define both "
+            "'custom_instruction' and 'custom_instruction_file'."
+        )
+    if not custom_instruction_file:
+        return custom_instruction
+    instruction_path = resolve_local_path(custom_instruction_file, base_dir)
+    return instruction_path.read_text(encoding="utf-8").strip() or None
+
+
 def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> ExtensionsConfig:
     """Parse extensions config.
 
@@ -2146,7 +2168,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         mcp_servers[str(name)] = normalize_mcp_server_config(raw_server, base_dir)
 
     raw_skill_paths = agent_section.get("skills", [])
-    custom_instruction = normalize_optional_string(agent_section.get("custom_instruction"))
+    custom_instruction = parse_agent_custom_instruction(agent_section, base_dir)
     raw_summarization_middleware_enabled = agent_section.get(
         "summarization_middleware_enabled",
         False,
@@ -2428,7 +2450,7 @@ def compose_agent_system_prompt(
     if not instruction:
         return "\n\n".join(sections)
     sections.append(
-        "Custom user instruction from [agent].custom_instruction in deepagent.toml:\n"
+        "Custom user instruction from deepagent.toml:\n"
         f"{instruction}"
     )
     return "\n\n".join(sections)

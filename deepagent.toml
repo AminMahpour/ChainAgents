@@ -53,6 +53,10 @@ memory_namespace = "filesystem"
 memory_files = ["/memories/AGENTS.md"]
 skills = ["skills"]
 mcp_servers = []
+# Optional instruction appended to the main agent system prompt.
+# Use either custom_instruction or custom_instruction_file, not both.
+# custom_instruction = "Always ask clarifying questions before editing files."
+# custom_instruction_file = "prompts/main-agent.md"
 # Legacy flag retained for compatibility; DeepAgents provides summarization.
 summarization_middleware_enabled = true
 # Token thresholds tune DeepAgents' built-in summarizer.

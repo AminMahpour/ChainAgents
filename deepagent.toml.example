@@ -54,7 +54,9 @@ memory_files = ["/memories/AGENTS.md"]
 skills = ["skills"]
 mcp_servers = ["repo"]
 # Optional instruction appended to the main agent system prompt.
+# Use either custom_instruction or custom_instruction_file, not both.
 # custom_instruction = "Always ask clarifying questions before editing files."
+# custom_instruction_file = "prompts/main-agent.md"
 # DeepAgents 0.6.7 provides summarization middleware in its base agent stack.
 # These optional token thresholds tune DeepAgents' built-in summarizer.
 summarization_trigger_tokens = 6000
