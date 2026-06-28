@@ -549,6 +549,38 @@ model = "fast"
     assert active_model.name == "fast-local"
 
 
+def test_model_profile_explicit_base_url_uses_runtime_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify runtime endpoint overrides replace same-provider profile URLs."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://toml-ollama.example:11434"
+name = "default-local"
+
+[model.profiles.fast]
+base_url = "http://profile-ollama.example:11434"
+name = "fast-local"
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-ollama.example:11434")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert active_model.name == "fast-local"
+    assert active_model.base_url == "http://env-ollama.example:11434"
+
+
 def test_model_profile_without_name_inherits_default_name_before_models(
     tmp_path: Path,
     monkeypatch,
@@ -646,6 +678,40 @@ model = "claude"
     assert config.model_name == "local-default"
     assert active_model.provider == "openai_compatible"
     assert active_model.base_url == "https://openai.example/v1"
+
+
+def test_provider_override_allows_selected_profile_endpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify selected profile endpoints can satisfy provider-switch preflight."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-default"
+
+[model.profiles.lmstudio]
+provider = "openai_compatible"
+base_url = "https://lmstudio.example/v1"
+name = "tool-model"
+api_key = "profile-key"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "lmstudio")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_provider == "openai_compatible"
+    assert config.model_name == "lmstudio"
+    assert active_model.provider == "openai_compatible"
+    assert active_model.base_url == "https://lmstudio.example/v1"
 
 
 def test_same_provider_override_preserves_agent_model_profile(
@@ -2667,7 +2733,7 @@ def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
 
     runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
 
-    asyncio.run(runtime.get_agent("low", thread_id="thread-1"))
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
 
     subagent_spec = captured["kwargs"]["subagents"][0]
     assert isinstance(subagent_spec["model"], ChatAnthropic)
@@ -2760,6 +2826,92 @@ def test_get_agent_resanitizes_inherited_tools_for_profile_subagent(
     assert anthropic_tool["input_schema"]["properties"] == {
         "path": {"type": "string"},
     }
+
+
+def test_get_agent_preserves_raw_inherited_tools_for_profile_subagent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify provider-switched subagents can use raw main tools."""
+
+    async def fake_mcp_tool(**kwargs):
+        """Return fake MCP tool arguments."""
+        return kwargs
+
+    inherited_tool = StructuredTool(
+        name="read_file",
+        description="Read a file.",
+        args_schema={
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        coroutine=fake_mcp_tool,
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the main DeepAgents graph creation call."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "tool_supports_openai_compatible_schema",
+        lambda tool: False,
+    )
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="openai_compatible",
+            model_name="default-openai",
+            model_choices=("default-openai", "claude-reviewer"),
+            model_base_url="https://openai-compatible.example/v1",
+            model_api_key="openai-key",
+            model_temperature=0.0,
+            default_reasoning="medium",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(
+                config_path=None,
+                subagents=(
+                    SubagentConfig(
+                        name="reviewer",
+                        description="Reviews output.",
+                        system_prompt="Review the work.",
+                        model="claude-reviewer",
+                    ),
+                ),
+            ),
+            model_profiles={
+                "claude-reviewer": deepagent_runtime.ModelDefaults(
+                    provider="anthropic",
+                    base_url=deepagent_runtime.DEFAULT_ANTHROPIC_BASE_URL,
+                    name="claude-sonnet-4-6",
+                    api_key="anthropic-key",
+                    thinking="disabled",
+                )
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    async def fake_build_main_tools(*, thread_id=None, mcp_session_id=None):
+        """Return a raw main-agent tool filtered out by the OpenAI main model."""
+        return [inherited_tool]
+
+    runtime._build_main_tools = fake_build_main_tools  # type: ignore[assignment]
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert captured["kwargs"]["tools"] is None
+    subagent_spec = captured["kwargs"]["subagents"][0]
+    inherited_tools = subagent_spec["tools"]
+    assert inherited_tools[0] is not inherited_tool
+    anthropic_tool = convert_to_anthropic_tool(inherited_tools[0])
+    assert anthropic_tool["input_schema"]["type"] == "object"
 
 
 def test_get_agent_does_not_inherit_tools_when_configured_tools_are_filtered(
@@ -2986,6 +3138,56 @@ def test_get_agent_uses_selected_profile_reasoning_effort(
     asyncio.run(runtime.get_agent("medium", model_name="fast-local", thread_id="thread-1"))
 
     assert captured["kwargs"]["model"] == "model:fast-model:low"
+
+
+def test_get_agent_explicit_reasoning_overrides_selected_profile_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify explicit runtime reasoning overrides profile reasoning defaults."""
+    captured: dict[str, Any] = {}
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+
+[model.profiles.fast]
+name = "fast-model"
+reasoning_effort = "low"
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the main DeepAgents graph creation call."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+        """Capture the effective model and reasoning level."""
+        selected_name = model_profile.name if model_profile is not None else model_name
+        return f"model:{selected_name}:{reasoning_level}"
+
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_REASONING", "high")
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    runtime = AgentRuntime(config, project_root=tmp_path)
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent(config.default_reasoning, thread_id="thread-1"))
+
+    assert config.default_reasoning == "high"
+    assert captured["kwargs"]["model"] == "model:fast-model:high"
 
 
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(

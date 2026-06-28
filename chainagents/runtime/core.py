@@ -1703,6 +1703,7 @@ class ModelDefaults:
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
         explicit_fields: Profile fields explicitly set in TOML.
+        runtime_override_fields: Fields explicitly overridden at runtime.
     """
 
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
@@ -1718,6 +1719,11 @@ class ModelDefaults:
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
     explicit_fields: frozenset[str] = field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
+    runtime_override_fields: frozenset[str] = field(
         default_factory=frozenset,
         compare=False,
         repr=False,
@@ -1994,7 +2000,10 @@ def rebase_model_profile_defaults(
         updates["name_is_explicit"] = base_model.name_is_explicit
     if "models" not in explicit_fields:
         updates["models"] = base_model.models
-    if "base_url" not in explicit_fields:
+    if (
+        "base_url" in base_model.runtime_override_fields
+        or "base_url" not in explicit_fields
+    ):
         updates["base_url"] = base_model.base_url
         updates["endpoint_query"] = base_model.endpoint_query
     if "api_key" not in explicit_fields:
@@ -2825,6 +2834,8 @@ class RuntimeConfig:
         model_api_key_override: Explicit runtime API key override.
         model_default_name: Runtime default model name before agent/profile selection.
         model_default_choices: Runtime default model list before profile names are added.
+        model_reasoning_override: Whether reasoning was explicitly overridden at runtime.
+        model_base_url_override: Whether the model endpoint was overridden at runtime.
     """
 
     database_url: str | None
@@ -2851,6 +2862,8 @@ class RuntimeConfig:
     model_api_key_override: str | None = None
     model_default_name: str | None = None
     model_default_choices: tuple[str, ...] = ()
+    model_reasoning_override: bool = False
+    model_base_url_override: bool = False
 
     @classmethod
     def from_env(
@@ -2924,17 +2937,42 @@ class RuntimeConfig:
             else ""
         )
 
-        endpoint_url_satisfies_provider_switch = (
-            model_provider == "openai_compatible" and bool(generic_model_endpoint_url)
-        )
         provider_changed = (
             bool(model_provider_override) and model_provider != model_defaults.provider
+        )
+        model_name = (
+            generic_model_name
+            or model_name_alias
+            or (
+                file_config.extensions.agent_model
+                if not provider_changed
+                else None
+            )
+            or model_defaults.name
+        )
+        model_name_override = generic_model_name or model_name_alias
+        model_default_name = (
+            model_defaults.name
+            if model_name_override in file_config.model_profiles
+            else model_name_override or model_defaults.name
+        )
+        selected_override_profile = file_config.model_profiles.get(
+            model_name_override or ""
+        )
+        profile_endpoint_satisfies_provider_switch = bool(
+            selected_override_profile is not None
+            and selected_override_profile.provider == model_provider
+            and selected_override_profile.base_url
+        )
+        endpoint_url_satisfies_provider_switch = (
+            model_provider == "openai_compatible" and bool(generic_model_endpoint_url)
         )
         provider_switch_requires_url = (
             provider_changed
             and model_provider in {"ollama", "openai_compatible"}
             and not generic_model_base_url
             and not endpoint_url_satisfies_provider_switch
+            and not profile_endpoint_satisfies_provider_switch
         )
         if provider_switch_requires_url:
             required_url_env = "DEEPAGENT_MODEL_BASE_URL"
@@ -2982,22 +3020,6 @@ class RuntimeConfig:
                 "or set a non-empty [model].name in deepagent.toml."
             )
 
-        model_name = (
-            generic_model_name
-            or model_name_alias
-            or (
-                file_config.extensions.agent_model
-                if not provider_changed
-                else None
-            )
-            or model_defaults.name
-        )
-        model_name_override = generic_model_name or model_name_alias
-        model_default_name = (
-            model_defaults.name
-            if model_name_override in file_config.model_profiles
-            else model_name_override or model_defaults.name
-        )
         model_choices = tuple(
             dict.fromkeys(
                 [
@@ -3101,6 +3123,7 @@ class RuntimeConfig:
             generic_model_reasoning or model_reasoning_alias,
             default=active_model_defaults.reasoning_effort,
         )
+        model_reasoning_override = bool(generic_model_reasoning or model_reasoning_alias)
         recursion_limit = normalize_recursion_limit(
             (
                 overrides.recursion_limit
@@ -3123,6 +3146,13 @@ class RuntimeConfig:
             temperature=model_temperature,
             repeat_penalty=model_repeat_penalty,
             disable_streaming=model_disable_streaming,
+            runtime_override_fields=(
+                frozenset({"base_url"})
+                if generic_model_base_url
+                or model_base_url_alias
+                or generic_model_endpoint_url
+                else frozenset()
+            ),
         )
         active_runtime_model = resolve_model_profile_defaults(
             runtime_default_model,
@@ -3198,6 +3228,14 @@ class RuntimeConfig:
             model_api_key_override=model_api_key_override,
             model_default_name=model_default_name,
             model_default_choices=model_defaults.models,
+            model_reasoning_override=model_reasoning_override,
+            model_base_url_override=(
+                bool(
+                    generic_model_base_url
+                    or model_base_url_alias
+                    or generic_model_endpoint_url
+                )
+            ),
         )
 
 
@@ -3321,6 +3359,11 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
         ),
         disable_streaming=normalize_disable_streaming(
             getattr(config, "model_disable_streaming", False)
+        ),
+        runtime_override_fields=(
+            frozenset({"base_url"})
+            if getattr(config, "model_base_url_override", False)
+            else frozenset()
         ),
     )
 
@@ -3853,20 +3896,29 @@ def has_nested_child_subagents(subagent: SubagentConfig) -> bool:
 def inherited_tools_for_model(
     *,
     inherited_tools: list[Any],
+    sanitized_inherited_tools: list[Any] | None = None,
     inherited_provider: ModelProvider,
     effective_provider: ModelProvider,
 ) -> list[Any]:
     """Return inherited tools adjusted for a subagent's effective model provider."""
     if effective_provider == inherited_provider:
-        return list(inherited_tools)
+        return list(
+            sanitized_inherited_tools
+            if sanitized_inherited_tools is not None
+            else inherited_tools
+        )
     return sanitize_tools_for_model(effective_provider, list(inherited_tools))
 
 
 def reasoning_level_for_profile(
     model_profile: ModelDefaults,
     fallback: ReasoningLevel,
+    *,
+    fallback_is_explicit: bool = False,
 ) -> ReasoningLevel:
     """Return the reasoning level to use when building a profile-backed model."""
+    if fallback_is_explicit:
+        return fallback
     if "reasoning_effort" in model_profile.explicit_fields:
         return model_profile.reasoning_effort
     if (
@@ -3887,6 +3939,7 @@ def build_static_sync_subagent_spec(
     reasoning_level: ReasoningLevel,
     inherited_model: ModelDefaults,
     project_root: Path | None,
+    reasoning_level_is_explicit: bool = False,
 ) -> dict[str, Any]:
     """Build a sync subagent spec for configured graph creation."""
     effective_model = resolve_runtime_model_profile(
@@ -3897,6 +3950,7 @@ def build_static_sync_subagent_spec(
     effective_reasoning_level = reasoning_level_for_profile(
         effective_model,
         reasoning_level,
+        fallback_is_explicit=reasoning_level_is_explicit,
     )
     inherited_model_tools = inherited_tools_for_model(
         inherited_tools=inherited_tools,
@@ -3940,6 +3994,7 @@ def build_static_sync_subagent_spec(
             backend=backend,
             inherited_tools=effective_tools,
             reasoning_level=effective_reasoning_level,
+            reasoning_level_is_explicit=reasoning_level_is_explicit,
             inherited_model=effective_model,
             project_root=project_root,
         )
@@ -4003,6 +4058,7 @@ def build_graph_subagent_specs(
             backend=resolved_backend,
             inherited_tools=list(inherited_tools or []),
             reasoning_level=config.default_reasoning,
+            reasoning_level_is_explicit=config.model_reasoning_override,
             inherited_model=resolve_runtime_model_profile(config),
             project_root=project_root,
         )
@@ -4327,9 +4383,11 @@ class AgentRuntime:
         self,
         *,
         reasoning_level: ReasoningLevel,
+        reasoning_level_is_explicit: bool,
         selected_model_profile: ModelDefaults,
         backend: Any,
         inherited_tools: list[Any],
+        sanitized_inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> list[Any]:
@@ -4342,9 +4400,11 @@ class AgentRuntime:
                 subagent,
                 registry=registry,
                 reasoning_level=reasoning_level,
+                reasoning_level_is_explicit=reasoning_level_is_explicit,
                 inherited_model=selected_model_profile,
                 backend=backend,
                 inherited_tools=inherited_tools,
+                sanitized_inherited_tools=sanitized_inherited_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
             )
@@ -4357,9 +4417,11 @@ class AgentRuntime:
         *,
         registry: dict[str, SubagentConfig],
         reasoning_level: ReasoningLevel,
+        reasoning_level_is_explicit: bool,
         inherited_model: ModelDefaults,
         backend: Any,
         inherited_tools: list[Any],
+        sanitized_inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> dict[str, Any]:
@@ -4372,6 +4434,7 @@ class AgentRuntime:
         effective_reasoning_level = reasoning_level_for_profile(
             effective_model,
             reasoning_level,
+            fallback_is_explicit=reasoning_level_is_explicit,
         )
         raw_own_tools = await self._get_mcp_tools(
             subagent.mcp_servers,
@@ -4384,6 +4447,7 @@ class AgentRuntime:
         )
         inherited_model_tools = inherited_tools_for_model(
             inherited_tools=inherited_tools,
+            sanitized_inherited_tools=sanitized_inherited_tools,
             inherited_provider=inherited_model.provider,
             effective_provider=effective_model.provider,
         )
@@ -4428,9 +4492,11 @@ class AgentRuntime:
                 child,
                 registry=registry,
                 reasoning_level=effective_reasoning_level,
+                reasoning_level_is_explicit=reasoning_level_is_explicit,
                 inherited_model=effective_model,
                 backend=backend,
-                inherited_tools=effective_tools,
+                inherited_tools=raw_own_tools if has_configured_own_tools else inherited_tools,
+                sanitized_inherited_tools=effective_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
             )
@@ -4490,9 +4556,14 @@ class AgentRuntime:
             self.config,
             selected_model,
         )
+        reasoning_level_is_explicit = (
+            self.config.model_reasoning_override
+            or reasoning_level != self.config.default_reasoning
+        )
         effective_reasoning_level = reasoning_level_for_profile(
             selected_model_profile,
             reasoning_level,
+            fallback_is_explicit=reasoning_level_is_explicit,
         )
         mcp_scope = self._mcp_scope(
             mcp_session_id=mcp_session_id,
@@ -4513,12 +4584,13 @@ class AgentRuntime:
                     model_profile=selected_model_profile,
                 )
                 rag_tool_enabled = self._rag_service is not None
+                raw_main_tools = await self._build_main_tools(
+                    thread_id=thread_id,
+                    mcp_session_id=mcp_session_id,
+                )
                 main_tools = sanitize_tools_for_model(
                     selected_model_profile.provider,
-                    await self._build_main_tools(
-                        thread_id=thread_id,
-                        mcp_session_id=mcp_session_id,
-                    ),
+                    raw_main_tools,
                 )
                 middleware = build_agent_middleware(
                     config=self.config,
@@ -4534,9 +4606,11 @@ class AgentRuntime:
                 )
                 subagent_specs = await self._build_runtime_subagent_specs(
                     reasoning_level=effective_reasoning_level,
+                    reasoning_level_is_explicit=reasoning_level_is_explicit,
                     selected_model_profile=selected_model_profile,
                     backend=backend,
-                    inherited_tools=main_tools,
+                    inherited_tools=raw_main_tools,
+                    sanitized_inherited_tools=main_tools,
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
