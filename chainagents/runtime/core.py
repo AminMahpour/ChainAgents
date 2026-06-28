@@ -3208,12 +3208,12 @@ class RuntimeConfig:
             if rag_embedding_provider == "auto":
                 rag_model_provider = active_runtime_model.provider
                 rag_model_base_url = active_runtime_model.base_url
-            elif rag_embedding_provider == runtime_default_model.provider:
-                rag_model_provider = runtime_default_model.provider
-                rag_model_base_url = runtime_default_model.base_url
             elif rag_embedding_provider == active_runtime_model.provider:
                 rag_model_provider = active_runtime_model.provider
                 rag_model_base_url = active_runtime_model.base_url
+            elif rag_embedding_provider == runtime_default_model.provider:
+                rag_model_provider = runtime_default_model.provider
+                rag_model_base_url = runtime_default_model.base_url
             elif rag_embedding_provider == "ollama":
                 rag_model_provider = "ollama"
                 rag_model_base_url = DEFAULT_OLLAMA_BASE_URL

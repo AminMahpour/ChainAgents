@@ -297,6 +297,45 @@ provider = "auto"
     assert "rag.embedding.model" in config.rag_error
 
 
+def test_runtime_config_uses_selected_profile_url_for_matching_rag_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify matching RAG providers inherit the selected profile endpoint."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-chat"
+
+[model.profiles.lmstudio]
+provider = "openai_compatible"
+base_url = "https://lmstudio.example/v1"
+name = "tool-model"
+api_key = "profile-key"
+
+[rag]
+enabled = true
+
+[rag.embedding]
+provider = "openai_compatible"
+model = "text-embedding-3-small"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "lmstudio")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.rag is not None
+    assert config.rag.embedding.provider == "openai_compatible"
+    assert config.rag.embedding.base_url == "https://lmstudio.example/v1"
+
+
 def test_runtime_config_keeps_explicit_rag_provider_on_default_model_url(
     tmp_path: Path,
     monkeypatch,
