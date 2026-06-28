@@ -297,6 +297,44 @@ provider = "auto"
     assert "rag.embedding.model" in config.rag_error
 
 
+def test_runtime_config_keeps_explicit_rag_provider_on_default_model_url(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify explicit RAG providers do not inherit selected chat profile URLs."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-chat"
+
+[model.profiles.claude]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "profile-key"
+
+[agent]
+model = "claude"
+
+[rag]
+enabled = true
+
+[rag.embedding]
+provider = "ollama"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.rag is not None
+    assert config.rag.embedding.provider == "ollama"
+    assert config.rag.embedding.base_url == "http://127.0.0.1:11434"
+
+
 def test_load_extensions_config_reads_mcp_stateful_flag(
     tmp_path: Path,
     monkeypatch,
@@ -408,6 +446,107 @@ model = "claude"
     assert model.temperature == 0.4
     assert model.effort == "medium"
     assert model.thinking is None
+
+
+def test_runtime_config_validates_credentials_against_selected_profile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify unused top-level providers do not require credentials."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+
+[model.profiles.local]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-model"
+
+[agent]
+model = "local"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPAGENT_MODEL_API_KEY", raising=False)
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_name == "local"
+    assert active_model.provider == "ollama"
+    assert active_model.name == "local-model"
+
+
+def test_model_profile_api_key_prefers_env_over_profile_toml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify environment credentials override selected profile keys."""
+    from langchain_anthropic import ChatAnthropic
+
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+
+[model.profiles.claude]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "stale-profile-key"
+
+[agent]
+model = "claude"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "env-anthropic-key")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert isinstance(model, ChatAnthropic)
+    assert model.anthropic_api_key.get_secret_value() == "env-anthropic-key"
+
+
+def test_model_profile_inherits_runtime_base_url_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify inherited profile endpoints are rebased on runtime overrides."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://toml-ollama.example:11434"
+name = "default-local"
+
+[model.profiles.fast]
+name = "fast-local"
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-ollama.example:11434")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_base_url == "http://env-ollama.example:11434"
+    assert active_model.base_url == "http://env-ollama.example:11434"
+    assert active_model.name == "fast-local"
 
 
 def test_build_model_resolves_named_profile_over_raw_model_name(

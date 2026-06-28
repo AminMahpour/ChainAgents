@@ -1702,6 +1702,7 @@ class ModelDefaults:
         temperature: The temperature value.
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
+        explicit_fields: Profile fields explicitly set in TOML.
     """
 
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
@@ -1716,6 +1717,11 @@ class ModelDefaults:
     temperature: float = DEFAULT_TEMPERATURE
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
+    explicit_fields: frozenset[str] = field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
 
 
 def _parse_model_names(value: Any, *, field_name: str) -> tuple[str, ...]:
@@ -1744,8 +1750,11 @@ def parse_model_profile_defaults(
             f"The top-level '{field_prefix.strip('[]')}' config must be a table/object."
         )
 
+    explicit_fields: set[str] = set()
     base_provider = base.provider if base is not None else DEFAULT_MODEL_PROVIDER
     provider_is_explicit = "provider" in raw_model
+    if provider_is_explicit:
+        explicit_fields.add("provider")
     provider = normalize_model_provider(
         raw_model.get("provider"),
         default=base_provider,
@@ -1756,14 +1765,19 @@ def parse_model_profile_defaults(
 
     raw_models = raw_model.get("models") if "models" in raw_model else None
     parsed_models = _parse_model_names(raw_models, field_name=f"{field_prefix}.models")
+    if raw_models is not None:
+        explicit_fields.add("models")
     if raw_models is None and base is not None and not provider_changed:
         parsed_models = base.models
 
     raw_name = str(raw_model.get("name", "")).strip() if "name" in raw_model else ""
     if raw_name:
+        explicit_fields.add("name")
+    if raw_name:
         name = raw_name
     elif parsed_models:
         name = parsed_models[0]
+        explicit_fields.add("name")
     elif base is not None and not provider_changed:
         name = base.name
     else:
@@ -1781,6 +1795,14 @@ def parse_model_profile_defaults(
     raw_base_url = normalize_optional_string(raw_model.get("base_url"))
     raw_endpoint_url = raw_model.get("endpoint_url")
     has_endpoint_url = normalize_optional_string(raw_endpoint_url) is not None
+    endpoint_is_explicit = bool(
+        raw_base_url is not None
+        or has_endpoint_url
+        or "endpoint" in raw_model
+        or "port" in raw_model
+    )
+    if endpoint_is_explicit:
+        explicit_fields.update({"base_url", "endpoint_query"})
     inherits_endpoint = bool(
         base is not None
         and not provider_changed
@@ -1832,6 +1854,8 @@ def parse_model_profile_defaults(
         if "api_key" in raw_model
         else (base.api_key if base is not None and not provider_changed else None)
     )
+    if "api_key" in raw_model:
+        explicit_fields.add("api_key")
     reasoning_effort = (
         normalize_reasoning_level(
             raw_model.get("reasoning_effort"),
@@ -1844,11 +1868,15 @@ def parse_model_profile_defaults(
         if "reasoning_effort" in raw_model or base is None
         else base.reasoning_effort
     )
+    if "reasoning_effort" in raw_model:
+        explicit_fields.add("reasoning_effort")
     thinking = (
         normalize_model_thinking(raw_model.get("thinking"))
         if "thinking" in raw_model or base is None
         else base.thinking
     )
+    if "thinking" in raw_model:
+        explicit_fields.add("thinking")
     temperature = (
         normalize_model_temperature(
             raw_model.get("temperature", raw_model.get("tempreature"))
@@ -1856,11 +1884,15 @@ def parse_model_profile_defaults(
         if "temperature" in raw_model or "tempreature" in raw_model or base is None
         else base.temperature
     )
+    if "temperature" in raw_model or "tempreature" in raw_model:
+        explicit_fields.add("temperature")
     repeat_penalty = (
         normalize_repeat_penalty(raw_model.get("repeat_penalty"))
         if "repeat_penalty" in raw_model or base is None
         else base.repeat_penalty
     )
+    if "repeat_penalty" in raw_model:
+        explicit_fields.add("repeat_penalty")
     disable_streaming = (
         parse_model_disable_streaming(raw_model)
         if (
@@ -1870,6 +1902,11 @@ def parse_model_profile_defaults(
         )
         else base.disable_streaming
     )
+    if (
+        "disable_streaming" in raw_model
+        or "disable_streaming_for_tool_calls" in raw_model
+    ):
+        explicit_fields.add("disable_streaming")
 
     return ModelDefaults(
         provider=provider,
@@ -1884,6 +1921,7 @@ def parse_model_profile_defaults(
         temperature=temperature,
         repeat_penalty=repeat_penalty,
         disable_streaming=disable_streaming,
+        explicit_fields=frozenset(explicit_fields),
     )
 
 
@@ -1927,15 +1965,51 @@ def resolve_model_profile_defaults(
     base_model = inherited_model or default_model
     selected_ref = normalize_optional_string(model_ref)
     if selected_ref and selected_ref in model_profiles:
-        return model_profiles[selected_ref]
+        return rebase_model_profile_defaults(model_profiles[selected_ref], base_model)
     if selected_ref:
         return replace(
             base_model,
             name=selected_ref,
             models=(),
             name_is_explicit=True,
+            explicit_fields=base_model.explicit_fields | frozenset({"name", "models"}),
         )
     return base_model
+
+
+def rebase_model_profile_defaults(
+    model_profile: ModelDefaults,
+    base_model: ModelDefaults,
+) -> ModelDefaults:
+    """Apply runtime base fields to profile values inherited from parsed defaults."""
+    if model_profile.provider != base_model.provider:
+        return model_profile
+
+    explicit_fields = model_profile.explicit_fields
+    updates: dict[str, Any] = {}
+    if "name" not in explicit_fields:
+        updates["name"] = base_model.name
+        updates["name_is_explicit"] = base_model.name_is_explicit
+    if "models" not in explicit_fields:
+        updates["models"] = base_model.models
+    if "base_url" not in explicit_fields:
+        updates["base_url"] = base_model.base_url
+        updates["endpoint_query"] = base_model.endpoint_query
+    if "api_key" not in explicit_fields:
+        updates["api_key"] = base_model.api_key
+    for field_name in (
+        "reasoning_effort",
+        "thinking",
+        "temperature",
+        "repeat_penalty",
+        "disable_streaming",
+    ):
+        if field_name not in explicit_fields:
+            updates[field_name] = getattr(base_model, field_name)
+
+    if not updates:
+        return model_profile
+    return replace(model_profile, **updates)
 
 
 @dataclass(frozen=True)
@@ -2746,6 +2820,7 @@ class RuntimeConfig:
         model_disable_streaming: Whether to disable model streaming.
         model_thinking: Anthropic thinking mode.
         model_profiles: Named model profiles available by profile name.
+        model_api_key_override: Explicit runtime API key override.
     """
 
     database_url: str | None
@@ -2769,6 +2844,7 @@ class RuntimeConfig:
     model_disable_streaming: DisableStreaming = False
     model_thinking: ModelThinking = DEFAULT_MODEL_THINKING
     model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
+    model_api_key_override: str | None = None
 
     @classmethod
     def from_env(
@@ -2959,8 +3035,13 @@ class RuntimeConfig:
             )
             if generic_model_base_url or model_base_url_alias:
                 model_endpoint_query = ()
+        model_api_key_override = (
+            normalize_optional_string(overrides.model_api_key)
+            if overrides.model_api_key is not None
+            else None
+        )
         if overrides.model_api_key is not None:
-            model_api_key = normalize_optional_string(overrides.model_api_key)
+            model_api_key = model_api_key_override
         else:
             provider_specific_api_key = (
                 normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
@@ -2976,11 +3057,6 @@ class RuntimeConfig:
                 provider_specific_api_key
                 or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
                 or model_default_api_key
-            )
-        if model_provider == "anthropic" and not model_api_key:
-            raise ValueError(
-                "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
-                "ANTHROPIC_API_KEY, or [model].api_key."
             )
         model_temperature = (
             normalize_model_temperature(overrides.model_temperature)
@@ -3037,15 +3113,46 @@ class RuntimeConfig:
             file_config.model_profiles,
             model_name,
         )
+        active_runtime_api_key = (
+            model_api_key_override
+            or (
+                normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+                if active_runtime_model.provider == "anthropic"
+                else None
+            )
+            or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+            or active_runtime_model.api_key
+        )
+        if active_runtime_model.provider == "anthropic" and not active_runtime_api_key:
+            raise ValueError(
+                "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
+                "ANTHROPIC_API_KEY, or [model].api_key."
+            )
         rag_requested = file_config.rag.enabled and not overrides.disable_rag
         rag = None
         rag_error = None
         if rag_requested:
+            rag_embedding_provider = file_config.rag.embedding.provider
+            if rag_embedding_provider == "auto":
+                rag_model_provider = active_runtime_model.provider
+                rag_model_base_url = active_runtime_model.base_url
+            elif rag_embedding_provider == runtime_default_model.provider:
+                rag_model_provider = runtime_default_model.provider
+                rag_model_base_url = runtime_default_model.base_url
+            elif rag_embedding_provider == active_runtime_model.provider:
+                rag_model_provider = active_runtime_model.provider
+                rag_model_base_url = active_runtime_model.base_url
+            elif rag_embedding_provider == "ollama":
+                rag_model_provider = "ollama"
+                rag_model_base_url = DEFAULT_OLLAMA_BASE_URL
+            else:
+                rag_model_provider = rag_embedding_provider
+                rag_model_base_url = ""
             try:
                 rag = resolve_rag_config(
                     file_config.rag,
-                    model_provider=active_runtime_model.provider,
-                    model_base_url=active_runtime_model.base_url,
+                    model_provider=rag_model_provider,
+                    model_base_url=rag_model_base_url,
                 )
             except ValueError as exc:
                 rag_error = str(exc)
@@ -3072,6 +3179,7 @@ class RuntimeConfig:
             model_disable_streaming=model_disable_streaming,
             model_thinking=model_defaults.thinking,
             model_profiles=file_config.model_profiles,
+            model_api_key_override=model_api_key_override,
         )
 
 
@@ -3214,17 +3322,19 @@ def model_api_key_for_profile(
     model_profile: ModelDefaults,
 ) -> str | None:
     """Return the effective API key for a resolved model profile."""
+    if config.model_api_key_override:
+        return config.model_api_key_override
+    if model_profile.provider == "anthropic":
+        provider_key = normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+        if provider_key:
+            return provider_key
+    generic_key = normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+    if generic_key:
+        return generic_key
     if model_profile.api_key:
         return model_profile.api_key
     if model_profile.provider == config.model_provider and config.model_api_key:
         return config.model_api_key
-    if model_profile.provider == "anthropic":
-        return (
-            normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
-            or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
-        )
-    if model_profile.provider == "openai_compatible":
-        return normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
     return None
 
 
