@@ -1702,6 +1702,10 @@ class ModelDefaults:
         temperature: The temperature value.
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
+        cross_provider_base_url: Runtime endpoint override for provider-switched
+            profiles.
+        cross_provider_endpoint_query: Runtime endpoint query for provider-switched
+            profiles.
         explicit_fields: Profile fields explicitly set in TOML.
         runtime_override_fields: Fields explicitly overridden at runtime.
     """
@@ -1718,6 +1722,8 @@ class ModelDefaults:
     temperature: float = DEFAULT_TEMPERATURE
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
+    cross_provider_base_url: str | None = None
+    cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     explicit_fields: frozenset[str] = field(
         default_factory=frozenset,
         compare=False,
@@ -1995,8 +2001,27 @@ def rebase_model_profile_defaults(
     if model_profile.provider != base_model.provider:
         updates: dict[str, Any] = {}
         if "cross_provider_base_url" in runtime_override_fields:
-            updates["base_url"] = base_model.base_url
-            updates["endpoint_query"] = base_model.endpoint_query
+            updates["base_url"] = (
+                base_model.cross_provider_base_url or base_model.base_url
+            )
+            updates["endpoint_query"] = (
+                base_model.cross_provider_endpoint_query
+                or base_model.endpoint_query
+            )
+        for field_name in ("temperature", "disable_streaming"):
+            if field_name in runtime_override_fields:
+                updates[field_name] = getattr(base_model, field_name)
+        if model_profile.runtime_override_fields != runtime_override_fields:
+            updates["runtime_override_fields"] = runtime_override_fields
+        if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
+            updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+        if (
+            model_profile.cross_provider_endpoint_query
+            != base_model.cross_provider_endpoint_query
+        ):
+            updates["cross_provider_endpoint_query"] = (
+                base_model.cross_provider_endpoint_query
+            )
         if not updates:
             return model_profile
         return replace(model_profile, **updates)
@@ -2027,6 +2052,17 @@ def rebase_model_profile_defaults(
             or field_name not in explicit_fields
         ):
             updates[field_name] = getattr(base_model, field_name)
+    if model_profile.runtime_override_fields != runtime_override_fields:
+        updates["runtime_override_fields"] = runtime_override_fields
+    if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
+        updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+    if (
+        model_profile.cross_provider_endpoint_query
+        != base_model.cross_provider_endpoint_query
+    ):
+        updates["cross_provider_endpoint_query"] = (
+            base_model.cross_provider_endpoint_query
+        )
 
     if not updates:
         return model_profile
@@ -2848,6 +2884,10 @@ class RuntimeConfig:
         model_base_url_override: Whether the model endpoint was overridden at runtime.
         model_cross_provider_base_url_override: Whether a generic runtime endpoint
             override may apply across profile provider boundaries.
+        model_cross_provider_base_url: Generic runtime endpoint for provider-switched
+            profiles.
+        model_cross_provider_endpoint_query: Generic runtime endpoint query for
+            provider-switched profiles.
         model_temperature_override: Whether temperature was overridden at runtime.
         model_disable_streaming_override: Whether streaming was overridden at runtime.
     """
@@ -2879,6 +2919,8 @@ class RuntimeConfig:
     model_reasoning_override: bool = False
     model_base_url_override: bool = False
     model_cross_provider_base_url_override: bool = False
+    model_cross_provider_base_url: str | None = None
+    model_cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_temperature_override: bool = False
     model_disable_streaming_override: bool = False
 
@@ -2977,6 +3019,16 @@ class RuntimeConfig:
         selected_override_profile = file_config.model_profiles.get(
             model_name_override or ""
         )
+        if (
+            model_provider_override
+            and selected_override_profile is not None
+            and selected_override_profile.provider != model_provider
+        ):
+            raise ValueError(
+                f"Model provider override '{model_provider}' does not match "
+                f"selected profile '{model_name_override}' provider "
+                f"'{selected_override_profile.provider}'."
+            )
         profile_endpoint_satisfies_provider_switch = bool(
             selected_override_profile is not None
             and selected_override_profile.provider == model_provider
@@ -3063,7 +3115,39 @@ class RuntimeConfig:
             file_config.model_profiles,
             model_name,
         )
+        cross_provider_model_base_url = (
+            generic_model_base_url if generic_model_base_url_override else None
+        )
+        cross_provider_model_endpoint_query: tuple[tuple[str, str], ...] = ()
         model_endpoint_query = model_defaults.endpoint_query
+        if (
+            generic_model_endpoint_url
+            and model_name in file_config.model_profiles
+            and active_model_defaults.provider != model_provider
+        ):
+            if active_model_defaults.provider == "anthropic":
+                (
+                    cross_provider_model_base_url,
+                    cross_provider_model_endpoint_query,
+                ) = normalize_anthropic_endpoint_url(
+                    generic_model_endpoint_url,
+                    required_message=(
+                        "The Anthropic model endpoint URL cannot be empty."
+                    ),
+                )
+            elif active_model_defaults.provider == "openai_compatible":
+                (
+                    cross_provider_model_base_url,
+                    cross_provider_model_endpoint_query,
+                ) = normalize_openai_endpoint_url(
+                    generic_model_endpoint_url,
+                    required_message="The model endpoint URL cannot be empty.",
+                )
+            else:
+                raise ValueError(
+                    "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
+                    "provider-switched Anthropic or OpenAI-compatible profiles."
+                )
         if model_provider == "anthropic":
             if generic_model_endpoint_url:
                 model_base_url, model_endpoint_query = normalize_anthropic_endpoint_url(
@@ -3158,7 +3242,7 @@ class RuntimeConfig:
                 model_disable_streaming = model_defaults.disable_streaming
         default_reasoning = normalize_reasoning_level(
             generic_model_reasoning or model_reasoning_alias,
-            default=active_model_defaults.reasoning_effort,
+            default=model_defaults.reasoning_effort,
         )
         model_reasoning_override = bool(generic_model_reasoning or model_reasoning_alias)
         recursion_limit = normalize_recursion_limit(
@@ -3183,6 +3267,8 @@ class RuntimeConfig:
             temperature=model_temperature,
             repeat_penalty=model_repeat_penalty,
             disable_streaming=model_disable_streaming,
+            cross_provider_base_url=cross_provider_model_base_url,
+            cross_provider_endpoint_query=cross_provider_model_endpoint_query,
             runtime_override_fields=(
                 frozenset(
                     {
@@ -3198,7 +3284,7 @@ class RuntimeConfig:
                             ),
                             (
                                 "cross_provider_base_url",
-                                generic_model_base_url_override,
+                                bool(cross_provider_model_base_url),
                             ),
                             ("temperature", model_temperature_override),
                             ("disable_streaming", model_disable_streaming_override),
@@ -3290,7 +3376,13 @@ class RuntimeConfig:
                     or generic_model_endpoint_url
                 )
             ),
-            model_cross_provider_base_url_override=generic_model_base_url_override,
+            model_cross_provider_base_url_override=bool(
+                cross_provider_model_base_url
+            ),
+            model_cross_provider_base_url=cross_provider_model_base_url,
+            model_cross_provider_endpoint_query=(
+                cross_provider_model_endpoint_query
+            ),
             model_temperature_override=model_temperature_override,
             model_disable_streaming_override=model_disable_streaming_override,
         )
@@ -3416,6 +3508,14 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
         ),
         disable_streaming=normalize_disable_streaming(
             getattr(config, "model_disable_streaming", False)
+        ),
+        cross_provider_base_url=getattr(
+            config,
+            "model_cross_provider_base_url",
+            None,
+        ),
+        cross_provider_endpoint_query=tuple(
+            getattr(config, "model_cross_provider_endpoint_query", ())
         ),
         runtime_override_fields=(
             frozenset(

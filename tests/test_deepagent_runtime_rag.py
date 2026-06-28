@@ -487,6 +487,43 @@ model = "claude"
     assert model.thinking is None
 
 
+def test_profile_agent_model_does_not_change_raw_model_default_reasoning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify raw model choices keep the base model reasoning default."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+reasoning_effort = "medium"
+
+[model.profiles.fast]
+name = "fast-local"
+reasoning_effort = "low"
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    selected_profile = deepagent_runtime.resolve_runtime_model_profile(config)
+    raw_model = deepagent_runtime.resolve_runtime_model_profile(
+        config,
+        "default-local",
+    )
+
+    assert config.default_reasoning == "medium"
+    assert selected_profile.reasoning_effort == "low"
+    assert raw_model.reasoning_effort == "medium"
+
+
 def test_runtime_config_validates_credentials_against_selected_profile(
     tmp_path: Path,
     monkeypatch,
@@ -655,6 +692,88 @@ model = "lmstudio"
     assert active_model.base_url == "https://env-openai.example/v1"
 
 
+def test_provider_switched_profile_endpoint_url_uses_generic_runtime_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify endpoint URL overrides can rebase provider-switched profiles."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+
+[model.profiles.lmstudio]
+provider = "openai_compatible"
+base_url = "https://profile-openai.example/v1"
+name = "tool-model"
+api_key = "profile-key"
+
+[agent]
+model = "lmstudio"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_ENDPOINT_URL",
+        (
+            "https://env-openai.example/openai/deployments/tool/chat/completions"
+            "?api-version=2026-01-01"
+        ),
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert active_model.provider == "openai_compatible"
+    assert active_model.name == "tool-model"
+    assert active_model.base_url == "https://env-openai.example/openai/deployments/tool"
+    assert active_model.endpoint_query == (("api-version", "2026-01-01"),)
+
+
+def test_rebased_profile_preserves_runtime_overrides_for_child_profiles() -> None:
+    """Verify inherited rebased profiles carry runtime override provenance."""
+    base_model = deepagent_runtime.ModelDefaults(
+        provider="ollama",
+        base_url="http://env-ollama.example:11434",
+        name="default-local",
+        temperature=0.7,
+        runtime_override_fields=frozenset({"base_url", "temperature"}),
+    )
+    main_profile = deepagent_runtime.ModelDefaults(
+        provider="ollama",
+        base_url="http://profile-main.example:11434",
+        name="fast-local",
+        temperature=0.1,
+        explicit_fields=frozenset({"base_url", "name", "temperature"}),
+    )
+    child_profile = deepagent_runtime.ModelDefaults(
+        provider="ollama",
+        base_url="http://profile-child.example:11434",
+        name="child-local",
+        temperature=0.2,
+        explicit_fields=frozenset({"base_url", "name", "temperature"}),
+    )
+
+    rebased_main = deepagent_runtime.rebase_model_profile_defaults(
+        main_profile,
+        base_model,
+    )
+    rebased_child = deepagent_runtime.rebase_model_profile_defaults(
+        child_profile,
+        rebased_main,
+    )
+
+    assert rebased_main.runtime_override_fields == frozenset(
+        {"base_url", "temperature"}
+    )
+    assert rebased_child.base_url == "http://env-ollama.example:11434"
+    assert rebased_child.temperature == 0.7
+
+
 def test_model_profile_temperature_uses_runtime_override(
     tmp_path: Path,
 ) -> None:
@@ -821,6 +940,36 @@ api_key = "profile-key"
     assert config.model_choices == ("lmstudio",)
     assert active_model.provider == "openai_compatible"
     assert active_model.base_url == "https://lmstudio.example/v1"
+
+
+def test_provider_override_rejects_selected_profile_provider_mismatch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify provider overrides cannot select a mismatched named profile."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-default"
+
+[model.profiles.claude-reviewer]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "profile-key"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "claude-reviewer")
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "https://openai.example/v1")
+    monkeypatch.setenv("DEEPAGENT_MODEL_API_KEY", "openai-key")
+
+    with pytest.raises(ValueError, match="provider.*claude-reviewer"):
+        deepagent_runtime.RuntimeConfig.from_env()
 
 
 def test_same_provider_override_preserves_agent_model_profile(
