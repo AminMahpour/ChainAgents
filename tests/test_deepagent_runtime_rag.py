@@ -783,6 +783,7 @@ api_key = "profile-key"
 
     assert config.model_provider == "openai_compatible"
     assert config.model_name == "lmstudio"
+    assert config.model_choices == ("lmstudio",)
     assert active_model.provider == "openai_compatible"
     assert active_model.base_url == "https://lmstudio.example/v1"
 
@@ -3353,6 +3354,86 @@ def test_get_agent_explicit_default_reasoning_overrides_profile_default(
     )
 
     assert captured["kwargs"]["model"] == "model:review-model:low"
+
+
+def test_get_agent_cache_distinguishes_reasoning_explicitness_for_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify agent caching preserves subagent reasoning explicitness."""
+    created_graphs: list[SimpleNamespace] = []
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture each DeepAgents graph creation call."""
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+        """Capture the effective model and reasoning level."""
+        selected_name = model_profile.name if model_profile is not None else model_name
+        return f"model:{selected_name}:{reasoning_level}"
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="ollama",
+            model_name="main",
+            model_choices=("main", "reviewer"),
+            model_base_url="http://127.0.0.1:11434",
+            model_api_key=None,
+            model_temperature=0.0,
+            default_reasoning="high",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(
+                config_path=None,
+                subagents=(
+                    SubagentConfig(
+                        name="reviewer",
+                        description="Reviews output.",
+                        system_prompt="Review the work.",
+                        model="reviewer",
+                    ),
+                ),
+            ),
+            model_profiles={
+                "main": deepagent_runtime.ModelDefaults(
+                    provider="ollama",
+                    base_url="http://127.0.0.1:11434",
+                    name="main-model",
+                    reasoning_effort="high",
+                    explicit_fields=frozenset({"name", "reasoning_effort"}),
+                ),
+                "reviewer": deepagent_runtime.ModelDefaults(
+                    provider="ollama",
+                    base_url="http://127.0.0.1:11434",
+                    name="review-model",
+                    reasoning_effort="low",
+                    explicit_fields=frozenset({"name", "reasoning_effort"}),
+                ),
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("high", model_name="main", thread_id="thread-1"))
+    asyncio.run(
+        runtime.get_agent(
+            "high",
+            model_name="main",
+            reasoning_level_is_explicit=True,
+            thread_id="thread-1",
+        )
+    )
+
+    assert len(created_graphs) == 2
+    assert created_graphs[0].kwargs["subagents"][0]["model"] == "model:review-model:low"
+    assert created_graphs[1].kwargs["subagents"][0]["model"] == "model:review-model:high"
 
 
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(

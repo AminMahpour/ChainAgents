@@ -2971,6 +2971,12 @@ class RuntimeConfig:
         endpoint_url_satisfies_provider_switch = (
             model_provider == "openai_compatible" and bool(generic_model_endpoint_url)
         )
+        profile_endpoint_only_satisfies_provider_switch = (
+            provider_changed
+            and profile_endpoint_satisfies_provider_switch
+            and not generic_model_base_url
+            and not endpoint_url_satisfies_provider_switch
+        )
         provider_switch_requires_url = (
             provider_changed
             and model_provider in {"ollama", "openai_compatible"}
@@ -3024,12 +3030,16 @@ class RuntimeConfig:
                 "or set a non-empty [model].name in deepagent.toml."
             )
 
+        default_model_choices = (
+            ()
+            if profile_endpoint_only_satisfies_provider_switch
+            else (model_defaults.name, *model_defaults.models)
+        )
         model_choices = tuple(
             dict.fromkeys(
                 [
                     model_name,
-                    model_defaults.name,
-                    *model_defaults.models,
+                    *default_model_choices,
                     *file_config.model_profiles.keys(),
                 ]
             )
@@ -4620,6 +4630,7 @@ class AgentRuntime:
         )
         cache_key = (
             effective_reasoning_level,
+            reasoning_level_is_explicit,
             selected_model,
             thread_id,
             async_subagent_url_override,
