@@ -620,6 +620,41 @@ model = "fast"
     assert active_model.base_url == "http://env-ollama.example:11434"
 
 
+def test_provider_switched_profile_base_url_uses_generic_runtime_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify generic endpoint overrides replace provider-switched profile URLs."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+
+[model.profiles.lmstudio]
+provider = "openai_compatible"
+base_url = "https://profile-openai.example/v1"
+name = "tool-model"
+api_key = "profile-key"
+
+[agent]
+model = "lmstudio"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "https://env-openai.example/v1")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert active_model.provider == "openai_compatible"
+    assert active_model.name == "tool-model"
+    assert active_model.base_url == "https://env-openai.example/v1"
+
+
 def test_model_profile_temperature_uses_runtime_override(
     tmp_path: Path,
 ) -> None:

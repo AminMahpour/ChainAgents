@@ -1990,10 +1990,17 @@ def rebase_model_profile_defaults(
     base_model: ModelDefaults,
 ) -> ModelDefaults:
     """Apply runtime base fields to profile values inherited from parsed defaults."""
-    if model_profile.provider != base_model.provider:
-        return model_profile
-
     explicit_fields = model_profile.explicit_fields
+    runtime_override_fields = base_model.runtime_override_fields
+    if model_profile.provider != base_model.provider:
+        updates: dict[str, Any] = {}
+        if "cross_provider_base_url" in runtime_override_fields:
+            updates["base_url"] = base_model.base_url
+            updates["endpoint_query"] = base_model.endpoint_query
+        if not updates:
+            return model_profile
+        return replace(model_profile, **updates)
+
     updates: dict[str, Any] = {}
     if "name" not in explicit_fields:
         updates["name"] = base_model.name
@@ -2001,7 +2008,7 @@ def rebase_model_profile_defaults(
     if "models" not in explicit_fields:
         updates["models"] = base_model.models
     if (
-        "base_url" in base_model.runtime_override_fields
+        "base_url" in runtime_override_fields
         or "base_url" not in explicit_fields
     ):
         updates["base_url"] = base_model.base_url
@@ -2015,7 +2022,10 @@ def rebase_model_profile_defaults(
         "repeat_penalty",
         "disable_streaming",
     ):
-        if field_name in base_model.runtime_override_fields or field_name not in explicit_fields:
+        if (
+            field_name in runtime_override_fields
+            or field_name not in explicit_fields
+        ):
             updates[field_name] = getattr(base_model, field_name)
 
     if not updates:
@@ -2836,6 +2846,8 @@ class RuntimeConfig:
         model_default_choices: Runtime default model list before profile names are added.
         model_reasoning_override: Whether reasoning was explicitly overridden at runtime.
         model_base_url_override: Whether the model endpoint was overridden at runtime.
+        model_cross_provider_base_url_override: Whether a generic runtime endpoint
+            override may apply across profile provider boundaries.
         model_temperature_override: Whether temperature was overridden at runtime.
         model_disable_streaming_override: Whether streaming was overridden at runtime.
     """
@@ -2866,6 +2878,7 @@ class RuntimeConfig:
     model_default_choices: tuple[str, ...] = ()
     model_reasoning_override: bool = False
     model_base_url_override: bool = False
+    model_cross_provider_base_url_override: bool = False
     model_temperature_override: bool = False
     model_disable_streaming_override: bool = False
 
@@ -2914,6 +2927,7 @@ class RuntimeConfig:
             os.getenv("DEEPAGENT_MODEL_BASE_URL")
         )
         generic_model_base_url = override_model_base_url or env_model_base_url or ""
+        generic_model_base_url_override = bool(generic_model_base_url)
         generic_model_base_url_from_env = (
             override_model_base_url is None and env_model_base_url is not None
         )
@@ -3182,6 +3196,10 @@ class RuntimeConfig:
                                     or generic_model_endpoint_url
                                 ),
                             ),
+                            (
+                                "cross_provider_base_url",
+                                generic_model_base_url_override,
+                            ),
                             ("temperature", model_temperature_override),
                             ("disable_streaming", model_disable_streaming_override),
                         )
@@ -3272,6 +3290,7 @@ class RuntimeConfig:
                     or generic_model_endpoint_url
                 )
             ),
+            model_cross_provider_base_url_override=generic_model_base_url_override,
             model_temperature_override=model_temperature_override,
             model_disable_streaming_override=model_disable_streaming_override,
         )
@@ -3404,6 +3423,14 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
                     field_name
                     for field_name, enabled in (
                         ("base_url", getattr(config, "model_base_url_override", False)),
+                        (
+                            "cross_provider_base_url",
+                            getattr(
+                                config,
+                                "model_cross_provider_base_url_override",
+                                False,
+                            ),
+                        ),
                         (
                             "temperature",
                             getattr(config, "model_temperature_override", False),
