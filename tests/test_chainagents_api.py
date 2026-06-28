@@ -139,6 +139,7 @@ def test_invoke_runs_prompt_through_agent() -> None:
             "args": ("high",),
             "kwargs": {
                 "model_name": "other-model",
+                "reasoning_level_is_explicit": True,
                 "thread_id": "thread-1",
                 "async_subagent_url_override": None,
                 "mcp_session_id": "session-1",

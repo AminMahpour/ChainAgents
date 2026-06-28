@@ -357,6 +357,37 @@ thinking = "auto"
 # endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
 ```
 
+Named model profiles let the main agent, Chainlit mode picker, and sync
+subagents use different provider settings from the same config file:
+
+```toml
+[model]
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:1234/v1"
+name = "local-default"
+models = ["local-default"]
+
+[model.profiles.fast-local]
+name = "local-fast"
+temperature = 0.1
+reasoning_effort = "low"
+
+[model.profiles.claude-reviewer]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+thinking = "auto"
+# api_key = "optional-if-ANTHROPIC_API_KEY-or-DEEPAGENT_MODEL_API_KEY-is-set"
+
+[agent]
+model = "fast-local"
+
+[[subagents]]
+name = "reviewer"
+description = "Reviews proposed changes."
+system_prompt = "Review for bugs, regressions, and missing tests."
+model = "claude-reviewer"
+```
+
 Notes:
 
 - `provider` selects `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic`.
@@ -366,6 +397,9 @@ Notes:
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
+- `[model.profiles.<name>]` defines a named profile. Profiles inherit omitted fields from `[model]` when they keep the same provider; profiles that switch to `openai_compatible` must provide `base_url` or `endpoint_url`, and profiles that switch to `anthropic` default to `https://api.anthropic.com` unless `base_url` or `endpoint_url` is set.
+- Profile names are surfaced in Chainlit settings and modes alongside `[model].models`. When a selected value matches a profile name, the full profile is used; otherwise the value is treated as a raw model name using the inherited/default provider settings.
+- `[agent].model` optionally sets the main/supervisor agent's default profile or raw model name. CLI and environment model overrides still take precedence.
 - `api_key` is optional for `provider = "openai_compatible"`; when omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
 - Anthropic requires an API key from `ANTHROPIC_API_KEY`, `DEEPAGENT_MODEL_API_KEY`, or `api_key`; when multiple are set, `ANTHROPIC_API_KEY` takes precedence over the generic key.
 - When switching from another provider to Anthropic through environment or CLI overrides, provide Anthropic credentials through `ANTHROPIC_API_KEY`, `DEEPAGENT_MODEL_API_KEY`, or `--api-key`; the runtime will not reuse an `api_key` from another provider's TOML config.
@@ -587,7 +621,7 @@ Supported subagent fields:
 - `system_prompt` or `system_prompt_file`: one is required
 - `skills`: optional list of skill source paths for that subagent
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
-- `model`: optional model override
+- `model`: optional profile name or raw model name. Profile names can switch provider settings and tool-schema handling for that sync subagent. Raw model names inherit the parent/default provider settings.
 - `nested_subagents`: optional list of top-level sync subagent names exposed as children of this subagent
 - `[[subagents.subagents]]`: optional inline private sync child subagents under a parent subagent
 
@@ -603,6 +637,7 @@ Main `[agent]` additions:
 - `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
 - `memory_namespace`: optional non-empty namespace for agent-scoped `/memories/` storage. Defaults to `filesystem`; allowed characters are letters, numbers, `-`, `_`, `.`, `@`, `+`, `:`, and `~`.
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
+- `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.

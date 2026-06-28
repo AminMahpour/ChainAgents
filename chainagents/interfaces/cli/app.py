@@ -48,6 +48,7 @@ from chainagents.runtime import (
     shutdown_langfuse_client,
     format_model_provider,
     normalize_reasoning_level,
+    resolve_runtime_model_profile,
     resolve_local_path,
 )
 from chainagents.rag.runtime import RagStatus, RagUploadResult, UploadedRagFile
@@ -1301,12 +1302,13 @@ def runtime_status_payload(runtime: AgentRuntime) -> dict[str, Any]:
         The constructed the json payload for cli runtime status output.
     """
     extensions = runtime.config.extensions
+    active_model = resolve_runtime_model_profile(runtime.config)
     return {
-        "model_provider": runtime.config.model_provider,
-        "model_provider_label": format_model_provider(runtime.config.model_provider),
+        "model_provider": active_model.provider,
+        "model_provider_label": format_model_provider(active_model.provider),
         "model": runtime.config.model_name,
         "model_choices": list(runtime.config.model_choices),
-        "model_base_url": runtime.config.model_base_url,
+        "model_base_url": active_model.base_url,
         "reasoning": runtime.config.default_reasoning,
         "model_disable_streaming": runtime.config.model_disable_streaming,
         "agent_state": runtime.config.agent_state,

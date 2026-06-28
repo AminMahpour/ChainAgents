@@ -21,6 +21,7 @@ from chainagents.runtime import (
     ReasoningLevel,
     build_langgraph_run_config,
     normalize_reasoning_level,
+    resolve_runtime_model_profile,
 )
 from chainagents.runtime.reflection import ReflectionCollector
 
@@ -69,6 +70,7 @@ class AgentRunContext:
     thread_id: str
     model_name: str
     reasoning_level: ReasoningLevel
+    reasoning_level_is_explicit: bool
     async_subagent_url: str | None
     mcp_session_id: str | None
 
@@ -113,9 +115,10 @@ def create_app(runtime: Any | None = None) -> FastAPI:
     async def status(request: Request) -> RuntimeStatusResponse:
         active_runtime = _runtime_from_request(request)
         config = active_runtime.config
+        active_model = resolve_runtime_model_profile(config)
         return RuntimeStatusResponse(
             model=config.model_name,
-            model_provider=config.model_provider,
+            model_provider=active_model.provider,
             model_choices=list(config.model_choices),
             default_reasoning=config.default_reasoning,
             agent_state=config.agent_state,
@@ -243,6 +246,7 @@ def _run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
         thread_id=thread_id,
         model_name=model_name,
         reasoning_level=reasoning_level,
+        reasoning_level_is_explicit=request.reasoning is not None,
         async_subagent_url=_optional_text(request.async_subagent_url),
         mcp_session_id=_optional_text(request.mcp_session_id),
     )
@@ -271,6 +275,7 @@ async def _iter_agent_events(
     agent = await runtime.get_agent(
         context.reasoning_level,
         model_name=context.model_name,
+        reasoning_level_is_explicit=context.reasoning_level_is_explicit,
         thread_id=context.thread_id,
         async_subagent_url_override=context.async_subagent_url,
         mcp_session_id=context.mcp_session_id,

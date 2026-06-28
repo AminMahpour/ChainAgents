@@ -14,7 +14,7 @@ import threading
 import tomllib
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -1412,12 +1412,14 @@ class SubagentConfig:
         *,
         tools: list[Any] | None = None,
         middleware: list[AgentMiddleware[Any, Any, Any]] | None = None,
+        model: Any | None = None,
     ) -> dict[str, Any]:
         """Convert this object to deepagents spec.
 
         Args:
             tools: The tools value.
             middleware: The middleware value.
+            model: Resolved model object for this subagent.
 
         Returns:
             The converted value.
@@ -1433,7 +1435,9 @@ class SubagentConfig:
             spec["tools"] = tools
         if middleware:
             spec["middleware"] = list(middleware)
-        if self.model:
+        if model is not None:
+            spec["model"] = model
+        elif self.model:
             spec["model"] = self.model
         return spec
 
@@ -1616,6 +1620,7 @@ class ExtensionsConfig:
         agent_memory_namespace: Shared StoreBackend namespace for /memories/.
         agent_memory_files: Startup memory files loaded into the agent prompt.
         agent_reflection: Correction reflection workflow configuration.
+        agent_model: Optional main-agent model profile or raw model name.
         recursion_limit: The recursion limit value.
         mcp_servers: The MCP servers value.
         skills: The skills value.
@@ -1643,6 +1648,7 @@ class ExtensionsConfig:
     agent_memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE
     agent_memory_files: tuple[str, ...] = DEFAULT_AGENT_MEMORY_FILES
     agent_reflection: ReflectionConfig = ReflectionConfig()
+    agent_model: str | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
     skills: tuple[str, ...] = ()
@@ -1696,6 +1702,12 @@ class ModelDefaults:
         temperature: The temperature value.
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
+        cross_provider_base_url: Runtime endpoint override for provider-switched
+            profiles.
+        cross_provider_endpoint_query: Runtime endpoint query for provider-switched
+            profiles.
+        explicit_fields: Profile fields explicitly set in TOML.
+        runtime_override_fields: Fields explicitly overridden at runtime.
     """
 
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
@@ -1710,6 +1722,351 @@ class ModelDefaults:
     temperature: float = DEFAULT_TEMPERATURE
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
+    cross_provider_base_url: str | None = None
+    cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
+    explicit_fields: frozenset[str] = field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
+    runtime_override_fields: frozenset[str] = field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
+
+
+def _parse_model_names(value: Any, *, field_name: str) -> tuple[str, ...]:
+    """Parse a TOML model list while preserving order and removing duplicates."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"The {field_name} config must be an array of strings.")
+    parsed_models: list[str] = []
+    for raw_candidate in value:
+        candidate = str(raw_candidate or "").strip()
+        if candidate and candidate not in parsed_models:
+            parsed_models.append(candidate)
+    return tuple(parsed_models)
+
+
+def parse_model_profile_defaults(
+    raw_model: dict[str, Any],
+    *,
+    base: ModelDefaults | None = None,
+    field_prefix: str = "[model]",
+) -> ModelDefaults:
+    """Parse one model default/profile table."""
+    if raw_model and not isinstance(raw_model, dict):
+        raise ValueError(
+            f"The top-level '{field_prefix.strip('[]')}' config must be a table/object."
+        )
+
+    explicit_fields: set[str] = set()
+    base_provider = base.provider if base is not None else DEFAULT_MODEL_PROVIDER
+    provider_is_explicit = "provider" in raw_model
+    if provider_is_explicit:
+        explicit_fields.add("provider")
+    provider = normalize_model_provider(
+        raw_model.get("provider"),
+        default=base_provider,
+    )
+    provider_changed = bool(
+        base is not None and provider_is_explicit and provider != base.provider
+    )
+
+    raw_models = raw_model.get("models") if "models" in raw_model else None
+    parsed_models = _parse_model_names(raw_models, field_name=f"{field_prefix}.models")
+    if raw_models is not None:
+        explicit_fields.add("models")
+    if raw_models is None and base is not None and not provider_changed:
+        parsed_models = base.models
+
+    raw_name = str(raw_model.get("name", "")).strip() if "name" in raw_model else ""
+    if raw_name:
+        explicit_fields.add("name")
+    if raw_name:
+        name = raw_name
+    elif raw_models is not None and parsed_models:
+        name = parsed_models[0]
+        explicit_fields.add("name")
+    elif base is not None and not provider_changed:
+        name = base.name
+    elif parsed_models:
+        name = parsed_models[0]
+    else:
+        name = DEFAULT_MODEL if provider == "ollama" else ""
+
+    if provider in {"openai_compatible", "anthropic"} and not name:
+        provider_label = (
+            "OpenAI-compatible" if provider == "openai_compatible" else "Anthropic"
+        )
+        raise ValueError(
+            f"{provider_label} model config must define a non-empty 'name' or 'models'."
+        )
+
+    endpoint_query: tuple[tuple[str, str], ...] = ()
+    raw_base_url = normalize_optional_string(raw_model.get("base_url"))
+    raw_endpoint_url = raw_model.get("endpoint_url")
+    has_endpoint_url = normalize_optional_string(raw_endpoint_url) is not None
+    endpoint_is_explicit = bool(
+        raw_base_url is not None
+        or has_endpoint_url
+        or "endpoint" in raw_model
+        or "port" in raw_model
+    )
+    if endpoint_is_explicit:
+        explicit_fields.update({"base_url", "endpoint_query"})
+    inherits_endpoint = bool(
+        base is not None
+        and not provider_changed
+        and raw_base_url is None
+        and not has_endpoint_url
+        and "endpoint" not in raw_model
+        and "port" not in raw_model
+    )
+    if inherits_endpoint:
+        base_url = base.base_url
+        endpoint_query = base.endpoint_query
+    elif provider == "ollama":
+        if raw_base_url:
+            base_url = normalize_model_base_url(
+                raw_base_url,
+                default=DEFAULT_OLLAMA_BASE_URL,
+            )
+        else:
+            base_url = compose_base_url(
+                raw_model.get("endpoint"),
+                normalize_model_port(raw_model.get("port")),
+            )
+    elif provider == "openai_compatible":
+        required_message = (
+            "OpenAI-compatible model config must define a non-empty "
+            "'base_url' or 'endpoint_url'."
+        )
+        if has_endpoint_url:
+            base_url, endpoint_query = normalize_openai_endpoint_url(
+                raw_endpoint_url,
+                required_message=required_message,
+            )
+        else:
+            base_url = normalize_model_base_url(
+                raw_model.get("base_url"),
+                required_message=required_message,
+            )
+    else:
+        if has_endpoint_url:
+            base_url, endpoint_query = normalize_anthropic_endpoint_url(raw_endpoint_url)
+        else:
+            base_url = normalize_model_base_url(
+                raw_model.get("base_url"),
+                default=DEFAULT_ANTHROPIC_BASE_URL,
+            )
+
+    api_key = (
+        normalize_optional_string(raw_model.get("api_key"))
+        if "api_key" in raw_model
+        else (base.api_key if base is not None and not provider_changed else None)
+    )
+    if "api_key" in raw_model:
+        explicit_fields.add("api_key")
+    reasoning_effort = (
+        normalize_reasoning_level(
+            raw_model.get("reasoning_effort"),
+            default=(
+                base.reasoning_effort
+                if base is not None
+                else DEFAULT_REASONING_LEVEL
+            ),
+        )
+        if "reasoning_effort" in raw_model or base is None
+        else base.reasoning_effort
+    )
+    if "reasoning_effort" in raw_model:
+        explicit_fields.add("reasoning_effort")
+    thinking = (
+        normalize_model_thinking(raw_model.get("thinking"))
+        if "thinking" in raw_model or base is None
+        else base.thinking
+    )
+    if "thinking" in raw_model:
+        explicit_fields.add("thinking")
+    temperature = (
+        normalize_model_temperature(
+            raw_model.get("temperature", raw_model.get("tempreature"))
+        )
+        if "temperature" in raw_model or "tempreature" in raw_model or base is None
+        else base.temperature
+    )
+    if "temperature" in raw_model or "tempreature" in raw_model:
+        explicit_fields.add("temperature")
+    repeat_penalty = (
+        normalize_repeat_penalty(raw_model.get("repeat_penalty"))
+        if "repeat_penalty" in raw_model or base is None
+        else base.repeat_penalty
+    )
+    if "repeat_penalty" in raw_model:
+        explicit_fields.add("repeat_penalty")
+    disable_streaming = (
+        parse_model_disable_streaming(raw_model)
+        if (
+            "disable_streaming" in raw_model
+            or "disable_streaming_for_tool_calls" in raw_model
+            or base is None
+        )
+        else base.disable_streaming
+    )
+    if (
+        "disable_streaming" in raw_model
+        or "disable_streaming_for_tool_calls" in raw_model
+    ):
+        explicit_fields.add("disable_streaming")
+
+    return ModelDefaults(
+        provider=provider,
+        base_url=base_url,
+        endpoint_query=endpoint_query,
+        name=name,
+        api_key=api_key,
+        models=parsed_models,
+        name_is_explicit=bool(raw_name or parsed_models),
+        reasoning_effort=reasoning_effort,
+        thinking=thinking,
+        temperature=temperature,
+        repeat_penalty=repeat_penalty,
+        disable_streaming=disable_streaming,
+        explicit_fields=frozenset(explicit_fields),
+    )
+
+
+def parse_model_profiles(
+    raw_model: dict[str, Any],
+    *,
+    base: ModelDefaults,
+) -> dict[str, ModelDefaults]:
+    """Parse named model profiles from the [model.profiles] TOML table."""
+    raw_profiles = raw_model.get("profiles", {})
+    if raw_profiles in ({}, None):
+        return {}
+    if not isinstance(raw_profiles, dict):
+        raise ValueError("The [model].profiles config must be a table/object.")
+
+    profiles: dict[str, ModelDefaults] = {}
+    for raw_name, raw_profile in raw_profiles.items():
+        profile_name = str(raw_name).strip()
+        if not profile_name:
+            raise ValueError("Model profile names must be non-empty strings.")
+        if not isinstance(raw_profile, dict):
+            raise ValueError(
+                f"Model profile '{profile_name}' must be a table/object."
+            )
+        profiles[profile_name] = parse_model_profile_defaults(
+            raw_profile,
+            base=base,
+            field_prefix=f"[model.profiles.{profile_name}]",
+        )
+    return profiles
+
+
+def resolve_model_profile_defaults(
+    default_model: ModelDefaults,
+    model_profiles: dict[str, ModelDefaults],
+    model_ref: str | None,
+    *,
+    inherited_model: ModelDefaults | None = None,
+) -> ModelDefaults:
+    """Resolve a profile-or-raw-model reference into concrete model settings."""
+    base_model = inherited_model or default_model
+    selected_ref = normalize_optional_string(model_ref)
+    if selected_ref and selected_ref in model_profiles:
+        return rebase_model_profile_defaults(model_profiles[selected_ref], base_model)
+    if selected_ref:
+        return replace(
+            base_model,
+            name=selected_ref,
+            models=(),
+            name_is_explicit=True,
+            explicit_fields=base_model.explicit_fields | frozenset({"name", "models"}),
+        )
+    return base_model
+
+
+def rebase_model_profile_defaults(
+    model_profile: ModelDefaults,
+    base_model: ModelDefaults,
+) -> ModelDefaults:
+    """Apply runtime base fields to profile values inherited from parsed defaults."""
+    explicit_fields = model_profile.explicit_fields
+    runtime_override_fields = base_model.runtime_override_fields
+    if model_profile.provider != base_model.provider:
+        updates: dict[str, Any] = {}
+        if "cross_provider_base_url" in runtime_override_fields:
+            updates["base_url"] = (
+                base_model.cross_provider_base_url or base_model.base_url
+            )
+            updates["endpoint_query"] = (
+                base_model.cross_provider_endpoint_query
+                or base_model.endpoint_query
+            )
+        for field_name in ("temperature", "disable_streaming"):
+            if field_name in runtime_override_fields:
+                updates[field_name] = getattr(base_model, field_name)
+        if model_profile.runtime_override_fields != runtime_override_fields:
+            updates["runtime_override_fields"] = runtime_override_fields
+        if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
+            updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+        if (
+            model_profile.cross_provider_endpoint_query
+            != base_model.cross_provider_endpoint_query
+        ):
+            updates["cross_provider_endpoint_query"] = (
+                base_model.cross_provider_endpoint_query
+            )
+        if not updates:
+            return model_profile
+        return replace(model_profile, **updates)
+
+    updates: dict[str, Any] = {}
+    if "name" not in explicit_fields:
+        updates["name"] = base_model.name
+        updates["name_is_explicit"] = base_model.name_is_explicit
+    if "models" not in explicit_fields:
+        updates["models"] = base_model.models
+    if (
+        "base_url" in runtime_override_fields
+        or "base_url" not in explicit_fields
+    ):
+        updates["base_url"] = base_model.base_url
+        updates["endpoint_query"] = base_model.endpoint_query
+    if "api_key" not in explicit_fields:
+        updates["api_key"] = base_model.api_key
+    for field_name in (
+        "reasoning_effort",
+        "thinking",
+        "temperature",
+        "repeat_penalty",
+        "disable_streaming",
+    ):
+        if (
+            field_name in runtime_override_fields
+            or field_name not in explicit_fields
+        ):
+            updates[field_name] = getattr(base_model, field_name)
+    if model_profile.runtime_override_fields != runtime_override_fields:
+        updates["runtime_override_fields"] = runtime_override_fields
+    if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
+        updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+    if (
+        model_profile.cross_provider_endpoint_query
+        != base_model.cross_provider_endpoint_query
+    ):
+        updates["cross_provider_endpoint_query"] = (
+            base_model.cross_provider_endpoint_query
+        )
+
+    if not updates:
+        return model_profile
+    return replace(model_profile, **updates)
 
 
 @dataclass(frozen=True)
@@ -1718,6 +2075,7 @@ class FileConfig:
 
     Attributes:
         model: Model name or model object used by the runtime.
+        model_profiles: Named model profiles available to agents.
         extensions: The extensions value.
         langfuse: Langfuse tracing configuration.
         rag: The RAG value.
@@ -1725,6 +2083,7 @@ class FileConfig:
 
     model: ModelDefaults
     extensions: ExtensionsConfig
+    model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
     langfuse: LangfuseConfig = LangfuseConfig()
     rag: RagConfig = RagConfig()
 
@@ -1766,83 +2125,7 @@ def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:
     raw_model = raw_config.get("model", {})
     if raw_model and not isinstance(raw_model, dict):
         raise ValueError("The top-level 'model' config must be a table/object.")
-
-    provider = normalize_model_provider(raw_model.get("provider"))
-    raw_name = str(raw_model.get("name", "")).strip()
-    raw_models = raw_model.get("models", [])
-    if raw_models and not isinstance(raw_models, list):
-        raise ValueError("The [model].models config must be an array of strings.")
-    parsed_models: list[str] = []
-    for raw_candidate in raw_models:
-        candidate = str(raw_candidate or "").strip()
-        if candidate and candidate not in parsed_models:
-            parsed_models.append(candidate)
-
-    if provider in {"openai_compatible", "anthropic"} and not raw_name and not parsed_models:
-        provider_label = (
-            "OpenAI-compatible" if provider == "openai_compatible" else "Anthropic"
-        )
-        raise ValueError(
-            f"{provider_label} model config must define a non-empty 'name' or 'models'."
-        )
-
-    raw_base_url = str(raw_model.get("base_url", "")).strip()
-    raw_endpoint_url = raw_model.get("endpoint_url")
-    endpoint_query: tuple[tuple[str, str], ...] = ()
-    if provider == "ollama":
-        if raw_base_url:
-            base_url = normalize_model_base_url(
-                raw_base_url,
-                default=DEFAULT_OLLAMA_BASE_URL,
-            )
-        else:
-            base_url = compose_base_url(
-                raw_model.get("endpoint"),
-                normalize_model_port(raw_model.get("port")),
-            )
-    elif provider == "openai_compatible":
-        required_message = (
-            "OpenAI-compatible model config must define a non-empty "
-            "'base_url' or 'endpoint_url'."
-        )
-        if normalize_optional_string(raw_endpoint_url):
-            base_url, endpoint_query = normalize_openai_endpoint_url(
-                raw_endpoint_url,
-                required_message=required_message,
-            )
-        else:
-            base_url = normalize_model_base_url(
-                raw_model.get("base_url"),
-                required_message=required_message,
-            )
-    else:
-        if normalize_optional_string(raw_endpoint_url):
-            base_url, endpoint_query = normalize_anthropic_endpoint_url(raw_endpoint_url)
-        else:
-            base_url = normalize_model_base_url(
-                raw_model.get("base_url"),
-                default=DEFAULT_ANTHROPIC_BASE_URL,
-            )
-
-    return ModelDefaults(
-        provider=provider,
-        base_url=base_url,
-        endpoint_query=endpoint_query,
-        name=raw_name or (parsed_models[0] if parsed_models else DEFAULT_MODEL),
-        api_key=normalize_optional_string(raw_model.get("api_key")),
-        models=tuple(parsed_models),
-        name_is_explicit=bool(raw_name or parsed_models),
-        reasoning_effort=normalize_reasoning_level(
-            raw_model.get("reasoning_effort"),
-            default=DEFAULT_REASONING_LEVEL,
-        ),
-        thinking=normalize_model_thinking(raw_model.get("thinking")),
-        temperature=normalize_model_temperature(
-            raw_model.get("temperature", raw_model.get("tempreature"))
-        ),
-        repeat_penalty=normalize_repeat_penalty(raw_model.get("repeat_penalty")),
-        disable_streaming=parse_model_disable_streaming(raw_model),
-    )
+    return parse_model_profile_defaults(raw_model, field_prefix="[model]")
 
 
 def parse_async_subagent_config(
@@ -2160,6 +2443,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_section.get("reflection"),
         agent_state=agent_state,
     )
+    agent_model = normalize_optional_string(agent_section.get("model"))
     raw_mcp_servers = mcp_section.get("servers", {})
     mcp_servers: dict[str, dict[str, Any]] = {}
     for name, raw_server in raw_mcp_servers.items():
@@ -2381,6 +2665,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_memory_namespace=agent_memory_namespace,
         agent_memory_files=agent_memory_files,
         agent_reflection=agent_reflection,
+        agent_model=agent_model,
         recursion_limit=recursion_limit,
         mcp_servers=mcp_servers or None,
         skills=skill_paths,
@@ -2499,6 +2784,7 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
         return FileConfig(
             model=ModelDefaults(),
             extensions=ExtensionsConfig(config_path=None),
+            model_profiles={},
             langfuse=LangfuseConfig(),
             rag=RagConfig(),
         )
@@ -2506,9 +2792,12 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
     with resolved_config_path.open("rb") as fh:
         raw_config = tomllib.load(fh)
 
+    model_defaults = parse_model_defaults(raw_config)
+    raw_model = raw_config.get("model", {})
     return FileConfig(
-        model=parse_model_defaults(raw_config),
+        model=model_defaults,
         extensions=parse_extensions_config(raw_config, resolved_config_path),
+        model_profiles=parse_model_profiles(raw_model, base=model_defaults),
         langfuse=parse_langfuse_config(raw_config),
         rag=parse_rag_config(raw_config, resolved_config_path),
     )
@@ -2587,6 +2876,20 @@ class RuntimeConfig:
         model_endpoint_query: The model endpoint query value.
         model_disable_streaming: Whether to disable model streaming.
         model_thinking: Anthropic thinking mode.
+        model_profiles: Named model profiles available by profile name.
+        model_api_key_override: Explicit runtime API key override.
+        model_default_name: Runtime default model name before agent/profile selection.
+        model_default_choices: Runtime default model list before profile names are added.
+        model_reasoning_override: Whether reasoning was explicitly overridden at runtime.
+        model_base_url_override: Whether the model endpoint was overridden at runtime.
+        model_cross_provider_base_url_override: Whether a generic runtime endpoint
+            override may apply across profile provider boundaries.
+        model_cross_provider_base_url: Generic runtime endpoint for provider-switched
+            profiles.
+        model_cross_provider_endpoint_query: Generic runtime endpoint query for
+            provider-switched profiles.
+        model_temperature_override: Whether temperature was overridden at runtime.
+        model_disable_streaming_override: Whether streaming was overridden at runtime.
     """
 
     database_url: str | None
@@ -2609,6 +2912,17 @@ class RuntimeConfig:
     model_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_disable_streaming: DisableStreaming = False
     model_thinking: ModelThinking = DEFAULT_MODEL_THINKING
+    model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
+    model_api_key_override: str | None = None
+    model_default_name: str | None = None
+    model_default_choices: tuple[str, ...] = ()
+    model_reasoning_override: bool = False
+    model_base_url_override: bool = False
+    model_cross_provider_base_url_override: bool = False
+    model_cross_provider_base_url: str | None = None
+    model_cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
+    model_temperature_override: bool = False
+    model_disable_streaming_override: bool = False
 
     @classmethod
     def from_env(
@@ -2655,6 +2969,7 @@ class RuntimeConfig:
             os.getenv("DEEPAGENT_MODEL_BASE_URL")
         )
         generic_model_base_url = override_model_base_url or env_model_base_url or ""
+        generic_model_base_url_override = bool(generic_model_base_url)
         generic_model_base_url_from_env = (
             override_model_base_url is None and env_model_base_url is not None
         )
@@ -2682,17 +2997,58 @@ class RuntimeConfig:
             else ""
         )
 
+        provider_changed = (
+            bool(model_provider_override) and model_provider != model_defaults.provider
+        )
+        model_name = (
+            generic_model_name
+            or model_name_alias
+            or (
+                file_config.extensions.agent_model
+                if not provider_changed
+                else None
+            )
+            or model_defaults.name
+        )
+        model_name_override = generic_model_name or model_name_alias
+        model_default_name = (
+            model_defaults.name
+            if model_name_override in file_config.model_profiles
+            else model_name_override or model_defaults.name
+        )
+        selected_override_profile = file_config.model_profiles.get(
+            model_name_override or ""
+        )
+        if (
+            model_provider_override
+            and selected_override_profile is not None
+            and selected_override_profile.provider != model_provider
+        ):
+            raise ValueError(
+                f"Model provider override '{model_provider}' does not match "
+                f"selected profile '{model_name_override}' provider "
+                f"'{selected_override_profile.provider}'."
+            )
+        profile_endpoint_satisfies_provider_switch = bool(
+            selected_override_profile is not None
+            and selected_override_profile.provider == model_provider
+            and selected_override_profile.base_url
+        )
         endpoint_url_satisfies_provider_switch = (
             model_provider == "openai_compatible" and bool(generic_model_endpoint_url)
         )
-        provider_changed = (
-            bool(model_provider_override) and model_provider != model_defaults.provider
+        profile_endpoint_only_satisfies_provider_switch = (
+            provider_changed
+            and profile_endpoint_satisfies_provider_switch
+            and not generic_model_base_url
+            and not endpoint_url_satisfies_provider_switch
         )
         provider_switch_requires_url = (
             provider_changed
             and model_provider in {"ollama", "openai_compatible"}
             and not generic_model_base_url
             and not endpoint_url_satisfies_provider_switch
+            and not profile_endpoint_satisfies_provider_switch
         )
         if provider_switch_requires_url:
             required_url_env = "DEEPAGENT_MODEL_BASE_URL"
@@ -2740,16 +3096,64 @@ class RuntimeConfig:
                 "or set a non-empty [model].name in deepagent.toml."
             )
 
-        model_name = generic_model_name or model_name_alias or model_defaults.name
+        default_model_choices = (
+            ()
+            if profile_endpoint_only_satisfies_provider_switch
+            else (model_defaults.name, *model_defaults.models)
+        )
+        profile_choices = tuple(
+            profile_name
+            for profile_name, profile in file_config.model_profiles.items()
+            if not (provider_changed and model_provider_override)
+            or profile.provider == model_provider
+        )
         model_choices = tuple(
             dict.fromkeys(
                 [
                     model_name,
-                    *model_defaults.models,
+                    *default_model_choices,
+                    *profile_choices,
                 ]
             )
         )
+        active_model_defaults = resolve_model_profile_defaults(
+            model_defaults,
+            file_config.model_profiles,
+            model_name,
+        )
+        cross_provider_model_base_url = (
+            generic_model_base_url if generic_model_base_url_override else None
+        )
+        cross_provider_model_endpoint_query: tuple[tuple[str, str], ...] = ()
         model_endpoint_query = model_defaults.endpoint_query
+        if (
+            generic_model_endpoint_url
+            and model_name in file_config.model_profiles
+            and active_model_defaults.provider != model_provider
+        ):
+            if active_model_defaults.provider == "anthropic":
+                (
+                    cross_provider_model_base_url,
+                    cross_provider_model_endpoint_query,
+                ) = normalize_anthropic_endpoint_url(
+                    generic_model_endpoint_url,
+                    required_message=(
+                        "The Anthropic model endpoint URL cannot be empty."
+                    ),
+                )
+            elif active_model_defaults.provider == "openai_compatible":
+                (
+                    cross_provider_model_base_url,
+                    cross_provider_model_endpoint_query,
+                ) = normalize_openai_endpoint_url(
+                    generic_model_endpoint_url,
+                    required_message="The model endpoint URL cannot be empty.",
+                )
+            else:
+                raise ValueError(
+                    "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
+                    "provider-switched Anthropic or OpenAI-compatible profiles."
+                )
         if model_provider == "anthropic":
             if generic_model_endpoint_url:
                 model_base_url, model_endpoint_query = normalize_anthropic_endpoint_url(
@@ -2787,8 +3191,13 @@ class RuntimeConfig:
             )
             if generic_model_base_url or model_base_url_alias:
                 model_endpoint_query = ()
+        model_api_key_override = (
+            normalize_optional_string(overrides.model_api_key)
+            if overrides.model_api_key is not None
+            else None
+        )
         if overrides.model_api_key is not None:
-            model_api_key = normalize_optional_string(overrides.model_api_key)
+            model_api_key = model_api_key_override
         else:
             provider_specific_api_key = (
                 normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
@@ -2805,28 +3214,32 @@ class RuntimeConfig:
                 or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
                 or model_default_api_key
             )
-        if model_provider == "anthropic" and not model_api_key:
-            raise ValueError(
-                "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
-                "ANTHROPIC_API_KEY, or [model].api_key."
-            )
         model_temperature = (
             normalize_model_temperature(overrides.model_temperature)
             if overrides.model_temperature is not None
             else model_defaults.temperature
         )
+        model_temperature_override = overrides.model_temperature is not None
         model_repeat_penalty = model_defaults.repeat_penalty
+        raw_disable_streaming = os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING")
+        raw_disable_streaming_for_tool_calls = os.getenv(
+            "DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS"
+        )
+        model_disable_streaming_override = bool(
+            overrides.model_disable_streaming is not None
+            or raw_disable_streaming is not None
+            or raw_disable_streaming_for_tool_calls is not None
+        )
         if overrides.model_disable_streaming is not None:
             model_disable_streaming = normalize_disable_streaming(
                 overrides.model_disable_streaming
             )
         else:
-            raw_disable_streaming = os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING")
             if raw_disable_streaming is not None:
                 model_disable_streaming = normalize_disable_streaming(raw_disable_streaming)
-            elif os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS") is not None:
+            elif raw_disable_streaming_for_tool_calls is not None:
                 if normalize_disable_streaming_for_tool_calls(
-                    os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS")
+                    raw_disable_streaming_for_tool_calls
                 ):
                     model_disable_streaming = "tool_calling"
                 else:
@@ -2837,6 +3250,7 @@ class RuntimeConfig:
             generic_model_reasoning or model_reasoning_alias,
             default=model_defaults.reasoning_effort,
         )
+        model_reasoning_override = bool(generic_model_reasoning or model_reasoning_alias)
         recursion_limit = normalize_recursion_limit(
             (
                 overrides.recursion_limit
@@ -2846,15 +3260,91 @@ class RuntimeConfig:
             default=file_config.extensions.recursion_limit,
             field_name="DEEPAGENT_RECURSION_LIMIT",
         )
+        runtime_default_model = ModelDefaults(
+            provider=model_provider,
+            base_url=model_base_url,
+            endpoint_query=model_endpoint_query,
+            name=model_default_name,
+            api_key=model_api_key,
+            models=model_defaults.models,
+            name_is_explicit=True,
+            reasoning_effort=default_reasoning,
+            thinking=model_defaults.thinking,
+            temperature=model_temperature,
+            repeat_penalty=model_repeat_penalty,
+            disable_streaming=model_disable_streaming,
+            cross_provider_base_url=cross_provider_model_base_url,
+            cross_provider_endpoint_query=cross_provider_model_endpoint_query,
+            runtime_override_fields=(
+                frozenset(
+                    {
+                        field_name
+                        for field_name, enabled in (
+                            (
+                                "base_url",
+                                bool(
+                                    generic_model_base_url
+                                    or model_base_url_alias
+                                    or generic_model_endpoint_url
+                                ),
+                            ),
+                            (
+                                "cross_provider_base_url",
+                                bool(cross_provider_model_base_url),
+                            ),
+                            ("temperature", model_temperature_override),
+                            ("disable_streaming", model_disable_streaming_override),
+                        )
+                        if enabled
+                    }
+                )
+            ),
+        )
+        active_runtime_model = resolve_model_profile_defaults(
+            runtime_default_model,
+            file_config.model_profiles,
+            model_name,
+        )
+        active_runtime_api_key = (
+            model_api_key_override
+            or (
+                normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+                if active_runtime_model.provider == "anthropic"
+                else None
+            )
+            or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+            or active_runtime_model.api_key
+        )
+        if active_runtime_model.provider == "anthropic" and not active_runtime_api_key:
+            raise ValueError(
+                "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
+                "ANTHROPIC_API_KEY, or [model].api_key."
+            )
         rag_requested = file_config.rag.enabled and not overrides.disable_rag
         rag = None
         rag_error = None
         if rag_requested:
+            rag_embedding_provider = file_config.rag.embedding.provider
+            if rag_embedding_provider == "auto":
+                rag_model_provider = active_runtime_model.provider
+                rag_model_base_url = active_runtime_model.base_url
+            elif rag_embedding_provider == active_runtime_model.provider:
+                rag_model_provider = active_runtime_model.provider
+                rag_model_base_url = active_runtime_model.base_url
+            elif rag_embedding_provider == runtime_default_model.provider:
+                rag_model_provider = runtime_default_model.provider
+                rag_model_base_url = runtime_default_model.base_url
+            elif rag_embedding_provider == "ollama":
+                rag_model_provider = "ollama"
+                rag_model_base_url = DEFAULT_OLLAMA_BASE_URL
+            else:
+                rag_model_provider = rag_embedding_provider
+                rag_model_base_url = ""
             try:
                 rag = resolve_rag_config(
                     file_config.rag,
-                    model_provider=model_provider,
-                    model_base_url=model_base_url,
+                    model_provider=rag_model_provider,
+                    model_base_url=rag_model_base_url,
                 )
             except ValueError as exc:
                 rag_error = str(exc)
@@ -2880,6 +3370,27 @@ class RuntimeConfig:
             model_endpoint_query=model_endpoint_query,
             model_disable_streaming=model_disable_streaming,
             model_thinking=model_defaults.thinking,
+            model_profiles=file_config.model_profiles,
+            model_api_key_override=model_api_key_override,
+            model_default_name=model_default_name,
+            model_default_choices=model_defaults.models,
+            model_reasoning_override=model_reasoning_override,
+            model_base_url_override=(
+                bool(
+                    generic_model_base_url
+                    or model_base_url_alias
+                    or generic_model_endpoint_url
+                )
+            ),
+            model_cross_provider_base_url_override=bool(
+                cross_provider_model_base_url
+            ),
+            model_cross_provider_base_url=cross_provider_model_base_url,
+            model_cross_provider_endpoint_query=(
+                cross_provider_model_endpoint_query
+            ),
+            model_temperature_override=model_temperature_override,
+            model_disable_streaming_override=model_disable_streaming_override,
         )
 
 
@@ -2966,51 +3477,184 @@ def build_langgraph_run_config(
     return run_config
 
 
+def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
+    """Return the default model profile represented by flattened runtime fields."""
+    provider = normalize_model_provider(
+        getattr(config, "model_provider", None),
+        default=DEFAULT_MODEL_PROVIDER,
+    )
+    default_base_url = (
+        DEFAULT_ANTHROPIC_BASE_URL
+        if provider == "anthropic"
+        else (DEFAULT_OLLAMA_BASE_URL if provider == "ollama" else "")
+    )
+    return ModelDefaults(
+        provider=provider,
+        base_url=str(getattr(config, "model_base_url", None) or default_base_url),
+        endpoint_query=tuple(getattr(config, "model_endpoint_query", ())),
+        name=str(
+            getattr(config, "model_default_name", None)
+            or getattr(config, "model_name", DEFAULT_MODEL)
+        ),
+        api_key=getattr(config, "model_api_key", None),
+        models=tuple(
+            getattr(config, "model_default_choices", ())
+            or getattr(config, "model_choices", ())
+        ),
+        name_is_explicit=True,
+        reasoning_effort=normalize_reasoning_level(
+            getattr(config, "default_reasoning", DEFAULT_REASONING_LEVEL),
+        ),
+        thinking=normalize_model_thinking(getattr(config, "model_thinking", None)),
+        temperature=normalize_model_temperature(
+            getattr(config, "model_temperature", DEFAULT_TEMPERATURE)
+        ),
+        repeat_penalty=normalize_repeat_penalty(
+            getattr(config, "model_repeat_penalty", None)
+        ),
+        disable_streaming=normalize_disable_streaming(
+            getattr(config, "model_disable_streaming", False)
+        ),
+        cross_provider_base_url=getattr(
+            config,
+            "model_cross_provider_base_url",
+            None,
+        ),
+        cross_provider_endpoint_query=tuple(
+            getattr(config, "model_cross_provider_endpoint_query", ())
+        ),
+        runtime_override_fields=(
+            frozenset(
+                {
+                    field_name
+                    for field_name, enabled in (
+                        ("base_url", getattr(config, "model_base_url_override", False)),
+                        (
+                            "cross_provider_base_url",
+                            getattr(
+                                config,
+                                "model_cross_provider_base_url_override",
+                                False,
+                            ),
+                        ),
+                        (
+                            "temperature",
+                            getattr(config, "model_temperature_override", False),
+                        ),
+                        (
+                            "disable_streaming",
+                            getattr(
+                                config,
+                                "model_disable_streaming_override",
+                                False,
+                            ),
+                        ),
+                    )
+                    if enabled
+                }
+            )
+        ),
+    )
+
+
+def resolve_runtime_model_profile(
+    config: RuntimeConfig,
+    model_name: str | None = None,
+    *,
+    inherited_model: ModelDefaults | None = None,
+) -> ModelDefaults:
+    """Resolve a runtime profile-or-model reference."""
+    if model_name is not None:
+        model_ref = model_name
+    elif inherited_model is not None:
+        model_ref = None
+    else:
+        model_ref = config.model_name
+    return resolve_model_profile_defaults(
+        runtime_default_model_profile(config),
+        getattr(config, "model_profiles", {}),
+        model_ref,
+        inherited_model=inherited_model,
+    )
+
+
+def model_api_key_for_profile(
+    config: RuntimeConfig,
+    model_profile: ModelDefaults,
+) -> str | None:
+    """Return the effective API key for a resolved model profile."""
+    if config.model_api_key_override:
+        return config.model_api_key_override
+    if model_profile.provider == "anthropic":
+        provider_key = normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+        if provider_key:
+            return provider_key
+    generic_key = normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
+    if generic_key:
+        return generic_key
+    if model_profile.api_key:
+        return model_profile.api_key
+    if model_profile.provider == config.model_provider and config.model_api_key:
+        return config.model_api_key
+    return None
+
+
 def build_model(
     config: RuntimeConfig,
     reasoning_level: ReasoningLevel,
     *,
     model_name: str | None = None,
+    model_profile: ModelDefaults | None = None,
 ) -> Any:
     """Build model.
 
     Args:
         config: Configuration object used by the operation.
         reasoning_level: The reasoning level value.
-        model_name: The model name value.
+        model_name: The model name or profile reference.
+        model_profile: Already resolved model profile settings.
 
     Returns:
         The constructed model.
     """
-    selected_model = str(model_name or config.model_name).strip() or config.model_name
-    if config.model_provider == "ollama":
+    resolved_profile = model_profile or resolve_runtime_model_profile(
+        config,
+        model_name,
+    )
+    selected_model = resolved_profile.name
+    if resolved_profile.provider == "ollama":
         kwargs: dict[str, Any] = {
             "model": selected_model,
-            "base_url": config.model_base_url,
+            "base_url": resolved_profile.base_url,
             "reasoning": reasoning_level,
-            "temperature": config.model_temperature,
-            "disable_streaming": config.model_disable_streaming,
+            "temperature": resolved_profile.temperature,
+            "disable_streaming": resolved_profile.disable_streaming,
         }
-        if config.model_repeat_penalty is not None:
-            kwargs["repeat_penalty"] = config.model_repeat_penalty
+        if resolved_profile.repeat_penalty is not None:
+            kwargs["repeat_penalty"] = resolved_profile.repeat_penalty
         return ChatOllama(**kwargs)
 
-    if config.model_provider == "anthropic":
+    api_key = model_api_key_for_profile(config, resolved_profile)
+    if resolved_profile.provider == "anthropic":
+        if not api_key:
+            raise ValueError(
+                "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
+                "ANTHROPIC_API_KEY, or [model].api_key."
+            )
         kwargs: dict[str, Any] = {
             "model": selected_model,
-            "base_url": config.model_base_url,
-            "temperature": config.model_temperature,
+            "base_url": resolved_profile.base_url,
+            "temperature": resolved_profile.temperature,
             "effort": reasoning_level,
-            "disable_streaming": config.model_disable_streaming,
+            "disable_streaming": resolved_profile.disable_streaming,
         }
         if should_enable_anthropic_adaptive_thinking(
             selected_model,
-            config.model_thinking,
+            resolved_profile.thinking,
         ):
             kwargs["thinking"] = {"type": "adaptive"}
-        if config.model_api_key:
-            kwargs["api_key"] = config.model_api_key
-        default_query = model_endpoint_query_to_dict(config.model_endpoint_query)
+        kwargs["api_key"] = api_key
+        default_query = model_endpoint_query_to_dict(resolved_profile.endpoint_query)
         if default_query:
             kwargs["default_query"] = default_query
             return AnthropicDefaultQueryChatAnthropic(**kwargs)
@@ -3018,15 +3662,34 @@ def build_model(
 
     kwargs: dict[str, Any] = {
         "model": selected_model,
-        "base_url": config.model_base_url,
-        "api_key": config.model_api_key or "deepagent",
-        "temperature": config.model_temperature,
-        "disable_streaming": config.model_disable_streaming,
+        "base_url": resolved_profile.base_url,
+        "api_key": api_key or "deepagent",
+        "temperature": resolved_profile.temperature,
+        "disable_streaming": resolved_profile.disable_streaming,
     }
-    default_query = model_endpoint_query_to_dict(config.model_endpoint_query)
+    default_query = model_endpoint_query_to_dict(resolved_profile.endpoint_query)
     if default_query:
         kwargs["default_query"] = default_query
     return OpenAICompatibleChatOpenAI(**kwargs)
+
+
+def build_model_for_profile(
+    config: RuntimeConfig,
+    reasoning_level: ReasoningLevel,
+    model_profile: ModelDefaults,
+) -> Any:
+    """Build a model from resolved profile settings."""
+    try:
+        parameters = inspect.signature(build_model).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "model_profile" in parameters:
+        return build_model(
+            config,
+            reasoning_level,
+            model_profile=model_profile,
+        )
+    return build_model(config, reasoning_level, model_name=model_profile.name)
 
 
 def should_enable_anthropic_adaptive_thinking(
@@ -3419,6 +4082,42 @@ def has_nested_child_subagents(subagent: SubagentConfig) -> bool:
     return bool(subagent.subagents or subagent.nested_subagent_names)
 
 
+def inherited_tools_for_model(
+    *,
+    inherited_tools: list[Any],
+    sanitized_inherited_tools: list[Any] | None = None,
+    inherited_provider: ModelProvider,
+    effective_provider: ModelProvider,
+) -> list[Any]:
+    """Return inherited tools adjusted for a subagent's effective model provider."""
+    if effective_provider == inherited_provider:
+        return list(
+            sanitized_inherited_tools
+            if sanitized_inherited_tools is not None
+            else inherited_tools
+        )
+    return sanitize_tools_for_model(effective_provider, list(inherited_tools))
+
+
+def reasoning_level_for_profile(
+    model_profile: ModelDefaults,
+    fallback: ReasoningLevel,
+    *,
+    fallback_is_explicit: bool = False,
+) -> ReasoningLevel:
+    """Return the reasoning level to use when building a profile-backed model."""
+    if fallback_is_explicit:
+        return fallback
+    if "reasoning_effort" in model_profile.explicit_fields:
+        return model_profile.reasoning_effort
+    if (
+        not model_profile.explicit_fields
+        and model_profile.reasoning_effort != DEFAULT_REASONING_LEVEL
+    ):
+        return model_profile.reasoning_effort
+    return fallback
+
+
 def build_static_sync_subagent_spec(
     config: RuntimeConfig,
     subagent: SubagentConfig,
@@ -3427,21 +4126,54 @@ def build_static_sync_subagent_spec(
     backend: Any,
     inherited_tools: list[Any],
     reasoning_level: ReasoningLevel,
-    inherited_model_name: str,
+    inherited_model: ModelDefaults,
     project_root: Path | None,
+    reasoning_level_is_explicit: bool = False,
 ) -> dict[str, Any]:
     """Build a sync subagent spec for configured graph creation."""
-    effective_model_name = subagent.model or inherited_model_name
-    effective_tools = list(inherited_tools)
+    effective_model = resolve_runtime_model_profile(
+        config,
+        subagent.model,
+        inherited_model=inherited_model,
+    )
+    effective_reasoning_level = reasoning_level_for_profile(
+        effective_model,
+        reasoning_level,
+        fallback_is_explicit=reasoning_level_is_explicit,
+    )
+    inherited_model_tools = inherited_tools_for_model(
+        inherited_tools=inherited_tools,
+        inherited_provider=inherited_model.provider,
+        effective_provider=effective_model.provider,
+    )
+    effective_tools = inherited_model_tools
     middleware = build_agent_middleware(
         config=config,
-        reasoning_level=reasoning_level,
-        model_name=effective_model_name,
+        reasoning_level=effective_reasoning_level,
+        model_name=effective_model.name,
         source=subagent.name,
         project_root=project_root,
     )
     if not has_nested_child_subagents(subagent):
-        return subagent.to_deepagents_spec(middleware=middleware)
+        subagent_model = (
+            build_model_for_profile(
+                config,
+                effective_reasoning_level,
+                effective_model,
+            )
+            if subagent.model
+            else None
+        )
+        subagent_tools = (
+            inherited_model_tools
+            if subagent.model and effective_model.provider != inherited_model.provider
+            else []
+        )
+        return subagent.to_deepagents_spec(
+            tools=subagent_tools,
+            middleware=middleware,
+            model=subagent_model,
+        )
 
     child_specs = [
         build_static_sync_subagent_spec(
@@ -3450,17 +4182,18 @@ def build_static_sync_subagent_spec(
             registry=registry,
             backend=backend,
             inherited_tools=effective_tools,
-            reasoning_level=reasoning_level,
-            inherited_model_name=effective_model_name,
+            reasoning_level=effective_reasoning_level,
+            reasoning_level_is_explicit=reasoning_level_is_explicit,
+            inherited_model=effective_model,
             project_root=project_root,
         )
         for child in nested_child_subagents(subagent, registry)
     ]
     runnable_kwargs: dict[str, Any] = {
-        "model": build_model(
+        "model": build_model_for_profile(
             config,
-            reasoning_level,
-            model_name=effective_model_name,
+            effective_reasoning_level,
+            effective_model,
         ),
         "tools": effective_tools or None,
         "system_prompt": subagent.system_prompt,
@@ -3506,6 +4239,12 @@ def build_graph_subagent_specs(
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
     )
+    inherited_model = resolve_runtime_model_profile(config)
+    graph_reasoning_level = reasoning_level_for_profile(
+        inherited_model,
+        config.default_reasoning,
+        fallback_is_explicit=config.model_reasoning_override,
+    )
     subagent_specs: list[Any] = [
         build_static_sync_subagent_spec(
             config,
@@ -3513,8 +4252,9 @@ def build_graph_subagent_specs(
             registry=registry,
             backend=resolved_backend,
             inherited_tools=list(inherited_tools or []),
-            reasoning_level=config.default_reasoning,
-            inherited_model_name=config.model_name,
+            reasoning_level=graph_reasoning_level,
+            reasoning_level_is_explicit=config.model_reasoning_override,
+            inherited_model=inherited_model,
             project_root=project_root,
         )
         for subagent in config.extensions.subagents
@@ -3572,7 +4312,13 @@ def create_configured_graph(
     else:
         if config.rag_requested and config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
-    main_tools = sanitize_tools_for_model(config.model_provider, tools)
+    main_model_profile = resolve_runtime_model_profile(config)
+    main_tools = sanitize_tools_for_model(main_model_profile.provider, tools)
+    main_reasoning_level = reasoning_level_for_profile(
+        main_model_profile,
+        config.default_reasoning,
+        fallback_is_explicit=config.model_reasoning_override,
+    )
     subagent_specs = build_graph_subagent_specs(
         config,
         include_async_subagents=include_async_subagents,
@@ -3581,7 +4327,11 @@ def create_configured_graph(
         inherited_tools=main_tools,
     )
     agent_kwargs: dict[str, Any] = {
-        "model": build_model(config, config.default_reasoning),
+        "model": build_model_for_profile(
+            config,
+            main_reasoning_level,
+            main_model_profile,
+        ),
         "tools": main_tools or None,
         "system_prompt": compose_rag_system_prompt(
             compose_agent_system_prompt(
@@ -3597,7 +4347,7 @@ def create_configured_graph(
         ),
         "middleware": build_agent_middleware(
             config=config,
-            reasoning_level=config.default_reasoning,
+            reasoning_level=main_reasoning_level,
             source="main-agent",
             project_root=PROJECT_ROOT,
         ),
@@ -3833,9 +4583,11 @@ class AgentRuntime:
         self,
         *,
         reasoning_level: ReasoningLevel,
-        selected_model: str,
+        reasoning_level_is_explicit: bool,
+        selected_model_profile: ModelDefaults,
         backend: Any,
         inherited_tools: list[Any],
+        sanitized_inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> list[Any]:
@@ -3848,9 +4600,11 @@ class AgentRuntime:
                 subagent,
                 registry=registry,
                 reasoning_level=reasoning_level,
-                inherited_model_name=selected_model,
+                reasoning_level_is_explicit=reasoning_level_is_explicit,
+                inherited_model=selected_model_profile,
                 backend=backend,
                 inherited_tools=inherited_tools,
+                sanitized_inherited_tools=sanitized_inherited_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
             )
@@ -3863,44 +4617,86 @@ class AgentRuntime:
         *,
         registry: dict[str, SubagentConfig],
         reasoning_level: ReasoningLevel,
-        inherited_model_name: str,
+        reasoning_level_is_explicit: bool,
+        inherited_model: ModelDefaults,
         backend: Any,
         inherited_tools: list[Any],
+        sanitized_inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
     ) -> dict[str, Any]:
         """Build one sync subagent spec, compiling it when it has children."""
-        effective_model_name = subagent.model or inherited_model_name
-        own_tools = sanitize_tools_for_model(
-            self.config.model_provider,
-            await self._get_mcp_tools(
-                subagent.mcp_servers,
-                thread_id=thread_id,
-                mcp_session_id=mcp_session_id,
-            ),
+        effective_model = resolve_runtime_model_profile(
+            self.config,
+            subagent.model,
+            inherited_model=inherited_model,
         )
-        effective_tools = own_tools or list(inherited_tools)
+        effective_reasoning_level = reasoning_level_for_profile(
+            effective_model,
+            reasoning_level,
+            fallback_is_explicit=reasoning_level_is_explicit,
+        )
+        raw_own_tools = await self._get_mcp_tools(
+            subagent.mcp_servers,
+            thread_id=thread_id,
+            mcp_session_id=mcp_session_id,
+        )
+        own_tools = sanitize_tools_for_model(
+            effective_model.provider,
+            raw_own_tools,
+        )
+        inherited_model_tools = inherited_tools_for_model(
+            inherited_tools=inherited_tools,
+            sanitized_inherited_tools=sanitized_inherited_tools,
+            inherited_provider=inherited_model.provider,
+            effective_provider=effective_model.provider,
+        )
+        has_configured_own_tools = bool(subagent.mcp_servers)
+        effective_tools = (
+            own_tools
+            if has_configured_own_tools
+            else own_tools or inherited_model_tools
+        )
         middleware = build_agent_middleware(
             config=self.config,
-            reasoning_level=reasoning_level,
-            model_name=effective_model_name,
+            reasoning_level=effective_reasoning_level,
+            model_name=effective_model.name,
             source=subagent.name,
             project_root=self.project_root,
         )
         if not has_nested_child_subagents(subagent):
+            subagent_tools = own_tools
+            if (
+                not subagent_tools
+                and subagent.model
+                and effective_model.provider != inherited_model.provider
+                and not has_configured_own_tools
+            ):
+                subagent_tools = inherited_model_tools
+            subagent_model = (
+                self._build_model(
+                    effective_reasoning_level,
+                    model_profile=effective_model,
+                )
+                if subagent.model
+                else None
+            )
             return subagent.to_deepagents_spec(
-                tools=own_tools,
+                tools=subagent_tools,
                 middleware=middleware,
+                model=subagent_model,
             )
 
         child_specs = [
             await self._build_runtime_sync_subagent_spec(
                 child,
                 registry=registry,
-                reasoning_level=reasoning_level,
-                inherited_model_name=effective_model_name,
+                reasoning_level=effective_reasoning_level,
+                reasoning_level_is_explicit=reasoning_level_is_explicit,
+                inherited_model=effective_model,
                 backend=backend,
-                inherited_tools=effective_tools,
+                inherited_tools=raw_own_tools if has_configured_own_tools else inherited_tools,
+                sanitized_inherited_tools=effective_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
             )
@@ -3908,8 +4704,8 @@ class AgentRuntime:
         ]
         runnable_kwargs: dict[str, Any] = {
             "model": self._build_model(
-                reasoning_level,
-                model_name=effective_model_name,
+                effective_reasoning_level,
+                model_profile=effective_model,
             ),
             "tools": effective_tools or None,
             "system_prompt": subagent.system_prompt,
@@ -3936,6 +4732,7 @@ class AgentRuntime:
         reasoning_level: ReasoningLevel,
         *,
         model_name: str | None = None,
+        reasoning_level_is_explicit: bool = False,
         thread_id: str | None = None,
         async_subagent_url_override: str | None = None,
         mcp_session_id: str | None = None,
@@ -3945,6 +4742,7 @@ class AgentRuntime:
         Args:
             reasoning_level: The reasoning level value.
             model_name: The model name value.
+            reasoning_level_is_explicit: Whether reasoning was set for this run.
             thread_id: Conversation thread identifier.
             async_subagent_url_override: The async subagent URL override value.
             mcp_session_id: MCP session identifier.
@@ -3952,13 +4750,31 @@ class AgentRuntime:
         Returns:
             The configured agent for a specific runtime context.
         """
-        selected_model = str(model_name or self.config.model_name).strip() or self.config.model_name
+        selected_model = (
+            str(model_name or self.config.model_name).strip()
+            or self.config.model_name
+        )
+        selected_model_profile = resolve_runtime_model_profile(
+            self.config,
+            selected_model,
+        )
+        reasoning_level_is_explicit = (
+            self.config.model_reasoning_override
+            or reasoning_level_is_explicit
+            or reasoning_level != self.config.default_reasoning
+        )
+        effective_reasoning_level = reasoning_level_for_profile(
+            selected_model_profile,
+            reasoning_level,
+            fallback_is_explicit=reasoning_level_is_explicit,
+        )
         mcp_scope = self._mcp_scope(
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
         cache_key = (
-            reasoning_level,
+            effective_reasoning_level,
+            reasoning_level_is_explicit,
             selected_model,
             thread_id,
             async_subagent_url_override,
@@ -3968,20 +4784,21 @@ class AgentRuntime:
             agent = self._agents.get(cache_key)
             if agent is None:
                 model = self._build_model(
-                    reasoning_level,
-                    model_name=selected_model,
+                    effective_reasoning_level,
+                    model_profile=selected_model_profile,
                 )
                 rag_tool_enabled = self._rag_service is not None
+                raw_main_tools = await self._build_main_tools(
+                    thread_id=thread_id,
+                    mcp_session_id=mcp_session_id,
+                )
                 main_tools = sanitize_tools_for_model(
-                    self.config.model_provider,
-                    await self._build_main_tools(
-                        thread_id=thread_id,
-                        mcp_session_id=mcp_session_id,
-                    ),
+                    selected_model_profile.provider,
+                    raw_main_tools,
                 )
                 middleware = build_agent_middleware(
                     config=self.config,
-                    reasoning_level=reasoning_level,
+                    reasoning_level=effective_reasoning_level,
                     model_name=selected_model,
                     source="main-agent",
                     project_root=self.project_root,
@@ -3992,10 +4809,12 @@ class AgentRuntime:
                     memory_namespace=self.config.extensions.agent_memory_namespace,
                 )
                 subagent_specs = await self._build_runtime_subagent_specs(
-                    reasoning_level=reasoning_level,
-                    selected_model=selected_model,
+                    reasoning_level=effective_reasoning_level,
+                    reasoning_level_is_explicit=reasoning_level_is_explicit,
+                    selected_model_profile=selected_model_profile,
                     backend=backend,
-                    inherited_tools=main_tools,
+                    inherited_tools=raw_main_tools,
+                    sanitized_inherited_tools=main_tools,
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
@@ -4199,6 +5018,7 @@ class AgentRuntime:
         reasoning_level: ReasoningLevel,
         *,
         model_name: str | None = None,
+        model_profile: ModelDefaults | None = None,
     ) -> Any:
         """Build the chat model for the current runtime settings.
 
@@ -4209,6 +5029,12 @@ class AgentRuntime:
         Returns:
             The constructed the chat model for the current runtime settings.
         """
+        if model_profile is not None:
+            return build_model_for_profile(
+                self.config,
+                reasoning_level,
+                model_profile,
+            )
         return build_model(self.config, reasoning_level, model_name=model_name)
 
     def _mcp_scope(

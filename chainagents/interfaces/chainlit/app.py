@@ -43,6 +43,8 @@ from chainagents.runtime import (
     build_langgraph_run_config,
     format_model_provider,
     normalize_reasoning_level,
+    reasoning_level_for_profile,
+    resolve_runtime_model_profile,
 )
 from chainagents.runtime.reflection import (
     ReflectionCollector,
@@ -1059,6 +1061,8 @@ def coerce_settings(
     *,
     default_model_name: str,
     available_models: tuple[str, ...],
+    default_reasoning_level: ReasoningLevel = DEFAULT_REASONING_LEVEL,
+    runtime_config: RuntimeConfig | None = None,
     show_reasoning_stream_default: bool = True,
     show_tool_calls_default: bool = True,
 ) -> AppSettings:
@@ -1068,6 +1072,8 @@ def coerce_settings(
         raw_settings: Raw settings to process.
         default_model_name: The default model name value.
         available_models: The available models value.
+        default_reasoning_level: Reasoning default when settings omit it.
+        runtime_config: Runtime config used to derive profile-aware defaults.
         show_reasoning_stream_default: Default reasoning stream visibility.
         show_tool_calls_default: Default tool-call visibility.
 
@@ -1099,8 +1105,14 @@ def coerce_settings(
         available_models=available_models,
         default=default_model_name,
     )
+    reasoning_default = (
+        default_reasoning_level_for_model(runtime_config, model_name)
+        if runtime_config is not None
+        else default_reasoning_level
+    )
     reasoning_level = normalize_reasoning_level(
-        raw_settings.get("reasoning_level", DEFAULT_REASONING_LEVEL)
+        raw_settings.get("reasoning_level", reasoning_default),
+        default=reasoning_default,
     )
     thread_id = str(
         raw_settings.get("thread_id") or current_chainlit_thread_id()
@@ -1146,6 +1158,44 @@ def resolve_reasoning_level_for_message(
     return normalize_reasoning_level(
         raw_modes.get("reasoning_level"),
         default=settings.reasoning_level,
+    )
+
+
+def message_has_reasoning_level_override(
+    message: cl.Message,
+    *,
+    reasoning_mode_enabled: bool = True,
+) -> bool:
+    """Return whether a message explicitly selected a reasoning level."""
+    if not reasoning_mode_enabled:
+        return False
+    raw_modes = getattr(message, "modes", None)
+    return isinstance(raw_modes, dict) and raw_modes.get("reasoning_level") is not None
+
+
+def default_reasoning_level_for_model(
+    config: RuntimeConfig,
+    model_name: str | None,
+) -> ReasoningLevel:
+    """Return the profile-aware reasoning default for a Chainlit model choice."""
+    model_profile = resolve_runtime_model_profile(config, model_name)
+    return reasoning_level_for_profile(
+        model_profile,
+        config.default_reasoning,
+        fallback_is_explicit=config.model_reasoning_override,
+    )
+
+
+def settings_reasoning_level_is_explicit(
+    config: RuntimeConfig,
+    settings: AppSettings,
+    model_name: str | None = None,
+) -> bool:
+    """Return whether chat settings override the selected model's reasoning default."""
+    selected_model = model_name if model_name is not None else settings.model_name
+    return (
+        normalize_reasoning_level(settings.reasoning_level)
+        != default_reasoning_level_for_model(config, selected_model)
     )
 
 
@@ -1283,7 +1333,10 @@ async def on_chat_start() -> None:
     extensions = runtime.config.extensions
     settings = AppSettings(
         model_name=runtime.config.model_name,
-        reasoning_level=runtime.config.default_reasoning,
+        reasoning_level=default_reasoning_level_for_model(
+            runtime.config,
+            runtime.config.model_name,
+        ),
         thread_id=current_chainlit_thread_id(),
         show_reasoning_stream=extensions.chainlit_reasoning_steps_enabled,
         show_tool_calls=extensions.chainlit_tool_steps_enabled,
@@ -1351,10 +1404,11 @@ async def on_chat_start() -> None:
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
     if runtime.config.extensions.chainlit_startup_status_enabled:
+        startup_model_profile = resolve_runtime_model_profile(runtime.config)
         startup_message = cl.Message(
             content=(
                 "Workspace agent ready.\n\n"
-                f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
+                f"- Model provider: `{format_model_provider(startup_model_profile.provider)}`\n"
                 f"- Model: `{runtime.config.model_name}`\n"
                 f"- Thread ID: `{settings.thread_id}`\n"
                 f"{persistence_line}"
@@ -1393,6 +1447,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         raw_settings,
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
+        runtime_config=runtime.config,
         show_reasoning_stream_default=extensions.chainlit_reasoning_steps_enabled,
         show_tool_calls_default=extensions.chainlit_tool_steps_enabled,
     )
@@ -1417,6 +1472,11 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     agent = await runtime.get_agent(
         settings.reasoning_level,
         model_name=settings.model_name,
+        reasoning_level_is_explicit=settings_reasoning_level_is_explicit(
+            runtime.config,
+            settings,
+            settings.model_name,
+        ),
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,
@@ -1445,6 +1505,7 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         raw_settings,
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
+        runtime_config=runtime.config,
         show_reasoning_stream_default=(
             runtime.config.extensions.chainlit_reasoning_steps_enabled
         ),
@@ -1529,6 +1590,7 @@ async def upload_rag_file(action: cl.Action) -> None:
         cl.user_session.get(SESSION_SETTINGS_KEY),
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
+        runtime_config=runtime.config,
         show_reasoning_stream_default=(
             runtime.config.extensions.chainlit_reasoning_steps_enabled
         ),
@@ -1667,9 +1729,21 @@ async def on_message(message: cl.Message) -> None:
         prompt_note=prompt_note,
     )
     async_url_override = async_subagent_url_override()
+    reasoning_level_is_explicit = (
+        message_has_reasoning_level_override(
+            message,
+            reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+        )
+        or settings_reasoning_level_is_explicit(
+            runtime.config,
+            settings,
+            effective_model_name,
+        )
+    )
     agent = await runtime.get_agent(
         effective_reasoning_level,
         model_name=effective_model_name,
+        reasoning_level_is_explicit=reasoning_level_is_explicit,
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,

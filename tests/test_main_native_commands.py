@@ -7,7 +7,13 @@ from types import SimpleNamespace
 import agent_commands
 import main
 import pytest
-from deepagent_runtime import AppSettings, ChainlitStarterConfig
+from deepagent_runtime import (
+    AppSettings,
+    ChainlitStarterConfig,
+    ExtensionsConfig,
+    ModelDefaults,
+    RuntimeConfig,
+)
 from chainagents.runtime.reflection import ReflectionProposal
 
 
@@ -268,6 +274,76 @@ def test_resolve_reasoning_level_for_message_uses_mode_override() -> None:
     resolved = main.resolve_reasoning_level_for_message(message, settings)
 
     assert resolved == "high"
+
+
+def test_message_has_reasoning_level_override_tracks_explicit_mode() -> None:
+    """Verify Chainlit reasoning modes preserve explicit per-message choices."""
+    message = SimpleNamespace(content="hello", modes={"reasoning_level": "medium"})
+
+    assert main.message_has_reasoning_level_override(message)
+
+
+def test_default_reasoning_level_for_model_uses_profile_default() -> None:
+    """Verify Chainlit defaults settings to the selected profile reasoning."""
+    config = RuntimeConfig(
+        database_url=None,
+        model_provider="ollama",
+        model_name="reviewer",
+        model_choices=("reviewer",),
+        model_base_url="http://127.0.0.1:11434",
+        model_api_key=None,
+        model_temperature=0.0,
+        default_reasoning="low",
+        persistence_mode="memory",
+        extensions=ExtensionsConfig(config_path=None),
+        model_profiles={
+            "reviewer": ModelDefaults(
+                provider="ollama",
+                base_url="http://127.0.0.1:11434",
+                name="review-model",
+                reasoning_effort="high",
+                explicit_fields=frozenset({"name", "reasoning_effort"}),
+            )
+        },
+    )
+
+    assert main.default_reasoning_level_for_model(config, "reviewer") == "high"
+
+
+def test_settings_reasoning_level_is_explicit_for_profile_mismatch() -> None:
+    """Verify Chainlit settings can override a profile reasoning default."""
+    config = RuntimeConfig(
+        database_url=None,
+        model_provider="ollama",
+        model_name="reviewer",
+        model_choices=("reviewer",),
+        model_base_url="http://127.0.0.1:11434",
+        model_api_key=None,
+        model_temperature=0.0,
+        default_reasoning="low",
+        persistence_mode="memory",
+        extensions=ExtensionsConfig(config_path=None),
+        model_profiles={
+            "reviewer": ModelDefaults(
+                provider="ollama",
+                base_url="http://127.0.0.1:11434",
+                name="review-model",
+                reasoning_effort="high",
+                explicit_fields=frozenset({"name", "reasoning_effort"}),
+            )
+        },
+    )
+    settings = AppSettings(
+        model_name="reviewer",
+        reasoning_level="low",
+        thread_id="thread-1",
+    )
+
+    assert main.settings_reasoning_level_is_explicit(
+        config,
+        settings,
+        "reviewer",
+    )
 
 
 def test_resolve_reasoning_level_for_message_falls_back_to_settings_default() -> None:
