@@ -648,6 +648,40 @@ model = "claude"
     assert active_model.base_url == "https://openai.example/v1"
 
 
+def test_same_provider_override_preserves_agent_model_profile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify no-op provider overrides still select [agent].model profiles."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-default"
+
+[model.profiles.fast]
+name = "fast-local"
+temperature = 0.2
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "ollama")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_provider == "ollama"
+    assert config.model_name == "fast"
+    assert active_model.name == "fast-local"
+    assert active_model.temperature == 0.2
+
+
 def test_build_model_resolves_named_profile_over_raw_model_name(
     tmp_path: Path,
     monkeypatch,
@@ -2823,6 +2857,135 @@ def test_get_agent_does_not_inherit_tools_when_configured_tools_are_filtered(
 
     subagent_spec = captured["kwargs"]["subagents"][0]
     assert "tools" not in subagent_spec
+
+
+def test_get_agent_inherits_selected_profile_for_model_less_compiled_subagent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify model-less compiled subagents inherit the selected main profile."""
+    created_graphs: list[SimpleNamespace] = []
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture every DeepAgents graph creation call."""
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+        """Capture the effective model and reasoning level."""
+        selected_name = model_profile.name if model_profile is not None else model_name
+        return f"model:{selected_name}:{reasoning_level}"
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="ollama",
+            model_name="default-local",
+            model_choices=("default-local", "claude-reviewer"),
+            model_base_url="http://127.0.0.1:11434",
+            model_api_key=None,
+            model_temperature=0.0,
+            default_reasoning="medium",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(
+                config_path=None,
+                subagents=(
+                    SubagentConfig(
+                        name="manager",
+                        description="Coordinates review.",
+                        system_prompt="Manage the work.",
+                        subagents=(
+                            SubagentConfig(
+                                name="reviewer",
+                                description="Reviews output.",
+                                system_prompt="Review the work.",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            model_profiles={
+                "claude-reviewer": deepagent_runtime.ModelDefaults(
+                    provider="anthropic",
+                    base_url=deepagent_runtime.DEFAULT_ANTHROPIC_BASE_URL,
+                    name="claude-sonnet-4-6",
+                    api_key="anthropic-key",
+                    thinking="disabled",
+                )
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(
+        runtime.get_agent(
+            "medium",
+            model_name="claude-reviewer",
+            thread_id="thread-1",
+        )
+    )
+
+    assert len(created_graphs) == 2
+    manager_kwargs = created_graphs[0].kwargs
+    assert manager_kwargs["model"] == "model:claude-sonnet-4-6:medium"
+
+
+def test_get_agent_uses_selected_profile_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify per-request model profile picks apply profile reasoning defaults."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the main DeepAgents graph creation call."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+        """Capture the effective model and reasoning level."""
+        selected_name = model_profile.name if model_profile is not None else model_name
+        return f"model:{selected_name}:{reasoning_level}"
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="ollama",
+            model_name="default-local",
+            model_choices=("default-local", "fast-local"),
+            model_base_url="http://127.0.0.1:11434",
+            model_api_key=None,
+            model_temperature=0.0,
+            default_reasoning="medium",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(config_path=None),
+            model_profiles={
+                "fast-local": deepagent_runtime.ModelDefaults(
+                    provider="ollama",
+                    base_url="http://127.0.0.1:11434",
+                    name="fast-model",
+                    reasoning_effort="low",
+                    explicit_fields=frozenset({"name", "reasoning_effort"}),
+                )
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", model_name="fast-local", thread_id="thread-1"))
+
+    assert captured["kwargs"]["model"] == "model:fast-model:low"
 
 
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(

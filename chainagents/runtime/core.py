@@ -2987,7 +2987,7 @@ class RuntimeConfig:
             or model_name_alias
             or (
                 file_config.extensions.agent_model
-                if model_provider_override is None
+                if not provider_changed
                 else None
             )
             or model_defaults.name
@@ -3332,7 +3332,12 @@ def resolve_runtime_model_profile(
     inherited_model: ModelDefaults | None = None,
 ) -> ModelDefaults:
     """Resolve a runtime profile-or-model reference."""
-    model_ref = model_name if model_name is not None else config.model_name
+    if model_name is not None:
+        model_ref = model_name
+    elif inherited_model is not None:
+        model_ref = None
+    else:
+        model_ref = config.model_name
     return resolve_model_profile_defaults(
         runtime_default_model_profile(config),
         getattr(config, "model_profiles", {}),
@@ -4485,12 +4490,16 @@ class AgentRuntime:
             self.config,
             selected_model,
         )
+        effective_reasoning_level = reasoning_level_for_profile(
+            selected_model_profile,
+            reasoning_level,
+        )
         mcp_scope = self._mcp_scope(
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
         cache_key = (
-            reasoning_level,
+            effective_reasoning_level,
             selected_model,
             thread_id,
             async_subagent_url_override,
@@ -4500,7 +4509,7 @@ class AgentRuntime:
             agent = self._agents.get(cache_key)
             if agent is None:
                 model = self._build_model(
-                    reasoning_level,
+                    effective_reasoning_level,
                     model_profile=selected_model_profile,
                 )
                 rag_tool_enabled = self._rag_service is not None
@@ -4513,7 +4522,7 @@ class AgentRuntime:
                 )
                 middleware = build_agent_middleware(
                     config=self.config,
-                    reasoning_level=reasoning_level,
+                    reasoning_level=effective_reasoning_level,
                     model_name=selected_model,
                     source="main-agent",
                     project_root=self.project_root,
@@ -4524,7 +4533,7 @@ class AgentRuntime:
                     memory_namespace=self.config.extensions.agent_memory_namespace,
                 )
                 subagent_specs = await self._build_runtime_subagent_specs(
-                    reasoning_level=reasoning_level,
+                    reasoning_level=effective_reasoning_level,
                     selected_model_profile=selected_model_profile,
                     backend=backend,
                     inherited_tools=main_tools,
