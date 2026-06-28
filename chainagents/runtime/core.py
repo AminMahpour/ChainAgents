@@ -3101,12 +3101,18 @@ class RuntimeConfig:
             if profile_endpoint_only_satisfies_provider_switch
             else (model_defaults.name, *model_defaults.models)
         )
+        profile_choices = tuple(
+            profile_name
+            for profile_name, profile in file_config.model_profiles.items()
+            if not (provider_changed and model_provider_override)
+            or profile.provider == model_provider
+        )
         model_choices = tuple(
             dict.fromkeys(
                 [
                     model_name,
                     *default_model_choices,
-                    *file_config.model_profiles.keys(),
+                    *profile_choices,
                 ]
             )
         )
@@ -4233,6 +4239,12 @@ def build_graph_subagent_specs(
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
     )
+    inherited_model = resolve_runtime_model_profile(config)
+    graph_reasoning_level = reasoning_level_for_profile(
+        inherited_model,
+        config.default_reasoning,
+        fallback_is_explicit=config.model_reasoning_override,
+    )
     subagent_specs: list[Any] = [
         build_static_sync_subagent_spec(
             config,
@@ -4240,9 +4252,9 @@ def build_graph_subagent_specs(
             registry=registry,
             backend=resolved_backend,
             inherited_tools=list(inherited_tools or []),
-            reasoning_level=config.default_reasoning,
+            reasoning_level=graph_reasoning_level,
             reasoning_level_is_explicit=config.model_reasoning_override,
-            inherited_model=resolve_runtime_model_profile(config),
+            inherited_model=inherited_model,
             project_root=project_root,
         )
         for subagent in config.extensions.subagents
@@ -4302,6 +4314,11 @@ def create_configured_graph(
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
     main_model_profile = resolve_runtime_model_profile(config)
     main_tools = sanitize_tools_for_model(main_model_profile.provider, tools)
+    main_reasoning_level = reasoning_level_for_profile(
+        main_model_profile,
+        config.default_reasoning,
+        fallback_is_explicit=config.model_reasoning_override,
+    )
     subagent_specs = build_graph_subagent_specs(
         config,
         include_async_subagents=include_async_subagents,
@@ -4312,7 +4329,7 @@ def create_configured_graph(
     agent_kwargs: dict[str, Any] = {
         "model": build_model_for_profile(
             config,
-            config.default_reasoning,
+            main_reasoning_level,
             main_model_profile,
         ),
         "tools": main_tools or None,
@@ -4330,7 +4347,7 @@ def create_configured_graph(
         ),
         "middleware": build_agent_middleware(
             config=config,
-            reasoning_level=config.default_reasoning,
+            reasoning_level=main_reasoning_level,
             source="main-agent",
             project_root=PROJECT_ROOT,
         ),

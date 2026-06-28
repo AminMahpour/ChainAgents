@@ -925,6 +925,11 @@ provider = "openai_compatible"
 base_url = "https://lmstudio.example/v1"
 name = "tool-model"
 api_key = "profile-key"
+
+[model.profiles.claude-reviewer]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "anthropic-key"
 """.strip(),
         encoding="utf-8",
     )
@@ -3618,6 +3623,62 @@ def test_get_agent_cache_distinguishes_reasoning_explicitness_for_subagents(
     assert len(created_graphs) == 2
     assert created_graphs[0].kwargs["subagents"][0]["model"] == "model:review-model:low"
     assert created_graphs[1].kwargs["subagents"][0]["model"] == "model:review-model:high"
+
+
+def test_create_configured_graph_uses_agent_profile_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify static graph export applies the selected main profile reasoning."""
+    captured: dict[str, Any] = {}
+    config = RuntimeConfig(
+        database_url=None,
+        model_provider="ollama",
+        model_name="fast",
+        model_choices=("fast",),
+        model_base_url="http://127.0.0.1:11434",
+        model_api_key=None,
+        model_temperature=0.0,
+        default_reasoning="medium",
+        persistence_mode="memory",
+        extensions=ExtensionsConfig(config_path=None),
+        model_profiles={
+            "fast": deepagent_runtime.ModelDefaults(
+                provider="ollama",
+                base_url="http://127.0.0.1:11434",
+                name="fast-model",
+                reasoning_effort="high",
+                explicit_fields=frozenset({"name", "reasoning_effort"}),
+            )
+        },
+    )
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the configured static graph."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+        """Capture the effective model and reasoning level."""
+        selected_name = model_profile.name if model_profile is not None else model_name
+        return f"model:{selected_name}:{reasoning_level}"
+
+    monkeypatch.setattr(
+        deepagent_runtime.RuntimeConfig,
+        "from_env",
+        staticmethod(lambda: config),
+    )
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "build_deepagent_backend",
+        lambda **kwargs: SimpleNamespace(),
+    )
+
+    deepagent_runtime.create_configured_graph(include_async_subagents=False)
+
+    assert captured["kwargs"]["model"] == "model:fast-model:high"
 
 
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(
