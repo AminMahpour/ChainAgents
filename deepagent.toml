@@ -32,6 +32,19 @@ reasoning_effort = "high"
 #thinking = "auto"
 #base_url = "https://api.anthropic.com"
 
+# Named profiles can override any [model] field. They can be selected from
+# Chainlit modes/settings or referenced by [agent].model and subagent model.
+#[model.profiles.fast-local]
+#name = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+#temperature = 0.1
+#reasoning_effort = "medium"
+#
+#[model.profiles.claude-reviewer]
+#provider = "anthropic"
+#name = "claude-sonnet-4-6"
+#thinking = "auto"
+#api_key = ""  # optional when ANTHROPIC_API_KEY or DEEPAGENT_MODEL_API_KEY is set
+
 [langfuse]
 # Set true to attach Langfuse's LangChain callback handler to agent runs.
 enabled = false
@@ -48,6 +61,8 @@ cwd = "."
 
 [agent]
 state = "stateful"
+# Optional profile or raw model name for the main/supervisor agent.
+# model = "fast-local"
 recursion_limit = 200
 memory_namespace = "filesystem"
 memory_files = ["/memories/AGENTS.md"]
@@ -101,6 +116,7 @@ description = "Researches the current repository, explains architecture, and ide
 system_prompt_file = "prompts/repo-researcher.md"
 skills = ["skills"]
 mcp_servers = ["repo"]
+# model = "claude-reviewer"
 
 [chainlit]
 # Set false to hide model selection in chat settings and Modes.

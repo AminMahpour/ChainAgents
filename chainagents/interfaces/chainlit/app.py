@@ -43,6 +43,7 @@ from chainagents.runtime import (
     build_langgraph_run_config,
     format_model_provider,
     normalize_reasoning_level,
+    resolve_runtime_model_profile,
 )
 from chainagents.runtime.reflection import (
     ReflectionCollector,
@@ -1351,10 +1352,11 @@ async def on_chat_start() -> None:
     if extensions.config_path is not None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
     if runtime.config.extensions.chainlit_startup_status_enabled:
+        startup_model_profile = resolve_runtime_model_profile(runtime.config)
         startup_message = cl.Message(
             content=(
                 "Workspace agent ready.\n\n"
-                f"- Model provider: `{format_model_provider(runtime.config.model_provider)}`\n"
+                f"- Model provider: `{format_model_provider(startup_model_profile.provider)}`\n"
                 f"- Model: `{runtime.config.model_name}`\n"
                 f"- Thread ID: `{settings.thread_id}`\n"
                 f"{persistence_line}"

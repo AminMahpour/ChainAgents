@@ -21,6 +21,7 @@ from chainagents.runtime import (
     ReasoningLevel,
     build_langgraph_run_config,
     normalize_reasoning_level,
+    resolve_runtime_model_profile,
 )
 from chainagents.runtime.reflection import ReflectionCollector
 
@@ -113,9 +114,10 @@ def create_app(runtime: Any | None = None) -> FastAPI:
     async def status(request: Request) -> RuntimeStatusResponse:
         active_runtime = _runtime_from_request(request)
         config = active_runtime.config
+        active_model = resolve_runtime_model_profile(config)
         return RuntimeStatusResponse(
             model=config.model_name,
-            model_provider=config.model_provider,
+            model_provider=active_model.provider,
             model_choices=list(config.model_choices),
             default_reasoning=config.default_reasoning,
             agent_state=config.agent_state,

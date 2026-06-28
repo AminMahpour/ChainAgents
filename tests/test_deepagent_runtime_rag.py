@@ -8,6 +8,7 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
@@ -356,6 +357,95 @@ models = ["gpt-oss:20b", "gemma4:27b"]
 
     assert config.model_name == "gpt-oss:20b"
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
+
+
+def test_runtime_config_reads_named_model_profiles_and_agent_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify named model profiles can be selected as the main agent model."""
+    from langchain_anthropic import ChatAnthropic
+
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+models = ["default-local", "backup-local"]
+
+[model.profiles.fast]
+name = "fast-local"
+temperature = 0.2
+reasoning_effort = "low"
+
+[model.profiles.claude]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "toml-key"
+temperature = 0.4
+thinking = "disabled"
+
+[agent]
+model = "claude"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_name == "claude"
+    assert config.model_choices == ("claude", "default-local", "backup-local", "fast")
+    assert set(config.model_profiles) == {"fast", "claude"}
+    assert config.extensions.agent_model == "claude"
+    assert isinstance(model, ChatAnthropic)
+    assert model.model == "claude-sonnet-4-6"
+    assert model.anthropic_api_url == deepagent_runtime.DEFAULT_ANTHROPIC_BASE_URL
+    assert model.anthropic_api_key.get_secret_value() == "toml-key"
+    assert model.temperature == 0.4
+    assert model.effort == "medium"
+    assert model.thinking is None
+
+
+def test_build_model_resolves_named_profile_over_raw_model_name(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify profile names can switch provider settings at model-build time."""
+    from langchain_openai import ChatOpenAI
+
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+
+[model.profiles.openai-tools]
+provider = "openai_compatible"
+base_url = "https://openai-compatible.example/v1"
+name = "tool-model"
+api_key = "profile-key"
+temperature = 0.1
+disable_streaming = "tool_calling"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high", model_name="openai-tools")
+
+    assert isinstance(model, ChatOpenAI)
+    assert model.model_name == "tool-model"
+    assert str(model.openai_api_base).rstrip("/") == "https://openai-compatible.example/v1"
+    assert model.openai_api_key.get_secret_value() == "profile-key"
+    assert model.temperature == 0.1
+    assert model.disable_streaming == "tool_calling"
 
 
 def test_runtime_config_reads_langfuse_enabled_from_toml(
@@ -2218,6 +2308,101 @@ def test_get_agent_builds_compiled_subagents_for_nested_sync_subagents(
     assert ("manager-mcp",) in mcp_tool_calls
     assert ("private-mcp",) in mcp_tool_calls
     assert ("reviewer-mcp",) in mcp_tool_calls
+
+
+def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify subagent model profiles control model construction and tool schemas."""
+    from langchain_anthropic import ChatAnthropic
+
+    async def fake_mcp_tool(**kwargs):
+        """Return fake MCP tool arguments."""
+        return kwargs
+
+    mcp_tool = StructuredTool(
+        name="read_file",
+        description="Read a file.",
+        args_schema={
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        coroutine=fake_mcp_tool,
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the main DeepAgents graph creation call."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="openai_compatible",
+            model_name="default-openai",
+            model_choices=("default-openai", "claude-reviewer"),
+            model_base_url="https://openai-compatible.example/v1",
+            model_api_key="openai-key",
+            model_temperature=0.0,
+            default_reasoning="medium",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(
+                config_path=None,
+                mcp_servers={
+                    "repo": {"transport": "stdio", "command": "npx", "args": []},
+                },
+                subagents=(
+                    SubagentConfig(
+                        name="reviewer",
+                        description="Reviews output.",
+                        system_prompt="Review the work.",
+                        mcp_servers=("repo",),
+                        model="claude-reviewer",
+                    ),
+                ),
+            ),
+            model_profiles={
+                "claude-reviewer": deepagent_runtime.ModelDefaults(
+                    provider="anthropic",
+                    base_url=deepagent_runtime.DEFAULT_ANTHROPIC_BASE_URL,
+                    name="claude-sonnet-4-6",
+                    api_key="anthropic-key",
+                    temperature=0.2,
+                    thinking="disabled",
+                )
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    async def fake_get_mcp_tools(
+        server_names,
+        *,
+        thread_id=None,
+        mcp_session_id=None,
+    ):
+        """Return the fake MCP tool for the configured subagent server."""
+        if tuple(server_names) == ("repo",):
+            return [mcp_tool]
+        return []
+
+    runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    subagent_spec = captured["kwargs"]["subagents"][0]
+    assert isinstance(subagent_spec["model"], ChatAnthropic)
+    assert subagent_spec["model"].model == "claude-sonnet-4-6"
+    assert subagent_spec["model"].anthropic_api_key.get_secret_value() == "anthropic-key"
+    assert len(subagent_spec["tools"]) == 1
+    anthropic_tool = convert_to_anthropic_tool(subagent_spec["tools"][0])
+    assert anthropic_tool["input_schema"]["type"] == "object"
 
 
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(
