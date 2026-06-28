@@ -581,6 +581,40 @@ model = "fast"
     assert active_model.base_url == "http://env-ollama.example:11434"
 
 
+def test_model_profile_temperature_uses_runtime_override(
+    tmp_path: Path,
+) -> None:
+    """Verify runtime temperature overrides replace profile defaults."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+
+[model.profiles.fast]
+name = "fast-local"
+temperature = 0.1
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env(
+        deepagent_runtime.RuntimeConfigOverrides(
+            config_path=config_path,
+            model_temperature=0.7,
+        )
+    )
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert active_model.name == "fast-local"
+    assert active_model.temperature == 0.7
+
+
 def test_model_profile_without_name_inherits_default_name_before_models(
     tmp_path: Path,
     monkeypatch,
@@ -1019,6 +1053,39 @@ disable_streaming = false
     config = deepagent_runtime.RuntimeConfig.from_env()
 
     assert config.model_disable_streaming == "tool_calling"
+
+
+def test_model_profile_disable_streaming_uses_runtime_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify runtime disable_streaming overrides replace profile defaults."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+disable_streaming = false
+
+[model.profiles.fast]
+name = "fast-local"
+disable_streaming = false
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_DISABLE_STREAMING", "tool_calling")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_disable_streaming == "tool_calling"
+    assert active_model.disable_streaming == "tool_calling"
 
 
 def test_runtime_config_reads_openai_endpoint_url_from_toml(
@@ -3188,6 +3255,65 @@ model = "fast"
 
     assert config.default_reasoning == "high"
     assert captured["kwargs"]["model"] == "model:fast-model:high"
+
+
+def test_get_agent_explicit_default_reasoning_overrides_profile_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify explicit per-run reasoning equal to default still overrides profiles."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the main DeepAgents graph creation call."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+        """Capture the effective model and reasoning level."""
+        selected_name = model_profile.name if model_profile is not None else model_name
+        return f"model:{selected_name}:{reasoning_level}"
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="ollama",
+            model_name="default-local",
+            model_choices=("default-local", "reviewer"),
+            model_base_url="http://127.0.0.1:11434",
+            model_api_key=None,
+            model_temperature=0.0,
+            default_reasoning="low",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(config_path=None),
+            model_profiles={
+                "reviewer": deepagent_runtime.ModelDefaults(
+                    provider="ollama",
+                    base_url="http://127.0.0.1:11434",
+                    name="review-model",
+                    reasoning_effort="high",
+                    explicit_fields=frozenset({"name", "reasoning_effort"}),
+                )
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(
+        runtime.get_agent(
+            "low",
+            model_name="reviewer",
+            reasoning_level_is_explicit=True,
+            thread_id="thread-1",
+        )
+    )
+
+    assert captured["kwargs"]["model"] == "model:review-model:low"
 
 
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(

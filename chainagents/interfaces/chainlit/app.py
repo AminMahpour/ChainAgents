@@ -1150,6 +1150,18 @@ def resolve_reasoning_level_for_message(
     )
 
 
+def message_has_reasoning_level_override(
+    message: cl.Message,
+    *,
+    reasoning_mode_enabled: bool = True,
+) -> bool:
+    """Return whether a message explicitly selected a reasoning level."""
+    if not reasoning_mode_enabled:
+        return False
+    raw_modes = getattr(message, "modes", None)
+    return isinstance(raw_modes, dict) and raw_modes.get("reasoning_level") is not None
+
+
 def resolve_model_name_for_message(
     message: cl.Message,
     settings: AppSettings,
@@ -1672,6 +1684,10 @@ async def on_message(message: cl.Message) -> None:
     agent = await runtime.get_agent(
         effective_reasoning_level,
         model_name=effective_model_name,
+        reasoning_level_is_explicit=message_has_reasoning_level_override(
+            message,
+            reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
+        ),
         thread_id=settings.thread_id,
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,

@@ -70,6 +70,7 @@ class AgentRunContext:
     thread_id: str
     model_name: str
     reasoning_level: ReasoningLevel
+    reasoning_level_is_explicit: bool
     async_subagent_url: str | None
     mcp_session_id: str | None
 
@@ -245,6 +246,7 @@ def _run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
         thread_id=thread_id,
         model_name=model_name,
         reasoning_level=reasoning_level,
+        reasoning_level_is_explicit=request.reasoning is not None,
         async_subagent_url=_optional_text(request.async_subagent_url),
         mcp_session_id=_optional_text(request.mcp_session_id),
     )
@@ -273,6 +275,7 @@ async def _iter_agent_events(
     agent = await runtime.get_agent(
         context.reasoning_level,
         model_name=context.model_name,
+        reasoning_level_is_explicit=context.reasoning_level_is_explicit,
         thread_id=context.thread_id,
         async_subagent_url_override=context.async_subagent_url,
         mcp_session_id=context.mcp_session_id,

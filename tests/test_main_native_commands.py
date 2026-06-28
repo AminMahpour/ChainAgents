@@ -270,6 +270,13 @@ def test_resolve_reasoning_level_for_message_uses_mode_override() -> None:
     assert resolved == "high"
 
 
+def test_message_has_reasoning_level_override_tracks_explicit_mode() -> None:
+    """Verify Chainlit reasoning modes preserve explicit per-message choices."""
+    message = SimpleNamespace(content="hello", modes={"reasoning_level": "medium"})
+
+    assert main.message_has_reasoning_level_override(message)
+
+
 def test_resolve_reasoning_level_for_message_falls_back_to_settings_default() -> None:
     """Verify that resolve reasoning level for message falls back to settings default."""
     message = SimpleNamespace(content="hello", modes={})

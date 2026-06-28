@@ -2015,7 +2015,7 @@ def rebase_model_profile_defaults(
         "repeat_penalty",
         "disable_streaming",
     ):
-        if field_name not in explicit_fields:
+        if field_name in base_model.runtime_override_fields or field_name not in explicit_fields:
             updates[field_name] = getattr(base_model, field_name)
 
     if not updates:
@@ -2836,6 +2836,8 @@ class RuntimeConfig:
         model_default_choices: Runtime default model list before profile names are added.
         model_reasoning_override: Whether reasoning was explicitly overridden at runtime.
         model_base_url_override: Whether the model endpoint was overridden at runtime.
+        model_temperature_override: Whether temperature was overridden at runtime.
+        model_disable_streaming_override: Whether streaming was overridden at runtime.
     """
 
     database_url: str | None
@@ -2864,6 +2866,8 @@ class RuntimeConfig:
     model_default_choices: tuple[str, ...] = ()
     model_reasoning_override: bool = False
     model_base_url_override: bool = False
+    model_temperature_override: bool = False
+    model_disable_streaming_override: bool = False
 
     @classmethod
     def from_env(
@@ -3101,18 +3105,27 @@ class RuntimeConfig:
             if overrides.model_temperature is not None
             else model_defaults.temperature
         )
+        model_temperature_override = overrides.model_temperature is not None
         model_repeat_penalty = model_defaults.repeat_penalty
+        raw_disable_streaming = os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING")
+        raw_disable_streaming_for_tool_calls = os.getenv(
+            "DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS"
+        )
+        model_disable_streaming_override = bool(
+            overrides.model_disable_streaming is not None
+            or raw_disable_streaming is not None
+            or raw_disable_streaming_for_tool_calls is not None
+        )
         if overrides.model_disable_streaming is not None:
             model_disable_streaming = normalize_disable_streaming(
                 overrides.model_disable_streaming
             )
         else:
-            raw_disable_streaming = os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING")
             if raw_disable_streaming is not None:
                 model_disable_streaming = normalize_disable_streaming(raw_disable_streaming)
-            elif os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS") is not None:
+            elif raw_disable_streaming_for_tool_calls is not None:
                 if normalize_disable_streaming_for_tool_calls(
-                    os.getenv("DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS")
+                    raw_disable_streaming_for_tool_calls
                 ):
                     model_disable_streaming = "tool_calling"
                 else:
@@ -3147,11 +3160,24 @@ class RuntimeConfig:
             repeat_penalty=model_repeat_penalty,
             disable_streaming=model_disable_streaming,
             runtime_override_fields=(
-                frozenset({"base_url"})
-                if generic_model_base_url
-                or model_base_url_alias
-                or generic_model_endpoint_url
-                else frozenset()
+                frozenset(
+                    {
+                        field_name
+                        for field_name, enabled in (
+                            (
+                                "base_url",
+                                bool(
+                                    generic_model_base_url
+                                    or model_base_url_alias
+                                    or generic_model_endpoint_url
+                                ),
+                            ),
+                            ("temperature", model_temperature_override),
+                            ("disable_streaming", model_disable_streaming_override),
+                        )
+                        if enabled
+                    }
+                )
             ),
         )
         active_runtime_model = resolve_model_profile_defaults(
@@ -3236,6 +3262,8 @@ class RuntimeConfig:
                     or generic_model_endpoint_url
                 )
             ),
+            model_temperature_override=model_temperature_override,
+            model_disable_streaming_override=model_disable_streaming_override,
         )
 
 
@@ -3361,9 +3389,27 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
             getattr(config, "model_disable_streaming", False)
         ),
         runtime_override_fields=(
-            frozenset({"base_url"})
-            if getattr(config, "model_base_url_override", False)
-            else frozenset()
+            frozenset(
+                {
+                    field_name
+                    for field_name, enabled in (
+                        ("base_url", getattr(config, "model_base_url_override", False)),
+                        (
+                            "temperature",
+                            getattr(config, "model_temperature_override", False),
+                        ),
+                        (
+                            "disable_streaming",
+                            getattr(
+                                config,
+                                "model_disable_streaming_override",
+                                False,
+                            ),
+                        ),
+                    )
+                    if enabled
+                }
+            )
         ),
     )
 
@@ -4532,6 +4578,7 @@ class AgentRuntime:
         reasoning_level: ReasoningLevel,
         *,
         model_name: str | None = None,
+        reasoning_level_is_explicit: bool = False,
         thread_id: str | None = None,
         async_subagent_url_override: str | None = None,
         mcp_session_id: str | None = None,
@@ -4541,6 +4588,7 @@ class AgentRuntime:
         Args:
             reasoning_level: The reasoning level value.
             model_name: The model name value.
+            reasoning_level_is_explicit: Whether reasoning was set for this run.
             thread_id: Conversation thread identifier.
             async_subagent_url_override: The async subagent URL override value.
             mcp_session_id: MCP session identifier.
@@ -4558,6 +4606,7 @@ class AgentRuntime:
         )
         reasoning_level_is_explicit = (
             self.config.model_reasoning_override
+            or reasoning_level_is_explicit
             or reasoning_level != self.config.default_reasoning
         )
         effective_reasoning_level = reasoning_level_for_profile(
