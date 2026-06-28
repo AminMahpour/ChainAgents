@@ -2992,7 +2992,12 @@ class RuntimeConfig:
             )
             or model_defaults.name
         )
-        model_default_name = generic_model_name or model_name_alias or model_defaults.name
+        model_name_override = generic_model_name or model_name_alias
+        model_default_name = (
+            model_defaults.name
+            if model_name_override in file_config.model_profiles
+            else model_name_override or model_defaults.name
+        )
         model_choices = tuple(
             dict.fromkeys(
                 [
@@ -3852,6 +3857,21 @@ def inherited_tools_for_model(
     return sanitize_tools_for_model(effective_provider, list(inherited_tools))
 
 
+def reasoning_level_for_profile(
+    model_profile: ModelDefaults,
+    fallback: ReasoningLevel,
+) -> ReasoningLevel:
+    """Return the reasoning level to use when building a profile-backed model."""
+    if "reasoning_effort" in model_profile.explicit_fields:
+        return model_profile.reasoning_effort
+    if (
+        not model_profile.explicit_fields
+        and model_profile.reasoning_effort != DEFAULT_REASONING_LEVEL
+    ):
+        return model_profile.reasoning_effort
+    return fallback
+
+
 def build_static_sync_subagent_spec(
     config: RuntimeConfig,
     subagent: SubagentConfig,
@@ -3869,6 +3889,10 @@ def build_static_sync_subagent_spec(
         subagent.model,
         inherited_model=inherited_model,
     )
+    effective_reasoning_level = reasoning_level_for_profile(
+        effective_model,
+        reasoning_level,
+    )
     inherited_model_tools = inherited_tools_for_model(
         inherited_tools=inherited_tools,
         inherited_provider=inherited_model.provider,
@@ -3877,7 +3901,7 @@ def build_static_sync_subagent_spec(
     effective_tools = inherited_model_tools
     middleware = build_agent_middleware(
         config=config,
-        reasoning_level=reasoning_level,
+        reasoning_level=effective_reasoning_level,
         model_name=effective_model.name,
         source=subagent.name,
         project_root=project_root,
@@ -3886,7 +3910,7 @@ def build_static_sync_subagent_spec(
         subagent_model = (
             build_model_for_profile(
                 config,
-                reasoning_level,
+                effective_reasoning_level,
                 effective_model,
             )
             if subagent.model
@@ -3910,7 +3934,7 @@ def build_static_sync_subagent_spec(
             registry=registry,
             backend=backend,
             inherited_tools=effective_tools,
-            reasoning_level=reasoning_level,
+            reasoning_level=effective_reasoning_level,
             inherited_model=effective_model,
             project_root=project_root,
         )
@@ -3919,7 +3943,7 @@ def build_static_sync_subagent_spec(
     runnable_kwargs: dict[str, Any] = {
         "model": build_model_for_profile(
             config,
-            reasoning_level,
+            effective_reasoning_level,
             effective_model,
         ),
         "tools": effective_tools or None,
@@ -4340,6 +4364,10 @@ class AgentRuntime:
             subagent.model,
             inherited_model=inherited_model,
         )
+        effective_reasoning_level = reasoning_level_for_profile(
+            effective_model,
+            reasoning_level,
+        )
         raw_own_tools = await self._get_mcp_tools(
             subagent.mcp_servers,
             thread_id=thread_id,
@@ -4362,7 +4390,7 @@ class AgentRuntime:
         )
         middleware = build_agent_middleware(
             config=self.config,
-            reasoning_level=reasoning_level,
+            reasoning_level=effective_reasoning_level,
             model_name=effective_model.name,
             source=subagent.name,
             project_root=self.project_root,
@@ -4378,7 +4406,7 @@ class AgentRuntime:
                 subagent_tools = inherited_model_tools
             subagent_model = (
                 self._build_model(
-                    reasoning_level,
+                    effective_reasoning_level,
                     model_profile=effective_model,
                 )
                 if subagent.model
@@ -4394,7 +4422,7 @@ class AgentRuntime:
             await self._build_runtime_sync_subagent_spec(
                 child,
                 registry=registry,
-                reasoning_level=reasoning_level,
+                reasoning_level=effective_reasoning_level,
                 inherited_model=effective_model,
                 backend=backend,
                 inherited_tools=effective_tools,
@@ -4405,7 +4433,7 @@ class AgentRuntime:
         ]
         runnable_kwargs: dict[str, Any] = {
             "model": self._build_model(
-                reasoning_level,
+                effective_reasoning_level,
                 model_profile=effective_model,
             ),
             "tools": effective_tools or None,

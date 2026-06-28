@@ -581,6 +581,36 @@ model = "fast"
     assert active_model.temperature == 0.1
 
 
+def test_model_profile_name_override_inherits_default_model_name(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify a profile reference override does not become the inherited model name."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "prod-local"
+models = ["debug-local"]
+
+[model.profiles.fast]
+temperature = 0.1
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "fast")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_name == "fast"
+    assert active_model.name == "prod-local"
+    assert active_model.temperature == 0.1
+
+
 def test_provider_override_bypasses_agent_model_profile(
     tmp_path: Path,
     monkeypatch,
@@ -2580,6 +2610,7 @@ def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
                     name="claude-sonnet-4-6",
                     api_key="anthropic-key",
                     temperature=0.2,
+                    reasoning_effort="high",
                     thinking="disabled",
                 )
             },
@@ -2602,12 +2633,13 @@ def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
 
     runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
 
-    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+    asyncio.run(runtime.get_agent("low", thread_id="thread-1"))
 
     subagent_spec = captured["kwargs"]["subagents"][0]
     assert isinstance(subagent_spec["model"], ChatAnthropic)
     assert subagent_spec["model"].model == "claude-sonnet-4-6"
     assert subagent_spec["model"].anthropic_api_key.get_secret_value() == "anthropic-key"
+    assert subagent_spec["model"].effort == "high"
     assert len(subagent_spec["tools"]) == 1
     anthropic_tool = convert_to_anthropic_tool(subagent_spec["tools"][0])
     assert anthropic_tool["input_schema"]["type"] == "object"
