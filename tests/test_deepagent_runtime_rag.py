@@ -2405,6 +2405,89 @@ def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
     assert anthropic_tool["input_schema"]["type"] == "object"
 
 
+def test_get_agent_resanitizes_inherited_tools_for_profile_subagent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify inherited tools are sanitized for an explicit subagent profile."""
+
+    async def fake_mcp_tool(**kwargs):
+        """Return fake MCP tool arguments."""
+        return kwargs
+
+    inherited_tool = StructuredTool(
+        name="read_file",
+        description="Read a file.",
+        args_schema={
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        coroutine=fake_mcp_tool,
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the main DeepAgents graph creation call."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="ollama",
+            model_name="default-local",
+            model_choices=("default-local", "claude-reviewer"),
+            model_base_url="http://127.0.0.1:11434",
+            model_api_key=None,
+            model_temperature=0.0,
+            default_reasoning="medium",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(
+                config_path=None,
+                subagents=(
+                    SubagentConfig(
+                        name="reviewer",
+                        description="Reviews output.",
+                        system_prompt="Review the work.",
+                        model="claude-reviewer",
+                    ),
+                ),
+            ),
+            model_profiles={
+                "claude-reviewer": deepagent_runtime.ModelDefaults(
+                    provider="anthropic",
+                    base_url=deepagent_runtime.DEFAULT_ANTHROPIC_BASE_URL,
+                    name="claude-sonnet-4-6",
+                    api_key="anthropic-key",
+                    thinking="disabled",
+                )
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    async def fake_build_main_tools(*, thread_id=None, mcp_session_id=None):
+        """Return an inherited tool needing Anthropic root-object normalization."""
+        return [inherited_tool]
+
+    runtime._build_main_tools = fake_build_main_tools  # type: ignore[assignment]
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    subagent_spec = captured["kwargs"]["subagents"][0]
+    inherited_tools = subagent_spec["tools"]
+    assert inherited_tools[0] is not inherited_tool
+    anthropic_tool = convert_to_anthropic_tool(inherited_tools[0])
+    assert anthropic_tool["input_schema"]["type"] == "object"
+    assert anthropic_tool["input_schema"]["properties"] == {
+        "path": {"type": "string"},
+    }
+
+
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(
     tmp_path: Path,
     monkeypatch,

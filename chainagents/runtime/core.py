@@ -3711,6 +3711,18 @@ def has_nested_child_subagents(subagent: SubagentConfig) -> bool:
     return bool(subagent.subagents or subagent.nested_subagent_names)
 
 
+def inherited_tools_for_model(
+    *,
+    inherited_tools: list[Any],
+    inherited_provider: ModelProvider,
+    effective_provider: ModelProvider,
+) -> list[Any]:
+    """Return inherited tools adjusted for a subagent's effective model provider."""
+    if effective_provider == inherited_provider:
+        return list(inherited_tools)
+    return sanitize_tools_for_model(effective_provider, list(inherited_tools))
+
+
 def build_static_sync_subagent_spec(
     config: RuntimeConfig,
     subagent: SubagentConfig,
@@ -3728,7 +3740,12 @@ def build_static_sync_subagent_spec(
         subagent.model,
         inherited_model=inherited_model,
     )
-    effective_tools = list(inherited_tools)
+    inherited_model_tools = inherited_tools_for_model(
+        inherited_tools=inherited_tools,
+        inherited_provider=inherited_model.provider,
+        effective_provider=effective_model.provider,
+    )
+    effective_tools = inherited_model_tools
     middleware = build_agent_middleware(
         config=config,
         reasoning_level=reasoning_level,
@@ -3746,7 +3763,13 @@ def build_static_sync_subagent_spec(
             if subagent.model
             else None
         )
+        subagent_tools = (
+            inherited_model_tools
+            if subagent.model and effective_model.provider != inherited_model.provider
+            else []
+        )
         return subagent.to_deepagents_spec(
+            tools=subagent_tools,
             middleware=middleware,
             model=subagent_model,
         )
@@ -4196,7 +4219,12 @@ class AgentRuntime:
                 mcp_session_id=mcp_session_id,
             ),
         )
-        effective_tools = own_tools or list(inherited_tools)
+        inherited_model_tools = inherited_tools_for_model(
+            inherited_tools=inherited_tools,
+            inherited_provider=inherited_model.provider,
+            effective_provider=effective_model.provider,
+        )
+        effective_tools = own_tools or inherited_model_tools
         middleware = build_agent_middleware(
             config=self.config,
             reasoning_level=reasoning_level,
@@ -4205,6 +4233,13 @@ class AgentRuntime:
             project_root=self.project_root,
         )
         if not has_nested_child_subagents(subagent):
+            subagent_tools = own_tools
+            if (
+                not subagent_tools
+                and subagent.model
+                and effective_model.provider != inherited_model.provider
+            ):
+                subagent_tools = inherited_model_tools
             subagent_model = (
                 self._build_model(
                     reasoning_level,
@@ -4214,7 +4249,7 @@ class AgentRuntime:
                 else None
             )
             return subagent.to_deepagents_spec(
-                tools=own_tools,
+                tools=subagent_tools,
                 middleware=middleware,
                 model=subagent_model,
             )
