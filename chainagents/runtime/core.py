@@ -1775,11 +1775,13 @@ def parse_model_profile_defaults(
         explicit_fields.add("name")
     if raw_name:
         name = raw_name
-    elif parsed_models:
+    elif raw_models is not None and parsed_models:
         name = parsed_models[0]
         explicit_fields.add("name")
     elif base is not None and not provider_changed:
         name = base.name
+    elif parsed_models:
+        name = parsed_models[0]
     else:
         name = DEFAULT_MODEL if provider == "ollama" else ""
 
@@ -2821,6 +2823,8 @@ class RuntimeConfig:
         model_thinking: Anthropic thinking mode.
         model_profiles: Named model profiles available by profile name.
         model_api_key_override: Explicit runtime API key override.
+        model_default_name: Runtime default model name before agent/profile selection.
+        model_default_choices: Runtime default model list before profile names are added.
     """
 
     database_url: str | None
@@ -2845,6 +2849,8 @@ class RuntimeConfig:
     model_thinking: ModelThinking = DEFAULT_MODEL_THINKING
     model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
     model_api_key_override: str | None = None
+    model_default_name: str | None = None
+    model_default_choices: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
@@ -2979,9 +2985,14 @@ class RuntimeConfig:
         model_name = (
             generic_model_name
             or model_name_alias
-            or file_config.extensions.agent_model
+            or (
+                file_config.extensions.agent_model
+                if model_provider_override is None
+                else None
+            )
             or model_defaults.name
         )
+        model_default_name = generic_model_name or model_name_alias or model_defaults.name
         model_choices = tuple(
             dict.fromkeys(
                 [
@@ -3098,7 +3109,7 @@ class RuntimeConfig:
             provider=model_provider,
             base_url=model_base_url,
             endpoint_query=model_endpoint_query,
-            name=model_name,
+            name=model_default_name,
             api_key=model_api_key,
             models=model_defaults.models,
             name_is_explicit=True,
@@ -3180,6 +3191,8 @@ class RuntimeConfig:
             model_thinking=model_defaults.thinking,
             model_profiles=file_config.model_profiles,
             model_api_key_override=model_api_key_override,
+            model_default_name=model_default_name,
+            model_default_choices=model_defaults.models,
         )
 
 
@@ -3281,9 +3294,15 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
         provider=provider,
         base_url=str(getattr(config, "model_base_url", None) or default_base_url),
         endpoint_query=tuple(getattr(config, "model_endpoint_query", ())),
-        name=str(getattr(config, "model_name", DEFAULT_MODEL)),
+        name=str(
+            getattr(config, "model_default_name", None)
+            or getattr(config, "model_name", DEFAULT_MODEL)
+        ),
         api_key=getattr(config, "model_api_key", None),
-        models=tuple(getattr(config, "model_choices", ())),
+        models=tuple(
+            getattr(config, "model_default_choices", ())
+            or getattr(config, "model_choices", ())
+        ),
         name_is_explicit=True,
         reasoning_effort=normalize_reasoning_level(
             getattr(config, "default_reasoning", DEFAULT_REASONING_LEVEL),
@@ -4321,20 +4340,26 @@ class AgentRuntime:
             subagent.model,
             inherited_model=inherited_model,
         )
+        raw_own_tools = await self._get_mcp_tools(
+            subagent.mcp_servers,
+            thread_id=thread_id,
+            mcp_session_id=mcp_session_id,
+        )
         own_tools = sanitize_tools_for_model(
             effective_model.provider,
-            await self._get_mcp_tools(
-                subagent.mcp_servers,
-                thread_id=thread_id,
-                mcp_session_id=mcp_session_id,
-            ),
+            raw_own_tools,
         )
         inherited_model_tools = inherited_tools_for_model(
             inherited_tools=inherited_tools,
             inherited_provider=inherited_model.provider,
             effective_provider=effective_model.provider,
         )
-        effective_tools = own_tools or inherited_model_tools
+        has_configured_own_tools = bool(subagent.mcp_servers)
+        effective_tools = (
+            own_tools
+            if has_configured_own_tools
+            else own_tools or inherited_model_tools
+        )
         middleware = build_agent_middleware(
             config=self.config,
             reasoning_level=reasoning_level,
@@ -4348,6 +4373,7 @@ class AgentRuntime:
                 not subagent_tools
                 and subagent.model
                 and effective_model.provider != inherited_model.provider
+                and not has_configured_own_tools
             ):
                 subagent_tools = inherited_model_tools
             subagent_model = (

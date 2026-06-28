@@ -549,6 +549,75 @@ model = "fast"
     assert active_model.name == "fast-local"
 
 
+def test_model_profile_without_name_inherits_default_name_before_models(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify inherited model lists do not make profile names explicit."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "prod-local"
+models = ["debug-local"]
+
+[model.profiles.fast]
+temperature = 0.1
+
+[agent]
+model = "fast"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert active_model.name == "prod-local"
+    assert active_model.models == ("debug-local",)
+    assert active_model.temperature == 0.1
+
+
+def test_provider_override_bypasses_agent_model_profile(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify provider overrides do not keep selecting [agent].model profiles."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-default"
+
+[model.profiles.claude]
+provider = "anthropic"
+name = "claude-sonnet-4-6"
+api_key = "profile-key"
+
+[agent]
+model = "claude"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "https://openai.example/v1")
+    monkeypatch.setenv("DEEPAGENT_MODEL_API_KEY", "openai-key")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_provider == "openai_compatible"
+    assert config.model_name == "local-default"
+    assert active_model.provider == "openai_compatible"
+    assert active_model.base_url == "https://openai.example/v1"
+
+
 def test_build_model_resolves_named_profile_over_raw_model_name(
     tmp_path: Path,
     monkeypatch,
@@ -2625,6 +2694,103 @@ def test_get_agent_resanitizes_inherited_tools_for_profile_subagent(
     assert anthropic_tool["input_schema"]["properties"] == {
         "path": {"type": "string"},
     }
+
+
+def test_get_agent_does_not_inherit_tools_when_configured_tools_are_filtered(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify filtered own tools do not fall back to inherited main-agent tools."""
+
+    async def fake_mcp_tool(**kwargs):
+        """Return fake MCP tool arguments."""
+        return kwargs
+
+    inherited_tool = StructuredTool(
+        name="read_file",
+        description="Read a file.",
+        args_schema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        coroutine=fake_mcp_tool,
+    )
+    filtered_tool = SimpleNamespace(
+        name="bad_schema",
+        args_schema={"type": "string"},
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_create_deep_agent(**kwargs):
+        """Capture the main DeepAgents graph creation call."""
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(kwargs=kwargs)
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            database_url=None,
+            model_provider="ollama",
+            model_name="default-local",
+            model_choices=("default-local", "openai-reviewer"),
+            model_base_url="http://127.0.0.1:11434",
+            model_api_key=None,
+            model_temperature=0.0,
+            default_reasoning="medium",
+            persistence_mode="memory",
+            extensions=ExtensionsConfig(
+                config_path=None,
+                mcp_servers={
+                    "bad": {"transport": "stdio", "command": "npx", "args": []},
+                },
+                subagents=(
+                    SubagentConfig(
+                        name="reviewer",
+                        description="Reviews output.",
+                        system_prompt="Review the work.",
+                        mcp_servers=("bad",),
+                        model="openai-reviewer",
+                    ),
+                ),
+            ),
+            model_profiles={
+                "openai-reviewer": deepagent_runtime.ModelDefaults(
+                    provider="openai_compatible",
+                    base_url="https://openai.example/v1",
+                    name="tool-model",
+                    api_key="openai-key",
+                )
+            },
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    async def fake_build_main_tools(*, thread_id=None, mcp_session_id=None):
+        """Return an inherited tool valid for OpenAI-compatible schemas."""
+        return [inherited_tool]
+
+    async def fake_get_mcp_tools(
+        server_names,
+        *,
+        thread_id=None,
+        mcp_session_id=None,
+    ):
+        """Return a configured subagent tool that will be filtered out."""
+        if tuple(server_names) == ("bad",):
+            return [filtered_tool]
+        return []
+
+    runtime._build_main_tools = fake_build_main_tools  # type: ignore[assignment]
+    runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    subagent_spec = captured["kwargs"]["subagents"][0]
+    assert "tools" not in subagent_spec
 
 
 def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(
