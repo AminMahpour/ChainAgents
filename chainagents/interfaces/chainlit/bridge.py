@@ -971,6 +971,7 @@ class ChainlitEventBridge:
         reasoning_steps_enabled: bool = True,
         tool_steps_enabled: bool = True,
         generative_ui_enabled: bool = True,
+        generated_ui_elements: dict[str, cl.CustomElement] | None = None,
         reflection_collector: ReflectionCollector | None = None,
     ) -> None:
         """Initialize the chainlit event bridge instance.
@@ -982,6 +983,7 @@ class ChainlitEventBridge:
             reasoning_steps_enabled: Whether to show reasoning steps.
             tool_steps_enabled: Whether to show tool steps.
             generative_ui_enabled: Whether to render generated UI custom elements.
+            generated_ui_elements: Shared generated UI element registry for this session.
             reflection_collector: Optional collector for post-run memory proposals.
         """
         self.prompt = prompt
@@ -997,7 +999,9 @@ class ChainlitEventBridge:
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
         self.summarization_steps: dict[str, cl.Step] = {}
-        self.generated_ui_elements: dict[str, cl.CustomElement] = {}
+        self.generated_ui_elements = (
+            generated_ui_elements if generated_ui_elements is not None else {}
+        )
         self.generated_file_paths: list[str] = []
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()

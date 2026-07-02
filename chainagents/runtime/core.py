@@ -1747,6 +1747,7 @@ def create_render_chainlit_ui_tool() -> Any:
             props,
             id=(id.strip() if isinstance(id, str) and id.strip() else None),
             metadata={"source": "main-agent"},
+            state_key=None,
         )
         return {
             "rendered": True,

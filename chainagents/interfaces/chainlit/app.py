@@ -65,6 +65,7 @@ SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_MCP_SESSION_ID_KEY = "mcp_session_id"
+SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
 REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
 UPLOAD_RAG_FILE_ACTION = "upload_rag_file"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
@@ -1284,6 +1285,17 @@ async def get_run_task_list(
     return run_task_list
 
 
+def get_generated_ui_elements() -> dict[str, cl.CustomElement]:
+    """Return the per-session generated UI element registry."""
+    generated_ui_elements = cl.user_session.get(SESSION_GENERATED_UI_ELEMENTS_KEY)
+    if isinstance(generated_ui_elements, dict):
+        return generated_ui_elements
+
+    generated_ui_elements = {}
+    cl.user_session.set(SESSION_GENERATED_UI_ELEMENTS_KEY, generated_ui_elements)
+    return generated_ui_elements
+
+
 def get_async_task_notifier(
     *,
     agent: Any,
@@ -1760,6 +1772,7 @@ async def on_message(message: cl.Message) -> None:
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
         generative_ui_enabled=runtime.config.extensions.chainlit_generative_ui_enabled,
+        generated_ui_elements=get_generated_ui_elements(),
         reflection_collector=ReflectionCollector.from_runtime_config(
             runtime.config,
             prompt=agent_prompt,

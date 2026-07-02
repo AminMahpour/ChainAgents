@@ -839,6 +839,59 @@ async def test_bridge_updates_existing_ui_element_by_id() -> None:
 
 
 @pytest.mark.anyio
+async def test_bridge_updates_shared_ui_element_registry_across_instances() -> None:
+    """Verify generated UI ids persist when bridge instances share a registry."""
+    generated_ui_elements: dict[str, _CustomElement] = {}
+    first_bridge = ChainlitEventBridge(
+        prompt="hello",
+        generated_ui_elements=generated_ui_elements,
+    )
+    second_bridge = ChainlitEventBridge(
+        prompt="next",
+        generated_ui_elements=generated_ui_elements,
+    )
+
+    await first_bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "First"},
+                    },
+                ),
+            },
+        }
+    )
+    await second_bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "Second"},
+                    },
+                ),
+            },
+        }
+    )
+
+    assert len(_CustomElement.instances) == 1
+    assert _CustomElement.instances[0].props == {"title": "Second"}
+    assert _CustomElement.instances[0].update_count == 1
+    assert len(_Message.instances) == 1
+    assert generated_ui_elements == {"panel-1": _CustomElement.instances[0]}
+
+
+@pytest.mark.anyio
 async def test_bridge_removes_existing_ui_element_by_id() -> None:
     """Verify remove-ui events remove the tracked custom element."""
     bridge = ChainlitEventBridge(prompt="hello")

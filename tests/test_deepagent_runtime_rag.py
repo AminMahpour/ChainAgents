@@ -4045,6 +4045,7 @@ def test_render_chainlit_ui_tool_pushes_generated_panel(monkeypatch) -> None:
             },
             "id": "panel-1",
             "metadata": {"source": "main-agent"},
+            "state_key": None,
         }
     ]
     assert result == {
