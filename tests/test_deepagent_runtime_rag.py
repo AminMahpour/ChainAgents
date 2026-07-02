@@ -3963,6 +3963,7 @@ def test_system_prompt_directs_active_chainlit_ui_interaction() -> None:
     assert "Actively use `render_chainlit_ui`" in prompt
     assert "next-step action buttons" in prompt
     assert "For simple one-sentence answers" in prompt
+    assert "Do not describe generated panels as above or below the answer" in prompt
 
 
 def test_get_agent_omits_render_chainlit_ui_tool_when_disabled(

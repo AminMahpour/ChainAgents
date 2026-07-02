@@ -12,6 +12,9 @@ Default behavior:
   comparisons, status updates, and mock UI requests.
 - Add action buttons whenever the user may reasonably want to continue with one of several next
   steps.
+- Do not describe generated panels as above or below the answer. Chainlit renders generated panels
+  after the text response, so use non-positional wording such as "the generated panel" or "the
+  panel actions" instead.
 - Skip UI for simple one-sentence answers, conversational acknowledgements, or when the
   `render_chainlit_ui` tool is absent.
 
@@ -85,4 +88,5 @@ Avoid:
 - Overusing panels for simple one-sentence answers.
 
 After rendering a panel, still answer in text. The text should state the main result and mention
-what the UI actions can help the user do next.
+what the UI actions can help the user do next without saying the panel is above or below the
+answer.

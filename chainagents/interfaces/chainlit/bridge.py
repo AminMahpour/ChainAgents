@@ -7,7 +7,7 @@ import ast
 import json
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1002,6 +1002,8 @@ class ChainlitEventBridge:
         self.generated_ui_elements = (
             generated_ui_elements if generated_ui_elements is not None else {}
         )
+        self.pending_generated_ui_events: dict[str, AgentStreamEvent] = {}
+        self.pending_generated_ui_order: list[str] = []
         self.generated_file_paths: list[str] = []
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
@@ -1082,6 +1084,7 @@ class ChainlitEventBridge:
         """Finish the chainlit event bridge."""
         await self._close_all_open_steps()
         await self._send_final_response_message()
+        await self._flush_pending_generated_ui_messages()
         if self.run_task_list is not None:
             await self.run_task_list.finish()
 
@@ -1229,12 +1232,43 @@ class ChainlitEventBridge:
         await step.update()
 
     async def _render_ui_message(self, event: AgentStreamEvent) -> None:
-        """Render a whitelisted LangGraph UI event as a Chainlit CustomElement."""
+        """Queue a whitelisted LangGraph UI event for post-response rendering."""
         if not self.generative_ui_enabled:
             return
         if event.ui_name not in GENERATIVE_UI_COMPONENTS or not event.ui_id:
             return
 
+        self._queue_generated_ui_message(event)
+
+    def _queue_generated_ui_message(self, event: AgentStreamEvent) -> None:
+        """Store a generated UI event until the final response has been sent."""
+        existing_pending = self.pending_generated_ui_events.get(event.ui_id)
+        if existing_pending is not None:
+            if event.ui_metadata.get("merge") is True:
+                event = replace(
+                    event,
+                    ui_props={
+                        **existing_pending.ui_props,
+                        **event.ui_props,
+                    },
+                )
+            self.pending_generated_ui_events[event.ui_id] = event
+            return
+
+        self.pending_generated_ui_events[event.ui_id] = event
+        self.pending_generated_ui_order.append(event.ui_id)
+
+    async def _flush_pending_generated_ui_messages(self) -> None:
+        """Render queued generated UI messages after the final response."""
+        for ui_id in list(self.pending_generated_ui_order):
+            event = self.pending_generated_ui_events.pop(ui_id, None)
+            if event is None:
+                continue
+            await self._send_generated_ui_message(event)
+        self.pending_generated_ui_order.clear()
+
+    async def _send_generated_ui_message(self, event: AgentStreamEvent) -> None:
+        """Send or update one generated UI CustomElement."""
         existing_element = self.generated_ui_elements.get(event.ui_id)
         if existing_element is not None:
             if event.ui_metadata.get("merge") is True:
@@ -1259,6 +1293,9 @@ class ChainlitEventBridge:
         """Remove a tracked Chainlit CustomElement for a LangGraph remove-ui event."""
         if not self.generative_ui_enabled or not event.ui_id:
             return
+        self.pending_generated_ui_events.pop(event.ui_id, None)
+        if event.ui_id in self.pending_generated_ui_order:
+            self.pending_generated_ui_order.remove(event.ui_id)
         element = self.generated_ui_elements.pop(event.ui_id, None)
         if element is not None:
             await element.remove()
