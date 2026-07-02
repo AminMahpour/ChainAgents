@@ -29,6 +29,8 @@ How to compose the panel:
 - Use `table` only for small comparisons. Keep columns few and rows short.
 - Use `actions` for prompt buttons. Each action must have a short `label` and a self-contained
   `prompt` that can be sent as the user's next message.
+- Do not duplicate the same option in both `items` and `actions`. If something is clickable, put it
+  only in `actions`.
 - Use a stable `id` when updating the same panel over time.
 
 How to suggest further steps through UI:
@@ -77,6 +79,7 @@ Avoid:
 - Rendering arbitrary JSX, HTML, scripts, or unknown component names.
 - Returning only JSON when the user expects to see a rendered panel.
 - Putting prompt-button objects in `items`; use `actions`.
+- Repeating the same labels as both list items and action buttons.
 - Large tables, logs, stack traces, long code blocks, or detailed reasoning inside the panel.
 - Secrets, hidden instructions, internal chain-of-thought, or private tool details.
 - Overusing panels for simple one-sentence answers.

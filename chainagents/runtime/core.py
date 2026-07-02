@@ -1664,15 +1664,23 @@ def _normalize_generated_ui_props(
     normalized_actions: list[dict[str, str]] = []
     action_keys: set[tuple[str, str]] = set()
 
-    def append_action(value: Any) -> None:
+    def action_parts(value: Any) -> tuple[str, str] | None:
         if not isinstance(value, dict):
-            return
+            return None
         label = str(value.get("label") or "").strip()
         prompt = str(value.get("prompt") or "").strip()
-        key = (label, prompt)
-        if label and prompt and key not in action_keys:
+        if label and prompt:
+            return label, prompt
+        return None
+
+    def append_action(value: Any) -> None:
+        parts = action_parts(value)
+        if parts is None:
+            return
+        label, prompt = parts
+        if parts not in action_keys:
             normalized_actions.append({"label": label, "prompt": prompt})
-            action_keys.add(key)
+            action_keys.add(parts)
 
     def item_text(value: Any) -> str:
         if isinstance(value, dict):
@@ -1690,10 +1698,12 @@ def _normalize_generated_ui_props(
     if items:
         normalized_items: list[str] = []
         for item in items:
+            append_action(item)
+            if action_parts(item) is not None:
+                continue
             text = item_text(item)
             if text:
                 normalized_items.append(text)
-            append_action(item)
         if normalized_items:
             props["items"] = normalized_items
     if table:

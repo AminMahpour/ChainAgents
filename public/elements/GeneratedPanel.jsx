@@ -26,7 +26,10 @@ function listItems(value) {
   if (!Array.isArray(value)) {
     return [];
   }
-  return value.map(itemText).filter((item) => item.trim());
+  return value
+    .filter((item) => !isActionLike(item))
+    .map(itemText)
+    .filter((item) => item.trim());
 }
 
 function itemText(value) {
@@ -36,6 +39,13 @@ function itemText(value) {
     );
   }
   return asText(value);
+}
+
+function isActionLike(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  return Boolean(asText(value.label).trim() && asText(value.prompt).trim());
 }
 
 function tableColumns(table) {

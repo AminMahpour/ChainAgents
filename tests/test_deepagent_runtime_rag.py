@@ -4054,8 +4054,10 @@ def test_render_chainlit_ui_tool_pushes_generated_panel(monkeypatch) -> None:
     }
 
 
-def test_render_chainlit_ui_tool_normalizes_action_shaped_items(monkeypatch) -> None:
-    """Verify action-shaped list items render as text and prompt buttons."""
+def test_render_chainlit_ui_tool_promotes_action_items_without_duplicate_list(
+    monkeypatch,
+) -> None:
+    """Verify action-shaped items become buttons without duplicate list rows."""
     pushed: list[dict[str, Any]] = []
 
     def fake_push_ui_message(name: str, props: dict[str, Any], **kwargs: Any):
@@ -4071,6 +4073,12 @@ def test_render_chainlit_ui_tool_normalizes_action_shaped_items(monkeypatch) -> 
             "id": "mock-checklist-panel",
             "title": "Task Checklist",
             "summary": "Example of a short checklist panel.",
+            "actions": [
+                {
+                    "label": "Configure model provider",
+                    "prompt": "Show me how to change the model provider.",
+                },
+            ],
             "items": [
                 {
                     "label": "Configure model provider",
@@ -4084,10 +4092,7 @@ def test_render_chainlit_ui_tool_normalizes_action_shaped_items(monkeypatch) -> 
         }
     )
 
-    assert pushed[0]["props"]["items"] == [
-        "Configure model provider",
-        "Set up MCP servers",
-    ]
+    assert "items" not in pushed[0]["props"]
     assert pushed[0]["props"]["actions"] == [
         {
             "label": "Configure model provider",
