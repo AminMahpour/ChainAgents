@@ -304,6 +304,9 @@ async def _iter_agent_events(
 
 def _event_payload(event: AgentStreamEvent, context: AgentRunContext) -> dict[str, Any]:
     payload = asdict(event)
+    if event.kind not in {"ui_message", "ui_remove"}:
+        for key in ("ui_id", "ui_name", "ui_props", "ui_metadata"):
+            payload.pop(key, None)
     payload.update(
         {
             "thread_id": context.thread_id,

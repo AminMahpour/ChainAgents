@@ -489,6 +489,58 @@ def test_adapter_streams_summarization_status_events() -> None:
     ]
 
 
+def test_adapter_streams_langgraph_ui_message_events() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    events = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                "custom",
+                {
+                    "type": "ui",
+                    "id": "panel-1",
+                    "name": "GeneratedPanel",
+                    "props": {
+                        "title": "Build result",
+                        "facts": {"Tests": "passing"},
+                    },
+                    "metadata": {"source": "main-agent"},
+                },
+            )
+        )
+    )
+
+    assert events == [
+        AgentStreamEvent(
+            kind="ui_message",
+            source="main-agent",
+            ui_id="panel-1",
+            ui_name="GeneratedPanel",
+            ui_props={
+                "title": "Build result",
+                "facts": {"Tests": "passing"},
+            },
+            ui_metadata={"source": "main-agent"},
+        )
+    ]
+
+
+def test_adapter_streams_langgraph_ui_remove_events() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    events = adapter.events_from_raw_event(
+        _raw_event(("custom", {"type": "remove-ui", "id": "panel-1"}))
+    )
+
+    assert events == [
+        AgentStreamEvent(
+            kind="ui_remove",
+            source="main-agent",
+            ui_id="panel-1",
+        )
+    ]
+
+
 def test_adapter_ignores_nested_chain_events() -> None:
     adapter = AgentStreamEventAdapter(prompt="hello")
 

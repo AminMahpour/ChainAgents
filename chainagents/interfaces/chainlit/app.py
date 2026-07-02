@@ -1759,6 +1759,7 @@ async def on_message(message: cl.Message) -> None:
         chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
+        generative_ui_enabled=runtime.config.extensions.chainlit_generative_ui_enabled,
         reflection_collector=ReflectionCollector.from_runtime_config(
             runtime.config,
             prompt=agent_prompt,

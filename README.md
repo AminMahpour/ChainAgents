@@ -669,6 +669,8 @@ reasoning_steps_enabled = true
 tool_steps_enabled = true
 # Set false to hide the initial startup status message ("Workspace agent ready...").
 startup_status_enabled = true
+# Set false to hide generated Chainlit CustomElement panels and remove the render tool.
+generative_ui_enabled = true
 # Set false to keep legacy non-chronological streaming order in Chainlit.
 chronological_ui_enabled = true
 commands = [
@@ -696,6 +698,7 @@ Notes:
 - `[chainlit].reasoning_steps_enabled = false` hides streamed reasoning `cl.Step` panels and reasoning task-list entries while preserving model reasoning settings.
 - `[chainlit].tool_steps_enabled = false` hides streamed tool `cl.Step` panels and tool task-list entries while preserving tool execution.
 - `[chainlit].startup_status_enabled = false` disables the initial startup status message that summarizes runtime configuration.
+- `[chainlit].generative_ui_enabled = false` hides generated Chainlit CustomElement panels and removes the `render_chainlit_ui` tool from the main agent.
 - `[chainlit].chronological_ui_enabled = false` disables chronological UI ordering so response tokens stream immediately and reasoning steps are not force-rolled at tool boundaries.
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.
