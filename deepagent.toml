@@ -71,7 +71,7 @@ mcp_servers = []
 # Optional instruction appended to the main agent system prompt.
 # Use either custom_instruction or custom_instruction_file, not both.
 # custom_instruction = "Always ask clarifying questions before editing files."
-# custom_instruction_file = "prompts/main-agent.md"
+custom_instruction_file = "prompts/ui_promots.md"
 # Legacy flag retained for compatibility; DeepAgents provides summarization.
 summarization_middleware_enabled = true
 # Token thresholds tune DeepAgents' built-in summarizer.
@@ -129,6 +129,8 @@ reasoning_steps_enabled = true
 tool_steps_enabled = true
 # Set false to hide the initial startup status message ("Workspace agent ready...").
 startup_status_enabled = false
+# Set false to hide generated Chainlit CustomElement panels and remove the render tool.
+generative_ui_enabled = true
 chronological_ui_enabled = false
 commands = [
   { name = "ask-researcher", description = "Delegate to repo-researcher.", target = "subagent", value = "repo-researcher", template = "{input}" },

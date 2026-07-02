@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
@@ -13,6 +13,8 @@ StreamEventKind = Literal[
     "tool_call",
     "tool_result",
     "summarization_status",
+    "ui_message",
+    "ui_remove",
 ]
 
 LANGGRAPH_STREAM_MODES = {
@@ -42,6 +44,10 @@ class AgentStreamEvent:
     tool_args_delta: str = ""
     tool_result: str = ""
     status: str = ""
+    ui_id: str = ""
+    ui_name: str = ""
+    ui_props: dict[str, Any] = field(default_factory=dict)
+    ui_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def stringify_content(value: Any) -> str:
@@ -317,6 +323,10 @@ class AgentStreamEventAdapter:
         data = part.get("data")
         if not isinstance(data, dict):
             return []
+        if data.get("type") == "ui":
+            return self._events_from_ui_message(data)
+        if data.get("type") == "remove-ui":
+            return self._events_from_ui_remove(data)
         if data.get("kind") != SUMMARIZATION_STATUS_KIND:
             return []
 
@@ -328,6 +338,44 @@ class AgentStreamEventAdapter:
                 text=str(
                     data.get("message") or "Conversation summarization triggered."
                 ).strip(),
+            )
+        ]
+
+    @staticmethod
+    def _events_from_ui_message(data: dict[str, Any]) -> list[AgentStreamEvent]:
+        ui_id = str(data.get("id") or "").strip()
+        ui_name = str(data.get("name") or "").strip()
+        props = data.get("props")
+        metadata = data.get("metadata")
+        if not ui_id or not ui_name or not isinstance(props, dict):
+            return []
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        source = str(
+            metadata.get("source") or metadata.get("name") or "main-agent"
+        ).strip() or "main-agent"
+        return [
+            AgentStreamEvent(
+                kind="ui_message",
+                source=source,
+                ui_id=ui_id,
+                ui_name=ui_name,
+                ui_props=props,
+                ui_metadata=metadata,
+            )
+        ]
+
+    @staticmethod
+    def _events_from_ui_remove(data: dict[str, Any]) -> list[AgentStreamEvent]:
+        ui_id = str(data.get("id") or "").strip()
+        if not ui_id:
+            return []
+        return [
+            AgentStreamEvent(
+                kind="ui_remove",
+                source="main-agent",
+                ui_id=ui_id,
             )
         ]
 

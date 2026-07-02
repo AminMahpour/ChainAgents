@@ -71,7 +71,7 @@ mcp_servers = ["repo"]
 # Optional instruction appended to the main agent system prompt.
 # Use either custom_instruction or custom_instruction_file, not both.
 # custom_instruction = "Always ask clarifying questions before editing files."
-# custom_instruction_file = "prompts/main-agent.md"
+# custom_instruction_file = "prompts/ui_promots.md"
 # DeepAgents 0.6.7 provides summarization middleware in its base agent stack.
 # These optional token thresholds tune DeepAgents' built-in summarizer.
 summarization_trigger_tokens = 6000
@@ -96,6 +96,8 @@ reasoning_steps_enabled = true
 tool_steps_enabled = true
 # Set false to disable the initial startup status message in chat.
 startup_status_enabled = true
+# Set false to hide generated Chainlit CustomElement panels and remove the render tool.
+generative_ui_enabled = true
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },

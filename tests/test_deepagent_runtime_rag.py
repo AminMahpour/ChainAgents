@@ -3931,6 +3931,181 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
 
 
+def test_get_agent_includes_render_chainlit_ui_tool_by_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify the main agent receives the built-in Chainlit UI render tool."""
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests."""
+        captured["tools"] = tools or []
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(make_runtime_config(tmp_path))
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    tool_names = [tool.name for tool in captured["tools"]]
+    assert "render_chainlit_ui" in tool_names
+
+
+def test_system_prompt_directs_active_chainlit_ui_interaction() -> None:
+    """Verify the built-in prompt pushes active Chainlit generated UI use."""
+    prompt = deepagent_runtime.SYSTEM_PROMPT
+
+    assert "Actively use `render_chainlit_ui`" in prompt
+    assert "next-step action buttons" in prompt
+    assert "For simple one-sentence answers" in prompt
+
+
+def test_get_agent_omits_render_chainlit_ui_tool_when_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify the render UI tool is omitted when generative UI is disabled."""
+    captured: dict[str, object] = {}
+
+    def fake_create_deep_agent(*, tools=None, **kwargs):
+        """Capture Deep Agent factory arguments for tests."""
+        captured["tools"] = tools or []
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                chainlit_generative_ui_enabled=False,
+            ),
+        )
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    tool_names = [tool.name for tool in captured["tools"]]
+    assert "render_chainlit_ui" not in tool_names
+
+
+def test_render_chainlit_ui_tool_pushes_generated_panel(monkeypatch) -> None:
+    """Verify the render UI tool emits a LangGraph GeneratedPanel UI message."""
+    pushed: list[dict[str, Any]] = []
+
+    def fake_push_ui_message(name: str, props: dict[str, Any], **kwargs: Any):
+        """Capture UI messages without requiring a runnable context."""
+        pushed.append({"name": name, "props": props, **kwargs})
+        return {"type": "ui", "id": kwargs.get("id") or "panel-1", "name": name}
+
+    monkeypatch.setattr(deepagent_runtime, "push_ui_message", fake_push_ui_message)
+
+    tool = deepagent_runtime.create_render_chainlit_ui_tool()
+    result = tool.invoke(
+        {
+            "id": "panel-1",
+            "title": "Build result",
+            "summary": "All checks completed.",
+            "facts": {"Tests": "passing"},
+            "items": ["Config parsed", "Bridge rendered"],
+            "table": {
+                "columns": ["Check", "Status"],
+                "rows": [["pytest", "pass"]],
+            },
+            "actions": [
+                {"label": "Run full suite", "prompt": "Run the full test suite."}
+            ],
+        }
+    )
+
+    assert pushed == [
+        {
+            "name": "GeneratedPanel",
+            "props": {
+                "title": "Build result",
+                "summary": "All checks completed.",
+                "facts": {"Tests": "passing"},
+                "items": ["Config parsed", "Bridge rendered"],
+                "table": {
+                    "columns": ["Check", "Status"],
+                    "rows": [["pytest", "pass"]],
+                },
+                "actions": [
+                    {"label": "Run full suite", "prompt": "Run the full test suite."}
+                ],
+            },
+            "id": "panel-1",
+            "metadata": {"source": "main-agent"},
+            "state_key": None,
+        }
+    ]
+    assert result == {
+        "rendered": True,
+        "component": "GeneratedPanel",
+        "id": "panel-1",
+    }
+
+
+def test_render_chainlit_ui_tool_promotes_action_items_without_duplicate_list(
+    monkeypatch,
+) -> None:
+    """Verify action-shaped items become buttons without duplicate list rows."""
+    pushed: list[dict[str, Any]] = []
+
+    def fake_push_ui_message(name: str, props: dict[str, Any], **kwargs: Any):
+        """Capture UI messages without requiring a runnable context."""
+        pushed.append({"name": name, "props": props, **kwargs})
+        return {"type": "ui", "id": kwargs.get("id") or "panel-1", "name": name}
+
+    monkeypatch.setattr(deepagent_runtime, "push_ui_message", fake_push_ui_message)
+
+    tool = deepagent_runtime.create_render_chainlit_ui_tool()
+    tool.invoke(
+        {
+            "id": "mock-checklist-panel",
+            "title": "Task Checklist",
+            "summary": "Example of a short checklist panel.",
+            "actions": [
+                {
+                    "label": "Configure model provider",
+                    "prompt": "Show me how to change the model provider.",
+                },
+            ],
+            "items": [
+                {
+                    "label": "Configure model provider",
+                    "prompt": "Show me how to change the model provider.",
+                },
+                {
+                    "label": "Set up MCP servers",
+                    "prompt": "List the configured MCP servers.",
+                },
+            ],
+        }
+    )
+
+    assert "items" not in pushed[0]["props"]
+    assert pushed[0]["props"]["actions"] == [
+        {
+            "label": "Configure model provider",
+            "prompt": "Show me how to change the model provider.",
+        },
+        {
+            "label": "Set up MCP servers",
+            "prompt": "List the configured MCP servers.",
+        },
+    ]
+
+
 def test_stateful_mcp_reuses_session_per_chainlit_session(
     tmp_path: Path,
     monkeypatch,
@@ -4199,6 +4374,27 @@ commands = [
     assert extensions.chainlit_tool_steps_enabled is False
     assert extensions.chainlit_startup_status_enabled is False
     assert extensions.chainlit_chronological_ui_enabled is False
+    assert extensions.chainlit_generative_ui_enabled is True
+
+
+def test_load_extensions_config_parses_chainlit_generative_ui_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config parses generative UI toggle."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+generative_ui_enabled = false
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.chainlit_generative_ui_enabled is False
 
 
 def test_load_extensions_config_parses_chainlit_starters(
@@ -4506,6 +4702,25 @@ chronological_ui_enabled = "sometimes"
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
     with pytest.raises(ValueError, match="chronological_ui_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_generative_ui_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify that load extensions config rejects non boolean generative UI flag."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+generative_ui_enabled = "sometimes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="generative_ui_enabled"):
         deepagent_runtime.load_extensions_config()
 
 

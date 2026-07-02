@@ -131,6 +131,7 @@ class _Message:
         """
         self.content = content
         self.author = author
+        self.elements = list(_kwargs.get("elements", []) or [])
         self.id = f"message-{len(self.instances) + 1}"
         self.tokens: list[str] = []
         self.actions: list[Any] = []
@@ -214,6 +215,29 @@ class _Step:
         self.update_count += 1
 
 
+class _CustomElement:
+    """Provide an internal helper for Chainlit custom elements."""
+
+    instances: list["_CustomElement"] = []
+
+    def __init__(self, name: str, props: dict[str, Any], display: str = "inline", **_kwargs: Any) -> None:
+        """Initialize the custom element test double."""
+        self.name = name
+        self.props = props
+        self.display = display
+        self.update_count = 0
+        self.remove_count = 0
+        self.instances.append(self)
+
+    async def update(self) -> None:
+        """Record update calls on the test double."""
+        self.update_count += 1
+
+    async def remove(self) -> None:
+        """Record remove calls on the test double."""
+        self.remove_count += 1
+
+
 class _ToolMessage:
     """Provide an internal helper for a completed tool message."""
 
@@ -255,10 +279,12 @@ def _patch_chainlit_tasks(monkeypatch) -> None:
     """
     _Message.instances.clear()
     _Step.instances.clear()
+    _CustomElement.instances.clear()
     monkeypatch.setattr(chainlit_bridge.cl, "TaskStatus", _TaskStatus)
     monkeypatch.setattr(chainlit_bridge.cl, "Task", _Task)
     monkeypatch.setattr(chainlit_bridge.cl, "Step", _Step)
     monkeypatch.setattr(chainlit_bridge.cl, "Message", _Message)
+    monkeypatch.setattr(chainlit_bridge.cl, "CustomElement", _CustomElement)
 
 
 @pytest.mark.anyio
@@ -734,3 +760,206 @@ async def test_chainlit_bridge_shows_summarization_status() -> None:
     assert step.output == "Conversation summarization triggered."
     assert step.send_count == 1
     assert step.update_count == 1
+
+
+@pytest.mark.anyio
+async def test_bridge_renders_whitelisted_ui_message_as_custom_element() -> None:
+    """Verify whitelisted LangGraph UI events render Chainlit custom elements."""
+    bridge = ChainlitEventBridge(prompt="hello")
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "Build result"},
+                        "metadata": {"source": "main-agent"},
+                    },
+                ),
+            },
+        }
+    )
+
+    assert len(_CustomElement.instances) == 1
+    assert _CustomElement.instances[0].name == "GeneratedPanel"
+    assert _CustomElement.instances[0].props == {"title": "Build result"}
+    assert _CustomElement.instances[0].display == "inline"
+    assert len(_Message.instances) == 1
+    assert _Message.instances[0].elements == [_CustomElement.instances[0]]
+    assert _Message.instances[0].send_count == 1
+
+
+@pytest.mark.anyio
+async def test_bridge_updates_existing_ui_element_by_id() -> None:
+    """Verify repeat UI ids update the existing custom element props."""
+    bridge = ChainlitEventBridge(prompt="hello")
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "First"},
+                    },
+                ),
+            },
+        }
+    )
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "Updated"},
+                    },
+                ),
+            },
+        }
+    )
+
+    assert len(_CustomElement.instances) == 1
+    assert _CustomElement.instances[0].props == {"title": "Updated"}
+    assert _CustomElement.instances[0].update_count == 1
+    assert len(_Message.instances) == 1
+
+
+@pytest.mark.anyio
+async def test_bridge_updates_shared_ui_element_registry_across_instances() -> None:
+    """Verify generated UI ids persist when bridge instances share a registry."""
+    generated_ui_elements: dict[str, _CustomElement] = {}
+    first_bridge = ChainlitEventBridge(
+        prompt="hello",
+        generated_ui_elements=generated_ui_elements,
+    )
+    second_bridge = ChainlitEventBridge(
+        prompt="next",
+        generated_ui_elements=generated_ui_elements,
+    )
+
+    await first_bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "First"},
+                    },
+                ),
+            },
+        }
+    )
+    await second_bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "Second"},
+                    },
+                ),
+            },
+        }
+    )
+
+    assert len(_CustomElement.instances) == 1
+    assert _CustomElement.instances[0].props == {"title": "Second"}
+    assert _CustomElement.instances[0].update_count == 1
+    assert len(_Message.instances) == 1
+    assert generated_ui_elements == {"panel-1": _CustomElement.instances[0]}
+
+
+@pytest.mark.anyio
+async def test_bridge_removes_existing_ui_element_by_id() -> None:
+    """Verify remove-ui events remove the tracked custom element."""
+    bridge = ChainlitEventBridge(prompt="hello")
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "First"},
+                    },
+                ),
+            },
+        }
+    )
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {"chunk": ("custom", {"type": "remove-ui", "id": "panel-1"})},
+        }
+    )
+
+    assert _CustomElement.instances[0].remove_count == 1
+
+
+@pytest.mark.anyio
+async def test_bridge_ignores_unknown_or_disabled_ui_components() -> None:
+    """Verify unregistered components and disabled generative UI do not render."""
+    bridge = ChainlitEventBridge(prompt="hello")
+    disabled_bridge = ChainlitEventBridge(prompt="hello", generative_ui_enabled=False)
+
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "UnknownPanel",
+                        "props": {"title": "First"},
+                    },
+                ),
+            },
+        }
+    )
+    await disabled_bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-2",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "Second"},
+                    },
+                ),
+            },
+        }
+    )
+
+    assert _CustomElement.instances == []
+    assert _Message.instances == []

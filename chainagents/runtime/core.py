@@ -34,12 +34,15 @@ from deepagents.backends import (
 from deepagents.middleware.skills import _list_skills
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.tools import tool
 from langchain_anthropic import ChatAnthropic
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
+from langgraph.graph.ui import push_ui_message
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from pydantic import BaseModel, Field
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
@@ -104,6 +107,7 @@ OPENAI_COMPATIBLE_REASONING_DELTA_KEYS = (
     "reasoning_details",
 )
 SUMMARIZATION_STATUS_EVENT_KIND = "summarization_status"
+GENERATIVE_UI_COMPONENT_NAME = "GeneratedPanel"
 SYSTEM_PROMPT_MEMORY_LINE = (
     "- Use `/memories/` for agent memory. Persistence depends on runtime configuration."
 )
@@ -125,6 +129,7 @@ Operating constraints:
 - When you finish, explain the result clearly and concisely.
 - For non-trivial, multi-step work, call `write_todos` early and keep it updated as you progress so the UI can reflect your current plan and progress.
 - If you expect to use multiple tools or perform more than two distinct steps, create a todo list before proceeding with the main work.
+- Actively use `render_chainlit_ui` in Chainlit for interactive or structured answers. When the tool is available, default to a compact GeneratedPanel for summaries, facts, checklists, comparisons, status updates, choices, and next-step action buttons. Still provide the normal text answer. For simple one-sentence answers or when the tool is absent, answer in text only.
 
 Availability questions:
 - When asked what skills are available, answer from the actually loaded Skills section in your system prompt, not from generic world knowledge or broad capabilities.
@@ -1608,6 +1613,151 @@ def virtual_workspace_path_to_local(path_value: str, project_root: Path | None =
     return str(local_path)
 
 
+class RenderChainlitUIInput(BaseModel):
+    """Define the schema for generated Chainlit UI panel requests."""
+
+    title: str = Field(
+        ...,
+        min_length=1,
+        description="Short title shown at the top of the generated UI panel.",
+    )
+    summary: str | None = Field(
+        default=None,
+        description="Optional concise markdown-style summary for the panel body.",
+    )
+    facts: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional key-value facts to display in a compact grid.",
+    )
+    items: list[Any] | None = Field(
+        default=None,
+        description=(
+            "Optional short list items to display in order. Prefer strings; "
+            "use actions, not items, for prompt buttons."
+        ),
+    )
+    table: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional small table with columns and rows.",
+    )
+    actions: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Optional prompt buttons with label and prompt values.",
+    )
+    id: str | None = Field(
+        default=None,
+        description="Optional stable panel id. Reusing it updates the existing panel.",
+    )
+
+
+def _normalize_generated_ui_props(
+    *,
+    title: str,
+    summary: str | None = None,
+    facts: dict[str, Any] | None = None,
+    items: list[Any] | None = None,
+    table: dict[str, Any] | None = None,
+    actions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return props accepted by the bundled GeneratedPanel custom element."""
+    props: dict[str, Any] = {"title": title.strip()}
+    normalized_actions: list[dict[str, str]] = []
+    action_keys: set[tuple[str, str]] = set()
+
+    def action_parts(value: Any) -> tuple[str, str] | None:
+        if not isinstance(value, dict):
+            return None
+        label = str(value.get("label") or "").strip()
+        prompt = str(value.get("prompt") or "").strip()
+        if label and prompt:
+            return label, prompt
+        return None
+
+    def append_action(value: Any) -> None:
+        parts = action_parts(value)
+        if parts is None:
+            return
+        label, prompt = parts
+        if parts not in action_keys:
+            normalized_actions.append({"label": label, "prompt": prompt})
+            action_keys.add(parts)
+
+    def item_text(value: Any) -> str:
+        if isinstance(value, dict):
+            for key in ("label", "text", "title", "value", "name"):
+                text = str(value.get(key) or "").strip()
+                if text:
+                    return text
+            return ""
+        return str(value).strip()
+
+    if summary is not None and summary.strip():
+        props["summary"] = summary.strip()
+    if facts:
+        props["facts"] = {str(key): value for key, value in facts.items()}
+    if items:
+        normalized_items: list[str] = []
+        for item in items:
+            append_action(item)
+            if action_parts(item) is not None:
+                continue
+            text = item_text(item)
+            if text:
+                normalized_items.append(text)
+        if normalized_items:
+            props["items"] = normalized_items
+    if table:
+        props["table"] = table
+    if actions:
+        for action in actions:
+            append_action(action)
+    if normalized_actions:
+        props["actions"] = normalized_actions
+    return props
+
+
+def create_render_chainlit_ui_tool() -> Any:
+    """Create the built-in tool that emits LangGraph UI messages for Chainlit."""
+
+    @tool(
+        "render_chainlit_ui",
+        args_schema=RenderChainlitUIInput,
+        return_direct=False,
+    )
+    def render_chainlit_ui(
+        title: str,
+        summary: str | None = None,
+        facts: dict[str, Any] | None = None,
+        items: list[Any] | None = None,
+        table: dict[str, Any] | None = None,
+        actions: list[dict[str, Any]] | None = None,
+        id: str | None = None,
+    ) -> dict[str, Any]:
+        """Render a whitelisted Chainlit generated UI panel for the current answer."""
+        props = _normalize_generated_ui_props(
+            title=title,
+            summary=summary,
+            facts=facts,
+            items=items,
+            table=table,
+            actions=actions,
+        )
+        ui_message = push_ui_message(
+            GENERATIVE_UI_COMPONENT_NAME,
+            props,
+            id=(id.strip() if isinstance(id, str) and id.strip() else None),
+            metadata={"source": "main-agent"},
+            state_key=None,
+        )
+        return {
+            "rendered": True,
+            "component": ui_message["name"],
+            "id": ui_message["id"],
+        }
+
+    return render_chainlit_ui
+
+
 @dataclass(frozen=True)
 class ExtensionsConfig:
     """Store optional runtime extension settings parsed from configuration.
@@ -1635,6 +1785,7 @@ class ExtensionsConfig:
         chainlit_tool_steps_enabled: The chainlit tool steps enabled value.
         chainlit_startup_status_enabled: The chainlit startup status enabled value.
         chainlit_chronological_ui_enabled: The chainlit chronological UI enabled value.
+        chainlit_generative_ui_enabled: Whether Chainlit generated UI is enabled.
         summarization_middleware_enabled: The summarization middleware enabled value.
         summarization_trigger_tokens: The summarization trigger tokens value.
         summarization_keep_tokens: The summarization keep tokens value.
@@ -1663,6 +1814,7 @@ class ExtensionsConfig:
     chainlit_tool_steps_enabled: bool = True
     chainlit_startup_status_enabled: bool = True
     chainlit_chronological_ui_enabled: bool = True
+    chainlit_generative_ui_enabled: bool = True
     summarization_middleware_enabled: bool = False
     summarization_trigger_tokens: int | None = None
     summarization_keep_tokens: int | None = None
@@ -2554,6 +2706,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_model_mode_enabled = chainlit_section.get("model_mode_enabled", True)
     raw_startup_status_enabled = chainlit_section.get("startup_status_enabled", True)
     raw_chronological_ui_enabled = chainlit_section.get("chronological_ui_enabled", True)
+    raw_generative_ui_enabled = chainlit_section.get("generative_ui_enabled", True)
     if not isinstance(raw_reasoning_mode_enabled, bool):
         raise ValueError(
             "The top-level 'chainlit.reasoning_mode_enabled' config must be a boolean."
@@ -2577,6 +2730,10 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     if not isinstance(raw_chronological_ui_enabled, bool):
         raise ValueError(
             "The top-level 'chainlit.chronological_ui_enabled' config must be a boolean."
+        )
+    if not isinstance(raw_generative_ui_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.generative_ui_enabled' config must be a boolean."
         )
 
     chainlit_commands: list[ChainlitCommandConfig] = []
@@ -2680,6 +2837,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         chainlit_tool_steps_enabled=raw_tool_steps_enabled,
         chainlit_startup_status_enabled=raw_startup_status_enabled,
         chainlit_chronological_ui_enabled=raw_chronological_ui_enabled,
+        chainlit_generative_ui_enabled=raw_generative_ui_enabled,
         summarization_middleware_enabled=raw_summarization_middleware_enabled,
         summarization_trigger_tokens=raw_summarization_trigger_tokens,
         summarization_keep_tokens=raw_summarization_keep_tokens,
@@ -4303,6 +4461,8 @@ def create_configured_graph(
         memory_namespace=config.extensions.agent_memory_namespace,
     )
     tools: list[Any] = []
+    if config.extensions.chainlit_generative_ui_enabled:
+        tools.append(create_render_chainlit_ui_tool())
     if config.rag is not None:
         tools.append(
             create_search_workspace_knowledge_tool(
@@ -5178,8 +5338,10 @@ class AgentRuntime:
             thread_id=thread_id,
             mcp_session_id=mcp_session_id,
         )
+        tools = list(tools)
+        if self.config.extensions.chainlit_generative_ui_enabled:
+            tools.append(create_render_chainlit_ui_tool())
         if self._rag_service is not None:
-            tools = list(tools)
             tools.append(
                 create_search_workspace_knowledge_tool(
                     self._rag_service,

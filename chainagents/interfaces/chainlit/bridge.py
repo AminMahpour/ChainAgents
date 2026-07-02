@@ -77,6 +77,7 @@ GENERATED_FILE_PATH_ARG_KEYS = (
     "dest",
     "output_path",
 )
+GENERATIVE_UI_COMPONENTS = frozenset({"GeneratedPanel"})
 
 
 def stringify_content(value: Any) -> str:
@@ -969,6 +970,8 @@ class ChainlitEventBridge:
         chronological_ui_enabled: bool = True,
         reasoning_steps_enabled: bool = True,
         tool_steps_enabled: bool = True,
+        generative_ui_enabled: bool = True,
+        generated_ui_elements: dict[str, cl.CustomElement] | None = None,
         reflection_collector: ReflectionCollector | None = None,
     ) -> None:
         """Initialize the chainlit event bridge instance.
@@ -979,6 +982,8 @@ class ChainlitEventBridge:
             chronological_ui_enabled: The chronological UI enabled value.
             reasoning_steps_enabled: Whether to show reasoning steps.
             tool_steps_enabled: Whether to show tool steps.
+            generative_ui_enabled: Whether to render generated UI custom elements.
+            generated_ui_elements: Shared generated UI element registry for this session.
             reflection_collector: Optional collector for post-run memory proposals.
         """
         self.prompt = prompt
@@ -994,12 +999,16 @@ class ChainlitEventBridge:
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
         self.summarization_steps: dict[str, cl.Step] = {}
+        self.generated_ui_elements = (
+            generated_ui_elements if generated_ui_elements is not None else {}
+        )
         self.generated_file_paths: list[str] = []
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
         self.chronological_ui_enabled = chronological_ui_enabled
         self.reasoning_steps_enabled = reasoning_steps_enabled
         self.tool_steps_enabled = tool_steps_enabled
+        self.generative_ui_enabled = generative_ui_enabled
         self.reflection_collector = reflection_collector
 
     async def start(self) -> None:
@@ -1033,6 +1042,10 @@ class ChainlitEventBridge:
             await self._complete_tool_event(event)
         elif event.kind == "summarization_status":
             await self._stream_summarization_status_event(event)
+        elif event.kind == "ui_message":
+            await self._render_ui_message(event)
+        elif event.kind == "ui_remove":
+            await self._remove_ui_message(event)
 
     async def _update_todos_from_update_part(self, part: dict[str, Any]) -> None:
         """Refresh Chainlit task list todos from a LangGraph update part."""
@@ -1214,6 +1227,41 @@ class ChainlitEventBridge:
             step.end = utc_now()
             self._schedule_step_auto_collapse(step)
         await step.update()
+
+    async def _render_ui_message(self, event: AgentStreamEvent) -> None:
+        """Render a whitelisted LangGraph UI event as a Chainlit CustomElement."""
+        if not self.generative_ui_enabled:
+            return
+        if event.ui_name not in GENERATIVE_UI_COMPONENTS or not event.ui_id:
+            return
+
+        existing_element = self.generated_ui_elements.get(event.ui_id)
+        if existing_element is not None:
+            if event.ui_metadata.get("merge") is True:
+                existing_element.props = {
+                    **dict(getattr(existing_element, "props", {}) or {}),
+                    **event.ui_props,
+                }
+            else:
+                existing_element.props = event.ui_props
+            await existing_element.update()
+            return
+
+        element = cl.CustomElement(
+            name=event.ui_name,
+            props=event.ui_props,
+            display="inline",
+        )
+        self.generated_ui_elements[event.ui_id] = element
+        await cl.Message(content="", elements=[element]).send()
+
+    async def _remove_ui_message(self, event: AgentStreamEvent) -> None:
+        """Remove a tracked Chainlit CustomElement for a LangGraph remove-ui event."""
+        if not self.generative_ui_enabled or not event.ui_id:
+            return
+        element = self.generated_ui_elements.pop(event.ui_id, None)
+        if element is not None:
+            await element.remove()
 
     async def _stream_tool_call_event(self, event: AgentStreamEvent) -> None:
         """Render a normalized streamed tool call event."""
