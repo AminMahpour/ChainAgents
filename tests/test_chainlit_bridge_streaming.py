@@ -785,6 +785,11 @@ async def test_bridge_renders_whitelisted_ui_message_as_custom_element() -> None
         }
     )
 
+    assert _CustomElement.instances == []
+    assert _Message.instances == []
+
+    await bridge.finish()
+
     assert len(_CustomElement.instances) == 1
     assert _CustomElement.instances[0].name == "GeneratedPanel"
     assert _CustomElement.instances[0].props == {"title": "Build result"}
@@ -792,6 +797,47 @@ async def test_bridge_renders_whitelisted_ui_message_as_custom_element() -> None
     assert len(_Message.instances) == 1
     assert _Message.instances[0].elements == [_CustomElement.instances[0]]
     assert _Message.instances[0].send_count == 1
+
+
+@pytest.mark.anyio
+async def test_bridge_sends_generated_ui_after_final_response(monkeypatch) -> None:
+    """Verify generated UI panels appear after the final answer message."""
+    bridge = ChainlitEventBridge(prompt="hello")
+    monkeypatch.setattr(
+        chainlit_bridge,
+        "attach_response_export_actions",
+        lambda *args, **kwargs: None,
+    )
+
+    await bridge._stream_response("Final answer")
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    "custom",
+                    {
+                        "type": "ui",
+                        "id": "panel-1",
+                        "name": "GeneratedPanel",
+                        "props": {"title": "Build result"},
+                    },
+                ),
+            },
+        }
+    )
+
+    assert _Message.instances == []
+
+    await bridge.finish()
+
+    assert len(_Message.instances) == 2
+    assert _Message.instances[0].content == "Final answer"
+    assert _Message.instances[0].elements == []
+    assert _Message.instances[1].content == ""
+    assert _Message.instances[1].elements == [_CustomElement.instances[0]]
+    assert _Message.instances[0].send_count == 1
+    assert _Message.instances[1].send_count == 1
 
 
 @pytest.mark.anyio
@@ -832,9 +878,11 @@ async def test_bridge_updates_existing_ui_element_by_id() -> None:
         }
     )
 
+    await bridge.finish()
+
     assert len(_CustomElement.instances) == 1
     assert _CustomElement.instances[0].props == {"title": "Updated"}
-    assert _CustomElement.instances[0].update_count == 1
+    assert _CustomElement.instances[0].update_count == 0
     assert len(_Message.instances) == 1
 
 
@@ -867,6 +915,8 @@ async def test_bridge_updates_shared_ui_element_registry_across_instances() -> N
             },
         }
     )
+    await first_bridge.finish()
+
     await second_bridge.handle_event(
         {
             "event": "on_chain_stream",
@@ -883,6 +933,8 @@ async def test_bridge_updates_shared_ui_element_registry_across_instances() -> N
             },
         }
     )
+
+    await second_bridge.finish()
 
     assert len(_CustomElement.instances) == 1
     assert _CustomElement.instances[0].props == {"title": "Second"}
@@ -912,6 +964,8 @@ async def test_bridge_removes_existing_ui_element_by_id() -> None:
             },
         }
     )
+    await bridge.finish()
+
     await bridge.handle_event(
         {
             "event": "on_chain_stream",

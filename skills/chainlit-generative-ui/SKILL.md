@@ -15,13 +15,14 @@ Working rules:
 3. Include `actions` when the user may want next steps. Prefer useful continuation buttons such as "Run tests", "Show diff", "Explain config", or "Create PR".
 4. Skip UI for simple one-sentence answers, conversational acknowledgements, and cases where a panel would duplicate the text without adding interaction.
 5. Do not render arbitrary JSX, HTML, scripts, or custom component names. This runtime only exposes the whitelisted `GeneratedPanel` component through `render_chainlit_ui`.
-6. Put only plain strings in `items`. Do not put objects with `label` and `prompt` there.
-7. Put prompt buttons in `actions`. Treat each button as a user-facing follow-up request with a clear label and prompt.
-8. For checklist-style panels with follow-up buttons, put the checklist labels in `items` and the clickable follow-ups in `actions`.
-9. Do not duplicate the same option in `items` and `actions`. If it is clickable, put it only in `actions`.
-10. Keep generated panels compact. Put detailed reasoning, long explanations, code, logs, and large datasets in the text response or files instead.
-11. Do not put secrets, hidden reasoning, system messages, or internal tool details in the panel.
-12. Reuse `id` only when updating the same panel. Use a stable, short id such as `deployment-summary` or `review-findings`.
+6. Do not describe generated panels as above or below the answer. Chainlit renders them after the text response, so use non-positional wording such as "the generated panel" or "the panel actions."
+7. Put only plain strings in `items`. Do not put objects with `label` and `prompt` there.
+8. Put prompt buttons in `actions`. Treat each button as a user-facing follow-up request with a clear label and prompt.
+9. For checklist-style panels with follow-up buttons, put the checklist labels in `items` and the clickable follow-ups in `actions`.
+10. Do not duplicate the same option in `items` and `actions`. If it is clickable, put it only in `actions`.
+11. Keep generated panels compact. Put detailed reasoning, long explanations, code, logs, and large datasets in the text response or files instead.
+12. Do not put secrets, hidden reasoning, system messages, or internal tool details in the panel.
+13. Reuse `id` only when updating the same panel. Use a stable, short id such as `deployment-summary` or `review-findings`.
 
 Supported `render_chainlit_ui` fields:
 
@@ -68,4 +69,4 @@ Example tool call:
 }
 ```
 
-After calling the tool, continue with the normal answer. The panel should complement the answer, not replace it.
+After calling the tool, continue with the normal answer. The panel should complement the answer, not replace it. Refer to it without above/below placement language.
