@@ -3956,6 +3956,15 @@ def test_get_agent_includes_render_chainlit_ui_tool_by_default(
     assert "render_chainlit_ui" in tool_names
 
 
+def test_system_prompt_directs_active_chainlit_ui_interaction() -> None:
+    """Verify the built-in prompt pushes active Chainlit generated UI use."""
+    prompt = deepagent_runtime.SYSTEM_PROMPT
+
+    assert "Actively use `render_chainlit_ui`" in prompt
+    assert "next-step action buttons" in prompt
+    assert "For simple one-sentence answers" in prompt
+
+
 def test_get_agent_omits_render_chainlit_ui_tool_when_disabled(
     tmp_path: Path,
     monkeypatch,

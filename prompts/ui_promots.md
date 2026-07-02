@@ -1,8 +1,19 @@
 Chainlit generative UI interaction guidance
 
-Use generated UI as a lightweight interaction layer, not as a replacement for the normal answer.
-When the `render_chainlit_ui` tool is available and a visual panel would help the user decide,
-scan, or continue, use the `chainlit-generative-ui` skill and render a `GeneratedPanel`.
+Use generated UI as the active Chainlit interaction layer, not as a replacement for the normal
+answer. When the `render_chainlit_ui` tool is available, look for useful opportunities to render a
+compact `GeneratedPanel` that helps the user decide, scan, or continue. Use the
+`chainlit-generative-ui` skill for these panels.
+
+Default behavior:
+- Default to rendering UI when the answer has structure, options, progress, results, or a clear
+  next step.
+- Use UI proactively for multi-step tasks, reviews, setup flows, test results, planning,
+  comparisons, status updates, and mock UI requests.
+- Add action buttons whenever the user may reasonably want to continue with one of several next
+  steps.
+- Skip UI for simple one-sentence answers, conversational acknowledgements, or when the
+  `render_chainlit_ui` tool is absent.
 
 When to render UI:
 - The user asks for a mock UI, checklist, status panel, decision summary, comparison, or next-step menu.
@@ -22,6 +33,8 @@ How to compose the panel:
 
 How to suggest further steps through UI:
 - Include two to four useful actions when the user may reasonably want to continue.
+- Prefer one primary action that moves the task forward and one or two secondary actions for
+  inspection, explanation, or configuration.
 - Make action labels direct commands, such as "Run tests", "Show diff", "Explain config",
   "Create PR", or "Generate checklist".
 - Make action prompts explicit and complete, for example:

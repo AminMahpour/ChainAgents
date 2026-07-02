@@ -5,19 +5,22 @@ description: Use this skill in Chainlit when a response would benefit from a gen
 
 # chainlit-generative-ui
 
-Use Chainlit generative UI to make structured results easier to scan while keeping the normal text response.
+Use Chainlit generative UI as the active interaction layer for structured Chainlit turns while
+keeping the normal text response.
 
 Working rules:
 
 1. Call `render_chainlit_ui` only when that tool is available in the current tool list. If it is absent, answer normally in text.
-2. Use the UI for concise, user-facing structure: summaries, decision cards, status panels, short checklists, small tables, and follow-up actions.
-3. Do not render arbitrary JSX, HTML, scripts, or custom component names. This runtime only exposes the whitelisted `GeneratedPanel` component through `render_chainlit_ui`.
-4. Put only plain strings in `items`. Do not put objects with `label` and `prompt` there.
-5. Put prompt buttons in `actions`. Treat each button as a user-facing follow-up request with a clear label and prompt.
-6. For checklist-style panels with follow-up buttons, put the checklist labels in `items` and the clickable follow-ups in `actions`.
-7. Keep generated panels compact. Put detailed reasoning, long explanations, code, logs, and large datasets in the text response or files instead.
-8. Do not put secrets, hidden reasoning, system messages, or internal tool details in the panel.
-9. Reuse `id` only when updating the same panel. Use a stable, short id such as `deployment-summary` or `review-findings`.
+2. Default to rendering UI for concise, user-facing structure: summaries, decision cards, status panels, short checklists, small tables, and follow-up actions.
+3. Include `actions` when the user may want next steps. Prefer useful continuation buttons such as "Run tests", "Show diff", "Explain config", or "Create PR".
+4. Skip UI for simple one-sentence answers, conversational acknowledgements, and cases where a panel would duplicate the text without adding interaction.
+5. Do not render arbitrary JSX, HTML, scripts, or custom component names. This runtime only exposes the whitelisted `GeneratedPanel` component through `render_chainlit_ui`.
+6. Put only plain strings in `items`. Do not put objects with `label` and `prompt` there.
+7. Put prompt buttons in `actions`. Treat each button as a user-facing follow-up request with a clear label and prompt.
+8. For checklist-style panels with follow-up buttons, put the checklist labels in `items` and the clickable follow-ups in `actions`.
+9. Keep generated panels compact. Put detailed reasoning, long explanations, code, logs, and large datasets in the text response or files instead.
+10. Do not put secrets, hidden reasoning, system messages, or internal tool details in the panel.
+11. Reuse `id` only when updating the same panel. Use a stable, short id such as `deployment-summary` or `review-findings`.
 
 Supported `render_chainlit_ui` fields:
 

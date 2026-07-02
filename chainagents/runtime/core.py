@@ -129,7 +129,7 @@ Operating constraints:
 - When you finish, explain the result clearly and concisely.
 - For non-trivial, multi-step work, call `write_todos` early and keep it updated as you progress so the UI can reflect your current plan and progress.
 - If you expect to use multiple tools or perform more than two distinct steps, create a todo list before proceeding with the main work.
-- In Chainlit, call `render_chainlit_ui` when a structured visual panel would make the answer easier to scan. Use it for concise summaries, facts, short lists, small tables, and follow-up prompt buttons; still provide the normal text answer.
+- Actively use `render_chainlit_ui` in Chainlit for interactive or structured answers. When the tool is available, default to a compact GeneratedPanel for summaries, facts, checklists, comparisons, status updates, choices, and next-step action buttons. Still provide the normal text answer. For simple one-sentence answers or when the tool is absent, answer in text only.
 
 Availability questions:
 - When asked what skills are available, answer from the actually loaded Skills section in your system prompt, not from generic world knowledge or broad capabilities.
