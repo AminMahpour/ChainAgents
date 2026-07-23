@@ -12,8 +12,10 @@ from rich.panel import Panel
 from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, Input, Markdown, RichLog, Static
+from textual.message import Message
+from textual.widgets import Footer, Header, Markdown, RichLog, Static, TextArea
 
 from chainagents.commands.native import (
     dumps_tool_result,
@@ -61,6 +63,35 @@ def capture_mcp_stdio_stderr(log_path: Path):
             yield
     finally:
         mcp_sessions.stdio_client = original_stdio_client
+
+
+class PromptTextArea(TextArea):
+    """Multiline prompt editor that preserves Enter as the send shortcut."""
+
+    BINDINGS = [
+        Binding("enter", "submit", "Send", priority=True),
+        Binding("shift+enter", "insert_newline", "New line", priority=True),
+    ]
+
+    class Submitted(Message):
+        """Prompt submission requested by the user."""
+
+        def __init__(self, text_area: PromptTextArea) -> None:
+            super().__init__()
+            self.text_area = text_area
+
+        @property
+        def control(self) -> PromptTextArea:
+            return self.text_area
+
+    def action_submit(self) -> None:
+        """Submit the current prompt without modifying its contents."""
+        self.post_message(self.Submitted(self))
+
+    def action_insert_newline(self) -> None:
+        """Insert a newline at the cursor, replacing any selection."""
+        start, end = self.selection
+        self.replace("\n", start, end, maintain_selection_offset=False)
 
 
 class ChainAgentsTuiApp(App[int]):
@@ -123,7 +154,7 @@ class ChainAgentsTuiApp(App[int]):
     }
 
     #prompt {
-        height: 3;
+        height: 6;
     }
 
     #commands {
@@ -174,12 +205,12 @@ class ChainAgentsTuiApp(App[int]):
                 yield RichLog(id="reasoning", wrap=True, markup=True, highlight=False)
                 yield RichLog(id="tools", wrap=True, markup=True, highlight=False)
         yield Static("", id="commands")
-        yield Input(placeholder="Prompt ChainAgents...", id="prompt")
+        yield PromptTextArea(placeholder="Prompt ChainAgents...", id="prompt")
         yield Footer()
 
     def on_mount(self) -> None:
         """Focus the prompt when the TUI starts."""
-        self.query_one("#prompt", Input).focus()
+        self.query_one("#prompt", PromptTextArea).focus()
         self._set_status(
             f"Ready. thread={self.thread_id} model={self.model_name} "
             f"reasoning={self.reasoning_level}"
@@ -192,22 +223,22 @@ class ChainAgentsTuiApp(App[int]):
             event.stop()
             self.action_complete_slash_command()
 
-    @on(Input.Submitted, "#prompt")
-    async def on_prompt_submitted(self, event: Input.Submitted) -> None:
+    @on(PromptTextArea.Submitted, "#prompt")
+    async def on_prompt_submitted(self, event: PromptTextArea.Submitted) -> None:
         """Send a submitted prompt to the agent."""
         event.stop()
-        prompt = event.value.strip()
+        prompt = event.text_area.text.strip()
         if not prompt or self.active_task is not None:
             return
 
-        event.input.value = ""
+        event.text_area.load_text("")
         self.hide_command_help()
         self.active_task = asyncio.create_task(self._run_prompt(prompt))
 
-    @on(Input.Changed, "#prompt")
-    def on_prompt_changed(self, event: Input.Changed) -> None:
+    @on(TextArea.Changed, "#prompt")
+    def on_prompt_changed(self, event: TextArea.Changed) -> None:
         """Refresh slash command help as the user types."""
-        self.refresh_command_help(event.value)
+        self.refresh_command_help(event.text_area.text)
 
     async def action_cancel_or_quit(self) -> None:
         """Cancel an active run, or exit when idle."""
@@ -236,14 +267,15 @@ class ChainAgentsTuiApp(App[int]):
         """Complete the first visible slash command into the prompt."""
         if not self.command_help_visible or not self.visible_command_names:
             return
-        prompt = self.query_one("#prompt", Input)
+        prompt = self.query_one("#prompt", PromptTextArea)
         command_name = self.visible_command_names[0]
-        prompt.value = f"/{command_name} "
-        prompt.cursor_position = len(prompt.value)
+        completed_command = f"/{command_name} "
+        prompt.load_text(completed_command)
+        prompt.cursor_location = (0, len(completed_command))
         self.hide_command_help()
 
     async def _run_prompt(self, raw_prompt: str) -> None:
-        prompt_input = self.query_one("#prompt", Input)
+        prompt_input = self.query_one("#prompt", PromptTextArea)
         prompt_input.disabled = True
         self._set_status("Running...")
         await self._append_conversation("You", raw_prompt)
@@ -269,7 +301,7 @@ class ChainAgentsTuiApp(App[int]):
     def refresh_command_help(self, prompt_value: str) -> None:
         """Show matching slash commands when the prompt starts with slash."""
         text = prompt_value.lstrip()
-        if not text.startswith("/") or " " in text:
+        if not text.startswith("/") or any(character.isspace() for character in text):
             self.hide_command_help()
             return
 
