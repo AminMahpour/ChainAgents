@@ -10,12 +10,13 @@ from typing import Any
 
 import pytest
 from textual.containers import VerticalScroll
-from textual.widgets import Input, Markdown, RichLog
+from textual.widgets import Markdown, RichLog
 
 import chainagents_cli
 from chainagents_tui import (
     DEFAULT_TUI_THREAD_ID,
     ChainAgentsTuiApp,
+    PromptTextArea,
     TUI_SIDE_PANEL_WIDTH,
     capture_mcp_stdio_stderr,
     run_tui,
@@ -262,7 +263,7 @@ async def test_tui_mounts_expected_panes_and_prompt() -> None:
         assert app.query_one("#conversation", VerticalScroll)
         assert app.query_one("#reasoning", RichLog)
         assert app.query_one("#tools", RichLog)
-        assert app.query_one("#prompt", Input)
+        assert app.query_one("#prompt", PromptTextArea)
 
 
 @pytest.mark.anyio
@@ -273,8 +274,8 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
     app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "hello"
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("hello")
         await pilot.press("enter")
         await pilot.pause()
 
@@ -290,6 +291,39 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_submits_multiline_prompt() -> None:
+    agent = _FakeAgent(
+        [
+            _raw_event(((), "messages", (_Token("Done"), {}))),
+        ]
+    )
+    app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("first line")
+        prompt.cursor_location = (0, len("first line"))
+
+        await pilot.press("shift+enter")
+        await pilot.press(*"second line")
+        await pilot.pause()
+
+        assert prompt.text == "first line\nsecond line"
+        assert agent.payload is None
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert agent.payload == {
+        "messages": [{"role": "user", "content": "first line\nsecond line"}]
+    }
+    assert app.conversation_entries == [
+        ("You", "first line\nsecond line"),
+        ("Assistant", "Done"),
+    ]
+
+
+@pytest.mark.anyio
 async def test_tui_renders_assistant_response_as_markdown_widget() -> None:
     agent = _FakeAgent(
         [
@@ -300,8 +334,8 @@ async def test_tui_renders_assistant_response_as_markdown_widget() -> None:
     app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "format this"
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("format this")
         await pilot.press("enter")
         await pilot.pause()
 
@@ -337,8 +371,8 @@ async def test_tui_streams_reasoning_and_tool_activity_to_side_panes() -> None:
     app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "inspect"
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("inspect")
         await pilot.press("enter")
         await pilot.pause()
 
@@ -363,8 +397,8 @@ async def test_tui_accumulates_reasoning_deltas_in_one_entry() -> None:
     app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "inspect"
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("inspect")
         await pilot.press("enter")
         await pilot.pause()
 
@@ -388,12 +422,12 @@ async def test_tui_starts_new_reasoning_entry_for_each_prompt() -> None:
     app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "first"
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("first")
         await pilot.press("enter")
         await pilot.pause()
 
-        prompt.value = "second"
+        prompt.load_text("second")
         await pilot.press("enter")
         await pilot.pause()
 
@@ -419,8 +453,8 @@ async def test_tui_applies_prompt_slash_commands() -> None:
     app = ChainAgentsTuiApp(runtime=runtime, args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "/summarize notes"
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("/summarize notes")
         await pilot.press("enter")
         await pilot.pause()
 
@@ -449,9 +483,9 @@ async def test_tui_shows_filtered_slash_commands_while_typing() -> None:
     app = ChainAgentsTuiApp(runtime=runtime, args=_args())
 
     async with app.run_test():
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "/su"
-        app.refresh_command_help(prompt.value)
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("/su")
+        app.refresh_command_help(prompt.text)
 
         assert app.command_help_visible is True
         assert app.visible_command_names == ["summarize"]
@@ -471,13 +505,13 @@ async def test_tui_tab_completes_first_matching_slash_command() -> None:
     app = ChainAgentsTuiApp(runtime=runtime, args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "/su"
-        app.refresh_command_help(prompt.value)
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("/su")
+        app.refresh_command_help(prompt.text)
 
         await pilot.press("tab")
 
-        assert prompt.value == "/summarize "
+        assert prompt.text == "/summarize "
         assert app.command_help_visible is False
 
 
@@ -487,14 +521,14 @@ async def test_tui_ctrl_c_cancels_active_run() -> None:
     app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
 
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "wait"
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("wait")
         await pilot.press("enter")
         await agent.started.wait()
 
         assert prompt.disabled is True
 
-        await app.action_cancel_or_quit()
+        await pilot.press("ctrl+c")
         await pilot.pause()
 
         assert agent.cancelled is True

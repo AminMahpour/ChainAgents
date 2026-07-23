@@ -234,11 +234,12 @@ uv run chainagents --tui
 
 The TUI defaults to thread ID `tui`, keeps the prompt box at the bottom, shows
 the conversation in the main pane with Markdown-formatted assistant responses,
-and splits reasoning and tool activity in the right sidebar. Type `/` in the TUI
-prompt to show configured slash commands, and press Tab to complete the first
-matching command. Stdio MCP server diagnostics are written to
-`.files/tui-stderr.log` in TUI mode so they do not corrupt the full-screen
-interface.
+and splits reasoning and tool activity in the right sidebar. The prompt editor
+supports multiple lines: press Shift+Enter to insert a newline and Enter to send
+the complete prompt. Type `/` to show configured slash commands, and press Tab
+to complete the first matching command. Stdio MCP server diagnostics are
+written to `.files/tui-stderr.log` in TUI mode so they do not corrupt the
+full-screen interface.
 
 Useful CLI examples:
 
