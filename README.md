@@ -626,11 +626,101 @@ Supported subagent fields:
 - `nested_subagents`: optional list of top-level sync subagent names exposed as children of this subagent
 - `[[subagents.subagents]]`: optional inline private sync child subagents under a parent subagent
 
-Nested subagents are synchronous only. Use `[[subagents.subagents]]` for children
-that should only be available to the parent, or `nested_subagents = ["name"]` to
-reuse a top-level sync subagent as a child while keeping it visible to the main
-agent. Async Agent Protocol subagents remain top-level `[[async_subagents]]`
-entries.
+### Nested Subagents
+
+Nested subagents let a synchronous subagent delegate work to its own synchronous
+child agents. They are useful when a coordinator needs focused helpers but the
+main agent should not necessarily see every helper directly.
+
+ChainAgents supports two nesting patterns:
+
+- use `[[subagents.subagents]]` for a private inline child available only to its
+  parent
+- use `nested_subagents = ["name"]` to reuse a top-level synchronous subagent as
+  a child while keeping it available to the main agent
+
+#### Add a Private Inline Child
+
+Place `[[subagents.subagents]]` immediately after its parent
+`[[subagents]]` entry:
+
+```toml
+[[subagents]]
+name = "research-manager"
+description = "Coordinates repository research and planning."
+system_prompt = "Delegate focused work and synthesize the results."
+
+[[subagents.subagents]]
+name = "repo-planner"
+description = "Turns repository findings into an implementation plan."
+system_prompt = "Produce a concise, actionable implementation plan."
+```
+
+In this configuration:
+
+- `repo-planner` is available to `research-manager`
+- `repo-planner` is not exposed directly to the main agent
+- the child can use the normal synchronous subagent fields, including `skills`,
+  `mcp_servers`, and `model`
+
+Use an inline child when it is an implementation detail of one parent.
+
+#### Reuse a Top-Level Subagent as a Child
+
+Define the child as a normal top-level `[[subagents]]` entry and reference its
+name from the parent:
+
+```toml
+[[subagents]]
+name = "research-manager"
+description = "Coordinates repository research and review."
+system_prompt = "Delegate research and ask the reviewer to check the result."
+nested_subagents = ["reviewer"]
+
+[[subagents]]
+name = "reviewer"
+description = "Reviews proposed changes for bugs and regressions."
+system_prompt = "Return concise findings with actionable file references."
+```
+
+In this configuration:
+
+- `reviewer` remains available directly to the main agent
+- `research-manager` can also delegate to `reviewer`
+- more than one parent can reference the same top-level subagent
+- each referenced name must exactly match a top-level synchronous subagent
+
+Use a reference when a role should be shared by the main agent or multiple
+parents. A parent can expose several shared children, for example
+`nested_subagents = ["planner", "reviewer"]`.
+
+#### Configuration and Inheritance
+
+Inline children accept the same fields as other synchronous subagents:
+`name`, `description`, `system_prompt` or `system_prompt_file`, `skills`,
+`mcp_servers`, `model`, and their own nested children. A referenced child uses
+the configuration from its top-level `[[subagents]]` entry wherever it is
+reused. When `model` is omitted, the child continues with its parent/default
+model configuration.
+
+#### Limitations and Validation
+
+Nested subagents are synchronous only. Async Agent Protocol subagents must
+remain top-level `[[async_subagents]]` entries.
+
+Configuration loading rejects:
+
+- a `nested_subagents` name that does not match a top-level synchronous
+  subagent
+- duplicate direct child names, including an inline child and a referenced
+  child with the same name
+- reference cycles such as `manager -> reviewer -> manager`
+- a nested child that defines `graph_id`, because that represents an async
+  subagent
+
+As a rule of thumb, use an inline child for a parent-private specialist, a
+referenced child for a shared synchronous role, and `[[async_subagents]]` for
+remote or background Agent Protocol work.
 
 Main `[agent]` additions:
 
