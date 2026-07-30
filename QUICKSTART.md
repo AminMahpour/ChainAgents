@@ -29,6 +29,10 @@ cd ChainAgents
 uv sync
 ```
 
+This installs the locked DeepAgents 0.7 release. ChainAgents explicitly keeps
+its todo-planning middleware, so multi-step work can still use `write_todos`
+and appear as a task list in Chainlit.
+
 ### 2. Pick a model provider
 
 **Option A: Ollama (local, free)**
@@ -101,6 +105,20 @@ Edit `deepagent.toml`:
 enabled = true
 include_globs = ["README.md", "prompts/**/*.md", "skills/**/*.md"]
 ```
+
+### Allow recursive file deletion
+
+DeepAgents 0.7 includes a recursive `delete` tool, but ChainAgents disables it
+by default. Opt in only when the main agent and local synchronous subagents
+should be able to remove files:
+
+```toml
+[agent]
+delete_tool_enabled = true
+```
+
+Leave the setting unset or `false` to retain the safer default filesystem
+surface.
 
 ### Add a Skill
 

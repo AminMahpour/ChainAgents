@@ -33,6 +33,7 @@ Highlights
 - Chainlit image uploads sent to vision-capable models as photo attachments for OCR or image analysis
 - Chainlit OCR/image uploads accept PNG, JPEG, WEBP, and GIF files
 - config-driven synchronous and async DeepAgents subagents
+- DeepAgents `>=0.7.0,<0.8.0` with explicit todo planning and safe filesystem defaults
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
@@ -161,6 +162,9 @@ uv sync
 ollama pull gpt-oss:20b
 ```
 
+The dependency manifests require DeepAgents `>=0.7.0,<0.8.0`; `uv sync`
+installs the matching locked release.
+
 PDF downloads are rendered with WeasyPrint. `uv sync` installs the Python package,
 but WeasyPrint also needs native rendering libraries. On macOS, install them with:
 
@@ -185,6 +189,7 @@ This repo now includes a live [deepagent.toml](deepagent.toml) with:
 
 - model defaults for provider, base URL, model name, and reasoning effort
 - a higher LangGraph recursion limit for longer tool-heavy Deep Agent runs
+- recursive file deletion disabled unless `[agent].delete_tool_enabled = true`
 - a real `repo` MCP server pinned to `npx @modelcontextprotocol/server-filesystem@2025.8.21`
 - a `repo-researcher` subagent using [prompts/repo-researcher.md](prompts/repo-researcher.md)
 - the repo-local `skills/` source for both the main agent and the subagent
@@ -437,6 +442,7 @@ The `[agent]` table configures main-agent runtime behavior:
 ```toml
 [agent]
 state = "stateful"
+delete_tool_enabled = false
 recursion_limit = 200
 memory_namespace = "filesystem"
 memory_files = ["/memories/AGENTS.md"]
@@ -455,15 +461,37 @@ tool_failure_mode = "unrecovered"
 Notes:
 
 - `state = "stateful"` passes the configured LangGraph store and checkpointer to DeepAgents so thread IDs can continue conversation state. `state = "stateless"` omits those state handles and does not expose `/memories/` when building the agent graph.
+- `delete_tool_enabled = false` preserves the pre-0.7 filesystem surface. Set it to `true` only when the main agent and local synchronous subagents should receive DeepAgents 0.7's recursive `delete` tool. Remote async graphs have their own configuration.
 - `recursion_limit` is the LangGraph step limit for one agent run.
 - The built-in default is `100`; this repo's `deepagent.toml` sets it to `200`.
 - `DEEPAGENT_RECURSION_LIMIT` overrides this value when set.
 - Increase it for long tool-heavy runs that hit `GraphRecursionError`; lower it if you want runaway loops to stop sooner.
-- `memory_namespace` is the shared agent-scoped StoreBackend namespace for `/memories/`. The default is `filesystem` to preserve existing memory data from earlier configs. Use only letters, numbers, hyphens, underscores, dots, `@`, `+`, colons, and tildes.
+- `memory_namespace` is the shared agent-scoped `StoreBackend` namespace for `/memories/`. ChainAgents passes a concrete backend instance and the explicit namespace tuple `(memory_namespace,)`, as required by DeepAgents 0.7. The default is `filesystem` to preserve existing memory data from earlier configs. Use only letters, numbers, hyphens, underscores, dots, `@`, `+`, colons, and tildes.
 - `memory_files` lists `/memories/` files DeepAgents loads into the startup memory prompt. The default is `["/memories/AGENTS.md"]`; set it to `[]` to keep the memory route without startup memory loading.
 - `custom_instruction` appends an inline instruction to the **main/supervisor** agent system prompt.
 - `custom_instruction_file` loads that appended instruction from a UTF-8 text file. Relative paths are resolved from the active `deepagent.toml`; use either `custom_instruction` or `custom_instruction_file`, not both. This repo uses `prompts/ui_promots.md` to encourage active Chainlit generated UI panels and next-step action buttons.
 - `[agent.reflection]` is opt-in. When enabled for stateful agents, ChainAgents proposes a compact lesson for `memory_file` after correction phrases such as "that was wrong" or after unrecovered tool failures. Chainlit asks with Save/Dismiss before writing through the agent; CLI, TUI, and API expose the proposal without mutating memory.
+
+### DeepAgents 0.7 Compatibility
+
+DeepAgents 0.7 no longer installs `TodoListMiddleware` by default. ChainAgents
+adds `langchain.agents.middleware.TodoListMiddleware` explicitly to every local
+main, synchronous, and nested agent stack. This preserves the `write_todos`
+tool, the `todos` state channel, the planning prompt, and Chainlit task-list
+rendering. Separately deployed async graphs must restore todo middleware in
+their own runtime if they rely on the same behavior.
+
+ChainAgents uses concrete `BackendProtocol` instances throughout. Backend
+integrations should use the current `ls(path)`, `glob(pattern, path=None)`,
+`grep(pattern, path=None, glob=None, max_count=None)`, and
+`read(file_path, offset=0, limit=2000) -> ReadResult` contracts. Consume
+`ReadResult.file_data` and its metadata fields rather than parsing rendered
+`read_file` text.
+
+For rendered tool output, empty `ls` and `glob` results are the string
+`No files found`, not `[]`. `read_file` line numbers no longer use a fixed-width
+`cat -n` gutter, so callers must not parse text by fixed character columns.
+ChainAgents does not parse any of these rendered filesystem outputs.
 
 ## Optional: Enable Workspace Docs RAG
 
@@ -728,12 +756,14 @@ Main `[agent]` additions:
 - `recursion_limit`: optional positive integer LangGraph step limit for a single agent run. Defaults to `100` unless overridden by `DEEPAGENT_RECURSION_LIMIT`.
 - `memory_namespace`: optional non-empty namespace for agent-scoped `/memories/` storage. Defaults to `filesystem`; allowed characters are letters, numbers, `-`, `_`, `.`, `@`, `+`, `:`, and `~`.
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
+- `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
 - `custom_instruction`: optional string appended to the **main/supervisor** agent system prompt. This setting does **not** get applied to separately configured prompts such as the `async_researcher` graph prompt.
 - `custom_instruction_file`: optional UTF-8 text file loaded as the main-agent custom instruction. Relative paths resolve from the active `deepagent.toml`. This is mutually exclusive with `custom_instruction`.
-- DeepAgents provides its own summarization middleware in the main agent and sync subagents.
+- ChainAgents explicitly restores `TodoListMiddleware` for the main agent and local sync subagents because DeepAgents 0.7 no longer includes it by default.
+- DeepAgents still provides its own summarization middleware in the main agent and sync subagents.
 - `summarization_trigger_tokens`: optional positive integer token threshold for DeepAgents' built-in summarization middleware.
 - `summarization_keep_tokens`: optional positive integer token budget to keep after DeepAgents summarizes conversation history.
 - Legacy `summarization_middleware_enabled` entries are still parsed for compatibility, but ChainAgents no longer injects a second summarization middleware.
@@ -918,7 +948,11 @@ Notes:
 
 Current scope of this config support:
 
-- it supports Deep Agents built-in tool surface plus config-driven skills and MCP tools
+- it exposes `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and
+  `execute` by default, plus `write_todos`, subagent tools, config-driven
+  skills, and MCP tools
+- it exposes recursive `delete` only when
+  `[agent].delete_tool_enabled = true`
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
 - if you need custom Python tools, extend [chainagents/runtime/core.py](chainagents/runtime/core.py)
