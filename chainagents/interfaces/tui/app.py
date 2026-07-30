@@ -33,6 +33,7 @@ from chainagents.runtime import (
     PROJECT_ROOT,
     ReasoningLevel,
     build_langgraph_run_config,
+    finalize_cancelled_token_usage,
     normalize_reasoning_level,
 )
 
@@ -419,6 +420,9 @@ class ChainAgentsTuiApp(App[int]):
                 for stream_event in adapter.events_from_raw_event(event):
                     reflection_collector.record_event(stream_event)
                     await self._handle_stream_event(stream_event)
+        except asyncio.CancelledError:
+            finalize_cancelled_token_usage(config)
+            raise
         except Exception as exc:
             stream_error = exc
             reflection_collector.mark_run_failed(exc)

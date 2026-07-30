@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +50,26 @@ class _FakeAgent:
         async def events():
             for event in self.events:
                 yield event
+
+        return events()
+
+
+class _DisconnectAgent:
+    """Simulate a live LangGraph stream closed by an API consumer."""
+
+    def __init__(self) -> None:
+        self.root_run_id = uuid4()
+
+    def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+        async def events():
+            for callback in config["callbacks"]:
+                callback.on_chain_start(
+                    {},
+                    payload,
+                    run_id=self.root_run_id,
+                )
+            yield _raw_event(((), "messages", (_Token("partial"), {})))
+            await asyncio.sleep(60)
 
         return events()
 
@@ -175,6 +196,36 @@ def test_invoke_runs_prompt_through_agent(
     agent.config["callbacks"][0].on_chain_end({}, run_id=uuid4())
     assert (runtime_root / ".files" / "token-usage.jsonl").exists()
     assert not (fallback_root / ".files" / "token-usage.jsonl").exists()
+
+
+def test_closing_api_event_stream_records_cancellation(tmp_path: Path) -> None:
+    """Dropping a disconnected stream must preserve its partial usage record."""
+    agent = _DisconnectAgent()
+    runtime = _FakeRuntime(agent, project_root=tmp_path)
+    context = chainagents_api.AgentRunContext(
+        prompt="hello",
+        thread_id="thread-1",
+        model_name="fake-model",
+        reasoning_level="medium",
+        reasoning_level_is_explicit=False,
+        async_subagent_url=None,
+        mcp_session_id=None,
+    )
+    events = chainagents_api._iter_agent_events(runtime, context)
+
+    async def consume_then_disconnect():
+        first = await anext(events)
+        await events.aclose()
+        return first
+
+    first = asyncio.run(consume_then_disconnect())
+
+    assert first.text == "partial"
+    record = json.loads(
+        (tmp_path / ".files" / "token-usage.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["request_id"] == str(agent.root_run_id)
+    assert record["status"] == "cancelled"
 
 
 def test_invoke_requires_thread_id() -> None:

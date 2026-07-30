@@ -40,7 +40,23 @@ class TokenUsageFileCallbackHandler(BaseCallbackHandler):
         self._input_tokens = 0
         self._output_tokens = 0
         self._total_tokens = 0
+        self._root_run_id: UUID | None = None
         self._written = False
+
+    def on_chain_start(
+        self,
+        serialized: dict[str, Any],
+        inputs: dict[str, Any],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Remember the root run identifier for explicit cancellation."""
+        if parent_run_id is not None:
+            return
+        with self._state_lock:
+            self._root_run_id = run_id
 
     def on_llm_end(
         self,
@@ -129,6 +145,13 @@ class TokenUsageFileCallbackHandler(BaseCallbackHandler):
         if parent_run_id is not None:
             return
         self._write_once(run_id=run_id, status="error")
+
+    def finalize_cancelled(self) -> None:
+        """Write cancellation usage after a stream closes without a terminal event."""
+        with self._state_lock:
+            run_id = self._root_run_id
+        if run_id is not None:
+            self._write_once(run_id=run_id, status="cancelled")
 
     def _write_once(self, *, run_id: UUID, status: str) -> None:
         """Append the terminal request record at most once."""

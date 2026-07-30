@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -455,6 +457,118 @@ def test_message_uploaded_rag_files_skips_image_uploads(tmp_path) -> None:
     uploads = main.message_uploaded_rag_files(message)
 
     assert [upload.name for upload in uploads] == ["notes.md"]
+
+
+@pytest.mark.anyio
+async def test_cancelled_chainlit_message_records_token_usage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Returning from Chainlit cancellation must not drop the usage record."""
+
+    class _Agent:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.root_run_id = uuid4()
+
+        def astream_events(
+            self,
+            payload,
+            *,
+            config,
+            version,
+            stream_mode,
+            subgraphs,
+        ):
+            async def events():
+                for callback in config["callbacks"]:
+                    callback.on_chain_start(
+                        {},
+                        payload,
+                        run_id=self.root_run_id,
+                    )
+                self.started.set()
+                await asyncio.sleep(60)
+                if False:
+                    yield None
+
+            return events()
+
+    class _Bridge:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def handle_event(self, _event) -> None:
+            pass
+
+    agent = _Agent()
+    extensions = SimpleNamespace(
+        chainlit_reasoning_steps_enabled=True,
+        chainlit_tool_steps_enabled=True,
+        chainlit_reasoning_mode_enabled=True,
+        chainlit_model_mode_enabled=True,
+        chainlit_chronological_ui_enabled=False,
+        chainlit_generative_ui_enabled=False,
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            model_name="fake-model",
+            model_choices=("fake-model",),
+            default_reasoning="medium",
+            recursion_limit=100,
+            extensions=extensions,
+        ),
+        project_root=tmp_path,
+    )
+
+    async def get_agent(*_args, **_kwargs):
+        return agent
+
+    async def get_runtime():
+        runtime.get_agent = get_agent
+        return runtime
+
+    async def get_task_list(**_kwargs):
+        return None
+
+    settings = AppSettings(
+        model_name="fake-model",
+        reasoning_level="medium",
+        thread_id="thread-1",
+    )
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "coerce_settings", lambda *_args, **_kwargs: settings)
+    monkeypatch.setattr(main, "get_run_task_list", get_task_list)
+    monkeypatch.setattr(main, "ChainlitEventBridge", _Bridge)
+    monkeypatch.setattr(main, "current_mcp_session_id", lambda: None)
+    monkeypatch.setattr(main, "get_generated_ui_elements", lambda: {})
+    monkeypatch.setattr(main, "get_async_task_notifier", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "settings_reasoning_level_is_explicit",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(main.cl.user_session, "get", lambda _key: settings)
+    message = SimpleNamespace(
+        content="wait",
+        command=None,
+        elements=[],
+        modes={},
+    )
+    task = asyncio.create_task(main.on_message(message))
+    await agent.started.wait()
+
+    task.cancel()
+    await task
+
+    record = json.loads(
+        (tmp_path / ".files" / "token-usage.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["request_id"] == str(agent.root_run_id)
+    assert record["status"] == "cancelled"
 
 
 def test_message_uploaded_image_parts_builds_data_url_parts(tmp_path) -> None:

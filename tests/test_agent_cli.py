@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -659,10 +660,38 @@ class _CaptureAgent:
         return events()
 
 
+class _CancelledPromptAgent:
+    """Simulate a CLI stream cancelled before LangGraph emits a terminal event."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.root_run_id = uuid4()
+
+    def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+        async def events():
+            for callback in config["callbacks"]:
+                callback.on_chain_start(
+                    {},
+                    payload,
+                    run_id=self.root_run_id,
+                )
+            self.started.set()
+            await asyncio.sleep(60)
+            if False:
+                yield None
+
+        return events()
+
+
 class _FakePromptRuntime:
     """Provide a test double for fake prompt runtime."""
 
-    def __init__(self, *, project_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        project_root: Path | None = None,
+        agent=None,
+    ) -> None:
         """Initialize the fake prompt runtime instance."""
         self.project_root = project_root or Path.cwd()
         self.config = SimpleNamespace(
@@ -670,7 +699,7 @@ class _FakePromptRuntime:
             model_name="fake-model",
             recursion_limit=100,
         )
-        self.agent = _CaptureAgent()
+        self.agent = agent or _CaptureAgent()
 
     async def get_agent(self, *args, **kwargs):
         """Return the fake prompt agent used by CLI tests.
@@ -773,6 +802,34 @@ async def test_cli_photo_attaches_image_content_to_agent_payload(
     runtime.agent.config["callbacks"][0].on_chain_end({}, run_id=uuid4())
     assert (runtime_root / ".files" / "token-usage.jsonl").exists()
     assert not (fallback_root / ".files" / "token-usage.jsonl").exists()
+
+
+@pytest.mark.anyio
+async def test_cancelled_cli_prompt_records_token_usage(tmp_path: Path) -> None:
+    """Closing a cancelled CLI stream must preserve its usage record."""
+    agent = _CancelledPromptAgent()
+    runtime = _FakePromptRuntime(project_root=tmp_path, agent=agent)
+    args = chainagents_cli.parse_args(["--prompt", "wait"])
+    task = asyncio.create_task(
+        chainagents_cli.run_agent_prompt(
+            runtime,  # type: ignore[arg-type]
+            args,
+            prompt="wait",
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+    )
+    await agent.started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    record = json.loads(
+        (tmp_path / ".files" / "token-usage.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["request_id"] == str(agent.root_run_id)
+    assert record["status"] == "cancelled"
 
 
 @pytest.mark.anyio

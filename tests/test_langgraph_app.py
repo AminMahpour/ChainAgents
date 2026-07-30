@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType
-from typing import TypedDict
+from typing import Any, AsyncIterator, TypedDict
+from uuid import uuid4
 
+import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
@@ -48,7 +51,18 @@ def _load_langgraph_app() -> ModuleType:
     return module
 
 
-def test_agent_server_exports_add_request_scoped_token_logging(
+@asynccontextmanager
+async def _open_factory_result(value: Any) -> AsyncIterator[Any]:
+    """Open current and context-managed graph factory results uniformly."""
+    if hasattr(value, "__aenter__"):
+        async with value as graph:
+            yield graph
+        return
+    yield value
+
+
+@pytest.mark.anyio
+async def test_agent_server_exports_add_request_scoped_token_logging(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -75,20 +89,22 @@ def test_agent_server_exports_add_request_scoped_token_logging(
             "tags": ["server"],
         },
     ]
-    configured_graphs = [
-        module.supervisor(run_configs[0]),
-        module.async_researcher(run_configs[1]),
-    ]
+    async with (
+        _open_factory_result(module.supervisor(run_configs[0])) as supervisor,
+        _open_factory_result(
+            module.async_researcher(run_configs[1])
+        ) as async_researcher,
+    ):
+        configured_graphs = [supervisor, async_researcher]
+        callbacks = [graph.config["callbacks"][0] for graph in configured_graphs]
+        assert all(
+            isinstance(callback, TokenUsageFileCallbackHandler)
+            for callback in callbacks
+        )
+        assert callbacks[0] is not callbacks[1]
 
-    callbacks = [graph.config["callbacks"][0] for graph in configured_graphs]
-    assert all(
-        isinstance(callback, TokenUsageFileCallbackHandler)
-        for callback in callbacks
-    )
-    assert callbacks[0] is not callbacks[1]
-
-    for graph, run_config in zip(configured_graphs, run_configs, strict=True):
-        graph.invoke({"value": 1}, config=run_config)
+        for graph, run_config in zip(configured_graphs, run_configs, strict=True):
+            graph.invoke({"value": 1}, config=run_config)
 
     records = [
         json.loads(line)
@@ -116,3 +132,31 @@ def test_agent_server_exports_add_request_scoped_token_logging(
             "tags": ["server"],
         },
     ]
+
+
+@pytest.mark.anyio
+async def test_agent_server_factory_finalizes_cancelled_usage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Factory teardown without a terminal event must record cancellation."""
+    observed_configs: list[RunnableConfig] = []
+    monkeypatch.setattr(runtime_core, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(runtime_package, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        runtime_package,
+        "create_configured_graph",
+        lambda **_kwargs: _compiled_test_graph(observed_configs),
+    )
+    module = _load_langgraph_app()
+    root_run_id = uuid4()
+
+    async with _open_factory_result(module.supervisor({})) as graph:
+        callback = graph.config["callbacks"][0]
+        callback.on_chain_start({}, {}, run_id=root_run_id)
+
+    record = json.loads(
+        (tmp_path / ".files" / "token-usage.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["request_id"] == str(root_run_id)
+    assert record["status"] == "cancelled"

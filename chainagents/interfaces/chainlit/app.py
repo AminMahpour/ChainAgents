@@ -41,6 +41,7 @@ from chainagents.runtime import (
     ReasoningLevel,
     RuntimeConfig,
     build_langgraph_run_config,
+    finalize_cancelled_token_usage,
     format_model_provider,
     normalize_reasoning_level,
     reasoning_level_for_profile,
@@ -1812,6 +1813,7 @@ async def on_message(message: cl.Message) -> None:
                 break
             await bridge.handle_event(part)
     except asyncio.CancelledError:
+        finalize_cancelled_token_usage(config)
         with suppress(Exception):
             await stream.aclose()
         return

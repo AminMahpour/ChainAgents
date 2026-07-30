@@ -421,8 +421,10 @@ Notes:
 ChainAgents always appends one aggregate record per agent request to
 `.files/token-usage.jsonl`. The log covers Chainlit, CLI, TUI, API, Agent
 Server graphs, and nested subagent model calls. Records contain the UTC
-timestamp, an opaque request identifier, completion status, and aggregate
-input, output, and total token counts.
+timestamp, an opaque request identifier, completion status (`success`, `error`,
+or `cancelled`), and aggregate input, output, and total token counts. Streaming
+OpenAI-compatible models request provider usage metadata so completed model
+calls contribute to the aggregate.
 
 The log never includes prompts, responses, tool arguments, or per-model
 breakdowns. It also omits conversation thread IDs so an agent-readable log

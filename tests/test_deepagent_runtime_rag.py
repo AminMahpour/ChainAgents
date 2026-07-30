@@ -1050,6 +1050,7 @@ disable_streaming = "tool_calling"
     assert model.openai_api_key.get_secret_value() == "profile-key"
     assert model.temperature == 0.1
     assert model.disable_streaming == "tool_calling"
+    assert model.stream_usage is True
 
 
 def test_runtime_config_reads_langfuse_enabled_from_toml(

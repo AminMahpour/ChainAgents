@@ -13,7 +13,7 @@ import re
 import threading
 import tomllib
 from collections.abc import Awaitable, Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path, PurePosixPath
@@ -3667,6 +3667,16 @@ def build_token_usage_callback_handler(
     )
 
 
+def finalize_cancelled_token_usage(run_config: dict[str, Any]) -> None:
+    """Finalize request-scoped token usage callbacks after cancellation."""
+    callbacks = run_config.get("callbacks")
+    if not isinstance(callbacks, list):
+        return
+    for callback in callbacks:
+        if isinstance(callback, TokenUsageFileCallbackHandler):
+            callback.finalize_cancelled()
+
+
 def build_agent_server_graph_factory(
     graph: Any,
     *,
@@ -3674,17 +3684,18 @@ def build_agent_server_graph_factory(
 ) -> Callable[[RunnableConfig], Any]:
     """Build an Agent Server factory with request-scoped token logging."""
 
-    def graph_factory(_config: RunnableConfig) -> Any:
+    @asynccontextmanager
+    async def graph_factory(_config: RunnableConfig):
         # Agent Server supplies this config again when invoking the returned
         # graph. Bind only the new callback here so upstream callbacks are not
         # duplicated when the invocation config is merged.
-        return graph.with_config(
-            callbacks=[
-                build_token_usage_callback_handler(
-                    project_root=project_root,
-                )
-            ]
+        callback = build_token_usage_callback_handler(
+            project_root=project_root,
         )
+        try:
+            yield graph.with_config(callbacks=[callback])
+        finally:
+            callback.finalize_cancelled()
 
     return graph_factory
 
@@ -3911,6 +3922,7 @@ def build_model(
         "api_key": api_key or "deepagent",
         "temperature": resolved_profile.temperature,
         "disable_streaming": resolved_profile.disable_streaming,
+        "stream_usage": True,
     }
     default_query = model_endpoint_query_to_dict(resolved_profile.endpoint_query)
     if default_query:

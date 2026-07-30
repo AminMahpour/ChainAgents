@@ -20,6 +20,7 @@ from chainagents.runtime import (
     AgentRuntime,
     ReasoningLevel,
     build_langgraph_run_config,
+    finalize_cancelled_token_usage,
     normalize_reasoning_level,
     resolve_runtime_model_profile,
 )
@@ -301,6 +302,9 @@ async def _iter_agent_events(
                 if reflection_collector is not None:
                     reflection_collector.record_event(event)
                 yield event
+    except (asyncio.CancelledError, GeneratorExit):
+        finalize_cancelled_token_usage(config)
+        raise
     finally:
         with suppress(Exception):
             await stream.aclose()

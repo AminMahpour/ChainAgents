@@ -45,6 +45,7 @@ from chainagents.runtime import (
     RuntimeConfig,
     RuntimeConfigOverrides,
     build_langgraph_run_config,
+    finalize_cancelled_token_usage,
     shutdown_langfuse_client,
     format_model_provider,
     normalize_reasoning_level,
@@ -1719,6 +1720,7 @@ async def run_agent_prompt(
                 break
             await renderer.handle_event(event)
     except asyncio.CancelledError:
+        finalize_cancelled_token_usage(config)
         with suppress(Exception):
             await stream.aclose()
         raise

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -115,9 +116,16 @@ class _BlockingAgent:
     def __init__(self) -> None:
         self.started = asyncio.Event()
         self.cancelled = False
+        self.root_run_id = uuid4()
 
     def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
         async def events():
+            for callback in config["callbacks"]:
+                callback.on_chain_start(
+                    {},
+                    payload,
+                    run_id=self.root_run_id,
+                )
             self.started.set()
             try:
                 await asyncio.sleep(60)
@@ -543,9 +551,12 @@ async def test_tui_tab_completes_first_matching_slash_command() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_ctrl_c_cancels_active_run() -> None:
+async def test_tui_ctrl_c_cancels_active_run(tmp_path: Path) -> None:
     agent = _BlockingAgent()
-    app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
+    app = ChainAgentsTuiApp(
+        runtime=_FakeRuntime(agent, project_root=tmp_path),
+        args=_args(),
+    )
 
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", PromptTextArea)
@@ -561,3 +572,9 @@ async def test_tui_ctrl_c_cancels_active_run() -> None:
         assert agent.cancelled is True
         assert prompt.disabled is False
         assert app.status_message == "Cancelled."
+
+    record = json.loads(
+        (tmp_path / ".files" / "token-usage.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["request_id"] == str(agent.root_run_id)
+    assert record["status"] == "cancelled"

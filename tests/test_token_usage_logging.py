@@ -188,6 +188,26 @@ def test_root_error_writes_usage_accumulated_before_failure(tmp_path: Path) -> N
     assert record["total_tokens"] == 12
 
 
+def test_cancelled_root_writes_partial_usage_once(tmp_path: Path) -> None:
+    """Cancellation must preserve completed model usage without duplicate records."""
+    log_path = tmp_path / "token-usage.jsonl"
+    handler = TokenUsageFileCallbackHandler(log_path=log_path)
+    root_id = uuid4()
+    handler.on_chain_start({}, {}, run_id=root_id)
+    handler.on_llm_end(usage_result(9, 3), run_id=uuid4())
+
+    handler.finalize_cancelled()
+    handler.on_chain_end({}, run_id=root_id)
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["request_id"] == str(root_id)
+    assert records[0]["status"] == "cancelled"
+    assert records[0]["input_tokens"] == 9
+    assert records[0]["output_tokens"] == 3
+    assert records[0]["total_tokens"] == 12
+
+
 def test_model_error_includes_usage_from_partial_response(tmp_path: Path) -> None:
     """Dropping an error response must undercount tokens consumed by that call."""
     log_path = tmp_path / "token-usage.jsonl"
