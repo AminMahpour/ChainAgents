@@ -416,6 +416,17 @@ Notes:
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, `DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_DISABLE_STREAMING`, and `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.
 
+## Token Usage Log
+
+ChainAgents always appends one aggregate record per agent request to
+`.files/token-usage.jsonl`. The log covers Chainlit, CLI, TUI, API, and nested
+subagent model calls. Records contain the UTC timestamp, thread and request
+identifiers, completion status, and aggregate input, output, and total token
+counts.
+
+The log never includes prompts, responses, tool arguments, or per-model
+breakdowns. The `.files/` directory is ignored by Git.
+
 ## Optional: Enable Langfuse Tracing
 
 Langfuse tracing is disabled by default. To enable it, set your Langfuse

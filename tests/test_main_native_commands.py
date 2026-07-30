@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import agent_commands
 import main
 import pytest
+from chainagents.runtime import core as runtime_core
 from deepagent_runtime import (
     AppSettings,
     ChainlitStarterConfig,
     ExtensionsConfig,
     ModelDefaults,
     RuntimeConfig,
+    TokenUsageFileCallbackHandler,
 )
 from chainagents.runtime.reflection import ReflectionProposal
 
@@ -413,16 +417,26 @@ def test_resolve_model_name_for_message_ignores_override_when_disabled() -> None
     assert resolved == "gpt-oss:20b"
 
 
-def test_build_langgraph_config_includes_recursion_limit() -> None:
-    """Verify that build langgraph config includes recursion limit."""
+def test_build_langgraph_config_includes_token_logging_under_runtime_root(
+    tmp_path: Path,
+) -> None:
+    """Verify Chainlit's config helper cannot bypass token usage logging."""
     settings = SimpleNamespace(thread_id="thread-1")
 
-    config = main.build_langgraph_config(settings, recursion_limit=100)
+    config = main.build_langgraph_config(
+        settings,
+        runtime_config=SimpleNamespace(recursion_limit=100),
+        project_root=tmp_path,
+    )
 
-    assert config == {
+    assert len(config["callbacks"]) == 1
+    assert isinstance(config["callbacks"][0], TokenUsageFileCallbackHandler)
+    assert {key: value for key, value in config.items() if key != "callbacks"} == {
         "configurable": {"thread_id": "thread-1"},
         "recursion_limit": 100,
     }
+    config["callbacks"][0].on_chain_end({}, run_id=uuid4())
+    assert (tmp_path / ".files" / "token-usage.jsonl").exists()
 
 
 def test_message_uploaded_rag_files_skips_image_uploads(tmp_path) -> None:
@@ -793,10 +807,14 @@ async def test_ask_to_save_reflection_lesson_dismiss_does_not_save(
 
 @pytest.mark.anyio
 async def test_save_reflection_lesson_invokes_agent_in_reflection_thread(
+    tmp_path: Path,
     monkeypatch,
 ) -> None:
     """Verify confirmed reflections are saved by a hidden agent run."""
     captured: dict[str, object] = {}
+    runtime_root = tmp_path / "runtime-root"
+    fallback_root = tmp_path / "fallback-root"
+    monkeypatch.setattr(runtime_core, "PROJECT_ROOT", fallback_root)
 
     class _Agent:
         async def ainvoke(self, payload, *, config):
@@ -806,6 +824,7 @@ async def test_save_reflection_lesson_invokes_agent_in_reflection_thread(
 
     class _Runtime:
         config = SimpleNamespace(recursion_limit=100)
+        project_root = runtime_root
 
         async def get_agent(self, *args, **kwargs):
             captured["agent_args"] = args
@@ -849,10 +868,16 @@ async def test_save_reflection_lesson_invokes_agent_in_reflection_thread(
         "async_subagent_url_override": None,
         "mcp_session_id": "mcp-session",
     }
-    assert captured["config"] == {
+    config = captured["config"]
+    assert len(config["callbacks"]) == 1
+    assert isinstance(config["callbacks"][0], TokenUsageFileCallbackHandler)
+    assert {key: value for key, value in config.items() if key != "callbacks"} == {
         "configurable": {"thread_id": "thread-1:reflection"},
         "recursion_limit": 100,
     }
+    config["callbacks"][0].on_chain_end({}, run_id=uuid4())
+    assert (runtime_root / ".files" / "token-usage.jsonl").exists()
+    assert not (fallback_root / ".files" / "token-usage.jsonl").exists()
     prompt = captured["payload"]["messages"][0]["content"]
     assert "Target memory file: /memories/AGENTS.md" in prompt
     assert "Lessons learned from corrections" in prompt

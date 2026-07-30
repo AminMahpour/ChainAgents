@@ -7,10 +7,13 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 import chainagents_cli
+from chainagents.runtime import core as runtime_core
+from chainagents.runtime.token_usage import TokenUsageFileCallbackHandler
 from deepagent_runtime import RuntimeConfig
 from rag_runtime import RagStatus, RagUploadResult
 
@@ -659,8 +662,9 @@ class _CaptureAgent:
 class _FakePromptRuntime:
     """Provide a test double for fake prompt runtime."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, project_root: Path | None = None) -> None:
         """Initialize the fake prompt runtime instance."""
+        self.project_root = project_root or Path.cwd()
         self.config = SimpleNamespace(
             default_reasoning="medium",
             model_name="fake-model",
@@ -718,7 +722,10 @@ async def test_cli_runs_rag_actions_without_prompt(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_cli_photo_attaches_image_content_to_agent_payload(tmp_path: Path) -> None:
+async def test_cli_photo_attaches_image_content_to_agent_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify that CLI photo attaches image content to agent payload.
 
     Args:
@@ -735,7 +742,10 @@ async def test_cli_photo_attaches_image_content_to_agent_payload(tmp_path: Path)
             "--no-stream",
         ]
     )
-    runtime = _FakePromptRuntime()
+    runtime_root = tmp_path / "runtime-root"
+    fallback_root = tmp_path / "fallback-root"
+    monkeypatch.setattr(runtime_core, "PROJECT_ROOT", fallback_root)
+    runtime = _FakePromptRuntime(project_root=runtime_root)
 
     code = await chainagents_cli.run_agent_prompt(
         runtime,  # type: ignore[arg-type]
@@ -755,6 +765,14 @@ async def test_cli_photo_attaches_image_content_to_agent_payload(tmp_path: Path)
         {"type": "text", "text": "Describe this scene"},
         {"type": "image_url", "image_url": {"url": expected_image_url}},
     ]
+    assert len(runtime.agent.config["callbacks"]) == 1
+    assert isinstance(
+        runtime.agent.config["callbacks"][0],
+        TokenUsageFileCallbackHandler,
+    )
+    runtime.agent.config["callbacks"][0].on_chain_end({}, run_id=uuid4())
+    assert (runtime_root / ".files" / "token-usage.jsonl").exists()
+    assert not (fallback_root / ".files" / "token-usage.jsonl").exists()
 
 
 @pytest.mark.anyio

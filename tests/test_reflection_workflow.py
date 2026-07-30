@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -68,6 +69,7 @@ class _FakeRuntime:
     def __init__(self, agent: _FakeAgent, *, reflection_enabled: bool = True) -> None:
         """Initialize the fake runtime."""
         self.agent = agent
+        self.project_root = Path.cwd()
         self.config = SimpleNamespace(
             default_reasoning="medium",
             model_name="fake-model",

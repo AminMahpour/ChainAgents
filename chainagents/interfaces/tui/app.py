@@ -394,6 +394,7 @@ class ChainAgentsTuiApp(App[int]):
         config = build_langgraph_run_config(
             self.runtime.config,
             thread_id=self.thread_id,
+            project_root=self.runtime.project_root,
         )
         adapter = AgentStreamEventAdapter(prompt=prompt)
         reflection_collector = ReflectionCollector.from_runtime_config(

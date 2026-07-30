@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import TodoListMiddleware
@@ -1194,16 +1195,20 @@ def test_build_langgraph_run_config_attaches_langfuse_callback_handler(
 
     assert run_config["configurable"] == {"thread_id": "thread-1"}
     assert run_config["recursion_limit"] == config.recursion_limit
-    assert run_config["callbacks"] == created_handlers
+    assert isinstance(
+        run_config["callbacks"][0],
+        deepagent_runtime.TokenUsageFileCallbackHandler,
+    )
+    assert run_config["callbacks"][1:] == created_handlers
     assert run_config["metadata"]["langfuse_session_id"] == "thread-1"
     assert "chainagents" in run_config["tags"]
 
 
-def test_build_langgraph_run_config_omits_callbacks_when_langfuse_is_disabled(
+def test_build_langgraph_run_config_keeps_token_callback_when_langfuse_is_disabled(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """Verify disabled Langfuse tracing leaves run config unchanged.
+    """Verify token logging remains active without optional Langfuse tracing.
 
     Args:
         tmp_path: Path to the tmp.
@@ -1221,10 +1226,33 @@ def test_build_langgraph_run_config_omits_callbacks_when_langfuse_is_disabled(
         thread_id="thread-1",
     )
 
-    assert run_config == {
-        "configurable": {"thread_id": "thread-1"},
-        "recursion_limit": deepagent_runtime.DEFAULT_RECURSION_LIMIT,
-    }
+    assert run_config["configurable"] == {"thread_id": "thread-1"}
+    assert run_config["recursion_limit"] == deepagent_runtime.DEFAULT_RECURSION_LIMIT
+    assert len(run_config["callbacks"]) == 1
+    assert isinstance(
+        run_config["callbacks"][0],
+        deepagent_runtime.TokenUsageFileCallbackHandler,
+    )
+    assert "metadata" not in run_config
+    assert "tags" not in run_config
+
+
+def test_build_langgraph_run_config_token_callback_uses_project_root(
+    tmp_path: Path,
+) -> None:
+    """Ignoring the supplied root must write token usage outside the test project."""
+    run_config = deepagent_runtime.build_langgraph_run_config(
+        make_runtime_config(tmp_path),
+        thread_id="thread-1",
+        project_root=tmp_path,
+    )
+    root_id = uuid4()
+
+    run_config["callbacks"][0].on_chain_end({}, run_id=root_id)
+
+    log_path = tmp_path / ".files" / "token-usage.jsonl"
+    assert log_path.exists()
+    assert str(root_id) in log_path.read_text()
 
 
 def test_runtime_config_disables_streaming_for_tool_calls_from_toml(

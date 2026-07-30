@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from textual.containers import VerticalScroll
 from textual.widgets import Markdown, RichLog
 
 import chainagents_cli
+from chainagents.runtime import core as runtime_core
+from chainagents.runtime.token_usage import TokenUsageFileCallbackHandler
 from chainagents_tui import (
     DEFAULT_TUI_THREAD_ID,
     ChainAgentsTuiApp,
@@ -127,8 +131,14 @@ class _BlockingAgent:
 
 
 class _FakeRuntime:
-    def __init__(self, agent: _FakeAgent | _BlockingAgent) -> None:
+    def __init__(
+        self,
+        agent: _FakeAgent | _BlockingAgent,
+        *,
+        project_root: Path | None = None,
+    ) -> None:
         self.agent = agent
+        self.project_root = project_root or Path.cwd()
         self.config = SimpleNamespace(
             default_reasoning="medium",
             model_name="fake-model",
@@ -267,11 +277,20 @@ async def test_tui_mounts_expected_panes_and_prompt() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_submits_prompt_and_streams_response() -> None:
+async def test_tui_submits_prompt_and_streams_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime-root"
+    fallback_root = tmp_path / "fallback-root"
+    monkeypatch.setattr(runtime_core, "PROJECT_ROOT", fallback_root)
     agent = _FakeAgent([
         _raw_event(((), "messages", (_Token("Hello from agent"), {}))),
     ])
-    app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
+    app = ChainAgentsTuiApp(
+        runtime=_FakeRuntime(agent, project_root=runtime_root),
+        args=_args(),
+    )
 
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", PromptTextArea)
@@ -280,10 +299,18 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
         await pilot.pause()
 
     assert agent.payload == {"messages": [{"role": "user", "content": "hello"}]}
-    assert agent.config == {
+    assert len(agent.config["callbacks"]) == 1
+    assert isinstance(
+        agent.config["callbacks"][0],
+        TokenUsageFileCallbackHandler,
+    )
+    assert {key: value for key, value in agent.config.items() if key != "callbacks"} == {
         "configurable": {"thread_id": DEFAULT_TUI_THREAD_ID},
         "recursion_limit": 100,
     }
+    agent.config["callbacks"][0].on_chain_end({}, run_id=uuid4())
+    assert (runtime_root / ".files" / "token-usage.jsonl").exists()
+    assert not (fallback_root / ".files" / "token-usage.jsonl").exists()
     assert app.conversation_entries == [
         ("You", "hello"),
         ("Assistant", "Hello from agent"),

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 import chainagents_api
+from chainagents.runtime import core as runtime_core
+from chainagents.runtime.token_usage import TokenUsageFileCallbackHandler
 
 
 class _Token:
@@ -52,9 +56,15 @@ class _FakeAgent:
 class _FakeRuntime:
     """Provide the runtime surface required by the API module."""
 
-    def __init__(self, agent: _FakeAgent) -> None:
+    def __init__(
+        self,
+        agent: _FakeAgent,
+        *,
+        project_root: Path | None = None,
+    ) -> None:
         """Initialize the fake runtime."""
         self.agent = agent
+        self.project_root = project_root or Path.cwd()
         self.requests: list[dict[str, Any]] = []
         self.config = SimpleNamespace(
             default_reasoning="medium",
@@ -104,15 +114,21 @@ def test_status_reports_runtime_configuration() -> None:
     }
 
 
-def test_invoke_runs_prompt_through_agent() -> None:
+def test_invoke_runs_prompt_through_agent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     """Verify the invoke endpoint returns the final streamed response."""
+    runtime_root = tmp_path / "runtime-root"
+    fallback_root = tmp_path / "fallback-root"
+    monkeypatch.setattr(runtime_core, "PROJECT_ROOT", fallback_root)
     agent = _FakeAgent(
         [
             _raw_event(((), "messages", (_Token("Hello"), {}))),
             _raw_event(((), "messages", (_Token("Hello world"), {}))),
         ]
     )
-    runtime = _FakeRuntime(agent)
+    runtime = _FakeRuntime(agent, project_root=runtime_root)
     app = chainagents_api.create_app(runtime=runtime)
 
     with TestClient(app) as client:
@@ -147,10 +163,18 @@ def test_invoke_runs_prompt_through_agent() -> None:
         }
     ]
     assert agent.payload == {"messages": [{"role": "user", "content": "hello"}]}
-    assert agent.config == {
+    assert len(agent.config["callbacks"]) == 1
+    assert isinstance(
+        agent.config["callbacks"][0],
+        TokenUsageFileCallbackHandler,
+    )
+    assert {key: value for key, value in agent.config.items() if key != "callbacks"} == {
         "configurable": {"thread_id": "thread-1"},
         "recursion_limit": 100,
     }
+    agent.config["callbacks"][0].on_chain_end({}, run_id=uuid4())
+    assert (runtime_root / ".files" / "token-usage.jsonl").exists()
+    assert not (fallback_root / ".files" / "token-usage.jsonl").exists()
 
 
 def test_invoke_requires_thread_id() -> None:

@@ -67,6 +67,10 @@ from chainagents.runtime.reflection import (
     ReflectionConfig,
     normalize_reflection_config,
 )
+from chainagents.runtime.token_usage import (
+    DEFAULT_TOKEN_USAGE_LOG_PATH,
+    TokenUsageFileCallbackHandler,
+)
 
 
 ModelProvider = Literal["ollama", "openai_compatible", "anthropic"]
@@ -3651,16 +3655,31 @@ def shutdown_langfuse_client(config: RuntimeConfig) -> bool:
     return True
 
 
+def build_token_usage_callback_handler(
+    *,
+    thread_id: str,
+    project_root: Path | None = None,
+) -> TokenUsageFileCallbackHandler:
+    """Build the always-on request token usage callback."""
+    root = (project_root or PROJECT_ROOT).resolve()
+    return TokenUsageFileCallbackHandler(
+        thread_id=thread_id,
+        log_path=root / DEFAULT_TOKEN_USAGE_LOG_PATH,
+    )
+
+
 def build_langgraph_run_config(
     config: RuntimeConfig,
     *,
     thread_id: str,
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
     """Build LangGraph run config shared by all ChainAgents entrypoints.
 
     Args:
         config: Configuration object used by the operation.
         thread_id: Conversation thread identifier.
+        project_root: Optional project root for local runtime files.
 
     Returns:
         A LangGraph configuration dictionary for the run.
@@ -3668,10 +3687,16 @@ def build_langgraph_run_config(
     run_config: dict[str, Any] = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": config.recursion_limit,
+        "callbacks": [
+            build_token_usage_callback_handler(
+                thread_id=thread_id,
+                project_root=project_root,
+            )
+        ],
     }
     langfuse_handler = build_langfuse_callback_handler(config)
     if langfuse_handler is not None:
-        run_config["callbacks"] = [langfuse_handler]
+        run_config["callbacks"].append(langfuse_handler)
         run_config["metadata"] = {"langfuse_session_id": thread_id}
         run_config["tags"] = ["chainagents"]
     return run_config

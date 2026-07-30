@@ -281,7 +281,11 @@ async def _iter_agent_events(
         mcp_session_id=context.mcp_session_id,
     )
     payload = {"messages": [{"role": "user", "content": context.prompt}]}
-    config = build_langgraph_run_config(runtime.config, thread_id=context.thread_id)
+    config = build_langgraph_run_config(
+        runtime.config,
+        thread_id=context.thread_id,
+        project_root=runtime.project_root,
+    )
     adapter = AgentStreamEventAdapter(prompt=context.prompt)
     stream = agent.astream_events(
         payload,
