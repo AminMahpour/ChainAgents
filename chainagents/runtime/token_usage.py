@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -144,7 +145,8 @@ class TokenUsageFileCallbackHandler(BaseCallbackHandler):
         """Append aggregate usage when the root request fails."""
         if parent_run_id is not None:
             return
-        self._write_once(run_id=run_id, status="error")
+        status = "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+        self._write_once(run_id=run_id, status=status)
 
     def finalize_cancelled(self) -> None:
         """Write cancellation usage after a stream closes without a terminal event."""

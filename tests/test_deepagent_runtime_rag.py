@@ -1050,6 +1050,41 @@ disable_streaming = "tool_calling"
     assert model.openai_api_key.get_secret_value() == "profile-key"
     assert model.temperature == 0.1
     assert model.disable_streaming == "tool_calling"
+    assert model.stream_usage is None
+
+
+def test_build_model_enables_stream_usage_when_profile_opts_in(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Ignoring the profile opt-in must disable streaming usage metadata."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "default-local"
+
+[model.profiles.usage-capable]
+provider = "openai_compatible"
+base_url = "https://usage-capable.example/v1"
+name = "usage-model"
+stream_usage = true
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    profile = config.model_profiles["usage-capable"]
+    model = deepagent_runtime.build_model(
+        config,
+        "medium",
+        model_name="usage-capable",
+    )
+
+    assert profile.stream_usage is True
     assert model.stream_usage is True
 
 

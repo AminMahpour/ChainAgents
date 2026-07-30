@@ -336,6 +336,8 @@ base_url = "http://127.0.0.1:1234/v1"
 temperature = 0
 name = "your-loaded-model-id"
 reasoning_effort = "medium"
+# Enable only when the endpoint supports OpenAI stream_options.include_usage.
+# stream_usage = true
 # api_key = "optional"
 ```
 
@@ -402,6 +404,7 @@ Notes:
 - Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
+- `stream_usage = true` asks an OpenAI-compatible endpoint to include usage metadata in streamed responses. It defaults to disabled because some compatible servers reject `stream_options.include_usage`; enable it only for endpoints that support that option. Named profiles can set it independently.
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `[model.profiles.<name>]` defines a named profile. Profiles inherit omitted fields from `[model]` when they keep the same provider; profiles that switch to `openai_compatible` must provide `base_url` or `endpoint_url`, and profiles that switch to `anthropic` default to `https://api.anthropic.com` unless `base_url` or `endpoint_url` is set.
@@ -422,9 +425,10 @@ ChainAgents always appends one aggregate record per agent request to
 `.files/token-usage.jsonl`. The log covers Chainlit, CLI, TUI, API, Agent
 Server graphs, and nested subagent model calls. Records contain the UTC
 timestamp, an opaque request identifier, completion status (`success`, `error`,
-or `cancelled`), and aggregate input, output, and total token counts. Streaming
-OpenAI-compatible models request provider usage metadata so completed model
-calls contribute to the aggregate.
+or `cancelled`), and aggregate input, output, and total token counts. For
+OpenAI-compatible models, set `stream_usage = true` only when the endpoint
+supports streamed usage metadata; without provider usage metadata, streamed
+model calls may contribute zero tokens.
 
 The log never includes prompts, responses, tool arguments, or per-model
 breakdowns. It also omits conversation thread IDs so an agent-readable log

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import TypedDict
 from uuid import uuid4
 
+import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, Generation, LLMResult
+from langgraph.graph import END, START, StateGraph
 
 from chainagents.runtime.token_usage import TokenUsageFileCallbackHandler
 
@@ -196,6 +200,7 @@ def test_cancelled_root_writes_partial_usage_once(tmp_path: Path) -> None:
     handler.on_chain_start({}, {}, run_id=root_id)
     handler.on_llm_end(usage_result(9, 3), run_id=uuid4())
 
+    handler.on_chain_error(asyncio.CancelledError(), run_id=root_id)
     handler.finalize_cancelled()
     handler.on_chain_end({}, run_id=root_id)
 
@@ -206,6 +211,51 @@ def test_cancelled_root_writes_partial_usage_once(tmp_path: Path) -> None:
     assert records[0]["input_tokens"] == 9
     assert records[0]["output_tokens"] == 3
     assert records[0]["total_tokens"] == 12
+
+
+@pytest.mark.anyio
+async def test_real_graph_root_cancellation_is_classified_as_cancelled(
+    tmp_path: Path,
+) -> None:
+    """Treating LangGraph's root cancellation error as generic must fail this test."""
+
+    class State(TypedDict):
+        value: int
+
+    started = asyncio.Event()
+
+    async def block(state: State) -> State:
+        started.set()
+        await asyncio.sleep(60)
+        return state
+
+    builder = StateGraph(State)
+    builder.add_node("block", block)
+    builder.add_edge(START, "block")
+    builder.add_edge("block", END)
+    graph = builder.compile()
+    log_path = tmp_path / "token-usage.jsonl"
+    handler = TokenUsageFileCallbackHandler(log_path=log_path)
+    stream = graph.astream_events(
+        {"value": 1},
+        config={"callbacks": [handler]},
+        version="v2",
+    )
+
+    async def consume() -> None:
+        async for _event in stream:
+            pass
+
+    task = asyncio.create_task(consume())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await stream.aclose()
+    handler.finalize_cancelled()
+
+    record = json.loads(log_path.read_text())
+    assert record["status"] == "cancelled"
 
 
 def test_model_error_includes_usage_from_partial_response(tmp_path: Path) -> None:

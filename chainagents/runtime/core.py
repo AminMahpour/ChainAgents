@@ -1889,6 +1889,7 @@ class ModelDefaults:
         temperature: The temperature value.
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
+        stream_usage: Whether streamed requests ask the provider for usage metadata.
         cross_provider_base_url: Runtime endpoint override for provider-switched
             profiles.
         cross_provider_endpoint_query: Runtime endpoint query for provider-switched
@@ -1909,6 +1910,7 @@ class ModelDefaults:
     temperature: float = DEFAULT_TEMPERATURE
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
+    stream_usage: bool = False
     cross_provider_base_url: str | None = None
     cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     explicit_fields: frozenset[str] = field(
@@ -2108,6 +2110,17 @@ def parse_model_profile_defaults(
         or "disable_streaming_for_tool_calls" in raw_model
     ):
         explicit_fields.add("disable_streaming")
+    if "stream_usage" in raw_model:
+        stream_usage = raw_model["stream_usage"]
+        if not isinstance(stream_usage, bool):
+            raise ValueError(
+                f"The {field_prefix}.stream_usage config must be a boolean."
+            )
+        explicit_fields.add("stream_usage")
+    elif base is not None and not provider_changed:
+        stream_usage = base.stream_usage
+    else:
+        stream_usage = False
 
     return ModelDefaults(
         provider=provider,
@@ -2122,6 +2135,7 @@ def parse_model_profile_defaults(
         temperature=temperature,
         repeat_penalty=repeat_penalty,
         disable_streaming=disable_streaming,
+        stream_usage=stream_usage,
         explicit_fields=frozenset(explicit_fields),
     )
 
@@ -2233,6 +2247,7 @@ def rebase_model_profile_defaults(
         "temperature",
         "repeat_penalty",
         "disable_streaming",
+        "stream_usage",
     ):
         if (
             field_name in runtime_override_fields
@@ -3080,6 +3095,8 @@ class RuntimeConfig:
         rag_error: The RAG error value.
         model_endpoint_query: The model endpoint query value.
         model_disable_streaming: Whether to disable model streaming.
+        model_stream_usage: Whether streamed requests ask the provider for usage
+            metadata.
         model_thinking: Anthropic thinking mode.
         model_profiles: Named model profiles available by profile name.
         model_api_key_override: Explicit runtime API key override.
@@ -3116,6 +3133,7 @@ class RuntimeConfig:
     rag_error: str | None = None
     model_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_disable_streaming: DisableStreaming = False
+    model_stream_usage: bool = False
     model_thinking: ModelThinking = DEFAULT_MODEL_THINKING
     model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
     model_api_key_override: str | None = None
@@ -3478,6 +3496,7 @@ class RuntimeConfig:
             temperature=model_temperature,
             repeat_penalty=model_repeat_penalty,
             disable_streaming=model_disable_streaming,
+            stream_usage=model_defaults.stream_usage,
             cross_provider_base_url=cross_provider_model_base_url,
             cross_provider_endpoint_query=cross_provider_model_endpoint_query,
             runtime_override_fields=(
@@ -3574,6 +3593,7 @@ class RuntimeConfig:
             rag_error=rag_error,
             model_endpoint_query=model_endpoint_query,
             model_disable_streaming=model_disable_streaming,
+            model_stream_usage=model_defaults.stream_usage,
             model_thinking=model_defaults.thinking,
             model_profiles=file_config.model_profiles,
             model_api_key_override=model_api_key_override,
@@ -3771,6 +3791,7 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
         disable_streaming=normalize_disable_streaming(
             getattr(config, "model_disable_streaming", False)
         ),
+        stream_usage=bool(getattr(config, "model_stream_usage", False)),
         cross_provider_base_url=getattr(
             config,
             "model_cross_provider_base_url",
@@ -3922,8 +3943,9 @@ def build_model(
         "api_key": api_key or "deepagent",
         "temperature": resolved_profile.temperature,
         "disable_streaming": resolved_profile.disable_streaming,
-        "stream_usage": True,
     }
+    if resolved_profile.stream_usage:
+        kwargs["stream_usage"] = True
     default_query = model_endpoint_query_to_dict(resolved_profile.endpoint_query)
     if default_query:
         kwargs["default_query"] = default_query
