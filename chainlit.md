@@ -7,6 +7,7 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 - Final assistant response streams into the main chat message.
 - Raw model reasoning is shown in Chain of Thought steps.
 - Tool calls and tool outputs are rendered as native Chainlit tool steps.
+- Todo updates from `write_todos` are rendered as the current Chainlit task list.
 - Each completed assistant response includes Markdown and WeasyPrint-backed PDF download buttons.
 - Completed reasoning and tool steps auto-collapse based on `chainlit.toml`.
 
@@ -23,6 +24,9 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 - if `deepagent.toml` is missing, the runtime defaults to `http://127.0.0.1:11434`, `gpt-oss:20b`, and `medium`
 - `DEEPAGENT_MODEL_*` env vars override the TOML defaults, and `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain available as Ollama-only compatibility aliases
 - DeepAgents manages conversation summarization in its base agent stack.
+- DeepAgents 0.7 no longer adds todo middleware by default, so ChainAgents
+  explicitly restores it to preserve `write_todos`, `todos` state, and the
+  planning prompt.
 
 ## Optional Persistence
 
@@ -32,6 +36,12 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 ## Optional Extensions
 
 - Use `deepagent.toml` to add skills, MCP servers, custom subagents, and async subagents.
+- Recursive `delete` is disabled by default. Set
+  `[agent].delete_tool_enabled = true` to expose it to the main agent and local
+  synchronous subagents; remote async graphs are configured independently.
+- Command `execute` is also disabled by default. Set
+  `[agent].execute_tool_enabled = true` to expose it independently; the local
+  backend must implement compatible sandbox execution.
 - Use `[chainlit].commands` in `deepagent.toml` to add slash commands that can rewrite prompts, delegate to configured subagents, or invoke MCP tools directly.
 - Each sync subagent can have its own `skills` and `mcp_servers`.
 - Async subagents are Agent Protocol background jobs configured with `graph_id` and optional `url`/`headers`.

@@ -61,6 +61,10 @@ cwd = "."
 
 [agent]
 state = "stateful"
+# DeepAgents 0.7 adds recursive delete and command execution tools. ChainAgents
+# keeps each tool disabled unless its setting is explicitly enabled.
+delete_tool_enabled = false
+execute_tool_enabled = false
 # Optional profile or raw model name for the main/supervisor agent.
 # model = "fast-local"
 recursion_limit = 200
@@ -74,7 +78,8 @@ mcp_servers = []
 custom_instruction_file = "prompts/ui_promots.md"
 # Legacy flag retained for compatibility; DeepAgents provides summarization.
 summarization_middleware_enabled = true
-# Token thresholds tune DeepAgents' built-in summarizer.
+# Token thresholds tune DeepAgents' built-in summarizer. ChainAgents separately
+# restores TodoListMiddleware because DeepAgents 0.7 no longer includes it.
 summarization_trigger_tokens = 150000
 summarization_keep_tokens = 10000
 

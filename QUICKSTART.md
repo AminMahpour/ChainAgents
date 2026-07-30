@@ -29,6 +29,10 @@ cd ChainAgents
 uv sync
 ```
 
+This installs the locked DeepAgents 0.7 release. ChainAgents explicitly keeps
+its todo-planning middleware, so multi-step work can still use `write_todos`
+and appear as a task list in Chainlit.
+
 ### 2. Pick a model provider
 
 **Option A: Ollama (local, free)**
@@ -101,6 +105,23 @@ Edit `deepagent.toml`:
 enabled = true
 include_globs = ["README.md", "prompts/**/*.md", "skills/**/*.md"]
 ```
+
+### Allow high-risk filesystem tools
+
+DeepAgents 0.7 includes recursive `delete` and command `execute` tools, but
+ChainAgents disables both by default. Enable either tool independently only
+when the main agent and local synchronous subagents need that access:
+
+```toml
+[agent]
+delete_tool_enabled = true
+execute_tool_enabled = true
+```
+
+Leave either setting unset or `false` to keep that tool unavailable. The
+default ChainAgents backend is not execution-capable, so enabling `execute`
+only exposes the tool for use with a compatible sandbox backend; it does not
+grant host-shell access by itself.
 
 ### Add a Skill
 

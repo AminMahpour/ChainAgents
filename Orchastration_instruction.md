@@ -16,6 +16,8 @@ cwd = "."
 
 [agent]
 recursion_limit = 200
+delete_tool_enabled = false
+execute_tool_enabled = false
 skills = ["skills"]
 # Do not set mcp_servers here if the main agent should only orchestrate.
 ```
@@ -62,8 +64,13 @@ enabled = false
 
 ## Caveats
 
-- This removes MCP tools from the main agent, but DeepAgents may still provide
-  built-in planning or workspace behavior depending on backend/runtime behavior.
+- This removes MCP tools from the main agent, but not DeepAgents' built-in
+  filesystem, planning, or delegation tools. ChainAgents explicitly restores
+  `write_todos` for local agents under DeepAgents 0.7.
+- The default filesystem surface includes `ls`, `read_file`, `write_file`,
+  `edit_file`, `glob`, and `grep`. Recursive `delete` is available only when
+  `[agent].delete_tool_enabled = true`, and `execute` is available only when
+  `[agent].execute_tool_enabled = true` with an execution-capable backend.
 - Async subagents cannot declare `mcp_servers` in this local config. Their MCP
   access must be configured in the remote graph.
 - Subagent descriptions should be narrow and explicit so the main agent can

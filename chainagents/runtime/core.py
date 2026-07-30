@@ -26,12 +26,15 @@ install_langchain_warning_filters()
 
 from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.backends import (
+    BackendProtocol,
     CompositeBackend,
     FilesystemBackend,
     StateBackend,
     StoreBackend,
 )
+from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import _list_skills
+from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langchain_core.tools import tool
@@ -86,6 +89,14 @@ DEFAULT_EXTENSIONS_CONFIG = "deepagent.toml"
 DEFAULT_RECURSION_LIMIT = 100
 DEFAULT_AGENT_MEMORY_NAMESPACE = "filesystem"
 DEFAULT_AGENT_MEMORY_FILES = ("/memories/AGENTS.md",)
+DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS = (
+    "ls",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob",
+    "grep",
+)
 AGENT_MEMORY_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
@@ -1236,6 +1247,7 @@ def create_deep_agent_with_configured_summarization(
 
 def build_agent_middleware(
     *,
+    backend: BackendProtocol,
     config: RuntimeConfig | None = None,
     reasoning_level: ReasoningLevel | None = None,
     model_name: str | None = None,
@@ -1245,6 +1257,7 @@ def build_agent_middleware(
     """Build agent middleware.
 
     Args:
+        backend: Concrete DeepAgents backend used by filesystem middleware.
         config: Configuration object used by the operation.
         reasoning_level: The reasoning level value.
         model_name: The model name value.
@@ -1254,12 +1267,23 @@ def build_agent_middleware(
     Returns:
         The constructed agent middleware.
     """
-    # DeepAgents 0.6.7 owns summarization middleware in its base main-agent and
+    # DeepAgents owns summarization middleware in its base main-agent and
     # sync-subagent stacks. Passing another SummarizationMiddleware here creates
     # duplicate middleware names that LangChain rejects during agent creation.
-    middleware: list[AgentMiddleware[Any, Any, Any]] = [
-        ToolExecutionResilienceMiddleware(project_root=project_root)
-    ]
+    middleware: list[AgentMiddleware[Any, Any, Any]] = [TodoListMiddleware()]
+    filesystem_tools = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
+    if config is not None:
+        if config.extensions.delete_tool_enabled:
+            filesystem_tools.append("delete")
+        if config.extensions.execute_tool_enabled:
+            filesystem_tools.append("execute")
+    middleware.append(
+        FilesystemMiddleware(
+            backend=backend,
+            tools=filesystem_tools,
+        )
+    )
+    middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
     return middleware
 
 
@@ -1769,6 +1793,8 @@ class ExtensionsConfig:
         agent_state: Whether the DeepAgents graph is stateful or stateless.
         agent_memory_namespace: Shared StoreBackend namespace for /memories/.
         agent_memory_files: Startup memory files loaded into the agent prompt.
+        delete_tool_enabled: Whether to expose DeepAgents' recursive delete tool.
+        execute_tool_enabled: Whether to expose DeepAgents' execute tool.
         agent_reflection: Correction reflection workflow configuration.
         agent_model: Optional main-agent model profile or raw model name.
         recursion_limit: The recursion limit value.
@@ -1798,6 +1824,8 @@ class ExtensionsConfig:
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     agent_memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE
     agent_memory_files: tuple[str, ...] = DEFAULT_AGENT_MEMORY_FILES
+    delete_tool_enabled: bool = False
+    execute_tool_enabled: bool = False
     agent_reflection: ReflectionConfig = ReflectionConfig()
     agent_model: str | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
@@ -1829,6 +1857,8 @@ class ExtensionsConfig:
         """
         return bool(
             self.skills
+            or self.delete_tool_enabled
+            or self.execute_tool_enabled
             or self.agent_mcp_servers
             or self.subagents
             or self.async_subagents
@@ -2591,6 +2621,16 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_section.get("memory_namespace")
     )
     agent_memory_files = normalize_agent_memory_files(agent_section.get("memory_files"))
+    raw_delete_tool_enabled = agent_section.get("delete_tool_enabled", False)
+    if not isinstance(raw_delete_tool_enabled, bool):
+        raise ValueError(
+            "The top-level 'agent.delete_tool_enabled' config must be a boolean."
+        )
+    raw_execute_tool_enabled = agent_section.get("execute_tool_enabled", False)
+    if not isinstance(raw_execute_tool_enabled, bool):
+        raise ValueError(
+            "The top-level 'agent.execute_tool_enabled' config must be a boolean."
+        )
     agent_reflection = normalize_reflection_config(
         agent_section.get("reflection"),
         agent_state=agent_state,
@@ -2821,6 +2861,8 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_state=agent_state,
         agent_memory_namespace=agent_memory_namespace,
         agent_memory_files=agent_memory_files,
+        delete_tool_enabled=raw_delete_tool_enabled,
+        execute_tool_enabled=raw_execute_tool_enabled,
         agent_reflection=agent_reflection,
         agent_model=agent_model,
         recursion_limit=recursion_limit,
@@ -4306,6 +4348,7 @@ def build_static_sync_subagent_spec(
     )
     effective_tools = inherited_model_tools
     middleware = build_agent_middleware(
+        backend=backend,
         config=config,
         reasoning_level=effective_reasoning_level,
         model_name=effective_model.name,
@@ -4506,6 +4549,7 @@ def create_configured_graph(
             rag_enabled=config.rag is not None,
         ),
         "middleware": build_agent_middleware(
+            backend=backend,
             config=config,
             reasoning_level=main_reasoning_level,
             source="main-agent",
@@ -4818,6 +4862,7 @@ class AgentRuntime:
             else own_tools or inherited_model_tools
         )
         middleware = build_agent_middleware(
+            backend=backend,
             config=self.config,
             reasoning_level=effective_reasoning_level,
             model_name=effective_model.name,
@@ -4956,17 +5001,18 @@ class AgentRuntime:
                     selected_model_profile.provider,
                     raw_main_tools,
                 )
+                backend = build_deepagent_backend(
+                    project_root=self.project_root,
+                    include_memories=self.config.agent_state == "stateful",
+                    memory_namespace=self.config.extensions.agent_memory_namespace,
+                )
                 middleware = build_agent_middleware(
+                    backend=backend,
                     config=self.config,
                     reasoning_level=effective_reasoning_level,
                     model_name=selected_model,
                     source="main-agent",
                     project_root=self.project_root,
-                )
-                backend = build_deepagent_backend(
-                    project_root=self.project_root,
-                    include_memories=self.config.agent_state == "stateful",
-                    memory_namespace=self.config.extensions.agent_memory_namespace,
                 )
                 subagent_specs = await self._build_runtime_subagent_specs(
                     reasoning_level=effective_reasoning_level,

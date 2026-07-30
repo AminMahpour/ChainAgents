@@ -2,7 +2,7 @@
   "$schema": "https://langgra.ph/schema.json",
   "dependencies": [
     ".",
-    "deepagents>=0.5.0",
+    "deepagents>=0.7.0,<0.8.0",
     "langchain-mcp-adapters>=0.1.9",
     "langchain-ollama>=1.0.1",
     "langchain-openai>=1.0.1",

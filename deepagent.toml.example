@@ -55,6 +55,10 @@ url = "http://localhost:8000/mcp"
 
 [agent]
 state = "stateful"
+# DeepAgents 0.7 adds recursive delete and command execution tools. ChainAgents
+# keeps each tool disabled by default; opt in only when agents need that access.
+delete_tool_enabled = false
+execute_tool_enabled = false
 # Optional profile or raw model name for the main/supervisor agent.
 # model = "fast-local"
 # A repo-root AGENTS.md file is loaded automatically into the main agent prompt.
@@ -72,8 +76,9 @@ mcp_servers = ["repo"]
 # Use either custom_instruction or custom_instruction_file, not both.
 # custom_instruction = "Always ask clarifying questions before editing files."
 # custom_instruction_file = "prompts/ui_promots.md"
-# DeepAgents 0.6.7 provides summarization middleware in its base agent stack.
-# These optional token thresholds tune DeepAgents' built-in summarizer.
+# DeepAgents provides summarization middleware in its base agent stack.
+# ChainAgents restores TodoListMiddleware because DeepAgents 0.7 removed it
+# from the default stack. These token thresholds tune the built-in summarizer.
 summarization_trigger_tokens = 6000
 summarization_keep_tokens = 2400
 

@@ -10,6 +10,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
@@ -2527,6 +2529,64 @@ def test_get_agent_passes_deepagents_backend_instance(
     assert backend.routes["/workspace/"].cwd == tmp_path
 
 
+@pytest.mark.parametrize(
+    ("delete_tool_enabled", "execute_tool_enabled", "expected_high_risk_tools"),
+    [
+        (False, False, set()),
+        (True, False, {"delete"}),
+        (False, True, {"execute"}),
+        (True, True, {"delete", "execute"}),
+    ],
+)
+def test_deepagents_middleware_restores_todos_and_controls_high_risk_tools(
+    tmp_path: Path,
+    delete_tool_enabled: bool,
+    execute_tool_enabled: bool,
+    expected_high_risk_tools: set[str],
+) -> None:
+    """Verify DeepAgents 0.7 planning state and high-risk tool policy."""
+    extensions = ExtensionsConfig(
+        config_path=None,
+        delete_tool_enabled=delete_tool_enabled,
+        execute_tool_enabled=execute_tool_enabled,
+    )
+    config = make_runtime_config(tmp_path, extensions=extensions)
+    backend = build_deepagent_backend(project_root=tmp_path)
+
+    middleware = deepagent_runtime.build_agent_middleware(
+        config=config,
+        backend=backend,
+        project_root=tmp_path,
+    )
+
+    assert any(isinstance(item, TodoListMiddleware) for item in middleware)
+    filesystem_middleware = [
+        item for item in middleware if isinstance(item, FilesystemMiddleware)
+    ]
+    assert len(filesystem_middleware) == 1
+    assert {tool.name for tool in filesystem_middleware[0].tools} == {
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        *expected_high_risk_tools,
+    }
+
+    graph = deepagent_runtime.create_deep_agent_with_configured_summarization(
+        config,
+        model=FakeListChatModel(responses=["ok"]),
+        middleware=middleware,
+        backend=backend,
+    )
+    tool_names = set(graph.nodes["tools"].bound.tools_by_name)
+    assert "write_todos" in tool_names
+    assert ("delete" in tool_names) is delete_tool_enabled
+    assert ("execute" in tool_names) is execute_tool_enabled
+    assert "todos" in graph.channels
+
+
 def test_get_agent_passes_agent_memory_files_when_stateful(
     tmp_path: Path,
     monkeypatch,
@@ -2711,6 +2771,7 @@ def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
 
     middleware = captured["kwargs"]["middleware"]
     assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+    assert any(isinstance(item, TodoListMiddleware) for item in middleware)
     assert not any(
         isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
         for item in middleware
@@ -2721,6 +2782,7 @@ def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
         isinstance(item, ToolExecutionResilienceMiddleware)
         for item in subagent_middleware
     )
+    assert any(isinstance(item, TodoListMiddleware) for item in subagent_middleware)
     assert not any(
         isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
         for item in subagent_middleware
@@ -4535,6 +4597,71 @@ summarization_keep_tokens = 2400
     assert extensions.summarization_middleware_enabled is True
     assert extensions.summarization_trigger_tokens == 6000
     assert extensions.summarization_keep_tokens == 2400
+
+
+def test_load_extensions_config_defaults_high_risk_tools_to_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify delete and execute remain unavailable unless the user opts in."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text("[agent]\n", encoding="utf-8")
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.delete_tool_enabled is False
+    assert extensions.execute_tool_enabled is False
+
+
+def test_load_extensions_config_parses_high_risk_tool_flags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify users can opt in to the DeepAgents delete and execute tools."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        "[agent]\ndelete_tool_enabled = true\nexecute_tool_enabled = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    extensions = deepagent_runtime.load_extensions_config()
+
+    assert extensions.delete_tool_enabled is True
+    assert extensions.execute_tool_enabled is True
+
+
+def test_load_extensions_config_rejects_non_boolean_delete_tool_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify the delete-tool opt-in rejects ambiguous values."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        '[agent]\ndelete_tool_enabled = "yes"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="delete_tool_enabled"):
+        deepagent_runtime.load_extensions_config()
+
+
+def test_load_extensions_config_rejects_non_boolean_execute_tool_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify the execute-tool opt-in rejects ambiguous values."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        '[agent]\nexecute_tool_enabled = "yes"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="execute_tool_enabled"):
+        deepagent_runtime.load_extensions_config()
 
 
 def test_load_extensions_config_rejects_non_boolean_summarization_middleware_flag(
