@@ -61,9 +61,10 @@ cwd = "."
 
 [agent]
 state = "stateful"
-# DeepAgents 0.7 adds a recursive delete tool. ChainAgents keeps it disabled
-# unless this setting is explicitly enabled.
+# DeepAgents 0.7 adds recursive delete and command execution tools. ChainAgents
+# keeps each tool disabled unless its setting is explicitly enabled.
 delete_tool_enabled = false
+execute_tool_enabled = false
 # Optional profile or raw model name for the main/supervisor agent.
 # model = "fast-local"
 recursion_limit = 200

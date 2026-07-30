@@ -106,19 +106,22 @@ enabled = true
 include_globs = ["README.md", "prompts/**/*.md", "skills/**/*.md"]
 ```
 
-### Allow recursive file deletion
+### Allow high-risk filesystem tools
 
-DeepAgents 0.7 includes a recursive `delete` tool, but ChainAgents disables it
-by default. Opt in only when the main agent and local synchronous subagents
-should be able to remove files:
+DeepAgents 0.7 includes recursive `delete` and command `execute` tools, but
+ChainAgents disables both by default. Enable either tool independently only
+when the main agent and local synchronous subagents need that access:
 
 ```toml
 [agent]
 delete_tool_enabled = true
+execute_tool_enabled = true
 ```
 
-Leave the setting unset or `false` to retain the safer default filesystem
-surface.
+Leave either setting unset or `false` to keep that tool unavailable. The
+default ChainAgents backend is not execution-capable, so enabling `execute`
+only exposes the tool for use with a compatible sandbox backend; it does not
+grant host-shell access by itself.
 
 ### Add a Skill
 

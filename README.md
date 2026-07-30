@@ -190,6 +190,7 @@ This repo now includes a live [deepagent.toml](deepagent.toml) with:
 - model defaults for provider, base URL, model name, and reasoning effort
 - a higher LangGraph recursion limit for longer tool-heavy Deep Agent runs
 - recursive file deletion disabled unless `[agent].delete_tool_enabled = true`
+- command execution disabled unless `[agent].execute_tool_enabled = true`
 - a real `repo` MCP server pinned to `npx @modelcontextprotocol/server-filesystem@2025.8.21`
 - a `repo-researcher` subagent using [prompts/repo-researcher.md](prompts/repo-researcher.md)
 - the repo-local `skills/` source for both the main agent and the subagent
@@ -443,6 +444,7 @@ The `[agent]` table configures main-agent runtime behavior:
 [agent]
 state = "stateful"
 delete_tool_enabled = false
+execute_tool_enabled = false
 recursion_limit = 200
 memory_namespace = "filesystem"
 memory_files = ["/memories/AGENTS.md"]
@@ -462,6 +464,7 @@ Notes:
 
 - `state = "stateful"` passes the configured LangGraph store and checkpointer to DeepAgents so thread IDs can continue conversation state. `state = "stateless"` omits those state handles and does not expose `/memories/` when building the agent graph.
 - `delete_tool_enabled = false` preserves the pre-0.7 filesystem surface. Set it to `true` only when the main agent and local synchronous subagents should receive DeepAgents 0.7's recursive `delete` tool. Remote async graphs have their own configuration.
+- `execute_tool_enabled = false` keeps command execution out of the tool surface. Set it to `true` only when the main agent and local synchronous subagents should receive DeepAgents 0.7's `execute` tool. The default ChainAgents backend is not execution-capable, so opting in exposes the tool for a compatible sandbox backend but does not grant host-shell access by itself. Remote async graphs have their own configuration.
 - `recursion_limit` is the LangGraph step limit for one agent run.
 - The built-in default is `100`; this repo's `deepagent.toml` sets it to `200`.
 - `DEEPAGENT_RECURSION_LIMIT` overrides this value when set.
@@ -757,6 +760,7 @@ Main `[agent]` additions:
 - `memory_namespace`: optional non-empty namespace for agent-scoped `/memories/` storage. Defaults to `filesystem`; allowed characters are letters, numbers, `-`, `_`, `.`, `@`, `+`, `:`, and `~`.
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
+- `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
@@ -948,11 +952,13 @@ Notes:
 
 Current scope of this config support:
 
-- it exposes `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, and
-  `execute` by default, plus `write_todos`, subagent tools, config-driven
-  skills, and MCP tools
+- it exposes `ls`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`
+  by default, plus `write_todos`, subagent tools, config-driven skills, and MCP
+  tools
 - it exposes recursive `delete` only when
   `[agent].delete_tool_enabled = true`
+- it exposes `execute` only when `[agent].execute_tool_enabled = true`; the
+  configured backend must also implement sandbox execution
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
 - if you need custom Python tools, extend [chainagents/runtime/core.py](chainagents/runtime/core.py)

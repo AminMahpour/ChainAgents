@@ -55,9 +55,10 @@ url = "http://localhost:8000/mcp"
 
 [agent]
 state = "stateful"
-# DeepAgents 0.7 adds a recursive delete tool. ChainAgents keeps it disabled
-# by default; opt in only when agents should be able to remove files.
+# DeepAgents 0.7 adds recursive delete and command execution tools. ChainAgents
+# keeps each tool disabled by default; opt in only when agents need that access.
 delete_tool_enabled = false
+execute_tool_enabled = false
 # Optional profile or raw model name for the main/supervisor agent.
 # model = "fast-local"
 # A repo-root AGENTS.md file is loaded automatically into the main agent prompt.

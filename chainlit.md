@@ -39,6 +39,9 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 - Recursive `delete` is disabled by default. Set
   `[agent].delete_tool_enabled = true` to expose it to the main agent and local
   synchronous subagents; remote async graphs are configured independently.
+- Command `execute` is also disabled by default. Set
+  `[agent].execute_tool_enabled = true` to expose it independently; the local
+  backend must implement compatible sandbox execution.
 - Use `[chainlit].commands` in `deepagent.toml` to add slash commands that can rewrite prompts, delegate to configured subagents, or invoke MCP tools directly.
 - Each sync subagent can have its own `skills` and `mcp_servers`.
 - Async subagents are Agent Protocol background jobs configured with `graph_id` and optional `url`/`headers`.

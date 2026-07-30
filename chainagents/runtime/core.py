@@ -96,7 +96,6 @@ DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS = (
     "edit_file",
     "glob",
     "grep",
-    "execute",
 )
 AGENT_MEMORY_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -1272,13 +1271,18 @@ def build_agent_middleware(
     # sync-subagent stacks. Passing another SummarizationMiddleware here creates
     # duplicate middleware names that LangChain rejects during agent creation.
     middleware: list[AgentMiddleware[Any, Any, Any]] = [TodoListMiddleware()]
-    if config is None or not config.extensions.delete_tool_enabled:
-        middleware.append(
-            FilesystemMiddleware(
-                backend=backend,
-                tools=list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS),
-            )
+    filesystem_tools = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
+    if config is not None:
+        if config.extensions.delete_tool_enabled:
+            filesystem_tools.append("delete")
+        if config.extensions.execute_tool_enabled:
+            filesystem_tools.append("execute")
+    middleware.append(
+        FilesystemMiddleware(
+            backend=backend,
+            tools=filesystem_tools,
         )
+    )
     middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
     return middleware
 
@@ -1790,6 +1794,7 @@ class ExtensionsConfig:
         agent_memory_namespace: Shared StoreBackend namespace for /memories/.
         agent_memory_files: Startup memory files loaded into the agent prompt.
         delete_tool_enabled: Whether to expose DeepAgents' recursive delete tool.
+        execute_tool_enabled: Whether to expose DeepAgents' execute tool.
         agent_reflection: Correction reflection workflow configuration.
         agent_model: Optional main-agent model profile or raw model name.
         recursion_limit: The recursion limit value.
@@ -1820,6 +1825,7 @@ class ExtensionsConfig:
     agent_memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE
     agent_memory_files: tuple[str, ...] = DEFAULT_AGENT_MEMORY_FILES
     delete_tool_enabled: bool = False
+    execute_tool_enabled: bool = False
     agent_reflection: ReflectionConfig = ReflectionConfig()
     agent_model: str | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
@@ -1852,6 +1858,7 @@ class ExtensionsConfig:
         return bool(
             self.skills
             or self.delete_tool_enabled
+            or self.execute_tool_enabled
             or self.agent_mcp_servers
             or self.subagents
             or self.async_subagents
@@ -2619,6 +2626,11 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         raise ValueError(
             "The top-level 'agent.delete_tool_enabled' config must be a boolean."
         )
+    raw_execute_tool_enabled = agent_section.get("execute_tool_enabled", False)
+    if not isinstance(raw_execute_tool_enabled, bool):
+        raise ValueError(
+            "The top-level 'agent.execute_tool_enabled' config must be a boolean."
+        )
     agent_reflection = normalize_reflection_config(
         agent_section.get("reflection"),
         agent_state=agent_state,
@@ -2850,6 +2862,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_memory_namespace=agent_memory_namespace,
         agent_memory_files=agent_memory_files,
         delete_tool_enabled=raw_delete_tool_enabled,
+        execute_tool_enabled=raw_execute_tool_enabled,
         agent_reflection=agent_reflection,
         agent_model=agent_model,
         recursion_limit=recursion_limit,
