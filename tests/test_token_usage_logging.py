@@ -37,7 +37,6 @@ def test_aggregates_model_calls_into_one_root_request_record(tmp_path: Path) -> 
     """A missing accumulator or write-once boundary must fail this test."""
     log_path = tmp_path / ".files" / "token-usage.jsonl"
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
     handler.on_llm_end(usage_result(10, 4), run_id=uuid4())
@@ -51,7 +50,6 @@ def test_aggregates_model_calls_into_one_root_request_record(tmp_path: Path) -> 
     record = records[0]
     assert isinstance(record.pop("timestamp"), str)
     assert record == {
-        "thread_id": "thread-1",
         "request_id": str(root_id),
         "status": "success",
         "input_tokens": 16,
@@ -66,7 +64,6 @@ def test_normalizes_provider_token_usage_when_standard_metadata_is_absent(
     """Removing fallback normalization must make provider usage disappear."""
     log_path = tmp_path / "token-usage.jsonl"
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
     result = LLMResult(
@@ -75,6 +72,32 @@ def test_normalizes_provider_token_usage_when_standard_metadata_is_absent(
             "token_usage": {
                 "prompt_tokens": 5,
                 "completion_tokens": 2,
+            }
+        },
+    )
+
+    handler.on_llm_end(result, run_id=uuid4())
+    handler.on_chain_end({}, run_id=uuid4())
+
+    record = json.loads(log_path.read_text())
+    assert record["input_tokens"] == 5
+    assert record["output_tokens"] == 2
+    assert record["total_tokens"] == 7
+
+
+def test_derives_total_when_provider_total_is_malformed(tmp_path: Path) -> None:
+    """Trusting a malformed total must make the aggregate inconsistent."""
+    log_path = tmp_path / "token-usage.jsonl"
+    handler = TokenUsageFileCallbackHandler(
+        log_path=log_path,
+    )
+    result = LLMResult(
+        generations=[[Generation(text="done")]],
+        llm_output={
+            "token_usage": {
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "total_tokens": "7",
             }
         },
     )
@@ -102,7 +125,6 @@ def test_standard_metadata_takes_precedence_over_provider_fallback(
         }
     }
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
 
@@ -121,7 +143,6 @@ def test_nested_chain_completion_does_not_write_a_request_record(
     """Removing the root-run check must create a premature nested record."""
     log_path = tmp_path / "token-usage.jsonl"
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
 
@@ -138,7 +159,6 @@ def test_repeated_root_terminal_events_write_once(tmp_path: Path) -> None:
     """Removing the terminal guard must duplicate the request record."""
     log_path = tmp_path / "token-usage.jsonl"
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
     root_id = uuid4()
@@ -153,7 +173,6 @@ def test_root_error_writes_usage_accumulated_before_failure(tmp_path: Path) -> N
     """Removing error finalization must lose tokens spent before a failure."""
     log_path = tmp_path / "token-usage.jsonl"
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
     handler.on_llm_end(usage_result(9, 3), run_id=uuid4())
@@ -173,7 +192,6 @@ def test_model_error_includes_usage_from_partial_response(tmp_path: Path) -> Non
     """Dropping an error response must undercount tokens consumed by that call."""
     log_path = tmp_path / "token-usage.jsonl"
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
 
@@ -196,7 +214,6 @@ def test_ignores_malformed_negative_and_boolean_token_counts(
     """Accepting invalid counts must corrupt totals or raise during logging."""
     log_path = tmp_path / "token-usage.jsonl"
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
     result = LLMResult(
@@ -227,7 +244,6 @@ def test_file_write_failure_warns_without_failing_the_request(
     log_path = tmp_path / "token-usage.jsonl"
     log_path.mkdir()
     handler = TokenUsageFileCallbackHandler(
-        thread_id="thread-1",
         log_path=log_path,
     )
 

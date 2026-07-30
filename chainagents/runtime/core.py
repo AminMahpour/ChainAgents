@@ -37,6 +37,7 @@ from deepagents.middleware.skills import _list_skills
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_anthropic import ChatAnthropic
 from langchain_ollama import ChatOllama
@@ -3657,15 +3658,35 @@ def shutdown_langfuse_client(config: RuntimeConfig) -> bool:
 
 def build_token_usage_callback_handler(
     *,
-    thread_id: str,
     project_root: Path | None = None,
 ) -> TokenUsageFileCallbackHandler:
     """Build the always-on request token usage callback."""
     root = (project_root or PROJECT_ROOT).resolve()
     return TokenUsageFileCallbackHandler(
-        thread_id=thread_id,
         log_path=root / DEFAULT_TOKEN_USAGE_LOG_PATH,
     )
+
+
+def build_agent_server_graph_factory(
+    graph: Any,
+    *,
+    project_root: Path | None = None,
+) -> Callable[[RunnableConfig], Any]:
+    """Build an Agent Server factory with request-scoped token logging."""
+
+    def graph_factory(_config: RunnableConfig) -> Any:
+        # Agent Server supplies this config again when invoking the returned
+        # graph. Bind only the new callback here so upstream callbacks are not
+        # duplicated when the invocation config is merged.
+        return graph.with_config(
+            callbacks=[
+                build_token_usage_callback_handler(
+                    project_root=project_root,
+                )
+            ]
+        )
+
+    return graph_factory
 
 
 def build_langgraph_run_config(
@@ -3689,7 +3710,6 @@ def build_langgraph_run_config(
         "recursion_limit": config.recursion_limit,
         "callbacks": [
             build_token_usage_callback_handler(
-                thread_id=thread_id,
                 project_root=project_root,
             )
         ],

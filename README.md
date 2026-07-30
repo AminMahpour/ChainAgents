@@ -419,13 +419,15 @@ Notes:
 ## Token Usage Log
 
 ChainAgents always appends one aggregate record per agent request to
-`.files/token-usage.jsonl`. The log covers Chainlit, CLI, TUI, API, and nested
-subagent model calls. Records contain the UTC timestamp, thread and request
-identifiers, completion status, and aggregate input, output, and total token
-counts.
+`.files/token-usage.jsonl`. The log covers Chainlit, CLI, TUI, API, Agent
+Server graphs, and nested subagent model calls. Records contain the UTC
+timestamp, an opaque request identifier, completion status, and aggregate
+input, output, and total token counts.
 
 The log never includes prompts, responses, tool arguments, or per-model
-breakdowns. The `.files/` directory is ignored by Git.
+breakdowns. It also omits conversation thread IDs so an agent-readable log
+cannot disclose reusable checkpoint identifiers between users. The `.files/`
+directory is ignored by Git.
 
 ## Optional: Enable Langfuse Tracing
 
@@ -875,7 +877,7 @@ For compatibility with DeepAgents' native discriminator, a `[[subagents]]` entry
 This repo includes a LangGraph co-deployment entrypoint for ASGI transport:
 
 - [langgraph.json](langgraph.json) registers `supervisor` and `async-researcher`
-- [langgraph_app.py](langgraph_app.py) exports both graphs
+- [langgraph_app.py](langgraph_app.py) exports request-scoped graph factories
 - omit `url` in `deepagent.toml` when running through LangGraph Agent Server
 
 Run the co-deployed Agent Protocol server with enough worker capacity for the supervisor plus background tasks:

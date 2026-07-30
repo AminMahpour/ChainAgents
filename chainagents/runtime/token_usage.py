@@ -32,10 +32,9 @@ class TokenUsageFileCallbackHandler(BaseCallbackHandler):
 
     run_inline = True
 
-    def __init__(self, *, thread_id: str, log_path: Path) -> None:
+    def __init__(self, *, log_path: Path) -> None:
         """Initialize a request-scoped token usage callback."""
         super().__init__()
-        self._thread_id = thread_id
         self._log_path = log_path
         self._state_lock = threading.Lock()
         self._input_tokens = 0
@@ -94,10 +93,11 @@ class TokenUsageFileCallbackHandler(BaseCallbackHandler):
             or 0
         )
         raw_total_tokens = usage.get("total_tokens")
+        normalized_total_tokens = _token_count(raw_total_tokens)
         total_tokens = (
             input_tokens + output_tokens
-            if raw_total_tokens is None
-            else (_token_count(raw_total_tokens) or 0)
+            if normalized_total_tokens is None
+            else normalized_total_tokens
         )
         with self._state_lock:
             self._input_tokens += input_tokens
@@ -140,7 +140,6 @@ class TokenUsageFileCallbackHandler(BaseCallbackHandler):
                 "timestamp": datetime.now(timezone.utc)
                 .isoformat(timespec="milliseconds")
                 .replace("+00:00", "Z"),
-                "thread_id": self._thread_id,
                 "request_id": str(run_id),
                 "status": status,
                 "input_tokens": self._input_tokens,

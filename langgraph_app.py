@@ -1,4 +1,4 @@
-"""Compatibility wrapper for the moved LangGraph app exports."""
+"""Compatibility wrapper for the moved LangGraph Agent Server exports."""
 
 from __future__ import annotations
 
