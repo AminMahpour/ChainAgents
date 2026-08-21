@@ -341,6 +341,42 @@ def test_ingest_uploaded_files_adds_thread_scoped_results(
     assert search_result["results"][0]["path"] == "uploaded/notes.md"
 
 
+def test_clone_thread_uploads_isolated_and_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify branch threads clone source uploads without escaping or duplicating."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    upload_source = tmp_path / "notes.md"
+    upload_source.write_text("uploaded content about release notes", encoding="utf-8")
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    service.ingest_uploaded_files(
+        thread_id="source-thread",
+        uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+    )
+
+    first = service.clone_thread_uploads(
+        source_thread_id="source-thread",
+        target_thread_id="../../branch-thread",
+    )
+    second = service.clone_thread_uploads(
+        source_thread_id="source-thread",
+        target_thread_id="../../branch-thread",
+    )
+
+    assert first.added_files == ("notes.md",)
+    assert second.added_files == ()
+    assert service.search(
+        query="release notes",
+        thread_id="../../branch-thread",
+    )["results"][0]["path"] == "uploaded/notes.md"
+    target_files = service._thread_upload_files_directory("../../branch-thread")
+    assert target_files.resolve().is_relative_to(service.uploads_root.resolve())
+    assert [path.name for path in target_files.iterdir()] == ["notes.md"]
+
+
 def test_ingest_uploaded_files_rejects_unsupported_extensions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

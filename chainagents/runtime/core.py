@@ -71,6 +71,7 @@ from chainagents.runtime.reflection import (
 
 ModelProvider = Literal["ollama", "openai_compatible", "anthropic"]
 ReasoningLevel = Literal["low", "medium", "high"]
+ModelModality = Literal["text", "image"]
 DisableStreaming = bool | Literal["tool_calling"]
 ModelThinking = Literal["auto", "adaptive", "disabled"]
 PersistenceMode = Literal["memory", "postgres"]
@@ -1904,6 +1905,7 @@ class ModelDefaults:
     temperature: float = DEFAULT_TEMPERATURE
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
+    modalities: tuple[ModelModality, ...] = ("text",)
     cross_provider_base_url: str | None = None
     cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     explicit_fields: frozenset[str] = field(
@@ -1930,6 +1932,36 @@ def _parse_model_names(value: Any, *, field_name: str) -> tuple[str, ...]:
         if candidate and candidate not in parsed_models:
             parsed_models.append(candidate)
     return tuple(parsed_models)
+
+
+def normalize_model_modalities(
+    value: Any | None,
+    *,
+    default: tuple[ModelModality, ...] = ("text",),
+    field_name: str = "[model].modalities",
+) -> tuple[ModelModality, ...]:
+    """Normalize declared model input modalities with a safe text-only default."""
+    if value is None:
+        return default
+    if not isinstance(value, list):
+        raise ValueError(f"The {field_name} config must be an array of strings.")
+
+    modalities: list[ModelModality] = []
+    for raw_modality in value:
+        if not isinstance(raw_modality, str):
+            raise ValueError(
+                f"The {field_name} config may only contain 'text' and 'image'."
+            )
+        modality = raw_modality.strip().lower()
+        if modality not in {"text", "image"}:
+            raise ValueError(
+                f"The {field_name} config may only contain 'text' and 'image'."
+            )
+        if modality not in modalities:
+            modalities.append(modality)  # type: ignore[arg-type]
+    if "text" not in modalities:
+        raise ValueError(f"The {field_name} config must include 'text'.")
+    return tuple(modalities)
 
 
 def parse_model_profile_defaults(
@@ -2103,6 +2135,13 @@ def parse_model_profile_defaults(
         or "disable_streaming_for_tool_calls" in raw_model
     ):
         explicit_fields.add("disable_streaming")
+    modalities = normalize_model_modalities(
+        raw_model.get("modalities") if "modalities" in raw_model else None,
+        default=(base.modalities if base is not None else ("text",)),
+        field_name=f"{field_prefix}.modalities",
+    )
+    if "modalities" in raw_model:
+        explicit_fields.add("modalities")
 
     return ModelDefaults(
         provider=provider,
@@ -2117,6 +2156,7 @@ def parse_model_profile_defaults(
         temperature=temperature,
         repeat_penalty=repeat_penalty,
         disable_streaming=disable_streaming,
+        modalities=modalities,
         explicit_fields=frozenset(explicit_fields),
     )
 
@@ -2228,6 +2268,7 @@ def rebase_model_profile_defaults(
         "temperature",
         "repeat_penalty",
         "disable_streaming",
+        "modalities",
     ):
         if (
             field_name in runtime_override_fields
@@ -3112,6 +3153,7 @@ class RuntimeConfig:
     model_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_disable_streaming: DisableStreaming = False
     model_thinking: ModelThinking = DEFAULT_MODEL_THINKING
+    model_modalities: tuple[ModelModality, ...] = ("text",)
     model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
     model_api_key_override: str | None = None
     model_default_name: str | None = None
@@ -3473,6 +3515,7 @@ class RuntimeConfig:
             temperature=model_temperature,
             repeat_penalty=model_repeat_penalty,
             disable_streaming=model_disable_streaming,
+            modalities=model_defaults.modalities,
             cross_provider_base_url=cross_provider_model_base_url,
             cross_provider_endpoint_query=cross_provider_model_endpoint_query,
             runtime_override_fields=(
@@ -3570,6 +3613,7 @@ class RuntimeConfig:
             model_endpoint_query=model_endpoint_query,
             model_disable_streaming=model_disable_streaming,
             model_thinking=model_defaults.thinking,
+            model_modalities=model_defaults.modalities,
             model_profiles=file_config.model_profiles,
             model_api_key_override=model_api_key_override,
             model_default_name=model_default_name,
@@ -3714,6 +3758,9 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
         ),
         disable_streaming=normalize_disable_streaming(
             getattr(config, "model_disable_streaming", False)
+        ),
+        modalities=normalize_model_modalities(
+            list(getattr(config, "model_modalities", ("text",))),
         ),
         cross_provider_base_url=getattr(
             config,
@@ -5109,6 +5156,24 @@ class AgentRuntime:
             self._rag_service.ingest_uploaded_files,
             thread_id=thread_id,
             uploads=uploads,
+        )
+
+    async def clone_rag_uploads(
+        self,
+        *,
+        source_thread_id: str,
+        target_thread_id: str,
+    ) -> RagUploadResult:
+        """Clone thread-scoped RAG uploads for a fresh conversation branch."""
+        if self._rag_service is None:
+            return RagUploadResult(
+                thread_id=target_thread_id,
+                reason=self.config.rag_error or "Knowledge index is unavailable.",
+            )
+        return await asyncio.to_thread(
+            self._rag_service.clone_thread_uploads,
+            source_thread_id=source_thread_id,
+            target_thread_id=target_thread_id,
         )
 
     def resolve_chainlit_command(self, name: str) -> ChainlitCommandConfig | None:

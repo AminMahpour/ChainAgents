@@ -20,6 +20,7 @@ dependencies = [
     "markdown-it-py>=4.0.0",
     "psycopg[binary,pool]>=3.2.0",
     "pytest>=8.3.0",
+    "python-multipart>=0.0.32",
     "rich>=15.0.0",
     "textual>=6.1.0",
     "uvicorn>=0.44.0",

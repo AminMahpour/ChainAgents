@@ -373,11 +373,13 @@ provider = "openai_compatible"
 base_url = "http://127.0.0.1:1234/v1"
 name = "local-default"
 models = ["local-default"]
+modalities = ["text"]
 
 [model.profiles.fast-local]
 name = "local-fast"
 temperature = 0.1
 reasoning_effort = "low"
+modalities = ["text", "image"]
 
 [model.profiles.claude-reviewer]
 provider = "anthropic"
@@ -404,6 +406,7 @@ Notes:
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
+- `modalities` declares accepted input types for a model or profile. It defaults to `["text"]`; add `"image"` only for models that accept image content.
 - `[model.profiles.<name>]` defines a named profile. Profiles inherit omitted fields from `[model]` when they keep the same provider; profiles that switch to `openai_compatible` must provide `base_url` or `endpoint_url`, and profiles that switch to `anthropic` default to `https://api.anthropic.com` unless `base_url` or `endpoint_url` is set.
 - Profile names are surfaced in Chainlit settings and modes alongside `[model].models`. When a selected value matches a profile name, the full profile is used; otherwise the value is treated as a raw model name using the inherited/default provider settings.
 - `[agent].model` optionally sets the main/supervisor agent's default profile or raw model name. CLI and environment model overrides still take precedence.
