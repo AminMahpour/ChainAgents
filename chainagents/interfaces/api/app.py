@@ -12,10 +12,12 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.exports.response import build_pdf_bytes
 from chainagents.runtime import (
     AgentRuntime,
     ReasoningLevel,
@@ -28,6 +30,7 @@ from chainagents.runtime.reflection import ReflectionCollector
 
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
+MAX_RESPONSE_PDF_CONTENT_LENGTH = 2_000_000
 
 
 class AgentRunRequest(BaseModel):
@@ -60,6 +63,22 @@ class RuntimeStatusResponse(BaseModel):
     agent_state: str
     recursion_limit: int
     persistence_mode: str
+
+
+class ResponsePdfExportRequest(BaseModel):
+    """HTTP request body for exporting one assistant response as PDF."""
+
+    content: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_RESPONSE_PDF_CONTENT_LENGTH,
+    )
+    filename: str = Field(
+        default="response",
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
 
 
 @dataclass(frozen=True)
@@ -124,6 +143,27 @@ def create_app(runtime: Any | None = None) -> FastAPI:
             agent_state=config.agent_state,
             recursion_limit=config.recursion_limit,
             persistence_mode=config.persistence_mode,
+        )
+
+    @app.post("/api/exports/pdf", response_class=Response)
+    async def export_response_pdf(payload: ResponsePdfExportRequest) -> Response:
+        content = payload.content.strip()
+        if not content:
+            raise HTTPException(status_code=422, detail="content must not be blank.")
+
+        try:
+            pdf_content = await run_in_threadpool(build_pdf_bytes, content)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        return Response(
+            content=pdf_content,
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{payload.filename}.pdf"'
+                )
+            },
+            media_type="application/pdf",
         )
 
     @app.post("/api/agent/invoke", response_model=AgentRunResponse)

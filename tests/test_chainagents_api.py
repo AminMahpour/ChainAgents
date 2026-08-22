@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 import chainagents_api
@@ -101,6 +102,112 @@ def test_status_reports_runtime_configuration() -> None:
         "agent_state": "stateful",
         "recursion_limit": 100,
         "persistence_mode": "memory",
+    }
+
+
+def test_export_response_pdf_returns_downloadable_pdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify response Markdown is rendered and returned as a PDF attachment."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+    rendered: list[str] = []
+
+    def fake_build_pdf_bytes(content: str) -> bytes:
+        rendered.append(content)
+        return b"%PDF-response"
+
+    monkeypatch.setattr(
+        chainagents_api,
+        "build_pdf_bytes",
+        fake_build_pdf_bytes,
+        raising=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/exports/pdf",
+            json={"content": "# Exported response", "filename": "response-message-123"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF-response"
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="response-message-123.pdf"'
+    )
+    assert rendered == ["# Exported response"]
+
+
+def test_export_response_pdf_rejects_blank_content() -> None:
+    """Verify empty assistant responses cannot produce meaningless exports."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/exports/pdf",
+            json={"content": "   ", "filename": "response"},
+        )
+
+    assert response.status_code == 422
+
+
+def test_export_response_pdf_rejects_oversized_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify excessively large payloads are rejected before PDF rendering."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+    rendered: list[str] = []
+
+    def fake_build_pdf_bytes(content: str) -> bytes:
+        rendered.append(content)
+        return b"%PDF-response"
+
+    monkeypatch.setattr(
+        chainagents_api,
+        "build_pdf_bytes",
+        fake_build_pdf_bytes,
+        raising=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/exports/pdf",
+            json={"content": "a" * 2_000_001, "filename": "response"},
+        )
+
+    assert response.status_code == 422
+    assert rendered == []
+
+
+def test_export_response_pdf_reports_renderer_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify WeasyPrint runtime failures become actionable API errors."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    def fail_build_pdf_bytes(_content: str) -> bytes:
+        raise RuntimeError("PDF export requires WeasyPrint native libraries.")
+
+    monkeypatch.setattr(
+        chainagents_api,
+        "build_pdf_bytes",
+        fail_build_pdf_bytes,
+        raising=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/exports/pdf",
+            json={"content": "response", "filename": "response"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "PDF export requires WeasyPrint native libraries."
     }
 
 
