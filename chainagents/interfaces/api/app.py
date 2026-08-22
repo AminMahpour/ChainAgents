@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from chainagents.commands.native import (
     dumps_tool_result,
@@ -29,6 +30,7 @@ from chainagents.commands.native import (
     resolve_runtime_command,
 )
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.exports.response import build_pdf_bytes
 from chainagents.interfaces.uploads import (
     MAX_UPLOAD_FILE_BYTES,
     MAX_UPLOAD_FILES,
@@ -57,6 +59,9 @@ from chainagents.runtime.reflection import (
 
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
+MAX_RESPONSE_PDF_CONTENT_LENGTH = 100_000
+MAX_RESPONSE_PDF_LINES = 2_000
+MAX_CONCURRENT_RESPONSE_PDF_EXPORTS = 1
 MAX_HISTORY_MESSAGES = 200
 MAX_PENDING_REFLECTIONS = 128
 
@@ -262,6 +267,22 @@ class ReflectionSaveResponse(BaseModel):
     thread_id: str
 
 
+class ResponsePdfExportRequest(BaseModel):
+    """HTTP request body for exporting one assistant response as PDF."""
+
+    content: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_RESPONSE_PDF_CONTENT_LENGTH,
+    )
+    filename: str = Field(
+        default="response",
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+
+
 @dataclass(frozen=True)
 class AgentRunContext:
     """Resolved request values used for one agent run."""
@@ -304,6 +325,7 @@ def create_app(
     managed_runtime: AgentRuntime | None = None
     configured_ui_directory = _resolve_ui_directory(ui_dir)
     pending_reflections: OrderedDict[str, PendingReflection] = OrderedDict()
+    pdf_render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESPONSE_PDF_EXPORTS)
 
     def store_pending_reflection(
         token: str,
@@ -418,6 +440,48 @@ def create_app(
                 image_mime_types=list(SUPPORTED_IMAGE_MIME_TYPES),
                 rag_extensions=list(SUPPORTED_RAG_EXTENSIONS),
             ),
+        )
+
+    @app.post(
+        "/api/exports/pdf",
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Rendered assistant response PDF.",
+                "content": {
+                    "application/pdf": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                },
+            }
+        },
+    )
+    async def export_response_pdf(payload: ResponsePdfExportRequest) -> Response:
+        content = payload.content.strip()
+        if not content:
+            raise HTTPException(status_code=422, detail="content must not be blank.")
+        if len(content.splitlines()) > MAX_RESPONSE_PDF_LINES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"content must contain at most {MAX_RESPONSE_PDF_LINES:,} lines."
+                ),
+            )
+
+        try:
+            async with pdf_render_semaphore:
+                pdf_content = await run_in_threadpool(build_pdf_bytes, content)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        return Response(
+            content=pdf_content,
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{payload.filename}.pdf"'
+                )
+            },
+            media_type="application/pdf",
         )
 
     @app.post("/api/agent/invoke", response_model=AgentRunResponse)
