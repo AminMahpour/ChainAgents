@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
-import mimetypes
 import os
 import secrets
 import traceback
@@ -33,6 +31,15 @@ from chainagents.commands.native import (
 from chainagents.interfaces.chainlit.async_tasks import AsyncTaskNotifier, async_subagent_url_override
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
+from chainagents.interfaces.uploads import (
+    RAG_UPLOAD_ACCEPT,
+    NormalizedUpload,
+    image_content_part,
+    is_image_upload,
+    prompt_with_images,
+    provider_safe_image_mime_type,
+    uploaded_file_mime_type as _shared_uploaded_file_mime_type,
+)
 from chainagents.runtime import (
     DEFAULT_REASONING_LEVEL,
     AgentRuntime,
@@ -70,64 +77,6 @@ REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
 UPLOAD_RAG_FILE_ACTION = "upload_rag_file"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
 REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
-RAG_UPLOAD_ACCEPT = {
-    "text/plain": [
-        ".csv",
-        ".json",
-        ".log",
-        ".md",
-        ".py",
-        ".rst",
-        ".text",
-        ".toml",
-        ".txt",
-        ".yaml",
-        ".yml",
-    ],
-    "application/json": [".json"],
-    "text/markdown": [".md"],
-    "application/octet-stream": [
-        ".csv",
-        ".json",
-        ".log",
-        ".md",
-        ".py",
-        ".rst",
-        ".text",
-        ".toml",
-        ".txt",
-        ".yaml",
-        ".yml",
-    ],
-}
-IMAGE_UPLOAD_EXTENSIONS = {
-    ".bmp",
-    ".gif",
-    ".heic",
-    ".heif",
-    ".jpeg",
-    ".jpg",
-    ".png",
-    ".tif",
-    ".tiff",
-    ".webp",
-}
-VISION_IMAGE_MIME_TYPE_BY_EXTENSION = {
-    ".gif": "image/gif",
-    ".jpeg": "image/jpeg",
-    ".jpg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
-}
-VISION_IMAGE_MIME_TYPES = frozenset(VISION_IMAGE_MIME_TYPE_BY_EXTENSION.values())
-VISION_IMAGE_MIME_ALIASES = {
-    "image/jpg": "image/jpeg",
-    "image/pjpeg": "image/jpeg",
-    "image/x-png": "image/png",
-}
-GENERIC_UPLOAD_MIME_TYPES = {"", "application/octet-stream"}
-
-
 def load_chainlit_auth_users(
     *,
     raw_users: str | None = None,
@@ -599,32 +548,8 @@ def uploaded_file_mime_type(element: Any, *, path: Path, name: str) -> str:
     for attr in ("mime", "mime_type", "content_type"):
         raw_mime = getattr(element, attr, None)
         if isinstance(raw_mime, str) and "/" in raw_mime:
-            return raw_mime.split(";", 1)[0].strip().lower()
-
-    for candidate in (name, path.name):
-        guessed_type, _ = mimetypes.guess_type(candidate)
-        if guessed_type:
-            return guessed_type.lower()
-    return ""
-
-
-def is_image_upload(path: Path, mime_type: str) -> bool:
-    """Return whether an uploaded file should be sent as an image attachment."""
-    if mime_type.startswith("image/"):
-        return True
-    return path.suffix.lower() in IMAGE_UPLOAD_EXTENSIONS
-
-
-def provider_safe_image_mime_type(path: Path, mime_type: str) -> str | None:
-    """Return a vision-provider-safe MIME type for an uploaded image."""
-    normalized_mime = VISION_IMAGE_MIME_ALIASES.get(mime_type, mime_type)
-    if normalized_mime in VISION_IMAGE_MIME_TYPES:
-        return normalized_mime
-
-    inferred_mime = VISION_IMAGE_MIME_TYPE_BY_EXTENSION.get(path.suffix.lower())
-    if inferred_mime and normalized_mime in GENERIC_UPLOAD_MIME_TYPES:
-        return inferred_mime
-    return None
+            return _shared_uploaded_file_mime_type(raw_mime, path=path, name=name)
+    return _shared_uploaded_file_mime_type(None, path=path, name=name)
 
 
 def message_uploaded_rag_files(message: cl.Message) -> list[UploadedRagFile]:
@@ -678,14 +603,18 @@ def message_uploaded_image_parts(message: cl.Message) -> list[dict[str, Any]]:
         if image_mime_type is None:
             continue
         try:
-            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            data = path.read_bytes()
         except OSError:
             continue
         parts.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{image_mime_type};base64,{encoded}"},
-            }
+            image_content_part(
+                NormalizedUpload(
+                    name=path.name,
+                    mime_type=image_mime_type,
+                    kind="image",
+                    data=data,
+                )
+            )
         )
     return parts
 
@@ -697,21 +626,11 @@ def chainlit_prompt_text(
     prompt_note: str,
 ) -> str:
     """Build the text part of a Chainlit user message sent to the agent."""
-    if not image_names:
-        return f"{content}{prompt_note}"
-
-    prompt = content.strip()
-    if not prompt and image_names:
-        prompt = "Extract any visible text from the attached image(s)."
-
-    attached = ", ".join(f"`{name}`" for name in image_names)
-    prompt = (
-        f"{prompt}\n\n"
-        f"Attached image file(s): {attached}. "
-        "Use the image content directly when answering."
+    return prompt_with_images(
+        content,
+        image_names=image_names,
+        prompt_note=prompt_note,
     )
-
-    return f"{prompt}{prompt_note}"
 
 
 def chainlit_user_message_content(
