@@ -59,7 +59,9 @@ from chainagents.runtime.reflection import (
 
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
-MAX_RESPONSE_PDF_CONTENT_LENGTH = 2_000_000
+MAX_RESPONSE_PDF_CONTENT_LENGTH = 100_000
+MAX_RESPONSE_PDF_LINES = 2_000
+MAX_CONCURRENT_RESPONSE_PDF_EXPORTS = 1
 MAX_HISTORY_MESSAGES = 200
 MAX_PENDING_REFLECTIONS = 128
 
@@ -323,6 +325,7 @@ def create_app(
     managed_runtime: AgentRuntime | None = None
     configured_ui_directory = _resolve_ui_directory(ui_dir)
     pending_reflections: OrderedDict[str, PendingReflection] = OrderedDict()
+    pdf_render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESPONSE_PDF_EXPORTS)
 
     def store_pending_reflection(
         token: str,
@@ -439,14 +442,35 @@ def create_app(
             ),
         )
 
-    @app.post("/api/exports/pdf", response_class=Response)
+    @app.post(
+        "/api/exports/pdf",
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Rendered assistant response PDF.",
+                "content": {
+                    "application/pdf": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                },
+            }
+        },
+    )
     async def export_response_pdf(payload: ResponsePdfExportRequest) -> Response:
         content = payload.content.strip()
         if not content:
             raise HTTPException(status_code=422, detail="content must not be blank.")
+        if len(content.splitlines()) > MAX_RESPONSE_PDF_LINES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"content must contain at most {MAX_RESPONSE_PDF_LINES:,} lines."
+                ),
+            )
 
         try:
-            pdf_content = await run_in_threadpool(build_pdf_bytes, content)
+            async with pdf_render_semaphore:
+                pdf_content = await run_in_threadpool(build_pdf_bytes, content)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 

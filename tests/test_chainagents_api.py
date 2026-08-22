@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import json
-from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event, Lock
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -303,6 +305,77 @@ def test_export_response_pdf_returns_downloadable_pdf(
     assert rendered == ["# Exported response"]
 
 
+def test_export_response_pdf_declares_binary_openapi_response() -> None:
+    """Verify generated clients can identify the successful PDF body."""
+    app = chainagents_api.create_app(runtime=_FakeRuntime(_FakeAgent([])))
+
+    pdf_schema = app.openapi()["paths"]["/api/exports/pdf"]["post"]["responses"][
+        "200"
+    ]["content"]["application/pdf"]["schema"]
+
+    assert pdf_schema == {"type": "string", "format": "binary"}
+
+
+def test_export_response_pdf_serializes_concurrent_renders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify one app process admits only one PDF renderer at a time."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+    render_lock = Lock()
+    active_renders = 0
+    max_active_renders = 0
+
+    def fake_build_pdf_bytes(content: str) -> bytes:
+        nonlocal active_renders, max_active_renders
+        with render_lock:
+            active_renders += 1
+            max_active_renders = max(max_active_renders, active_renders)
+        try:
+            if content == "first":
+                first_started.set()
+                if not release_first.wait(timeout=2):
+                    raise RuntimeError("timed out waiting to finish the first render")
+            else:
+                second_started.set()
+            return b"%PDF-response"
+        finally:
+            with render_lock:
+                active_renders -= 1
+
+    monkeypatch.setattr(
+        chainagents_api,
+        "build_pdf_bytes",
+        fake_build_pdf_bytes,
+        raising=False,
+    )
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        first_response = pool.submit(
+            client.post,
+            "/api/exports/pdf",
+            json={"content": "first", "filename": "first"},
+        )
+        assert first_started.wait(timeout=2)
+        second_response = pool.submit(
+            client.post,
+            "/api/exports/pdf",
+            json={"content": "second", "filename": "second"},
+        )
+        try:
+            assert not second_started.wait(timeout=0.2)
+        finally:
+            release_first.set()
+
+        assert first_response.result(timeout=3).status_code == 200
+        assert second_response.result(timeout=3).status_code == 200
+
+    assert max_active_renders == 1
+
+
 def test_export_response_pdf_rejects_blank_content() -> None:
     """Verify empty assistant responses cannot produce meaningless exports."""
     runtime = _FakeRuntime(_FakeAgent([]))
@@ -339,10 +412,45 @@ def test_export_response_pdf_rejects_oversized_content(
     with TestClient(app) as client:
         response = client.post(
             "/api/exports/pdf",
-            json={"content": "a" * 2_000_001, "filename": "response"},
+            json={"content": "a" * 100_001, "filename": "response"},
         )
 
     assert response.status_code == 422
+    assert rendered == []
+
+
+def test_export_response_pdf_rejects_structurally_expensive_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify line-heavy Markdown is rejected before PDF rendering."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+    rendered: list[str] = []
+
+    def fake_build_pdf_bytes(content: str) -> bytes:
+        rendered.append(content)
+        return b"%PDF-response"
+
+    monkeypatch.setattr(
+        chainagents_api,
+        "build_pdf_bytes",
+        fake_build_pdf_bytes,
+        raising=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/exports/pdf",
+            json={
+                "content": "\n\n".join(["paragraph"] * 5_000),
+                "filename": "response",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "content must contain at most 2,000 lines."
+    }
     assert rendered == []
 
 
