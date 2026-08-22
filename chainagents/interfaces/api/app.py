@@ -9,8 +9,10 @@ import base64
 import binascii
 import json
 import os
+import secrets
 import tempfile
-from collections.abc import AsyncIterator
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -55,6 +57,8 @@ from chainagents.runtime.reflection import (
 
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
+MAX_HISTORY_MESSAGES = 200
+MAX_PENDING_REFLECTIONS = 128
 
 
 class AgentImageUrl(BaseModel):
@@ -127,8 +131,26 @@ class AgentRunRequest(BaseModel):
     reasoning: ReasoningLevel | None = None
     async_subagent_url: str | None = None
     mcp_session_id: str | None = None
-    history: list[AgentHistoryMessage] = Field(default_factory=list)
+    history: list[AgentHistoryMessage] = Field(
+        default_factory=list,
+        max_length=MAX_HISTORY_MESSAGES,
+    )
     source_thread_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_history_image_count(self) -> "AgentRunRequest":
+        """Bound replay images to the same aggregate limit as uploads."""
+        image_count = sum(
+            isinstance(part, AgentImageContentPart)
+            for message in self.history
+            if isinstance(message.content, list)
+            for part in message.content
+        )
+        if image_count > MAX_UPLOAD_FILES:
+            raise ValueError(
+                f"history may contain at most {MAX_UPLOAD_FILES} image attachments"
+            )
+        return self
 
 
 class AgentRunResponse(BaseModel):
@@ -214,6 +236,7 @@ class ReflectionProposalRequest(BaseModel):
     trigger: str = Field(..., min_length=1)
     tool_name: str = ""
     tool_result: str = ""
+    confirmation_token: str = Field(..., min_length=1)
 
 
 class ReflectionSaveRequest(BaseModel):
@@ -253,6 +276,14 @@ class AgentRunContext:
     image_parts: tuple[dict[str, Any], ...] = ()
 
 
+@dataclass(frozen=True)
+class PendingReflection:
+    """Bind one opaque confirmation token to a server-issued proposal."""
+
+    thread_id: str
+    proposal: ReflectionProposal
+
+
 def create_app(
     runtime: Any | None = None,
     ui_dir: str | Path | None = None,
@@ -267,6 +298,31 @@ def create_app(
     """
     managed_runtime: AgentRuntime | None = None
     configured_ui_directory = _resolve_ui_directory(ui_dir)
+    pending_reflections: OrderedDict[str, PendingReflection] = OrderedDict()
+
+    def store_pending_reflection(
+        token: str,
+        pending: PendingReflection,
+    ) -> None:
+        """Store one bounded pending proposal, evicting the oldest if needed."""
+        pending_reflections[token] = pending
+        pending_reflections.move_to_end(token)
+        while len(pending_reflections) > MAX_PENDING_REFLECTIONS:
+            pending_reflections.popitem(last=False)
+
+    def issue_reflection_token(
+        thread_id: str,
+        proposal: ReflectionProposal,
+    ) -> str:
+        """Issue an opaque token proving a proposal originated from this server."""
+        token = secrets.token_urlsafe(32)
+        while token in pending_reflections:
+            token = secrets.token_urlsafe(32)
+        store_pending_reflection(
+            token,
+            PendingReflection(thread_id=thread_id, proposal=proposal),
+        )
+        return token
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -393,7 +449,11 @@ def create_app(
         active_runtime = _runtime_from_request(request)
         context = await _prepare_run_context(active_runtime, payload)
         return StreamingResponse(
-            _agent_stream_lines(active_runtime, context),
+            _agent_stream_lines(
+                active_runtime,
+                context,
+                issue_reflection_token=issue_reflection_token,
+            ),
             media_type=NDJSON_MEDIA_TYPE,
         )
 
@@ -506,7 +566,11 @@ def create_app(
                     prompt=final_prompt,
                     image_parts=image_parts,
                 )
-                async for line in _agent_stream_lines(active_runtime, active_context):
+                async for line in _agent_stream_lines(
+                    active_runtime,
+                    active_context,
+                    issue_reflection_token=issue_reflection_token,
+                ):
                     yield line
             finally:
                 temporary_directory.cleanup()
@@ -566,29 +630,52 @@ def create_app(
             tool_name=proposal_payload.tool_name.strip(),
             tool_result=proposal_payload.tool_result.strip(),
         )
+        confirmation_token = proposal_payload.confirmation_token.strip()
+        pending_reflection = pending_reflections.get(confirmation_token)
+        if pending_reflection is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Reflection proposal is unknown, expired, or already saved.",
+            )
+        if (
+            pending_reflection.thread_id != context.thread_id
+            or pending_reflection.proposal != proposal
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Reflection proposal does not match the server-issued proposal.",
+            )
+
+        pending_reflections.pop(confirmation_token)
         reflection_thread_id = f"{context.thread_id}:reflection"
-        agent = await active_runtime.get_agent(
-            context.reasoning_level,
-            model_name=context.model_name,
-            reasoning_level_is_explicit=context.reasoning_level_is_explicit,
-            thread_id=reflection_thread_id,
-            async_subagent_url_override=context.async_subagent_url,
-            mcp_session_id=context.mcp_session_id,
-        )
-        await agent.ainvoke(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": reflection_save_prompt(proposal),
-                    }
-                ]
-            },
-            config=build_langgraph_run_config(
-                active_runtime.config,
+        saved = False
+        try:
+            agent = await active_runtime.get_agent(
+                context.reasoning_level,
+                model_name=context.model_name,
+                reasoning_level_is_explicit=context.reasoning_level_is_explicit,
                 thread_id=reflection_thread_id,
-            ),
-        )
+                async_subagent_url_override=context.async_subagent_url,
+                mcp_session_id=context.mcp_session_id,
+            )
+            await agent.ainvoke(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": reflection_save_prompt(proposal),
+                        }
+                    ]
+                },
+                config=build_langgraph_run_config(
+                    active_runtime.config,
+                    thread_id=reflection_thread_id,
+                ),
+            )
+            saved = True
+        finally:
+            if not saved:
+                store_pending_reflection(confirmation_token, pending_reflection)
         return ReflectionSaveResponse(
             saved=True,
             memory_file=configured_memory_file,
@@ -679,6 +766,8 @@ def _store_temporary_rag_uploads(
 async def _agent_stream_lines(
     runtime: Any,
     context: AgentRunContext,
+    *,
+    issue_reflection_token: Callable[[str, ReflectionProposal], str],
 ) -> AsyncIterator[str]:
     """Yield the stable NDJSON stream contract for one resolved run."""
     if context.command_error:
@@ -707,13 +796,11 @@ async def _agent_stream_lines(
         proposal = reflection_collector.build_proposal()
         if proposal is not None:
             yield _json_line(
-                {
-                    "kind": "reflection_proposal",
-                    "proposal": proposal.to_payload(),
-                    "thread_id": context.thread_id,
-                    "model": context.model_name,
-                    "reasoning": context.reasoning_level,
-                }
+                _reflection_proposal_payload(
+                    proposal,
+                    context,
+                    issue_reflection_token=issue_reflection_token,
+                )
             )
         yield _json_line(_done_payload(context))
     except asyncio.CancelledError:
@@ -723,13 +810,11 @@ async def _agent_stream_lines(
         proposal = reflection_collector.build_proposal()
         if proposal is not None:
             yield _json_line(
-                {
-                    "kind": "reflection_proposal",
-                    "proposal": proposal.to_payload(),
-                    "thread_id": context.thread_id,
-                    "model": context.model_name,
-                    "reasoning": context.reasoning_level,
-                }
+                _reflection_proposal_payload(
+                    proposal,
+                    context,
+                    issue_reflection_token=issue_reflection_token,
+                )
             )
         yield _json_line(
             {
@@ -740,6 +825,27 @@ async def _agent_stream_lines(
                 "reasoning": context.reasoning_level,
             }
         )
+
+
+def _reflection_proposal_payload(
+    proposal: ReflectionProposal,
+    context: AgentRunContext,
+    *,
+    issue_reflection_token: Callable[[str, ReflectionProposal], str],
+) -> dict[str, Any]:
+    """Build a reflection event whose proposal can be confirmed exactly once."""
+    proposal_payload = proposal.to_payload()
+    proposal_payload["confirmation_token"] = issue_reflection_token(
+        context.thread_id,
+        proposal,
+    )
+    return {
+        "kind": "reflection_proposal",
+        "proposal": proposal_payload,
+        "thread_id": context.thread_id,
+        "model": context.model_name,
+        "reasoning": context.reasoning_level,
+    }
 
 
 def _done_payload(context: AgentRunContext) -> dict[str, Any]:
