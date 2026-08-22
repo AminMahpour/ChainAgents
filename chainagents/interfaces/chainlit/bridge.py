@@ -15,6 +15,7 @@ import chainlit as cl
 from chainlit.utils import utc_now
 
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.exports.generated_files import generated_file_paths_from_tool_args
 from chainagents.runtime.reflection import ReflectionCollector, ReflectionProposal
 from chainagents.exports.response import attach_response_export_actions
 
@@ -69,14 +70,6 @@ def load_auto_collapse_delay_seconds() -> float:
 
 AUTO_COLLAPSE_DELAY_SECONDS = load_auto_collapse_delay_seconds()
 ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
-GENERATED_FILE_TOOL_SUFFIXES = ("write_file", "edit_file", "create_file")
-GENERATED_FILE_PATH_ARG_KEYS = (
-    "path",
-    "file_path",
-    "destination",
-    "dest",
-    "output_path",
-)
 GENERATIVE_UI_COMPONENTS = frozenset({"GeneratedPanel"})
 
 
@@ -482,31 +475,6 @@ def tool_task_title(source: str, tool_name: str, raw_args: str) -> str:
                 return f"{source}: {titled}" if source != "main-agent" else titled
 
     return f"{source}: {name}" if source != "main-agent" else name
-
-
-def generated_file_paths_from_tool_args(tool_name: str, raw_args: str) -> tuple[str, ...]:
-    """Return generated file paths captured from write-style tool arguments."""
-    name = tool_name.strip().lower()
-    if not any(name.endswith(suffix) for suffix in GENERATED_FILE_TOOL_SUFFIXES):
-        return ()
-
-    parsed = parse_tool_args(raw_args)
-    if not isinstance(parsed, dict):
-        return ()
-
-    paths: list[str] = []
-    for key in GENERATED_FILE_PATH_ARG_KEYS:
-        value = parsed.get(key)
-        if isinstance(value, str) and value.strip():
-            paths.append(value.strip())
-        elif isinstance(value, list):
-            paths.extend(
-                item.strip()
-                for item in value
-                if isinstance(item, str) and item.strip()
-            )
-
-    return tuple(dict.fromkeys(paths))
 
 
 def is_assistant_message(message: Any) -> bool:
