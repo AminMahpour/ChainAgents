@@ -14,26 +14,25 @@ import chainlit as cl
 from chainlit.element import Element, File, Pdf
 from markdown_it import MarkdownIt
 
+from chainagents.exports.generated_files import (
+    GENERATED_FILE_PATH_RE,
+    GENERATED_OUTPUTS_DIRECTORY,
+    MAX_GENERATED_FILES,
+)
+
 
 DOWNLOAD_MARKDOWN_ACTION = "download_response_markdown"
 DOWNLOAD_PDF_ACTION = "download_response_pdf"
 RESPONSE_EXPORTS_SESSION_KEY = "response_exports"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
-GENERATED_OUTPUTS_DIRECTORY = Path(".files/outputs")
-MAX_GENERATED_FILE_ATTACHMENTS = 12
+MAX_GENERATED_FILE_ATTACHMENTS = MAX_GENERATED_FILES
 HOMEBREW_LIBRARY_PATH = Path("/opt/homebrew/lib")
 PDF_EXPORT_DEPENDENCY_ERROR = (
     "PDF export requires WeasyPrint and its native runtime libraries. "
     "On macOS, install them with `brew install weasyprint`; on Linux, install "
     "the Pango packages listed in the WeasyPrint installation guide. Restart "
     "the app after installing the system libraries."
-)
-GENERATED_FILE_PATH_RE = re.compile(
-    r"(?P<path>"
-    r"(?:/workspace/|\.files/outputs/|/[^`'\"<>\s)]*/\.files/outputs/)"
-    r"[^`'\"<>\s)]*"
-    r")"
 )
 GENERATED_FILE_TRAILING_PUNCTUATION = ".,;:!?"
 PDF_STYLES = """

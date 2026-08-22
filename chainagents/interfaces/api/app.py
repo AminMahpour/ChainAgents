@@ -8,6 +8,7 @@ import asyncio
 import base64
 import binascii
 import json
+import mimetypes
 import os
 import secrets
 import tempfile
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
@@ -30,6 +31,12 @@ from chainagents.commands.native import (
     resolve_runtime_command,
 )
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.exports.generated_files import (
+    generated_file_descriptors,
+    generated_file_paths_from_text,
+    generated_file_paths_from_tool_args,
+    resolve_generated_download,
+)
 from chainagents.exports.response import build_pdf_bytes
 from chainagents.interfaces.uploads import (
     MAX_UPLOAD_FILE_BYTES,
@@ -202,6 +209,7 @@ class RuntimeModelOption(BaseModel):
 class RuntimeFeatureFlags(BaseModel):
     """UI surfaces supported by the active ChainAgents configuration."""
 
+    generated_files: bool
     reasoning: bool
     tools: bool
     generated_panels: bool
@@ -406,6 +414,7 @@ def create_app(
             models=model_options,
             reasoning_levels=["low", "medium", "high"],
             features=RuntimeFeatureFlags(
+                generated_files=True,
                 reasoning=bool(
                     getattr(extensions, "chainlit_reasoning_mode_enabled", True)
                 ),
@@ -440,6 +449,30 @@ def create_app(
                 image_mime_types=list(SUPPORTED_IMAGE_MIME_TYPES),
                 rag_extensions=list(SUPPORTED_RAG_EXTENSIONS),
             ),
+        )
+
+    @app.get("/api/generated-files/{relative_path:path}")
+    async def download_generated_file(
+        relative_path: str,
+        request: Request,
+    ) -> FileResponse:
+        """Download one existing file confined to generated outputs."""
+        active_runtime = _runtime_from_request(request)
+        path = resolve_generated_download(
+            relative_path,
+            project_root=Path(active_runtime.project_root),
+        )
+        if path is None:
+            raise HTTPException(status_code=404, detail="Generated file not found.")
+        mime_type, _encoding = mimetypes.guess_type(path.name)
+        return FileResponse(
+            path,
+            filename=path.name,
+            media_type=mime_type or "application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.post(
@@ -870,13 +903,41 @@ async def _agent_stream_lines(
         runtime.config,
         prompt=context.prompt,
     )
+    generated_file_paths: list[str] = []
+    generated_files_emitted = False
+    response_parts: list[str] = []
+    tool_calls: dict[str, tuple[str, str]] = {}
     try:
         async for event in _iter_agent_events(
             runtime,
             context,
             reflection_collector=reflection_collector,
         ):
+            if event.kind == "tool_call":
+                if event.previous_tool_call_id:
+                    tool_calls.pop(event.previous_tool_call_id, None)
+                tool_calls[event.tool_call_id] = (event.tool_name, event.tool_args)
+            elif event.kind == "tool_result":
+                tool_name, tool_args = tool_calls.pop(
+                    event.tool_call_id,
+                    (event.tool_name, ""),
+                )
+                if event.status.lower() != "error":
+                    generated_file_paths.extend(
+                        generated_file_paths_from_tool_args(tool_name, tool_args)
+                    )
+            elif event.kind == "response_delta":
+                response_parts.append(event.text)
             yield _json_line(_event_payload(event, context))
+        generated_files_line = _generated_files_line(
+            runtime,
+            context,
+            generated_file_paths=generated_file_paths,
+            response_text="".join(response_parts),
+        )
+        if generated_files_line is not None:
+            yield generated_files_line
+            generated_files_emitted = True
         proposal = reflection_collector.build_proposal()
         if proposal is not None:
             yield _json_line(
@@ -891,6 +952,15 @@ async def _agent_stream_lines(
         raise
     except Exception as exc:
         reflection_collector.mark_run_failed(exc)
+        if not generated_files_emitted:
+            generated_files_line = _generated_files_line(
+                runtime,
+                context,
+                generated_file_paths=generated_file_paths,
+                response_text="".join(response_parts),
+            )
+            if generated_files_line is not None:
+                yield generated_files_line
         proposal = reflection_collector.build_proposal()
         if proposal is not None:
             yield _json_line(
@@ -909,6 +979,38 @@ async def _agent_stream_lines(
                 "reasoning": context.reasoning_level,
             }
         )
+
+
+def _generated_files_line(
+    runtime: Any,
+    context: AgentRunContext,
+    *,
+    generated_file_paths: list[str],
+    response_text: str,
+) -> str | None:
+    """Build the generated-files event after final filesystem validation."""
+    raw_paths = [
+        *generated_file_paths,
+        *generated_file_paths_from_text(response_text),
+    ]
+    if not raw_paths:
+        return None
+    descriptors = generated_file_descriptors(
+        raw_paths,
+        project_root=Path(runtime.project_root),
+    )
+    if not descriptors:
+        return None
+    return _json_line(
+        {
+            "kind": "generated_files",
+            "source": "main-agent",
+            "files": [descriptor.to_payload() for descriptor in descriptors],
+            "thread_id": context.thread_id,
+            "model": context.model_name,
+            "reasoning": context.reasoning_level,
+        }
+    )
 
 
 def _reflection_proposal_payload(

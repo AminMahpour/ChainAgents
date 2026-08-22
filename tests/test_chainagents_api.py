@@ -223,6 +223,7 @@ def test_status_reports_runtime_configuration() -> None:
         ],
         "reasoning_levels": ["low", "medium", "high"],
         "features": {
+            "generated_files": True,
             "reasoning": True,
             "tools": True,
             "generated_panels": True,
@@ -900,6 +901,226 @@ def test_stream_returns_ndjson_agent_events() -> None:
             "reasoning": "medium",
         },
     ]
+
+
+def test_stream_emits_generated_files_after_successful_output_write(
+    tmp_path: Path,
+) -> None:
+    """Verify successful output writes become terminal download metadata."""
+    output_path = tmp_path / ".files" / "outputs" / "reports" / "summary.csv"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("name,value\nalpha,1\n", encoding="utf-8")
+
+    tool_call = _Token()
+    tool_call.tool_call_chunks = [
+        {
+            "id": "call-1",
+            "name": "write_file",
+            "args": '{"path":"/workspace/.files/outputs/reports/summary.csv"}',
+        }
+    ]
+    tool_result = SimpleNamespace(
+        type="tool",
+        name="write_file",
+        status="success",
+        tool_call_id="call-1",
+        content="File written successfully",
+    )
+    runtime = _FakeRuntime(
+        _FakeAgent(
+            [
+                _raw_event(((), "messages", (tool_call, {}))),
+                _raw_event(((), "messages", (tool_result, {}))),
+                _raw_event(((), "messages", (_Token("Created the report."), {}))),
+            ]
+        )
+    )
+    runtime.project_root = tmp_path
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "create a report", "thread_id": "thread-1"},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    assert [line["kind"] for line in lines[-2:]] == ["generated_files", "done"]
+    assert lines[-2] == {
+        "kind": "generated_files",
+        "source": "main-agent",
+        "files": [
+            {
+                "name": "summary.csv",
+                "mime_type": "text/csv",
+                "size_bytes": output_path.stat().st_size,
+                "download_url": "/api/generated-files/reports/summary.csv",
+            }
+        ],
+        "thread_id": "thread-1",
+        "model": "fake-model",
+        "reasoning": "medium",
+    }
+
+
+def test_stream_ignores_failed_or_missing_output_writes(tmp_path: Path) -> None:
+    """Verify failed tools and paths without files do not create download metadata."""
+    output_path = tmp_path / ".files" / "outputs" / "failed.txt"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("must not be exposed", encoding="utf-8")
+    tool_call = _Token()
+    tool_call.tool_call_chunks = [
+        {
+            "id": "call-1",
+            "name": "write_file",
+            "args": '{"path":"/workspace/.files/outputs/failed.txt"}',
+        },
+        {
+            "id": "call-2",
+            "name": "write_file",
+            "args": '{"path":"/workspace/.files/outputs/missing.txt"}',
+        },
+    ]
+    failed_result = SimpleNamespace(
+        type="tool",
+        name="write_file",
+        status="error",
+        tool_call_id="call-1",
+        content="write failed",
+    )
+    missing_result = SimpleNamespace(
+        type="tool",
+        name="write_file",
+        status="success",
+        tool_call_id="call-2",
+        content="write claimed success",
+    )
+    runtime = _FakeRuntime(
+        _FakeAgent(
+            [
+                _raw_event(((), "messages", (tool_call, {}))),
+                _raw_event(((), "messages", (failed_result, {}))),
+                _raw_event(((), "messages", (missing_result, {}))),
+            ]
+        )
+    )
+    runtime.project_root = tmp_path
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "write files", "thread_id": "thread-1"},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    assert "generated_files" not in [line["kind"] for line in lines]
+
+
+def test_stream_emits_existing_output_referenced_by_response(tmp_path: Path) -> None:
+    """Verify indirect file creation is discoverable from the final response path."""
+    output_path = tmp_path / ".files" / "outputs" / "chart.pdf"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"%PDF-1.4\n")
+    runtime = _FakeRuntime(
+        _FakeAgent(
+            [
+                _raw_event(
+                    (
+                        (),
+                        "messages",
+                        (_Token("Saved `/workspace/.files/outputs/chart.pdf`."), {}),
+                    )
+                )
+            ]
+        )
+    )
+    runtime.project_root = tmp_path
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "create a chart", "thread_id": "thread-1"},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    generated = next(line for line in lines if line["kind"] == "generated_files")
+    assert generated["files"] == [
+        {
+            "name": "chart.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": output_path.stat().st_size,
+            "download_url": "/api/generated-files/chart.pdf",
+        }
+    ]
+
+
+def test_stream_emits_verified_files_before_later_run_error(tmp_path: Path) -> None:
+    """Verify artifacts remain available when a later stream operation fails."""
+    output_path = tmp_path / ".files" / "outputs" / "partial.txt"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("usable output", encoding="utf-8")
+
+    class _FailingAgent(_FakeAgent):
+        def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+            async def events():
+                for event in self.events:
+                    yield event
+                raise RuntimeError("late failure")
+
+            return events()
+
+    runtime = _FakeRuntime(
+        _FailingAgent(
+            [
+                _raw_event(
+                    (
+                        (),
+                        "messages",
+                        (_Token("Saved `/workspace/.files/outputs/partial.txt`."), {}),
+                    )
+                )
+            ]
+        )
+    )
+    runtime.project_root = tmp_path
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "create partial output", "thread_id": "thread-1"},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    assert [line["kind"] for line in lines[-2:]] == ["generated_files", "error"]
+    assert lines[-2]["files"][0]["download_url"] == "/api/generated-files/partial.txt"
+    assert lines[-1]["error"] == "RuntimeError: late failure"
+
+
+def test_generated_file_download_survives_app_recreation(tmp_path: Path) -> None:
+    """Verify deterministic artifact links work across API process lifetimes."""
+    output_path = tmp_path / ".files" / "outputs" / "reports" / "summary.csv"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"name,value\nalpha,1\n")
+    download_url = "/api/generated-files/reports/summary.csv"
+
+    for _attempt in range(2):
+        runtime = _FakeRuntime(_FakeAgent([]))
+        runtime.project_root = tmp_path
+        app = chainagents_api.create_app(runtime=runtime)
+
+        with TestClient(app) as client:
+            response = client.get(download_url)
+
+        assert response.status_code == 200
+        assert response.content == output_path.read_bytes()
+        assert response.headers["content-type"].startswith("text/csv")
+        assert response.headers["content-disposition"].startswith("attachment;")
+        assert "summary.csv" in response.headers["content-disposition"]
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
 
 
 def test_stream_requires_thread_id() -> None:
