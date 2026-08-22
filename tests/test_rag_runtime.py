@@ -368,6 +368,7 @@ def test_clone_thread_uploads_isolated_and_idempotent(
 
     assert first.added_files == ("notes.md",)
     assert second.added_files == ()
+    assert second.conflict is True
     assert service.search(
         query="release notes",
         thread_id="../../branch-thread",

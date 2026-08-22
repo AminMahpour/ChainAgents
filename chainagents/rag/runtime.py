@@ -555,6 +555,7 @@ class RagUploadResult:
         chunk_count: The chunk count value.
         rejected_files: The rejected files value.
         reason: The reason value.
+        conflict: Whether an operation rejected a non-fresh target thread.
     """
 
     thread_id: str
@@ -563,6 +564,7 @@ class RagUploadResult:
     chunk_count: int = 0
     rejected_files: tuple[str, ...] = ()
     reason: str | None = None
+    conflict: bool = False
 
     @property
     def success(self) -> bool:
@@ -912,6 +914,7 @@ class WorkspaceDocsRAG:
                 return RagUploadResult(
                     thread_id=target_id,
                     reason="Target thread already has uploaded files.",
+                    conflict=True,
                 )
             if not source_directory.is_dir():
                 return RagUploadResult(

@@ -53,6 +53,7 @@ RAG_UPLOAD_MIME_TYPES = {
     "application/toml",
     "application/x-toml",
     "application/x-yaml",
+    "application/yaml",
     "text/csv",
     "text/markdown",
     "text/plain",

@@ -119,6 +119,10 @@ class AgentHistoryMessage(BaseModel):
                 raise ValueError("history message content must not be blank")
         elif not self.content:
             raise ValueError("history message content must not be empty")
+        elif self.role == "assistant" and any(
+            isinstance(part, AgentImageContentPart) for part in self.content
+        ):
+            raise ValueError("history images are allowed only in user messages")
         return self
 
 
@@ -273,6 +277,7 @@ class AgentRunContext:
     source_thread_id: str | None
     direct_response: str | None = None
     command_error: str | None = None
+    command_error_status: int = 422
     image_parts: tuple[dict[str, Any], ...] = ()
 
 
@@ -423,7 +428,10 @@ def create_app(
         active_runtime = _runtime_from_request(request)
         context = await _prepare_run_context(active_runtime, payload)
         if context.command_error:
-            raise HTTPException(status_code=422, detail=context.command_error)
+            raise HTTPException(
+                status_code=context.command_error_status,
+                detail=context.command_error,
+            )
         response_parts: list[str] = []
         try:
             async for event in _iter_agent_events(active_runtime, context):
@@ -501,20 +509,15 @@ def create_app(
                     prompt,
                     image_names=tuple(upload.name for upload in image_uploads),
                 )
-                context = await _prepare_run_context(active_runtime, context_request)
+                context = await _prepare_run_context(
+                    active_runtime,
+                    context_request,
+                    has_current_images=bool(image_uploads),
+                )
             else:
                 context = replace(
                     _run_context(active_runtime, context_request),
                     prompt="",
-                )
-            selected_model = resolve_runtime_model_profile(
-                active_runtime.config,
-                context.model_name,
-            )
-            if image_uploads and "image" not in selected_model.modalities:
-                raise HTTPException(
-                    status_code=422,
-                    detail="The selected model does not declare image input support.",
                 )
             stored_rag_uploads = _store_temporary_rag_uploads(
                 Path(temporary_directory.name),
@@ -528,18 +531,23 @@ def create_app(
             raise
 
         async def multipart_lines() -> AsyncIterator[str]:
+            active_context = context
             try:
-                active_context = context
                 if (
                     active_context.source_thread_id
                     and active_context.source_thread_id != active_context.thread_id
                 ):
                     clone_uploads = getattr(active_runtime, "clone_rag_uploads", None)
                     if clone_uploads is not None:
-                        await clone_uploads(
+                        clone_result = await clone_uploads(
                             source_thread_id=active_context.source_thread_id,
                             target_thread_id=active_context.thread_id,
                         )
+                        if bool(getattr(clone_result, "conflict", False)):
+                            raise RuntimeError(
+                                str(getattr(clone_result, "reason", "")).strip()
+                                or "Target branch thread is not fresh."
+                            )
                     active_context = replace(active_context, source_thread_id=None)
 
                 upload_result: RagUploadResult | None = None
@@ -572,6 +580,18 @@ def create_app(
                     issue_reflection_token=issue_reflection_token,
                 ):
                     yield line
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                yield _json_line(
+                    {
+                        "kind": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "thread_id": active_context.thread_id,
+                        "model": active_context.model_name,
+                        "reasoning": active_context.reasoning_level,
+                    }
+                )
             finally:
                 temporary_directory.cleanup()
 
@@ -915,19 +935,44 @@ def _run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
     )
 
 
-async def _prepare_run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
+async def _prepare_run_context(
+    runtime: Any,
+    request: AgentRunRequest,
+    *,
+    has_current_images: bool = False,
+) -> AgentRunContext:
     """Resolve validation and native command behavior for one request."""
     context = _run_context(runtime, request)
+    await _validate_history_replay(runtime, context)
+    _validate_image_modalities(
+        runtime,
+        context.model_name,
+        has_images=has_current_images or _history_contains_images(request.history),
+    )
+    context = await _clone_branch_rag_before_commands(runtime, context)
+    if context.command_error:
+        return context
     parsed = resolve_native_command(raw_text=context.prompt)
     if parsed is None:
         return context
 
-    result = await resolve_runtime_command(
-        runtime=runtime,
-        parsed=parsed,
-        thread_id=context.thread_id,
-        mcp_session_id=context.mcp_session_id,
-    )
+    try:
+        result = await resolve_runtime_command(
+            runtime=runtime,
+            parsed=parsed,
+            thread_id=context.thread_id,
+            mcp_session_id=context.mcp_session_id,
+        )
+    except ValueError as exc:
+        return replace(context, command_error=str(exc), command_error_status=422)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return replace(
+            context,
+            command_error=f"{type(exc).__name__}: {exc}",
+            command_error_status=500,
+        )
     if result.target == "unknown":
         return replace(
             context,
@@ -936,6 +981,108 @@ async def _prepare_run_context(runtime: Any, request: AgentRunRequest) -> AgentR
     if result.target == "mcp_tool":
         return replace(context, direct_response=dumps_tool_result(result.tool_result))
     return replace(context, prompt=(result.prompt or "").strip())
+
+
+async def _clone_branch_rag_before_commands(
+    runtime: Any,
+    context: AgentRunContext,
+) -> AgentRunContext:
+    """Atomically reserve a branch's RAG scope before command side effects."""
+    if (
+        context.source_thread_id is None
+        or context.source_thread_id == context.thread_id
+    ):
+        return context
+    clone_uploads = getattr(runtime, "clone_rag_uploads", None)
+    if clone_uploads is None:
+        return replace(context, source_thread_id=None)
+    try:
+        result = await clone_uploads(
+            source_thread_id=context.source_thread_id,
+            target_thread_id=context.thread_id,
+        )
+    except ValueError as exc:
+        return replace(
+            context,
+            command_error=str(exc),
+            command_error_status=422,
+            source_thread_id=None,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return replace(
+            context,
+            command_error=f"{type(exc).__name__}: {exc}",
+            command_error_status=500,
+            source_thread_id=None,
+        )
+    if bool(getattr(result, "conflict", False)):
+        return replace(
+            context,
+            command_error=(
+                str(getattr(result, "reason", "")).strip()
+                or "Target branch thread is not fresh."
+            ),
+            command_error_status=409,
+            source_thread_id=None,
+        )
+    return replace(context, source_thread_id=None)
+
+
+def _history_contains_images(history: list[AgentHistoryMessage]) -> bool:
+    """Return whether replay history contains user image content."""
+    return any(
+        isinstance(part, AgentImageContentPart)
+        for message in history
+        if isinstance(message.content, list)
+        for part in message.content
+    )
+
+
+def _validate_image_modalities(
+    runtime: Any,
+    model_name: str,
+    *,
+    has_images: bool,
+) -> None:
+    """Reject image content before commands or model calls for text-only profiles."""
+    if not has_images:
+        return
+    try:
+        selected_model = resolve_runtime_model_profile(runtime.config, model_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if "image" not in selected_model.modalities:
+        raise HTTPException(
+            status_code=422,
+            detail="The selected model does not declare image input support.",
+        )
+
+
+async def _validate_history_replay(runtime: Any, context: AgentRunContext) -> None:
+    """Allow stateful history replay only into a fresh branch checkpoint."""
+    if not context.history or runtime.config.agent_state != "stateful":
+        return
+    if (
+        context.source_thread_id is None
+        or context.source_thread_id == context.thread_id
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Stateful history replay requires a distinct source_thread_id and "
+                "fresh target thread_id."
+            ),
+        )
+    existing_checkpoint = await runtime.checkpointer.aget_tuple(
+        {"configurable": {"thread_id": context.thread_id}}
+    )
+    if existing_checkpoint is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="History cannot be replayed into an existing stateful thread.",
+        )
 
 
 def _history_message_payload(message: AgentHistoryMessage) -> dict[str, Any]:
@@ -968,13 +1115,6 @@ async def _iter_agent_events(
     *,
     reflection_collector: ReflectionCollector | None = None,
 ) -> AsyncIterator[AgentStreamEvent]:
-    if context.source_thread_id and context.source_thread_id != context.thread_id:
-        clone_uploads = getattr(runtime, "clone_rag_uploads", None)
-        if clone_uploads is not None:
-            await clone_uploads(
-                source_thread_id=context.source_thread_id,
-                target_thread_id=context.thread_id,
-            )
     if context.direct_response is not None:
         yield AgentStreamEvent(
             kind="response_delta",

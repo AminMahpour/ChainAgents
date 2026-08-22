@@ -62,15 +62,31 @@ class _FakeAgent:
         return {"messages": []}
 
 
+class _FakeCheckpointer:
+    """Report whether a target thread already has checkpoint state."""
+
+    def __init__(self) -> None:
+        self.existing_threads: set[str] = set()
+
+    async def aget_tuple(self, config):
+        """Return a checkpoint marker only for configured existing threads."""
+        thread_id = config["configurable"]["thread_id"]
+        return object() if thread_id in self.existing_threads else None
+
+
 class _FakeRuntime:
     """Provide the runtime surface required by the API module."""
 
     def __init__(self, agent: _FakeAgent) -> None:
         """Initialize the fake runtime."""
         self.agent = agent
+        self.checkpointer = _FakeCheckpointer()
         self.requests: list[dict[str, Any]] = []
         self.commands: dict[str, Any] = {}
+        self.command_requests: list[dict[str, Any]] = []
+        self.command_error: Exception | None = None
         self.cloned_threads: list[tuple[str, str]] = []
+        self.clone_result: Any | None = None
         self.upload_requests: list[dict[str, Any]] = []
         self.upload_paths: list[Any] = []
         self.operations: list[str] = []
@@ -119,13 +135,16 @@ class _FakeRuntime:
 
     async def invoke_mcp_tool_command(self, **kwargs):
         """Return a deterministic direct command result."""
+        self.command_requests.append(kwargs)
+        if self.command_error is not None:
+            raise self.command_error
         return {"echo": kwargs["raw_args"]}
 
     async def clone_rag_uploads(self, *, source_thread_id: str, target_thread_id: str):
         """Capture branch-scoped upload cloning."""
         self.cloned_threads.append((source_thread_id, target_thread_id))
         self.operations.append("clone")
-        return RagUploadResult(thread_id=target_thread_id)
+        return self.clone_result or RagUploadResult(thread_id=target_thread_id)
 
     async def ingest_rag_uploads(self, *, thread_id: str, uploads):
         """Capture temporary API uploads while they are readable."""
@@ -318,6 +337,7 @@ def test_invoke_replays_selected_history_and_clones_source_rag_scope() -> None:
     """Verify a branch run receives only validated selected-path history."""
     agent = _FakeAgent([_raw_event(((), "messages", (_Token("Done"), {})))])
     runtime = _FakeRuntime(agent)
+    runtime.config.model_modalities = ("text", "image")
     app = chainagents_api.create_app(runtime=runtime)
     image_data = base64.b64encode(b"small-png").decode("ascii")
 
@@ -370,6 +390,113 @@ def test_invoke_replays_selected_history_and_clones_source_rag_scope() -> None:
     }
 
 
+def test_stateful_history_requires_a_distinct_source_thread() -> None:
+    """Verify stateful continuation cannot replay messages into its checkpoint."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+    history = [{"role": "user", "content": "first question"}]
+
+    with TestClient(app) as client:
+        missing_source = client.post(
+            "/api/agent/invoke",
+            json={
+                "prompt": "continue",
+                "thread_id": "thread-1",
+                "history": history,
+            },
+        )
+        same_source = client.post(
+            "/api/agent/invoke",
+            json={
+                "prompt": "continue",
+                "thread_id": "thread-1",
+                "source_thread_id": "thread-1",
+                "history": history,
+            },
+        )
+
+    assert missing_source.status_code == 422
+    assert same_source.status_code == 422
+    assert runtime.requests == []
+
+
+def test_stateful_history_rejects_an_existing_target_checkpoint() -> None:
+    """Verify branch replay is accepted only for a fresh target thread."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.checkpointer.existing_threads.add("branch-thread")
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/invoke",
+            json={
+                "prompt": "continue",
+                "thread_id": "branch-thread",
+                "source_thread_id": "source-thread",
+                "history": [{"role": "user", "content": "first question"}],
+            },
+        )
+
+    assert response.status_code == 409
+    assert runtime.requests == []
+
+
+def test_branch_replay_rejects_rag_dirty_target_before_commands() -> None:
+    """Verify an atomic RAG clone conflict prevents branch command side effects."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.clone_result = SimpleNamespace(
+        conflict=True,
+        reason="Target thread already has uploaded files.",
+    )
+    runtime.commands["lookup"] = SimpleNamespace(
+        name="lookup",
+        description="Look something up",
+        target="mcp_tool",
+        value="lookup",
+        template=None,
+        mcp_server="docs",
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/invoke",
+            json={
+                "prompt": "/lookup topic",
+                "thread_id": "branch-thread",
+                "source_thread_id": "source-thread",
+                "history": [{"role": "user", "content": "first question"}],
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Target thread already has uploaded files."
+    }
+    assert runtime.command_requests == []
+    assert runtime.requests == []
+
+
+def test_stateless_history_allows_normal_continuation_replay() -> None:
+    """Verify stateless callers can provide history without a source thread."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.agent_state = "stateless"
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/invoke",
+            json={
+                "prompt": "continue",
+                "thread_id": "thread-1",
+                "history": [{"role": "user", "content": "first question"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert runtime.requests
+
+
 def test_history_rejects_server_owned_roles_and_remote_images() -> None:
     """Verify callers cannot inject system roles or remote image references."""
     runtime = _FakeRuntime(_FakeAgent([]))
@@ -402,9 +529,63 @@ def test_history_rejects_server_owned_roles_and_remote_images() -> None:
                 ],
             },
         )
+        assistant_image_response = client.post(
+            "/api/agent/invoke",
+            json={
+                "prompt": "continue",
+                "thread_id": "thread-1",
+                "source_thread_id": "source-thread",
+                "history": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,c21hbGw="
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
 
     assert system_response.status_code == 422
     assert remote_image_response.status_code == 422
+    assert assistant_image_response.status_code == 422
+    assert runtime.requests == []
+
+
+def test_history_images_require_a_multimodal_model() -> None:
+    """Verify replayed images are rejected before invoking a text-only model."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/invoke",
+            json={
+                "prompt": "continue",
+                "thread_id": "branch-thread",
+                "source_thread_id": "source-thread",
+                "history": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,c21hbGw="
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 422
     assert runtime.requests == []
 
 
@@ -600,6 +781,111 @@ def test_stream_returns_typed_error_for_unknown_command() -> None:
     assert runtime.requests == []
 
 
+def test_native_command_validation_failure_uses_typed_endpoint_errors() -> None:
+    """Verify invalid MCP command input is a typed client error."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.commands["lookup"] = SimpleNamespace(
+        name="lookup",
+        description="Look something up",
+        target="mcp_tool",
+        value="lookup",
+        template=None,
+        mcp_server="docs",
+    )
+    runtime.command_error = ValueError("Command arguments must be valid JSON.")
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        invoke_response = client.post(
+            "/api/agent/invoke",
+            json={"prompt": "/lookup malformed", "thread_id": "invoke-thread"},
+        )
+        stream_response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "/lookup malformed", "thread_id": "stream-thread"},
+        )
+
+    assert invoke_response.status_code == 422
+    assert invoke_response.json() == {
+        "detail": "Command arguments must be valid JSON."
+    }
+    assert stream_response.status_code == 200
+    assert [json.loads(line) for line in stream_response.iter_lines()] == [
+        {
+            "kind": "error",
+            "error": "Command arguments must be valid JSON.",
+            "thread_id": "stream-thread",
+            "model": "fake-model",
+            "reasoning": "medium",
+        }
+    ]
+    assert runtime.requests == []
+
+
+def test_native_command_execution_failure_uses_typed_endpoint_errors() -> None:
+    """Verify MCP execution failures use each endpoint's server-error contract."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.commands["lookup"] = SimpleNamespace(
+        name="lookup",
+        description="Look something up",
+        target="mcp_tool",
+        value="lookup",
+        template=None,
+        mcp_server="docs",
+    )
+    runtime.command_error = RuntimeError("MCP service unavailable.")
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        invoke_response = client.post(
+            "/api/agent/invoke",
+            json={"prompt": "/lookup topic", "thread_id": "invoke-thread"},
+        )
+        stream_response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "/lookup topic", "thread_id": "stream-thread"},
+        )
+
+    assert invoke_response.status_code == 500
+    assert invoke_response.json() == {"detail": "RuntimeError: MCP service unavailable."}
+    assert stream_response.status_code == 200
+    assert [json.loads(line) for line in stream_response.iter_lines()] == [
+        {
+            "kind": "error",
+            "error": "RuntimeError: MCP service unavailable.",
+            "thread_id": "stream-thread",
+            "model": "fake-model",
+            "reasoning": "medium",
+        }
+    ]
+    assert runtime.requests == []
+
+
+def test_multipart_validates_images_before_executing_native_commands() -> None:
+    """Verify invalid attachments cannot precede an MCP command side effect."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.commands["lookup"] = SimpleNamespace(
+        name="lookup",
+        description="Look something up",
+        target="mcp_tool",
+        value="lookup",
+        template=None,
+        mcp_server="docs",
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream/multipart",
+            data={"prompt": "/lookup topic", "thread_id": "thread-1"},
+            files={"files": ("scan.png", b"png-bytes", "image/png")},
+        )
+
+    assert response.status_code == 422
+    assert runtime.command_requests == []
+    assert runtime.requests == []
+
+
 def test_multipart_image_only_uses_ocr_fallback_and_multimodal_content() -> None:
     """Verify image-only turns use the existing OCR fallback prompt."""
     agent = _FakeAgent([_raw_event(((), "messages", (_Token("Visible text"), {})))])
@@ -697,6 +983,72 @@ def test_multipart_rag_only_clones_then_ingests_and_cleans_up() -> None:
     }
     assert lines[1]["kind"] == "done"
     assert runtime.requests == []
+
+
+def test_multipart_accepts_standard_yaml_mime_type() -> None:
+    """Verify modern YAML uploads reach the configured RAG ingestion path."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream/multipart",
+            data={"thread_id": "thread-1"},
+            files={"files": ("notes.yaml", b"topic: agents", "application/yaml")},
+        )
+
+    assert response.status_code == 200
+    assert runtime.upload_requests == [
+        {
+            "thread_id": "thread-1",
+            "uploads": [{"name": "notes.yaml", "content": "topic: agents"}],
+        }
+    ]
+
+
+@pytest.mark.parametrize("failure_point", ["clone", "ingest"])
+def test_multipart_preparation_failures_emit_terminal_error(failure_point: str) -> None:
+    """Verify branch and RAG preparation failures retain the NDJSON contract."""
+
+    class _FailingPreparationRuntime(_FakeRuntime):
+        async def clone_rag_uploads(self, **kwargs):
+            if failure_point == "clone":
+                raise RuntimeError("RAG clone failed.")
+            return await super().clone_rag_uploads(**kwargs)
+
+        async def ingest_rag_uploads(self, **kwargs):
+            if failure_point == "ingest":
+                raise RuntimeError("RAG ingestion failed.")
+            return await super().ingest_rag_uploads(**kwargs)
+
+    runtime = _FailingPreparationRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/agent/stream/multipart",
+            data={
+                "thread_id": "branch-thread",
+                "source_thread_id": "source-thread",
+            },
+            files={"files": ("notes.txt", b"agents", "text/plain")},
+        )
+
+    expected_error = (
+        "RuntimeError: RAG clone failed."
+        if failure_point == "clone"
+        else "RuntimeError: RAG ingestion failed."
+    )
+    assert response.status_code == 200
+    assert [json.loads(line) for line in response.iter_lines()] == [
+        {
+            "kind": "error",
+            "error": expected_error,
+            "thread_id": "branch-thread",
+            "model": "fake-model",
+            "reasoning": "medium",
+        }
+    ]
 
 
 def test_multipart_rag_disabled_reports_attachment_error_without_agent() -> None:
