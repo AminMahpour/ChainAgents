@@ -555,6 +555,7 @@ class RagUploadResult:
         chunk_count: The chunk count value.
         rejected_files: The rejected files value.
         reason: The reason value.
+        conflict: Whether an operation rejected a non-fresh target thread.
     """
 
     thread_id: str
@@ -563,6 +564,7 @@ class RagUploadResult:
     chunk_count: int = 0
     rejected_files: tuple[str, ...] = ()
     reason: str | None = None
+    conflict: bool = False
 
     @property
     def success(self) -> bool:
@@ -886,6 +888,60 @@ class WorkspaceDocsRAG:
                 indexed_files=indexed_files,
                 chunk_count=chunk_count,
                 rejected_files=tuple(rejected_files),
+            )
+
+    def clone_thread_uploads(
+        self,
+        *,
+        source_thread_id: str,
+        target_thread_id: str,
+    ) -> RagUploadResult:
+        """Clone one thread's stored RAG files into a fresh branch thread."""
+        source_id = source_thread_id.strip()
+        target_id = target_thread_id.strip()
+        if not source_id or not target_id:
+            raise ValueError("Source and target thread IDs must be non-empty.")
+        if source_id == target_id:
+            return RagUploadResult(
+                thread_id=target_id,
+                reason="Source and target threads are identical.",
+            )
+
+        with self._lock:
+            source_directory = self._thread_upload_files_directory(source_id)
+            target_directory = self._thread_upload_files_directory(target_id)
+            if target_directory.is_dir() and any(target_directory.iterdir()):
+                return RagUploadResult(
+                    thread_id=target_id,
+                    reason="Target thread already has uploaded files.",
+                    conflict=True,
+                )
+            if not source_directory.is_dir():
+                return RagUploadResult(
+                    thread_id=target_id,
+                    reason="Source thread has no uploaded files.",
+                )
+
+            source_files = [
+                path
+                for path in sorted(source_directory.iterdir(), key=lambda item: item.name)
+                if path.is_file() and self._supports_uploaded_file(path.name)
+            ]
+            if not source_files:
+                return RagUploadResult(
+                    thread_id=target_id,
+                    reason="Source thread has no supported uploaded files.",
+                )
+
+            target_directory.mkdir(parents=True, exist_ok=True)
+            for source_path in source_files:
+                shutil.copy2(source_path, target_directory / source_path.name)
+            indexed_files, chunk_count = self._rebuild_thread_uploads_locked(target_id)
+            return RagUploadResult(
+                thread_id=target_id,
+                added_files=tuple(path.name for path in source_files),
+                indexed_files=indexed_files,
+                chunk_count=chunk_count,
             )
 
     def search(

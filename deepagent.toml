@@ -9,6 +9,8 @@ repeat_penalty = 1.1
 #name = "qwen3.6:35b-a3b-nvfp4"
 name = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 #models = ["gpt-oss:20b", "gemma4:26b", "qwen3.6:27b"]
+# Declare ["text", "image"] only for models that accept image content.
+modalities = ["text"]
 
 reasoning_effort = "high"
 # Set true to bypass model streaming only for tool-calling requests.
@@ -38,6 +40,7 @@ reasoning_effort = "high"
 #name = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 #temperature = 0.1
 #reasoning_effort = "medium"
+#modalities = ["text", "image"]
 #
 #[model.profiles.claude-reviewer]
 #provider = "anthropic"

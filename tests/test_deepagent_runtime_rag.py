@@ -438,6 +438,94 @@ models = ["gpt-oss:20b", "gemma4:27b"]
     assert config.model_choices == ("gpt-oss:20b", "gemma4:27b")
 
 
+def test_model_profiles_inherit_and_override_declared_modalities(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify image input is opt-in and profile modality defaults are inherited."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+name = "default-local"
+modalities = ["text"]
+
+[model.profiles.fast]
+name = "fast-local"
+
+[model.profiles.vision]
+name = "vision-local"
+modalities = ["text", "image"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert deepagent_runtime.resolve_runtime_model_profile(
+        config, "default-local"
+    ).modalities == ("text",)
+    assert deepagent_runtime.resolve_runtime_model_profile(
+        config, "fast"
+    ).modalities == ("text",)
+    assert deepagent_runtime.resolve_runtime_model_profile(
+        config, "vision"
+    ).modalities == ("text", "image")
+
+
+def test_model_modalities_default_to_text_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify existing model configurations remain safely text-only."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        '[model]\nprovider = "ollama"\nname = "default-local"',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert deepagent_runtime.resolve_runtime_model_profile(config).modalities == (
+        "text",
+    )
+
+
+@pytest.mark.parametrize(
+    "modalities",
+    [
+        '["image"]',
+        '["text", "audio"]',
+        '"text"',
+    ],
+)
+def test_model_modalities_reject_unsafe_values(
+    tmp_path: Path,
+    monkeypatch,
+    modalities: str,
+) -> None:
+    """Verify invalid or non-text model modality declarations fail closed."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[model]",
+                'provider = "ollama"',
+                'name = "default-local"',
+                f"modalities = {modalities}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="modalities"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
 def test_runtime_config_reads_named_model_profiles_and_agent_model(
     tmp_path: Path,
     monkeypatch,
