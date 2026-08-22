@@ -132,20 +132,23 @@ def resolve_generated_output(raw_path: str, *, project_root: Path) -> Path | Non
         return None
 
     raw_candidate = Path(path_text)
-    if raw_candidate.is_absolute() and not path_text.startswith("/workspace/"):
-        candidate = raw_candidate
-    elif path_text.startswith("/workspace/"):
-        candidate = resolved_project_root / path_text.removeprefix("/workspace/")
+    if raw_candidate.is_absolute():
+        candidates = [raw_candidate]
+        if path_text.startswith("/workspace/"):
+            candidates.append(
+                resolved_project_root / path_text.removeprefix("/workspace/")
+            )
     else:
-        candidate = resolved_project_root / path_text
+        candidates = [resolved_project_root / path_text]
 
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError:
-        return None
-    if not resolved.is_file() or not _is_relative_to(resolved, output_root):
-        return None
-    return resolved
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved.is_file() and _is_relative_to(resolved, output_root):
+            return resolved
+    return None
 
 
 def resolve_generated_download(
@@ -167,7 +170,7 @@ def resolve_generated_download(
         return None
     try:
         resolved = (output_root / requested).resolve(strict=True)
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     if not resolved.is_file() or not _is_relative_to(resolved, output_root):
         return None

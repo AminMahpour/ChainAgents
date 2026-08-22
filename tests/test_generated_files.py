@@ -9,6 +9,7 @@ from chainagents.exports.generated_files import (
     MAX_GENERATED_FILES,
     generated_file_descriptors,
     resolve_generated_download,
+    resolve_generated_output,
 )
 
 
@@ -37,6 +38,45 @@ def test_generated_descriptors_reject_unsafe_or_unavailable_paths(
     assert descriptors == []
     assert resolve_generated_download("../secret.txt", project_root=tmp_path) is None
     assert resolve_generated_download(outside.as_posix(), project_root=tmp_path) is None
+
+
+def test_generated_output_rejects_cyclic_symlink(tmp_path: Path) -> None:
+    """A cyclic output reference must be ignored instead of breaking the stream."""
+    outputs = tmp_path / ".files" / "outputs"
+    outputs.mkdir(parents=True)
+    (outputs / "loop").symlink_to("loop")
+
+    assert (
+        resolve_generated_output(
+            "/workspace/.files/outputs/loop",
+            project_root=tmp_path,
+        )
+        is None
+    )
+
+
+def test_generated_download_rejects_cyclic_symlink(tmp_path: Path) -> None:
+    """A cyclic download path must fail closed instead of returning a server error."""
+    outputs = tmp_path / ".files" / "outputs"
+    outputs.mkdir(parents=True)
+    (outputs / "loop").symlink_to("loop")
+
+    assert resolve_generated_download("loop", project_root=tmp_path) is None
+
+
+def test_generated_output_preserves_physical_path_beneath_workspace(
+    monkeypatch,
+) -> None:
+    """A physical project path under /workspace wins over virtual path mapping."""
+    project_root = Path("/workspace/ChainAgents")
+    output = project_root / ".files" / "outputs" / "report.csv"
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
+    monkeypatch.setattr(Path, "is_file", lambda self: self == output)
+
+    assert (
+        resolve_generated_output(output.as_posix(), project_root=project_root)
+        == output
+    )
 
 
 def test_generated_descriptors_deduplicate_encode_and_cap_paths(
