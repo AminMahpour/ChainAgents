@@ -142,6 +142,7 @@ class AgentRunRequest(BaseModel):
     """HTTP request body for running the agent."""
 
     prompt: str = Field(..., min_length=1)
+    command: str | None = None
     thread_id: str = Field(..., min_length=1)
     model: str | None = None
     reasoning: ReasoningLevel | None = None
@@ -567,6 +568,7 @@ def create_app(
         request: Request,
         thread_id: str = Form(...),
         prompt: str = Form(""),
+        command: str | None = Form(None),
         model: str | None = Form(None),
         reasoning: str | None = Form(None),
         source_thread_id: str | None = Form(None),
@@ -592,6 +594,7 @@ def create_app(
             context_request = AgentRunRequest.model_validate(
                 {
                     "prompt": prompt.strip() or "__attachment_only__",
+                    "command": command,
                     "thread_id": thread_id,
                     "model": model,
                     "reasoning": reasoning,
@@ -610,6 +613,12 @@ def create_app(
                     active_runtime,
                     context_request,
                     has_current_images=bool(image_uploads),
+                )
+            elif _optional_text(command):
+                context = await _prepare_run_context(
+                    active_runtime,
+                    context_request,
+                    command_raw_text="",
                 )
             else:
                 context = replace(
@@ -1106,6 +1115,7 @@ async def _prepare_run_context(
     request: AgentRunRequest,
     *,
     has_current_images: bool = False,
+    command_raw_text: str | None = None,
 ) -> AgentRunContext:
     """Resolve validation and native command behavior for one request."""
     context = _run_context(runtime, request)
@@ -1118,7 +1128,10 @@ async def _prepare_run_context(
     context = await _clone_branch_rag_before_commands(runtime, context)
     if context.command_error:
         return context
-    parsed = resolve_native_command(raw_text=context.prompt)
+    parsed = resolve_native_command(
+        raw_text=context.prompt if command_raw_text is None else command_raw_text,
+        selected_command=request.command,
+    )
     if parsed is None:
         return context
 

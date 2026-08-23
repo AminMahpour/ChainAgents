@@ -163,17 +163,114 @@ def test_authenticate_chainlit_user_rejects_invalid_credentials() -> None:
     assert main.authenticate_chainlit_user("unknown", "change-me", users) is None
 
 
-def test_resolve_native_command_prefers_explicit_slash_text() -> None:
-    """Verify that resolve native command prefers explicit slash text."""
+def test_resolve_native_command_prefers_selected_command_for_slash_input() -> None:
+    """Verify selected commands treat slash-prefixed text as raw arguments."""
     parsed = agent_commands.resolve_native_command(
         raw_text="/summarize hello world",
         selected_command="ask-researcher",
     )
 
     assert parsed == agent_commands.ParsedNativeCommand(
-        command_name="summarize",
-        raw_args="hello world",
+        command_name="ask-researcher",
+        raw_args="/summarize hello world",
     )
+
+
+@pytest.mark.anyio
+async def test_on_message_rejects_unknown_selected_command_with_slash_input(
+    monkeypatch,
+) -> None:
+    """Verify slash-prefixed arguments do not hide an unknown selected command."""
+    sent_messages: list[dict[str, str]] = []
+    settings = SimpleNamespace(
+        model_name="gpt-oss:20b",
+        reasoning_level="medium",
+        thread_id="thread-1",
+        show_reasoning_stream=False,
+        show_tool_calls=False,
+    )
+
+    class _Runtime:
+        config = SimpleNamespace(
+            model_name="gpt-oss:20b",
+            model_choices=("gpt-oss:20b",),
+            extensions=SimpleNamespace(
+                chainlit_reasoning_steps_enabled=False,
+                chainlit_tool_steps_enabled=False,
+                chainlit_reasoning_mode_enabled=False,
+                chainlit_model_mode_enabled=False,
+            ),
+        )
+
+        def resolve_chainlit_command(self, _command_name: str):
+            return None
+
+        async def get_agent(self, *_args, **_kwargs):
+            raise AssertionError("unknown selected command should stop before agent lookup")
+
+    class _Message:
+        content = "/workspace/api.py"
+        command = "missing"
+
+    class _SystemMessage:
+        def __init__(self, **kwargs):
+            sent_messages.append(kwargs)
+
+        async def send(self):
+            return None
+
+    async def fake_get_runtime_or_notify():
+        return _Runtime()
+
+    async def fake_get_run_task_list(**_kwargs):
+        return None
+
+    monkeypatch.setattr(main, "get_runtime_or_notify", fake_get_runtime_or_notify)
+    monkeypatch.setattr(main, "coerce_settings", lambda *_args, **_kwargs: settings)
+    monkeypatch.setattr(
+        main.cl,
+        "user_session",
+        SimpleNamespace(get=lambda _key: None),
+    )
+    monkeypatch.setattr(
+        main,
+        "resolve_reasoning_level_for_message",
+        lambda *_args, **_kwargs: "medium",
+    )
+    monkeypatch.setattr(
+        main,
+        "resolve_model_name_for_message",
+        lambda *_args, **_kwargs: "gpt-oss:20b",
+    )
+    monkeypatch.setattr(main, "current_mcp_session_id", lambda: None)
+    monkeypatch.setattr(main, "get_run_task_list", fake_get_run_task_list)
+    monkeypatch.setattr(main, "message_uploaded_rag_files", lambda _message: [])
+    monkeypatch.setattr(main, "message_uploaded_image_parts", lambda _message: [])
+    monkeypatch.setattr(main, "message_uploaded_image_names", lambda _message: [])
+    monkeypatch.setattr(main, "unsupported_uploaded_image_names", lambda _message: [])
+    monkeypatch.setattr(
+        main,
+        "message_has_reasoning_level_override",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        main,
+        "settings_reasoning_level_is_explicit",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(main.cl, "Message", _SystemMessage)
+
+    await main.on_message(_Message())
+
+    assert sent_messages == [
+        {
+            "author": "System",
+            "content": (
+                "Unknown command `/missing`.\n"
+                "Use a configured command from startup or send a normal prompt."
+            ),
+        }
+    ]
 
 
 def test_build_chainlit_starters_maps_config_to_chainlit_starters() -> None:

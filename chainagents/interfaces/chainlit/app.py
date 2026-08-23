@@ -1605,9 +1605,13 @@ async def on_message(message: cl.Message) -> None:
             author="System",
         ).send()
 
+    selected_command = getattr(message, "command", None)
+    selected_command_supplied = bool(
+        str(selected_command or "").strip().lstrip("/")
+    )
     parsed_command = resolve_native_command(
         raw_text=message.content,
-        selected_command=getattr(message, "command", None),
+        selected_command=selected_command,
     )
     slash_command_from_text = parse_native_command(message.content)
     if (
@@ -1640,7 +1644,7 @@ async def on_message(message: cl.Message) -> None:
             ).send()
             return
         if transformed_prompt is None:
-            if slash_command_from_text is None:
+            if selected_command_supplied or slash_command_from_text is None:
                 await cl.Message(
                     author="System",
                     content=(

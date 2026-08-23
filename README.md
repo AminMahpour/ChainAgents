@@ -226,6 +226,17 @@ curl -N -X POST http://127.0.0.1:8000/api/agent/stream \
   -d "{\"prompt\":\"Summarize this repository\",\"thread_id\":\"$THREAD_ID\"}"
 ```
 
+JSON requests to `/api/agent/invoke` and `/api/agent/stream` accept an optional
+`command` field. When present, `prompt` is passed to that configured native
+command as its argument text. The multipart `/api/agent/stream/multipart`
+endpoint accepts the same optional `command` form field alongside `prompt`,
+`thread_id`, and uploaded files.
+
+The `/api/status` response sources its `starters` and their optional `command`
+values from the active `deepagent.toml`. A client launching a configured starter
+should send the starter `message` as `prompt` and its `command` separately; the
+runtime then applies the configured command template to that prompt.
+
 Run the same underlying agent from a terminal without the Chainlit UI:
 
 ```bash
