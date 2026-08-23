@@ -1164,6 +1164,36 @@ def test_stream_transforms_configured_prompt_command() -> None:
     }
 
 
+def test_stream_transforms_separately_selected_configured_command() -> None:
+    """Verify JSON command selection treats the prompt as command arguments."""
+    agent = _FakeAgent([_raw_event(((), "messages", (_Token("Reviewed"), {})))])
+    runtime = _FakeRuntime(agent)
+    runtime.commands["review"] = SimpleNamespace(
+        name="review",
+        description="Review a change",
+        target="prompt",
+        value="Review the change",
+        template="Review carefully: {input}",
+        mcp_server=None,
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={
+                "prompt": "api.py",
+                "command": "review",
+                "thread_id": "thread-1",
+            },
+        )
+
+    assert response.status_code == 200
+    assert agent.payload == {
+        "messages": [{"role": "user", "content": "Review carefully: api.py"}]
+    }
+
+
 def test_stream_emits_direct_mcp_command_result_without_agent_run() -> None:
     """Verify direct MCP commands complete through the typed stream contract."""
     runtime = _FakeRuntime(_FakeAgent([]))
@@ -1321,6 +1351,36 @@ def test_multipart_validates_images_before_executing_native_commands() -> None:
     assert runtime.requests == []
 
 
+def test_multipart_transforms_separately_selected_configured_command() -> None:
+    """Verify multipart command selection treats the prompt as command arguments."""
+    agent = _FakeAgent([_raw_event(((), "messages", (_Token("Reviewed"), {})))])
+    runtime = _FakeRuntime(agent)
+    runtime.commands["review"] = SimpleNamespace(
+        name="review",
+        description="Review a change",
+        target="prompt",
+        value="Review the change",
+        template="Review carefully: {input}",
+        mcp_server=None,
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream/multipart",
+            data={
+                "prompt": "api.py",
+                "command": "review",
+                "thread_id": "thread-1",
+            },
+        )
+
+    assert response.status_code == 200
+    assert agent.payload == {
+        "messages": [{"role": "user", "content": "Review carefully: api.py"}]
+    }
+
+
 def test_multipart_image_only_uses_ocr_fallback_and_multimodal_content() -> None:
     """Verify image-only turns use the existing OCR fallback prompt."""
     agent = _FakeAgent([_raw_event(((), "messages", (_Token("Visible text"), {})))])
@@ -1418,6 +1478,58 @@ def test_multipart_rag_only_clones_then_ingests_and_cleans_up() -> None:
     }
     assert lines[1]["kind"] == "done"
     assert runtime.requests == []
+
+
+def test_multipart_rag_only_selected_command_uses_empty_arguments() -> None:
+    """Verify a selected command receives empty args before the RAG upload note."""
+    agent = _FakeAgent([_raw_event(((), "messages", (_Token("Reviewed"), {})))])
+    runtime = _FakeRuntime(agent)
+    runtime.commands["review"] = SimpleNamespace(
+        name="review",
+        description="Review a change",
+        target="prompt",
+        value="Review the change",
+        template="Review carefully: {input}",
+        mcp_server=None,
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/stream/multipart",
+            data={
+                "prompt": "",
+                "command": "review",
+                "thread_id": "thread-1",
+            },
+            files={"files": ("notes.md", b"release notes", "text/markdown")},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    assert response.status_code == 200
+    assert [line["kind"] for line in lines] == [
+        "attachment_status",
+        "response_delta",
+        "done",
+    ]
+    assert runtime.upload_requests == [
+        {
+            "thread_id": "thread-1",
+            "uploads": [{"name": "notes.md", "content": "release notes"}],
+        }
+    ]
+    assert agent.payload == {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Review carefully:\n\n"
+                    "Thread knowledge uploaded for this request: `notes.md`."
+                ),
+            }
+        ]
+    }
+    assert "__attachment_only__" not in json.dumps(agent.payload)
 
 
 def test_multipart_accepts_standard_yaml_mime_type() -> None:
