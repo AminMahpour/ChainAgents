@@ -1182,7 +1182,7 @@ def test_stream_transforms_separately_selected_configured_command() -> None:
         response = client.post(
             "/api/agent/stream",
             json={
-                "prompt": "api.py",
+                "prompt": "/workspace/api.py",
                 "command": "review",
                 "thread_id": "thread-1",
             },
@@ -1190,7 +1190,9 @@ def test_stream_transforms_separately_selected_configured_command() -> None:
 
     assert response.status_code == 200
     assert agent.payload == {
-        "messages": [{"role": "user", "content": "Review carefully: api.py"}]
+        "messages": [
+            {"role": "user", "content": "Review carefully: /workspace/api.py"}
+        ]
     }
 
 
@@ -1369,7 +1371,7 @@ def test_multipart_transforms_separately_selected_configured_command() -> None:
         response = client.post(
             "/api/agent/stream/multipart",
             data={
-                "prompt": "api.py",
+                "prompt": "/workspace/api.py",
                 "command": "review",
                 "thread_id": "thread-1",
             },
@@ -1377,7 +1379,9 @@ def test_multipart_transforms_separately_selected_configured_command() -> None:
 
     assert response.status_code == 200
     assert agent.payload == {
-        "messages": [{"role": "user", "content": "Review carefully: api.py"}]
+        "messages": [
+            {"role": "user", "content": "Review carefully: /workspace/api.py"}
+        ]
     }
 
 

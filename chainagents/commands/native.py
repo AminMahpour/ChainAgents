@@ -68,23 +68,19 @@ def resolve_native_command(
 
     Args:
         raw_text: Raw user text to parse.
-        selected_command: Command selected through the Chainlit UI, if any.
+        selected_command: Command selected through a separate interface field, if any.
 
     Returns:
         The resolved native command.
     """
-    parsed = parse_native_command(raw_text)
-    if parsed is not None:
-        return parsed
-
     command_name = str(selected_command or "").strip().lstrip("/").lower()
-    if not command_name:
-        return None
+    if command_name:
+        return ParsedNativeCommand(
+            command_name=command_name,
+            raw_args=raw_text.strip(),
+        )
 
-    return ParsedNativeCommand(
-        command_name=command_name,
-        raw_args=raw_text.strip(),
-    )
+    return parse_native_command(raw_text)
 
 
 def apply_native_template(template: str | None, raw_args: str) -> str:
