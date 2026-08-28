@@ -58,6 +58,15 @@ export DEEPAGENT_MODEL_API_KEY="your-openai-key"
 export ANTHROPIC_API_KEY="your-anthropic-key"
 ```
 
+**Option D: Snowflake Cortex**
+
+Snowflake Cortex requires a key. Set a Snowflake PAT (or use the generic key,
+TOML `api_key`, or the CLI `--api-key` override):
+
+```bash
+export SNOWFLAKE_PAT="your-snowflake-pat"
+```
+
 ### 3. Run the app
 
 ```bash
@@ -82,6 +91,7 @@ Try one of these prompts:
 | **LM Studio** | Free | Depends on hardware | Full privacy | Start local server |
 | **OpenAI** | Pay-per-token | Fast | Data sent to OpenAI | Set `DEEPAGENT_MODEL_API_KEY` |
 | **Anthropic** | Pay-per-token | Fast | Data sent to Anthropic | Set `ANTHROPIC_API_KEY` |
+| **Snowflake Cortex** | Snowflake usage | Fast | Data sent to Snowflake | Set `SNOWFLAKE_PAT` |
 
 To switch providers, edit `deepagent.toml`:
 
@@ -91,6 +101,24 @@ provider = "ollama"        # or "openai_compatible" or "anthropic"
 name = "gpt-oss:20b"       # change model name
 base_url = "http://127.0.0.1:11434"   # for Ollama or LM Studio
 ```
+
+For Snowflake Cortex, use the exact provider value `snowflake_cortex` (no aliases), a
+key, and either the base URL or full Chat Completions endpoint:
+
+```toml
+[model]
+provider = "snowflake_cortex"
+base_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1"
+name = "claude-sonnet-4-5"
+# endpoint_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"
+```
+
+Keys resolve in this order: CLI `--api-key`, `SNOWFLAKE_PAT`,
+`DEEPAGENT_MODEL_API_KEY`, then `[model].api_key`. Cortex chat does not provide RAG
+embeddings automatically: when RAG is enabled, set `[rag.embedding].provider` to
+`ollama` or `openai_compatible`, with an appropriate `model` and `base_url` (plus
+`api_key` if needed). `auto` is not valid for Cortex. Tool-call IDs are normalized
+only for Cortex; other OpenAI-compatible providers are unchanged.
 
 Then restart the app.
 

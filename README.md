@@ -54,6 +54,7 @@ export DEEPAGENT_MODEL_REASONING="medium"
 export DEEPAGENT_RECURSION_LIMIT="200"
 # export DEEPAGENT_MODEL_API_KEY="optional-for-secured-openai-compatible-servers"
 # export ANTHROPIC_API_KEY="required-for-provider-anthropic-unless-DEEPAGENT_MODEL_API_KEY-is-set"
+# export SNOWFLAKE_PAT="required-for-provider-snowflake_cortex-unless-a-CLI-or-generic-key-is-set"
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
 export CHAINLIT_AUTH_USERS='{"admin":"change-me","alice":"alice-password"}'
@@ -78,6 +79,7 @@ export CHAINLIT_AUTH_USERS='{"admin":"change-me","alice":"alice-password"}'
 - they override the matching `[model]` values in `deepagent.toml`
 - `DEEPAGENT_MODEL_API_KEY` is used for secured OpenAI-compatible servers and can also supply the Anthropic API key when `ANTHROPIC_API_KEY` is unset
 - `ANTHROPIC_API_KEY` is read first when `provider = "anthropic"` or `provider = "claude"`, so stale generic keys do not override the Claude credential
+- `SNOWFLAKE_PAT` is read first when `provider = "snowflake_cortex"`; Cortex still requires a key, resolved in this order: `--api-key`, `SNOWFLAKE_PAT`, `DEEPAGENT_MODEL_API_KEY`, then `[model].api_key`
 - when switching to Anthropic with `DEEPAGENT_MODEL_PROVIDER`, unset stale `DEEPAGENT_MODEL_BASE_URL`; use `DEEPAGENT_MODEL_ENDPOINT_URL` with the `/v1/messages` path for env-based Anthropic proxy switches, or pass `--base-url` explicitly from the CLI
 - `DEEPAGENT_MODEL_DISABLE_STREAMING` accepts `true`, `false`, or `tool_calling`; `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS=true` is a convenience alias for `tool_calling`
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
@@ -178,6 +180,7 @@ for your distribution before starting the app.
 
 If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
 If you are using Claude through Anthropic, set `[model].provider = "anthropic"` and provide `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY`.
+For Snowflake Cortex, use the dedicated `snowflake_cortex` provider and a Snowflake PAT as shown in [Snowflake Cortex](#snowflake-cortex).
 
 If you enable workspace-docs RAG with Ollama embeddings, also pull an embedding model such as:
 
@@ -360,6 +363,45 @@ name = "your-loaded-model-id"
 # api_key = "optional"
 ```
 
+### Snowflake Cortex
+
+Snowflake Cortex uses the canonical provider value `snowflake_cortex` (no aliases).
+It requires a key. Set `SNOWFLAKE_PAT`, `DEEPAGENT_MODEL_API_KEY`, or `[model].api_key`,
+or pass `--api-key` for a one-off CLI run. Credential precedence is `--api-key`,
+`SNOWFLAKE_PAT`, `DEEPAGENT_MODEL_API_KEY`, then `[model].api_key`.
+
+Use either the Chat Completions base URL or the complete Chat Completions endpoint:
+
+```toml
+[model]
+provider = "snowflake_cortex"
+base_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1"
+name = "claude-sonnet-4-5"
+# api_key = ""  # optional only when SNOWFLAKE_PAT or DEEPAGENT_MODEL_API_KEY is set
+```
+
+```toml
+[model]
+provider = "snowflake_cortex"
+endpoint_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"
+name = "claude-sonnet-4-5"
+```
+
+For the CLI, the same settings can be supplied without editing TOML:
+
+```bash
+export SNOWFLAKE_PAT="your-snowflake-pat"
+uv run chainagents --provider snowflake_cortex \
+  --base-url "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1" \
+  --model claude-sonnet-4-5 --prompt "Summarize this repository"
+```
+
+The `auto` RAG embedding provider is not valid for a Cortex chat model. If RAG is
+enabled, set `[rag.embedding].provider` to `ollama` or `openai_compatible`, together
+with an appropriate embedding `model` and `base_url` (and `api_key` when needed).
+Tool-call IDs are normalized only for Snowflake Cortex outbound Chat Completions requests;
+other OpenAI-compatible providers keep their original tool-call IDs.
+
 For Claude through Anthropic:
 
 ```toml
@@ -538,7 +580,9 @@ Notes:
 - With `provider = "auto"`, the embedding backend follows the active chat-model provider.
 - For Ollama, the default embedding model is `nomic-embed-text`.
 - For OpenAI-compatible embeddings, set `[rag.embedding].model` explicitly.
-- For Anthropic chat models, set `[rag.embedding].provider` explicitly to `ollama` or `openai_compatible`; `auto` cannot infer a Claude embedding backend.
+- For Anthropic or Snowflake Cortex chat models, set `[rag.embedding].provider`
+  explicitly to `ollama` or `openai_compatible`, with an appropriate model and base
+  URL; `auto` is not valid for either provider.
 - On startup, the UI reports whether RAG is ready and how many files/chunks were indexed.
 - The startup message includes a `Rebuild Knowledge Index` action so you can refresh the index after documentation changes.
 - The startup message also includes `Upload File For RAG`, which lets you add text-based files to the current chat thread's knowledge index.

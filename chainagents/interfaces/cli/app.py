@@ -92,7 +92,13 @@ CONFIGURE_PROMPTS = (
         label="Model provider",
         kind="choice",
         default="ollama",
-        choices=("ollama", "openai_compatible", "anthropic", "claude"),
+        choices=(
+            "ollama",
+            "openai_compatible",
+            "snowflake_cortex",
+            "anthropic",
+            "claude",
+        ),
     ),
     ConfigPrompt(
         section="model",
@@ -251,7 +257,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--provider",
-        help="Model provider: ollama, openai_compatible, anthropic, or claude.",
+        choices=(
+            "ollama",
+            "openai_compatible",
+            "snowflake_cortex",
+            "anthropic",
+            "claude",
+        ),
+        help=(
+            "Model provider: ollama, openai_compatible, Snowflake Cortex "
+            "(`snowflake_cortex`), anthropic, or claude."
+        ),
     )
     parser.add_argument("--base-url", help="Model server base URL.")
     parser.add_argument(
@@ -391,6 +407,9 @@ def parse_config_prompt_value(raw_value: str, prompt: ConfigPrompt) -> Any:
     value = raw_value.strip()
     if prompt.kind == "choice":
         normalized = value.lower().replace("-", "_")
+        if normalized == "snowflake_cortex" and value != normalized:
+            choices = ", ".join(prompt.choices)
+            raise ValueError(f"Choose one of: {choices}.")
         if normalized not in prompt.choices:
             choices = ", ".join(prompt.choices)
             raise ValueError(f"Choose one of: {choices}.")

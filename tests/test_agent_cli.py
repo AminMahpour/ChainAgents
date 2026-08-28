@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,6 +53,55 @@ def test_cli_parses_configure_flag() -> None:
 
     assert args.configure is True
     assert args.config == "custom.toml"
+
+
+def test_configure_command_writes_canonical_snowflake_cortex_provider(
+    tmp_path: Path,
+) -> None:
+    """Verify interactive setup preserves the canonical Cortex provider value."""
+    config_path = tmp_path / "deepagent.toml"
+    answers = "\n".join(["snowflake_cortex", *([""] * 16)])
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["provider"] == "snowflake_cortex"
+
+
+def test_cli_provider_flag_accepts_only_canonical_snowflake_cortex() -> None:
+    """Verify CLI provider selection rejects a non-canonical Cortex alias."""
+    args = chainagents_cli.parse_args(["--provider", "snowflake_cortex", "--status"])
+
+    assert args.provider == "snowflake_cortex"
+    with pytest.raises(SystemExit, match="2"):
+        chainagents_cli.parse_args(["--provider", "snowflake-cortex", "--status"])
+
+
+def test_cli_help_advertises_canonical_snowflake_cortex_provider(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify rendered CLI help names the canonical Snowflake Cortex provider."""
+    with pytest.raises(SystemExit, match="0"):
+        chainagents_cli.parse_args(["--help"])
+
+    assert re.search(
+        r"Snowflake\s+Cortex \(`snowflake_cortex`\)",
+        capsys.readouterr().out,
+    )
+
+
+def test_interactive_provider_prompt_rejects_snowflake_cortex_alias() -> None:
+    """Verify interactive setup does not rewrite a non-canonical Cortex alias."""
+    provider_prompt = chainagents_cli.CONFIGURE_PROMPTS[0]
+
+    with pytest.raises(ValueError, match="Choose one of"):
+        chainagents_cli.parse_config_prompt_value("snowflake-cortex", provider_prompt)
 
 
 def test_configure_command_updates_known_toml_values(tmp_path: Path) -> None:
