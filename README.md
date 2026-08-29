@@ -33,7 +33,7 @@ Highlights
 - Chainlit image uploads sent to vision-capable models as photo attachments for OCR or image analysis
 - Chainlit OCR/image uploads accept PNG, JPEG, WEBP, and GIF files
 - config-driven synchronous and async DeepAgents subagents
-- DeepAgents `==0.7.9` with explicit todo planning and safe filesystem defaults
+- DeepAgents `==0.7.10` with explicit todo planning and safe filesystem defaults
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
@@ -162,7 +162,7 @@ uv sync
 ollama pull gpt-oss:20b
 ```
 
-The dependency manifests require DeepAgents `==0.7.9`; `uv sync`
+The dependency manifests require DeepAgents `==0.7.10`; `uv sync`
 installs the matching locked release.
 
 PDF downloads are rendered with WeasyPrint. `uv sync` installs the Python package,
