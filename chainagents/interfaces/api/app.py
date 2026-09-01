@@ -32,9 +32,11 @@ from chainagents.commands.native import (
 )
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
 from chainagents.exports.generated_files import (
+    generated_file_descriptors_for_backend,
     generated_file_descriptors,
     generated_file_paths_from_text,
     generated_file_paths_from_tool_args,
+    resolve_generated_download_for_backend,
     resolve_generated_download,
 )
 from chainagents.exports.response import build_pdf_bytes
@@ -189,6 +191,7 @@ class RuntimeStatusResponse(BaseModel):
     agent_state: str
     recursion_limit: int
     persistence_mode: str
+    backend: "RuntimeBackendStatus | None" = None
     ui_api_version: int = 1
     models: list["RuntimeModelOption"]
     reasoning_levels: list[ReasoningLevel]
@@ -243,6 +246,22 @@ class RuntimeUploadCapabilities(BaseModel):
     max_file_size_bytes: int
     image_mime_types: list[str]
     rag_extensions: list[str]
+
+
+class RuntimeBackendRoute(BaseModel):
+    """One non-sensitive configured virtual backend route."""
+
+    path: str
+    type: str
+
+
+class RuntimeBackendStatus(BaseModel):
+    """Non-sensitive DeepAgents backend capabilities exposed to clients."""
+
+    default_type: str
+    routes: list[RuntimeBackendRoute]
+    execution_capable: bool
+    workspace_local: bool
 
 
 class ReflectionProposalRequest(BaseModel):
@@ -412,6 +431,11 @@ def create_app(
             agent_state=config.agent_state,
             recursion_limit=config.recursion_limit,
             persistence_mode=config.persistence_mode,
+            backend=(
+                active_runtime.backend_metadata.to_status()
+                if getattr(active_runtime, "backend_metadata", None) is not None
+                else None
+            ),
             models=model_options,
             reasoning_levels=["low", "medium", "high"],
             features=RuntimeFeatureFlags(
@@ -456,9 +480,44 @@ def create_app(
     async def download_generated_file(
         relative_path: str,
         request: Request,
-    ) -> FileResponse:
+    ) -> Response:
         """Download one existing file confined to generated outputs."""
         active_runtime = _runtime_from_request(request)
+        backend = getattr(active_runtime, "backend", None)
+        if backend is not None:
+            download = await resolve_generated_download_for_backend(
+                relative_path,
+                backend=backend,
+                project_root=Path(active_runtime.project_root),
+            )
+            if download is None:
+                raise HTTPException(status_code=404, detail="Generated file not found.")
+            if download.local_path is not None:
+                return FileResponse(
+                    download.local_path,
+                    filename=download.name,
+                    media_type=download.mime_type,
+                    headers={
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            if download.content is None:
+                raise HTTPException(status_code=404, detail="Generated file not found.")
+            from urllib.parse import quote
+
+            return Response(
+                content=download.content,
+                media_type=download.mime_type,
+                headers={
+                    "Content-Disposition": (
+                        "attachment; filename*=utf-8''"
+                        + quote(download.name, safe="")
+                    ),
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
         path = resolve_generated_download(
             relative_path,
             project_root=Path(active_runtime.project_root),
@@ -938,7 +997,7 @@ async def _agent_stream_lines(
             elif event.kind == "response_delta":
                 response_parts.append(event.text)
             yield _json_line(_event_payload(event, context))
-        generated_files_line = _generated_files_line(
+        generated_files_line = await _generated_files_line(
             runtime,
             context,
             generated_file_paths=generated_file_paths,
@@ -962,7 +1021,7 @@ async def _agent_stream_lines(
     except Exception as exc:
         reflection_collector.mark_run_failed(exc)
         if not generated_files_emitted:
-            generated_files_line = _generated_files_line(
+            generated_files_line = await _generated_files_line(
                 runtime,
                 context,
                 generated_file_paths=generated_file_paths,
@@ -990,7 +1049,7 @@ async def _agent_stream_lines(
         )
 
 
-def _generated_files_line(
+async def _generated_files_line(
     runtime: Any,
     context: AgentRunContext,
     *,
@@ -1004,10 +1063,18 @@ def _generated_files_line(
     ]
     if not raw_paths:
         return None
-    descriptors = generated_file_descriptors(
-        raw_paths,
-        project_root=Path(runtime.project_root),
-    )
+    backend = getattr(runtime, "backend", None)
+    if backend is None:
+        descriptors = generated_file_descriptors(
+            raw_paths,
+            project_root=Path(runtime.project_root),
+        )
+    else:
+        descriptors = await generated_file_descriptors_for_backend(
+            raw_paths,
+            backend=backend,
+            project_root=Path(runtime.project_root),
+        )
     if not descriptors:
         return None
     return _json_line(

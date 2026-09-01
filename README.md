@@ -312,6 +312,8 @@ content rather than importable Python package code:
 
 - `deepagent.toml` and `deepagent.toml.example`: model, agent, MCP, RAG,
   Chainlit, Langfuse, and subagent configuration.
+- [`backends.md`](backends.md): optional native DeepAgents backend types,
+  routing, security acknowledgements, remote workspaces, and downloads.
 - `skills/`: Deep Agents skill sources referenced from TOML as `skills`.
 - `prompts/`: prompt files referenced by configured subagents.
 - `public/` and `.chainlit/`: Chainlit static assets and native Chainlit config.
@@ -493,6 +495,10 @@ Chainlit, CLI, TUI, and API agent runs. The LangGraph thread ID is also passed
 as the Langfuse session ID.
 
 ## Agent Runtime Config
+
+Optional native DeepAgents backend configuration is documented separately in
+[`backends.md`](backends.md). Omitting `[backend]` preserves the existing local
+composite backend.
 
 The `[agent]` table configures main-agent runtime behavior:
 

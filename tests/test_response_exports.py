@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 import pytest
 
 import response_exports
+from deepagents.backends.protocol import FileDownloadResponse, LsResult
 
 
 def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
@@ -30,12 +32,43 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
         project_root=tmp_path,
     )
 
-    assert [element.name for element in elements] == ["summary.csv", "plot.png"]
-    assert [element.path for element in elements] == [
-        report_path.as_posix(),
-        chart_path.as_posix(),
-    ]
-    assert [element.mime for element in elements] == ["text/csv", "image/png"]
+    assert [element.name for element in elements] == ["plot.png"]
+    assert [element.path for element in elements] == [chart_path.as_posix()]
+    assert [element.mime for element in elements] == ["image/png"]
+
+
+def test_remote_generated_file_elements_are_byte_backed(tmp_path: Path) -> None:
+    virtual_path = "/workspace/.files/outputs/report.txt"
+
+    class RemoteBackend:
+        async def als(self, path: str):
+            assert path == "/workspace/.files/outputs/"
+            return LsResult(
+                entries=[
+                    {
+                        "path": virtual_path,
+                        "is_dir": False,
+                        "size": 13,
+                        "modified_at": "",
+                    }
+                ]
+            )
+
+        async def adownload_files(self, paths: list[str]):
+            assert paths == [virtual_path]
+            return [FileDownloadResponse(path=virtual_path, content=b"remote report")]
+
+    elements = asyncio.run(
+        response_exports.generated_file_elements_from_paths_async(
+            [virtual_path],
+            backend=RemoteBackend(),
+            project_root=tmp_path,
+        )
+    )
+
+    assert [element.name for element in elements] == ["report.txt"]
+    assert elements[0].content == b"remote report"
+    assert elements[0].path is None
 
 
 def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts(

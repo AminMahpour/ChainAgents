@@ -17,7 +17,10 @@ from chainlit.utils import utc_now
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
 from chainagents.exports.generated_files import generated_file_paths_from_tool_args
 from chainagents.runtime.reflection import ReflectionCollector, ReflectionProposal
-from chainagents.exports.response import attach_response_export_actions
+from chainagents.exports.response import (
+    attach_response_export_actions,
+    attach_response_export_actions_for_backend,
+)
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
 RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
@@ -941,6 +944,8 @@ class ChainlitEventBridge:
         generative_ui_enabled: bool = True,
         generated_ui_elements: dict[str, cl.CustomElement] | None = None,
         reflection_collector: ReflectionCollector | None = None,
+        backend: object | None = None,
+        project_root: Path | None = None,
     ) -> None:
         """Initialize the chainlit event bridge instance.
 
@@ -980,6 +985,8 @@ class ChainlitEventBridge:
         self.tool_steps_enabled = tool_steps_enabled
         self.generative_ui_enabled = generative_ui_enabled
         self.reflection_collector = reflection_collector
+        self.backend = backend
+        self.project_root = project_root
 
     async def start(self) -> None:
         """Start the chainlit event bridge."""
@@ -1454,12 +1461,22 @@ class ChainlitEventBridge:
             )
             self.response_task_started = True
 
-        attach_response_export_actions(
-            self.response_message,
-            prompt=self.prompt,
-            response_text=self.response_buffer,
-            generated_file_paths=tuple(self.generated_file_paths),
-        )
+        if self.backend is None:
+            attach_response_export_actions(
+                self.response_message,
+                prompt=self.prompt,
+                response_text=self.response_buffer,
+                generated_file_paths=tuple(self.generated_file_paths),
+            )
+        else:
+            await attach_response_export_actions_for_backend(
+                self.response_message,
+                prompt=self.prompt,
+                response_text=self.response_buffer,
+                generated_file_paths=tuple(self.generated_file_paths),
+                backend=self.backend,
+                project_root=self.project_root,
+            )
         await self.response_message.update()
 
     def _should_flush_response_stream(self) -> bool:

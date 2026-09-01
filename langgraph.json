@@ -13,5 +13,8 @@
     "supervisor": "./langgraph_app.py:supervisor",
     "async-researcher": "./langgraph_app.py:async_researcher"
   },
+  "http": {
+    "app": "./chainagents/langgraph/webapp.py:app"
+  },
   "python_version": "3.12"
 }
