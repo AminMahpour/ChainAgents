@@ -1404,6 +1404,85 @@ model = "lmstudio"
     assert active_model.endpoint_query == (("api-version", "2026-01-01"),)
 
 
+def test_cortex_default_does_not_revalidate_anthropic_profile_endpoint_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply a full endpoint override only to the selected Anthropic profile."""
+    config_path = tmp_path / "deepagent.toml"
+    cortex_base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    config_path.write_text(
+        f"""
+[model]
+provider = "snowflake_cortex"
+base_url = "{cortex_base_url}"
+name = "claude-sonnet-4-5"
+api_key = "cortex-pat"
+
+[model.profiles.claude]
+provider = "anthropic"
+name = "claude-sonnet-4-5"
+api_key = "anthropic-key"
+
+[agent]
+model = "claude"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_ENDPOINT_URL",
+        "https://claude-proxy.example/v1/messages?route=review",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_base_url == cortex_base_url
+    assert active_model.provider == "anthropic"
+    assert active_model.base_url == "https://claude-proxy.example"
+    assert active_model.endpoint_query == (("route", "review"),)
+
+
+def test_cortex_default_does_not_revalidate_ollama_profile_base_url_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply a base URL override only to the selected Ollama profile."""
+    config_path = tmp_path / "deepagent.toml"
+    cortex_base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    config_path.write_text(
+        f"""
+[model]
+provider = "snowflake_cortex"
+base_url = "{cortex_base_url}"
+name = "claude-sonnet-4-5"
+api_key = "cortex-pat"
+
+[model.profiles.local]
+provider = "ollama"
+base_url = "http://profile-ollama.example:11434"
+name = "local-model"
+
+[agent]
+model = "local"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_BASE_URL",
+        "env-ollama.example:11434/",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_base_url == cortex_base_url
+    assert active_model.provider == "ollama"
+    assert active_model.base_url == "http://env-ollama.example:11434"
+
+
 def test_rebased_profile_preserves_runtime_overrides_for_child_profiles() -> None:
     """Verify inherited rebased profiles carry runtime override provenance."""
     base_model = deepagent_runtime.ModelDefaults(

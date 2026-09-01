@@ -14,7 +14,7 @@ import sys
 import tomllib
 import traceback
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -47,7 +47,9 @@ from chainagents.runtime import (
     build_langgraph_run_config,
     shutdown_langfuse_client,
     format_model_provider,
+    normalize_model_provider,
     normalize_reasoning_level,
+    normalize_snowflake_cortex_endpoint_url,
     resolve_runtime_model_profile,
     resolve_local_path,
 )
@@ -218,6 +220,19 @@ CONFIGURE_PROMPTS = (
 )
 
 
+def parse_model_provider_argument(value: str) -> str:
+    """Normalize existing provider aliases while keeping Cortex canonical."""
+    candidate = value.strip()
+    if candidate.lower() == "snowflake_cortex" and candidate != "snowflake_cortex":
+        raise argparse.ArgumentTypeError(
+            "Snowflake Cortex must use the exact provider value 'snowflake_cortex'."
+        )
+    try:
+        return normalize_model_provider(candidate)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build parser.
 
@@ -257,13 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--provider",
-        choices=(
-            "ollama",
-            "openai_compatible",
-            "snowflake_cortex",
-            "anthropic",
-            "claude",
-        ),
+        type=parse_model_provider_argument,
+        metavar="PROVIDER",
         help=(
             "Model provider: ollama, openai_compatible, Snowflake Cortex "
             "(`snowflake_cortex`), anthropic, or claude."
@@ -567,19 +577,56 @@ def run_configure_command(
 
     print("Configure ChainAgents. Press Enter to keep the current value.", file=stdout)
     updates: dict[tuple[str, str], Any] = {}
+    raw_current_model_provider = nested_config_value(
+        current_config,
+        section="model",
+        key="provider",
+    )
+    try:
+        current_model_provider = normalize_model_provider(raw_current_model_provider)
+    except ValueError:
+        current_model_provider = None
+    selected_model_provider = current_model_provider
     for prompt in CONFIGURE_PROMPTS:
         current_value = nested_config_value(
             current_config,
             section=prompt.section,
             key=prompt.key,
         )
+        effective_prompt = prompt
+        is_cortex_base_url = bool(
+            prompt.section == "model"
+            and prompt.key == "base_url"
+            and selected_model_provider == "snowflake_cortex"
+        )
+        if is_cortex_base_url:
+            effective_prompt = replace(prompt, default=None)
+            if current_model_provider != "snowflake_cortex":
+                current_value = None
         value, should_write = read_config_prompt_value(
-            prompt,
+            effective_prompt,
             current_value=current_value,
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,
         )
+        if prompt.section == "model" and prompt.key == "provider" and should_write:
+            selected_model_provider = normalize_model_provider(value)
+        if is_cortex_base_url:
+            if not should_write:
+                print(
+                    "Model base URL: Snowflake Cortex requires an explicit account URL.",
+                    file=stderr,
+                )
+                return 1
+            try:
+                value, _ = normalize_snowflake_cortex_endpoint_url(
+                    value,
+                    full_endpoint=False,
+                )
+            except ValueError as exc:
+                print(f"Model base URL: {exc}", file=stderr)
+                return 1
         if should_write:
             updates[(prompt.section, prompt.key)] = value
 

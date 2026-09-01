@@ -58,9 +58,16 @@ def test_cli_parses_configure_flag() -> None:
 def test_configure_command_writes_canonical_snowflake_cortex_provider(
     tmp_path: Path,
 ) -> None:
-    """Verify interactive setup preserves the canonical Cortex provider value."""
+    """Verify interactive setup writes a usable canonical Cortex model config."""
     config_path = tmp_path / "deepagent.toml"
-    answers = "\n".join(["snowflake_cortex", *([""] * 16)])
+    cortex_base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    answers = "\n".join(
+        [
+            "snowflake_cortex",
+            cortex_base_url,
+            *([""] * (len(chainagents_cli.CONFIGURE_PROMPTS) - 2)),
+        ]
+    )
 
     code = chainagents_cli.run_configure_command(
         config_path=config_path,
@@ -72,6 +79,27 @@ def test_configure_command_writes_canonical_snowflake_cortex_provider(
     assert code == 0
     parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert parsed["model"]["provider"] == "snowflake_cortex"
+    assert parsed["model"]["base_url"] == cortex_base_url
+
+
+def test_configure_command_requires_a_snowflake_cortex_base_url(
+    tmp_path: Path,
+) -> None:
+    """Reject interactive Cortex setup that does not provide an account URL."""
+    config_path = tmp_path / "deepagent.toml"
+    stderr = io.StringIO()
+    answers = "\n".join(["snowflake_cortex", *([""] * 16)])
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 1
+    assert not config_path.exists()
+    assert "Snowflake Cortex" in stderr.getvalue()
 
 
 def test_cli_provider_flag_accepts_only_canonical_snowflake_cortex() -> None:
@@ -81,6 +109,19 @@ def test_cli_provider_flag_accepts_only_canonical_snowflake_cortex() -> None:
     assert args.provider == "snowflake_cortex"
     with pytest.raises(SystemExit, match="2"):
         chainagents_cli.parse_args(["--provider", "snowflake-cortex", "--status"])
+
+
+def test_cli_provider_flag_preserves_existing_provider_normalization() -> None:
+    """Keep accepting legacy case and hyphen variants for existing providers."""
+    openai_args = chainagents_cli.parse_args(
+        ["--provider", "OPENAI-COMPATIBLE", "--status"]
+    )
+    anthropic_args = chainagents_cli.parse_args(
+        ["--provider", "CLAUDE", "--status"]
+    )
+
+    assert openai_args.provider == "openai_compatible"
+    assert anthropic_args.provider == "anthropic"
 
 
 def test_cli_help_advertises_canonical_snowflake_cortex_provider(

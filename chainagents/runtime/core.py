@@ -3523,6 +3523,10 @@ class RuntimeConfig:
             file_config.model_profiles,
             model_name,
         )
+        cross_provider_profile_selected = bool(
+            model_name in file_config.model_profiles
+            and active_model_defaults.provider != model_provider
+        )
         cross_provider_model_base_url = (
             generic_model_base_url if generic_model_base_url_override else None
         )
@@ -3540,10 +3544,14 @@ class RuntimeConfig:
                 full_endpoint=False,
                 required_message="The Snowflake Cortex model base URL cannot be empty.",
             )
+        elif cross_provider_profile_selected and generic_model_base_url_override:
+            cross_provider_model_base_url = normalize_model_base_url(
+                generic_model_base_url,
+                required_message="The model base URL cannot be empty.",
+            )
         if (
             generic_model_endpoint_url
-            and model_name in file_config.model_profiles
-            and active_model_defaults.provider != model_provider
+            and cross_provider_profile_selected
         ):
             if active_model_defaults.provider == "anthropic":
                 (
@@ -3577,7 +3585,12 @@ class RuntimeConfig:
                     "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
                     "provider-switched Anthropic or OpenAI-compatible profiles."
                 )
-        if model_provider == "anthropic":
+        if cross_provider_profile_selected and (
+            generic_model_base_url or generic_model_endpoint_url
+        ):
+            model_base_url = model_defaults.base_url
+            model_endpoint_query = model_defaults.endpoint_query
+        elif model_provider == "anthropic":
             if generic_model_endpoint_url:
                 model_base_url, model_endpoint_query = normalize_anthropic_endpoint_url(
                     generic_model_endpoint_url,
