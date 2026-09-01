@@ -15,7 +15,7 @@ from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -202,6 +202,687 @@ def test_openai_compatible_model_preserves_vllm_reasoning_delta() -> None:
     assert generation_chunk.message.additional_kwargs["reasoning_content"] == (
         "thinking through the answer"
     )
+
+
+def _cortex_messages(*, tool_call_ids: list[str], tool_result_ids: list[str]) -> list[Any]:
+    """Build a chat-completions tool-call exchange with literal raw IDs."""
+    return [
+        HumanMessage(content="Use the supplied tools."),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": f"tool_{index}",
+                    "args": {"index": index},
+                    "id": tool_call_id,
+                    "type": "tool_call",
+                }
+                for index, tool_call_id in enumerate(tool_call_ids)
+            ],
+        ),
+        *[
+            ToolMessage(content=f"result-{index}", tool_call_id=tool_call_id)
+            for index, tool_call_id in enumerate(tool_result_ids)
+        ],
+    ]
+
+
+def _cortex_model() -> Any:
+    """Build the dedicated Cortex chat-completions adapter for payload tests."""
+    return deepagent_runtime.SnowflakeCortexChatOpenAI(
+        model="llama3.3-70b",
+        base_url="https://acme.snowflakecomputing.com/api/v2/cortex/v1",
+        api_key="test-pat",
+    )
+
+
+def test_normalize_model_provider_accepts_only_canonical_snowflake_cortex() -> None:
+    """Verify Cortex provider parsing rejects aliases that would hide config errors."""
+    assert deepagent_runtime.normalize_model_provider("snowflake_cortex") == "snowflake_cortex"
+    with pytest.raises(ValueError, match="snowflake"):
+        deepagent_runtime.normalize_model_provider("snowflake")
+    with pytest.raises(ValueError, match="snowflake"):
+        deepagent_runtime.normalize_model_provider("snowflake-cortex")
+
+
+def test_runtime_config_reads_direct_snowflake_cortex_base_url_and_toml_key(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify direct Cortex configuration preserves its chat-completions base URL."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert config.model_provider == "snowflake_cortex"
+    assert config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    assert isinstance(model, deepagent_runtime.SnowflakeCortexChatOpenAI)
+    assert model.openai_api_key.get_secret_value() == "toml-pat"
+
+
+def test_runtime_config_normalizes_snowflake_cortex_full_endpoint_url(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify full Cortex chat-completions URLs normalize to the API base URL."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+endpoint_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions?trace=1"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    assert config.model_endpoint_query == (("trace", "1"),)
+
+
+def test_runtime_cortex_endpoint_override_supersedes_stale_base_url_env(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Prefer an explicit Cortex endpoint override over a stale base URL env."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "http://stale.example/v1")
+
+    config = deepagent_runtime.RuntimeConfig.from_env(
+        deepagent_runtime.RuntimeConfigOverrides(
+            model_endpoint_url=(
+                "https://acme.snowflakecomputing.com/api/v2/cortex/v1/"
+                "chat/completions?trace=1"
+            ),
+        )
+    )
+
+    assert config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    assert config.model_endpoint_query == (("trace", "1"),)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "endpoint"),
+    [
+        ("base_url", "acme.snowflakecomputing.com/api/v2/cortex/v1"),
+        ("base_url", "http://acme.snowflakecomputing.com/api/v2/cortex/v1"),
+        ("base_url", "https://api.example.test/api/v2/cortex/v1"),
+        ("base_url", "https://acme.snowflakecomputing.com/v1"),
+        ("endpoint_url", "acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"),
+        ("endpoint_url", "http://acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"),
+        ("endpoint_url", "https://api.example.test/api/v2/cortex/v1/chat/completions"),
+        ("endpoint_url", "https://acme.snowflakecomputing.com/api/v2/cortex/v1"),
+    ],
+)
+def test_runtime_config_rejects_invalid_snowflake_cortex_endpoints(
+    tmp_path: Path,
+    monkeypatch,
+    field_name: str,
+    endpoint: str,
+) -> None:
+    """Verify Cortex rejects invalid schemes, hosts, and Chat Completions paths."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        f"""
+[model]
+provider = "snowflake_cortex"
+{field_name} = "{endpoint}"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="Snowflake Cortex"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
+def test_runtime_config_accepts_snowflake_cortex_privatelink_base_url(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Cortex accepts a PrivateLink account hostname and trailing slash."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.privatelink.snowflakecomputing.com/api/v2/cortex/v1/"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_base_url == "https://acme.privatelink.snowflakecomputing.com/api/v2/cortex/v1"
+
+
+def test_runtime_config_accepts_snowflake_cortex_cn_full_endpoint_url(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Cortex forwards query parameters from valid China-region endpoints."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+endpoint_url = "https://acme.snowflakecomputing.cn/api/v2/cortex/v1/chat/completions/?trace=1&trace=2"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_base_url == "https://acme.snowflakecomputing.cn/api/v2/cortex/v1"
+    assert config.model_endpoint_query == (("trace", "1"), ("trace", "2"))
+
+
+def test_runtime_config_keeps_generic_openai_compatible_endpoint_normalization(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Cortex-only validation does not narrow generic endpoint handling."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "openai_compatible"
+base_url = "compatible.example.test/api/v2/cortex/v1"
+name = "compatible-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_base_url == "http://compatible.example.test/api/v2/cortex/v1"
+
+
+def test_snowflake_cortex_serializes_default_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify direct Cortex models send the configured default reasoning effort."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+reasoning_effort = "low"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    payload = deepagent_runtime.build_model(
+        config,
+        config.default_reasoning,
+    )._get_request_payload([HumanMessage(content="Explain the result.")])
+
+    assert payload["extra_body"] == {"reasoning": {"effort": "low"}}
+    assert "messages" in payload
+
+
+def test_snowflake_cortex_profile_serializes_explicit_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify selected Cortex profiles serialize their resolved reasoning effort."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local"
+reasoning_effort = "low"
+
+[model.profiles.cortex]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "profile-pat"
+reasoning_effort = "high"
+
+[agent]
+model = "cortex"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    profile = deepagent_runtime.resolve_runtime_model_profile(config)
+    reasoning = deepagent_runtime.reasoning_level_for_profile(
+        profile,
+        config.default_reasoning,
+    )
+    payload = deepagent_runtime.build_model(
+        config,
+        reasoning,
+        model_profile=profile,
+    )._get_request_payload([HumanMessage(content="Explain the result.")])
+
+    assert reasoning == "high"
+    assert payload["extra_body"] == {"reasoning": {"effort": "high"}}
+
+
+def test_runtime_config_reads_named_snowflake_cortex_profile(tmp_path: Path, monkeypatch) -> None:
+    """Verify a selected named profile can switch to the Cortex provider."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local"
+
+[model.profiles.cortex]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "profile-pat"
+
+[agent]
+model = "cortex"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    profile = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert profile.provider == "snowflake_cortex"
+    assert profile.name == "llama3.3-70b"
+    assert deepagent_runtime.model_api_key_for_profile(config, profile) == "profile-pat"
+
+
+def test_dynamic_cortex_profile_rejects_incompatible_generic_base_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Fail closed when a dynamic Cortex profile receives another provider URL."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local"
+
+[model.profiles.cortex]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "profile-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "http://ollama.example:11434")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    with pytest.raises(ValueError, match="Snowflake Cortex"):
+        deepagent_runtime.resolve_runtime_model_profile(config, "cortex")
+
+
+def test_dynamic_cortex_profile_uses_generic_endpoint_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply a deferred full endpoint override to a dynamic Cortex profile."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local"
+
+[model.profiles.cortex]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "profile-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_ENDPOINT_URL",
+        (
+            "https://override-account.snowflakecomputing.com/api/v2/cortex/v1/"
+            "chat/completions?trace=1"
+        ),
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    profile = deepagent_runtime.resolve_runtime_model_profile(config, "cortex")
+
+    assert profile.base_url == (
+        "https://override-account.snowflakecomputing.com/api/v2/cortex/v1"
+    )
+    assert profile.endpoint_query == (("trace", "1"),)
+
+
+@pytest.mark.parametrize(
+    ("cli_key", "snowflake_pat", "generic_key", "expected"),
+    [
+        ("cli-key", "pat-key", "generic-key", "cli-key"),
+        (None, "pat-key", "generic-key", "pat-key"),
+        (None, None, "generic-key", "generic-key"),
+        (None, None, None, "toml-key"),
+    ],
+)
+def test_snowflake_cortex_credential_precedence(
+    tmp_path: Path,
+    monkeypatch,
+    cli_key: str | None,
+    snowflake_pat: str | None,
+    generic_key: str | None,
+    expected: str,
+) -> None:
+    """Verify Cortex credentials honor CLI, PAT, generic, then TOML precedence."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "toml-key"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    for name, value in (
+        ("SNOWFLAKE_PAT", snowflake_pat),
+        ("DEEPAGENT_MODEL_API_KEY", generic_key),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    config = deepagent_runtime.RuntimeConfig.from_env(
+        deepagent_runtime.RuntimeConfigOverrides(model_api_key=cli_key)
+    )
+    profile = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert deepagent_runtime.model_api_key_for_profile(config, profile) == expected
+
+
+def test_snowflake_cortex_requires_a_credential_before_model_construction(monkeypatch) -> None:
+    """Verify Cortex never silently substitutes a placeholder API key."""
+    monkeypatch.delenv("SNOWFLAKE_PAT", raising=False)
+    monkeypatch.delenv("DEEPAGENT_MODEL_API_KEY", raising=False)
+    config = RuntimeConfig(
+        database_url=None,
+        model_provider="snowflake_cortex",
+        model_name="llama3.3-70b",
+        model_choices=("llama3.3-70b",),
+        model_base_url="https://acme.snowflakecomputing.com/api/v2/cortex/v1",
+        model_api_key=None,
+        model_temperature=0.0,
+        default_reasoning="medium",
+        persistence_mode="memory",
+        extensions=ExtensionsConfig(config_path=None),
+    )
+
+    with pytest.raises(ValueError, match="SNOWFLAKE_PAT"):
+        deepagent_runtime.build_model(config, "medium")
+
+
+def test_snowflake_cortex_auto_rag_reports_an_embedding_model_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify Cortex does not pretend its chat endpoint supplies auto embeddings."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+
+[rag]
+enabled = true
+
+[rag.embedding]
+provider = "auto"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.rag_requested is True
+    assert config.rag is None
+    assert config.rag_error is not None
+    assert "snowflake_cortex" in config.rag_error
+
+
+def test_snowflake_cortex_filters_tools_to_openai_compatible_schemas(monkeypatch) -> None:
+    """Verify Cortex receives the same valid tool subset as OpenAI-compatible APIs."""
+    object_schema_tool = SimpleNamespace(name="object-schema")
+    unsupported_tool = SimpleNamespace(name="unsupported")
+    monkeypatch.setattr(
+        deepagent_runtime,
+        "tool_supports_openai_compatible_schema",
+        lambda tool: tool is object_schema_tool,
+    )
+
+    assert deepagent_runtime.sanitize_tools_for_model(
+        "snowflake_cortex",
+        [object_schema_tool, unsupported_tool],
+    ) == [object_schema_tool]
+
+
+def test_snowflake_cortex_payload_normalizes_a_single_tool_call_without_mutating_messages() -> None:
+    """Verify raw tool IDs become canonical in a copied outbound Cortex payload."""
+    messages = _cortex_messages(
+        tool_call_ids=["raw-call-1"],
+        tool_result_ids=["raw-call-1"],
+    )
+
+    payload = _cortex_model()._get_request_payload(messages)
+
+    assert payload["messages"][1]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert payload["messages"][2]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert messages[1].tool_calls[0]["id"] == "raw-call-1"
+    assert messages[2].tool_call_id == "raw-call-1"
+
+
+def test_snowflake_cortex_payload_does_not_mutate_the_parent_payload(monkeypatch) -> None:
+    """Verify ID normalization leaves the retained parent payload unchanged."""
+    parent_payload = {
+        "model": "llama3.3-70b",
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "raw-call-1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "raw-call-1", "content": "result"},
+        ],
+    }
+    monkeypatch.setattr(
+        deepagent_runtime.OpenAICompatibleChatOpenAI,
+        "_get_request_payload",
+        lambda self, input_, *, stop=None, **kwargs: parent_payload,
+    )
+
+    payload = _cortex_model()._get_request_payload([])
+
+    assert payload is not parent_payload
+    assert payload["messages"][0]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert payload["messages"][1]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert parent_payload["messages"][0]["tool_calls"][0]["id"] == "raw-call-1"
+    assert parent_payload["messages"][1]["tool_call_id"] == "raw-call-1"
+
+
+def test_snowflake_cortex_payload_supports_parallel_calls_and_reversed_results() -> None:
+    """Verify each parallel result is matched by ID rather than positional order."""
+    payload = _cortex_model()._get_request_payload(
+        _cortex_messages(
+            tool_call_ids=["raw-call-1", "raw-call-2"],
+            tool_result_ids=["raw-call-2", "raw-call-1"],
+        )
+    )
+
+    assert [call["id"] for call in payload["messages"][1]["tool_calls"]] == [
+        "call_0d10c795ab49e92cef4fbfa5",
+        "call_f495221433c3def0d8718adc",
+    ]
+    assert [message["tool_call_id"] for message in payload["messages"][2:]] == [
+        "call_f495221433c3def0d8718adc",
+        "call_0d10c795ab49e92cef4fbfa5",
+    ]
+
+
+def test_snowflake_cortex_payload_keeps_already_canonical_ids() -> None:
+    """Verify canonical IDs are idempotent rather than hashed a second time."""
+    canonical_id = "call_0123456789abcdef01234567"
+
+    payload = _cortex_model()._get_request_payload(
+        _cortex_messages(tool_call_ids=[canonical_id], tool_result_ids=[canonical_id])
+    )
+
+    assert payload["messages"][1]["tool_calls"][0]["id"] == canonical_id
+    assert payload["messages"][2]["tool_call_id"] == canonical_id
+
+
+def test_snowflake_cortex_payload_allows_raw_ids_to_be_reused_after_a_completed_batch() -> None:
+    """Verify a completed batch does not reserve raw IDs for later assistant turns."""
+    messages = [
+        *_cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=["raw-call-1"]),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "again", "args": {}, "id": "raw-call-1", "type": "tool_call"}
+            ],
+        ),
+        ToolMessage(content="again", tool_call_id="raw-call-1"),
+    ]
+
+    payload = _cortex_model()._get_request_payload(messages)
+
+    assert payload["messages"][3]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert payload["messages"][4]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
+
+
+@pytest.mark.parametrize(
+    ("messages", "error"),
+    [
+        (
+            _cortex_messages(tool_call_ids=[""], tool_result_ids=[]),
+            "empty tool call ID",
+        ),
+        (
+            _cortex_messages(
+                tool_call_ids=["raw-call-1", "raw-call-1"],
+                tool_result_ids=[],
+            ),
+            "duplicate tool call ID",
+        ),
+        (
+            _cortex_messages(
+                tool_call_ids=[
+                    "raw-call-1",
+                    "call_0d10c795ab49e92cef4fbfa5",
+                ],
+                tool_result_ids=[],
+            ),
+            "duplicate canonical tool call ID",
+        ),
+        (
+            [
+                *_cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=[]),
+                HumanMessage(content="interrupt the unfinished batch"),
+            ],
+            "incomplete tool-call batch",
+        ),
+        (
+            _cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=["unknown"]),
+            "unmatched tool response ID",
+        ),
+        (
+            _cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=[""]),
+            "empty tool response ID",
+        ),
+        (
+            _cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=[]),
+            "incomplete tool-call batch",
+        ),
+    ],
+)
+def test_snowflake_cortex_payload_rejects_invalid_tool_call_batches(
+    messages: list[Any],
+    error: str,
+) -> None:
+    """Verify malformed Cortex tool exchanges fail before an HTTP request is made."""
+    with pytest.raises(ValueError, match=error):
+        _cortex_model()._get_request_payload(messages)
+
+
+def test_openai_compatible_payload_leaves_raw_tool_ids_unchanged() -> None:
+    """Verify the generic OpenAI-compatible adapter remains byte-for-byte permissive."""
+    model = deepagent_runtime.OpenAICompatibleChatOpenAI(
+        model="compatible",
+        base_url="https://compatible.example/v1",
+        api_key="test-key",
+    )
+
+    payload = model._get_request_payload(
+        _cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=["raw-call-1"])
+    )
+
+    assert payload["messages"][1]["tool_calls"][0]["id"] == "raw-call-1"
+    assert payload["messages"][2]["tool_call_id"] == "raw-call-1"
 
 
 def write_skill(
@@ -822,6 +1503,85 @@ model = "lmstudio"
     assert active_model.name == "tool-model"
     assert active_model.base_url == "https://env-openai.example/openai/deployments/tool"
     assert active_model.endpoint_query == (("api-version", "2026-01-01"),)
+
+
+def test_cortex_default_does_not_revalidate_anthropic_profile_endpoint_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply a full endpoint override only to the selected Anthropic profile."""
+    config_path = tmp_path / "deepagent.toml"
+    cortex_base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    config_path.write_text(
+        f"""
+[model]
+provider = "snowflake_cortex"
+base_url = "{cortex_base_url}"
+name = "claude-sonnet-4-5"
+api_key = "cortex-pat"
+
+[model.profiles.claude]
+provider = "anthropic"
+name = "claude-sonnet-4-5"
+api_key = "anthropic-key"
+
+[agent]
+model = "claude"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_ENDPOINT_URL",
+        "https://claude-proxy.example/v1/messages?route=review",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_base_url == cortex_base_url
+    assert active_model.provider == "anthropic"
+    assert active_model.base_url == "https://claude-proxy.example"
+    assert active_model.endpoint_query == (("route", "review"),)
+
+
+def test_cortex_default_does_not_revalidate_ollama_profile_base_url_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply a base URL override only to the selected Ollama profile."""
+    config_path = tmp_path / "deepagent.toml"
+    cortex_base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    config_path.write_text(
+        f"""
+[model]
+provider = "snowflake_cortex"
+base_url = "{cortex_base_url}"
+name = "claude-sonnet-4-5"
+api_key = "cortex-pat"
+
+[model.profiles.local]
+provider = "ollama"
+base_url = "http://profile-ollama.example:11434"
+name = "local-model"
+
+[agent]
+model = "local"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_BASE_URL",
+        "env-ollama.example:11434/",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    active_model = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert config.model_base_url == cortex_base_url
+    assert active_model.provider == "ollama"
+    assert active_model.base_url == "http://env-ollama.example:11434"
 
 
 def test_rebased_profile_preserves_runtime_overrides_for_child_profiles() -> None:

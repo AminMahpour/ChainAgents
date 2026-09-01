@@ -14,7 +14,7 @@ import sys
 import tomllib
 import traceback
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -47,7 +47,9 @@ from chainagents.runtime import (
     build_langgraph_run_config,
     shutdown_langfuse_client,
     format_model_provider,
+    normalize_model_provider,
     normalize_reasoning_level,
+    normalize_snowflake_cortex_endpoint_url,
     resolve_runtime_model_profile,
     resolve_local_path,
 )
@@ -92,7 +94,13 @@ CONFIGURE_PROMPTS = (
         label="Model provider",
         kind="choice",
         default="ollama",
-        choices=("ollama", "openai_compatible", "anthropic", "claude"),
+        choices=(
+            "ollama",
+            "openai_compatible",
+            "snowflake_cortex",
+            "anthropic",
+            "claude",
+        ),
     ),
     ConfigPrompt(
         section="model",
@@ -212,6 +220,19 @@ CONFIGURE_PROMPTS = (
 )
 
 
+def parse_model_provider_argument(value: str) -> str:
+    """Normalize existing provider aliases while keeping Cortex canonical."""
+    candidate = value.strip()
+    if candidate.lower() == "snowflake_cortex" and candidate != "snowflake_cortex":
+        raise argparse.ArgumentTypeError(
+            "Snowflake Cortex must use the exact provider value 'snowflake_cortex'."
+        )
+    try:
+        return normalize_model_provider(candidate)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build parser.
 
@@ -251,7 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--provider",
-        help="Model provider: ollama, openai_compatible, anthropic, or claude.",
+        type=parse_model_provider_argument,
+        metavar="PROVIDER",
+        help=(
+            "Model provider: ollama, openai_compatible, Snowflake Cortex "
+            "(`snowflake_cortex`), anthropic, or claude."
+        ),
     )
     parser.add_argument("--base-url", help="Model server base URL.")
     parser.add_argument(
@@ -391,6 +417,9 @@ def parse_config_prompt_value(raw_value: str, prompt: ConfigPrompt) -> Any:
     value = raw_value.strip()
     if prompt.kind == "choice":
         normalized = value.lower().replace("-", "_")
+        if normalized == "snowflake_cortex" and value != normalized:
+            choices = ", ".join(prompt.choices)
+            raise ValueError(f"Choose one of: {choices}.")
         if normalized not in prompt.choices:
             choices = ", ".join(prompt.choices)
             raise ValueError(f"Choose one of: {choices}.")
@@ -480,10 +509,20 @@ def toml_section_ranges(lines: list[str]) -> dict[str, tuple[int, int]]:
 def apply_toml_updates(
     original: str,
     updates: dict[tuple[str, str], Any],
+    *,
+    removals: set[tuple[str, str]] | None = None,
 ) -> str:
     """Apply known TOML scalar updates while preserving unrelated text."""
+    removals = removals or set()
     lines = original.splitlines()
-    section_order = list(dict.fromkeys(section for section, _ in updates))
+    section_order = list(
+        dict.fromkeys(
+            [
+                *(section for section, _ in updates),
+                *(section for section, _ in removals),
+            ]
+        )
+    )
     ranges = toml_section_ranges(lines)
 
     for section in section_order:
@@ -493,6 +532,8 @@ def apply_toml_updates(
             if update_section == section
         }
         if section not in ranges:
+            if not section_updates:
+                continue
             if lines and lines[-1] != "":
                 lines.append("")
             lines.append(f"[{section}]")
@@ -502,6 +543,19 @@ def apply_toml_updates(
             continue
 
         start, end = ranges[section]
+        section_removals = {
+            key
+            for removal_section, key in removals
+            if removal_section == section and key not in section_updates
+        }
+        for key in section_removals:
+            key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+            for index in range(start + 1, end):
+                if key_pattern.match(lines[index]):
+                    del lines[index]
+                    end -= 1
+                    ranges = toml_section_ranges(lines)
+                    break
         for key, value in section_updates.items():
             replacement = f"{key} = {toml_scalar(value)}"
             key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
@@ -548,23 +602,160 @@ def run_configure_command(
 
     print("Configure ChainAgents. Press Enter to keep the current value.", file=stdout)
     updates: dict[tuple[str, str], Any] = {}
+    removals: set[tuple[str, str]] = set()
+    raw_current_model_provider = nested_config_value(
+        current_config,
+        section="model",
+        key="provider",
+    )
+    try:
+        current_model_provider = normalize_model_provider(raw_current_model_provider)
+    except ValueError:
+        current_model_provider = None
+    current_model_endpoint_url = nested_config_value(
+        current_config,
+        section="model",
+        key="endpoint_url",
+    )
+    selected_model_provider = current_model_provider
     for prompt in CONFIGURE_PROMPTS:
         current_value = nested_config_value(
             current_config,
             section=prompt.section,
             key=prompt.key,
         )
+        effective_prompt = prompt
+        provider_changed = selected_model_provider != current_model_provider
+        is_model_base_url = prompt.section == "model" and prompt.key == "base_url"
+        is_model_name = prompt.section == "model" and prompt.key == "name"
+        is_cortex_base_url = bool(
+            is_model_base_url
+            and selected_model_provider == "snowflake_cortex"
+        )
+        is_openai_compatible_base_url = bool(
+            is_model_base_url
+            and selected_model_provider == "openai_compatible"
+        )
+        requires_explicit_model_name = bool(
+            is_model_name
+            and selected_model_provider
+            in {"openai_compatible", "snowflake_cortex", "anthropic"}
+        )
+        if is_model_base_url and provider_changed:
+            current_value = None
+        if is_model_name and provider_changed:
+            current_value = None
+        if is_model_base_url and selected_model_provider != "ollama":
+            effective_prompt = replace(prompt, default=None)
+        if is_cortex_base_url:
+            if current_model_provider != "snowflake_cortex":
+                current_value = None
+            elif current_model_endpoint_url is not None and current_value is not None:
+                try:
+                    normalize_snowflake_cortex_endpoint_url(
+                        current_model_endpoint_url,
+                        full_endpoint=True,
+                    )
+                except ValueError:
+                    try:
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_value,
+                            full_endpoint=False,
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        removals.add(("model", "endpoint_url"))
+                else:
+                    try:
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_value,
+                            full_endpoint=False,
+                        )
+                    except ValueError:
+                        current_value = None
+                        removals.add(("model", "base_url"))
+        elif requires_explicit_model_name:
+            effective_prompt = replace(prompt, default=None)
         value, should_write = read_config_prompt_value(
-            prompt,
+            effective_prompt,
             current_value=current_value,
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,
         )
+        if prompt.section == "model" and prompt.key == "provider" and should_write:
+            selected_model_provider = normalize_model_provider(value)
+            if selected_model_provider != current_model_provider:
+                removals.add(("model", "base_url"))
+                removals.add(("model", "endpoint_url"))
+                removals.add(("model", "api_key"))
+        if is_openai_compatible_base_url and not should_write:
+            if (
+                current_model_provider == "openai_compatible"
+                and str(current_model_endpoint_url or "").strip()
+            ):
+                continue
+            print(
+                "Model base URL: OpenAI-compatible providers require an explicit URL.",
+                file=stderr,
+            )
+            return 1
+        if is_cortex_base_url:
+            if not should_write:
+                if (
+                    current_model_provider == "snowflake_cortex"
+                    and current_model_endpoint_url is not None
+                ):
+                    try:
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_model_endpoint_url,
+                            full_endpoint=True,
+                        )
+                    except ValueError as exc:
+                        print(f"Model endpoint URL: {exc}", file=stderr)
+                        return 1
+                    continue
+                print(
+                    "Model base URL: Snowflake Cortex requires an explicit account URL.",
+                    file=stderr,
+                )
+                return 1
+            try:
+                value, _ = normalize_snowflake_cortex_endpoint_url(
+                    value,
+                    full_endpoint=False,
+                )
+            except ValueError as exc:
+                print(f"Model base URL: {exc}", file=stderr)
+                return 1
+            normalized_current_value = None
+            if current_value is not None:
+                try:
+                    normalized_current_value, _ = (
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_value,
+                            full_endpoint=False,
+                        )
+                    )
+                except ValueError:
+                    pass
+            if (
+                current_model_endpoint_url is not None
+                and value != normalized_current_value
+            ):
+                removals.add(("model", "endpoint_url"))
+        if requires_explicit_model_name and not should_write:
+            provider_label = format_model_provider(selected_model_provider)
+            print(
+                f"Model name: {provider_label} requires an explicit model name.",
+                file=stderr,
+            )
+            return 1
         if should_write:
             updates[(prompt.section, prompt.key)] = value
 
-    updated = apply_toml_updates(original, updates)
+    updated = apply_toml_updates(original, updates, removals=removals)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(updated, encoding="utf-8")
     print(f"Configuration written to {config_path}", file=stdout)

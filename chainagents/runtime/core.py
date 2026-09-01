@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -69,7 +70,7 @@ from chainagents.runtime.reflection import (
 )
 
 
-ModelProvider = Literal["ollama", "openai_compatible", "anthropic"]
+ModelProvider = Literal["ollama", "openai_compatible", "snowflake_cortex", "anthropic"]
 ReasoningLevel = Literal["low", "medium", "high"]
 ModelModality = Literal["text", "image"]
 DisableStreaming = bool | Literal["tool_calling"]
@@ -108,6 +109,16 @@ _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
 OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
 OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
 ANTHROPIC_MESSAGES_PATH_SUFFIX = "/v1/messages"
+OPENAI_COMPATIBLE_MODEL_PROVIDERS = frozenset({"openai_compatible", "snowflake_cortex"})
+SNOWFLAKE_CORTEX_CANONICAL_TOOL_CALL_ID_RE = re.compile(r"^call_[0-9a-f]{24}$")
+SNOWFLAKE_CORTEX_BASE_PATH = "/api/v2/cortex/v1"
+SNOWFLAKE_CORTEX_CHAT_COMPLETIONS_PATH = (
+    f"{SNOWFLAKE_CORTEX_BASE_PATH}{OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX}"
+)
+SNOWFLAKE_CORTEX_HOST_SUFFIXES = (
+    ".snowflakecomputing.com",
+    ".snowflakecomputing.cn",
+)
 
 # Anthropic reasoning is not represented by OpenAI-style `delta` keys here.
 # LangChain Anthropic maps Claude `thinking_delta` and `signature_delta` stream
@@ -370,15 +381,18 @@ def normalize_model_provider(
     Raises:
         ValueError: If the supplied value is invalid.
     """
-    candidate = str(value or default).strip().lower().replace("-", "_")
+    raw_candidate = str(value or default).strip().lower()
+    candidate = raw_candidate.replace("-", "_")
     if not candidate:
         return default
     if candidate == "claude":
         candidate = "anthropic"
-    if candidate not in {"ollama", "openai_compatible", "anthropic"}:
+    if candidate == "snowflake_cortex" and raw_candidate != candidate:
+        raise ValueError("The Snowflake Cortex provider must be 'snowflake_cortex'.")
+    if candidate not in {"ollama", "openai_compatible", "snowflake_cortex", "anthropic"}:
         raise ValueError(
             "The model provider must be 'ollama', 'openai_compatible', "
-            "'anthropic', or 'claude'."
+            "'snowflake_cortex', 'anthropic', or 'claude'."
         )
     return candidate  # type: ignore[return-value]
 
@@ -394,6 +408,8 @@ def format_model_provider(provider: ModelProvider) -> str:
     """
     if provider == "openai_compatible":
         return "OpenAI-compatible"
+    if provider == "snowflake_cortex":
+        return "Snowflake Cortex"
     if provider == "anthropic":
         return "Anthropic Claude"
     return "Ollama"
@@ -480,6 +496,81 @@ class OpenAICompatibleChatOpenAI(ChatOpenAI):
 
         generation_chunk.message.additional_kwargs["reasoning_content"] = reasoning_delta
         return generation_chunk
+
+
+class SnowflakeCortexChatOpenAI(OpenAICompatibleChatOpenAI):
+    """Adapt Snowflake Cortex Chat Completions tool-call IDs."""
+
+    def _get_request_payload(
+        self,
+        input_: Any,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        """Return a copied Chat Completions payload with canonical tool-call IDs."""
+        payload = copy.deepcopy(
+            super()._get_request_payload(input_, stop=stop, **kwargs)
+        )
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return payload
+
+        pending_ids: set[str] = set()
+        pending_canonical_ids: set[str] = set()
+        canonical_ids: dict[str, str] = {}
+        for message in messages:
+            if not isinstance(message, dict):
+                if pending_ids:
+                    raise ValueError("incomplete tool-call batch before a new non-tool message")
+                continue
+            role = message.get("role")
+            tool_calls = message.get("tool_calls")
+            if role == "assistant" and tool_calls:
+                if pending_ids:
+                    raise ValueError("incomplete tool-call batch before a new assistant batch")
+                if not isinstance(tool_calls, list):
+                    raise ValueError("assistant tool calls must be a list")
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        raise ValueError("assistant tool call must be an object")
+                    raw_id = tool_call.get("id")
+                    if not isinstance(raw_id, str) or not raw_id:
+                        raise ValueError("empty tool call ID")
+                    if raw_id in pending_ids:
+                        raise ValueError("duplicate tool call ID within a batch")
+                    canonical_id = (
+                        raw_id
+                        if SNOWFLAKE_CORTEX_CANONICAL_TOOL_CALL_ID_RE.fullmatch(raw_id)
+                        else f"call_{hashlib.sha256(raw_id.encode('utf-8')).hexdigest()[:24]}"
+                    )
+                    if canonical_id in pending_canonical_ids:
+                        raise ValueError("duplicate canonical tool call ID within a batch")
+                    pending_ids.add(raw_id)
+                    pending_canonical_ids.add(canonical_id)
+                    canonical_ids[raw_id] = canonical_id
+                    tool_call["id"] = canonical_id
+                continue
+
+            if role == "tool":
+                raw_id = message.get("tool_call_id")
+                if not isinstance(raw_id, str) or not raw_id:
+                    raise ValueError("empty tool response ID")
+                if raw_id not in pending_ids:
+                    raise ValueError("unmatched tool response ID")
+                message["tool_call_id"] = canonical_ids[raw_id]
+                pending_ids.remove(raw_id)
+                if not pending_ids:
+                    pending_canonical_ids.clear()
+                    canonical_ids.clear()
+                continue
+
+            if pending_ids:
+                raise ValueError("incomplete tool-call batch before a new non-tool message")
+
+        if pending_ids:
+            raise ValueError("incomplete tool-call batch at payload end")
+        return payload
 
 
 class AnthropicDefaultQueryChatAnthropic(ChatAnthropic):
@@ -677,6 +768,54 @@ def normalize_openai_endpoint_url(
 
     base_url = urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
     return base_url, tuple(parse_qsl(parsed.query, keep_blank_values=True))
+
+
+def normalize_snowflake_cortex_endpoint_url(
+    value: Any | None,
+    *,
+    full_endpoint: bool,
+    required_message: str | None = None,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Validate and normalize a Snowflake Cortex API base or full endpoint URL."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        raise ValueError(
+            required_message
+            or "Snowflake Cortex model config must define a non-empty endpoint URL."
+        )
+
+    parsed = urlsplit(candidate)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname:
+        raise ValueError("Snowflake Cortex endpoints must use an absolute HTTPS URL.")
+    if not any(hostname.endswith(suffix) for suffix in SNOWFLAKE_CORTEX_HOST_SUFFIXES):
+        raise ValueError(
+            "Snowflake Cortex endpoints must use a Snowflake account hostname."
+        )
+    if parsed.fragment:
+        raise ValueError("Snowflake Cortex endpoints must not include a fragment.")
+    if not full_endpoint and parsed.query:
+        raise ValueError(
+            "Snowflake Cortex base URLs must not include query parameters."
+        )
+
+    expected_path = (
+        SNOWFLAKE_CORTEX_CHAT_COMPLETIONS_PATH
+        if full_endpoint
+        else SNOWFLAKE_CORTEX_BASE_PATH
+    )
+    path = parsed.path[:-1] if parsed.path.endswith("/") else parsed.path
+    if path != expected_path:
+        kind = "endpoint URL" if full_endpoint else "base URL"
+        raise ValueError(
+            f"Snowflake Cortex {kind} must use the path '{expected_path}'."
+        )
+
+    base_url = urlunsplit((parsed.scheme, parsed.netloc, SNOWFLAKE_CORTEX_BASE_PATH, "", ""))
+    endpoint_query = (
+        tuple(parse_qsl(parsed.query, keep_blank_values=True)) if full_endpoint else ()
+    )
+    return base_url, endpoint_query
 
 
 def normalize_anthropic_endpoint_url(
@@ -1887,6 +2026,8 @@ class ModelDefaults:
         disable_streaming: Whether to disable model streaming.
         cross_provider_base_url: Runtime endpoint override for provider-switched
             profiles.
+        cross_provider_endpoint_url: Unnormalized full runtime endpoint override for
+            provider-switched profiles.
         cross_provider_endpoint_query: Runtime endpoint query for provider-switched
             profiles.
         explicit_fields: Profile fields explicitly set in TOML.
@@ -1907,6 +2048,7 @@ class ModelDefaults:
     disable_streaming: DisableStreaming = False
     modalities: tuple[ModelModality, ...] = ("text",)
     cross_provider_base_url: str | None = None
+    cross_provider_endpoint_url: str | None = None
     cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     explicit_fields: frozenset[str] = field(
         default_factory=frozenset,
@@ -2011,9 +2153,11 @@ def parse_model_profile_defaults(
     else:
         name = DEFAULT_MODEL if provider == "ollama" else ""
 
-    if provider in {"openai_compatible", "anthropic"} and not name:
+    if provider in {*OPENAI_COMPATIBLE_MODEL_PROVIDERS, "anthropic"} and not name:
         provider_label = (
-            "OpenAI-compatible" if provider == "openai_compatible" else "Anthropic"
+            "OpenAI-compatible"
+            if provider == "openai_compatible"
+            else ("Snowflake Cortex" if provider == "snowflake_cortex" else "Anthropic")
         )
         raise ValueError(
             f"{provider_label} model config must define a non-empty 'name' or 'models'."
@@ -2053,9 +2197,26 @@ def parse_model_profile_defaults(
                 raw_model.get("endpoint"),
                 normalize_model_port(raw_model.get("port")),
             )
+    elif provider == "snowflake_cortex":
+        required_message = (
+            "Snowflake Cortex model config must define a non-empty "
+            "'base_url' or 'endpoint_url'."
+        )
+        if has_endpoint_url:
+            base_url, endpoint_query = normalize_snowflake_cortex_endpoint_url(
+                raw_endpoint_url,
+                full_endpoint=True,
+                required_message=required_message,
+            )
+        else:
+            base_url, endpoint_query = normalize_snowflake_cortex_endpoint_url(
+                raw_model.get("base_url"),
+                full_endpoint=False,
+                required_message=required_message,
+            )
     elif provider == "openai_compatible":
         required_message = (
-            "OpenAI-compatible model config must define a non-empty "
+            f"{format_model_provider(provider)} model config must define a non-empty "
             "'base_url' or 'endpoint_url'."
         )
         if has_endpoint_url:
@@ -2222,10 +2383,56 @@ def rebase_model_profile_defaults(
     runtime_override_fields = base_model.runtime_override_fields
     if model_profile.provider != base_model.provider:
         updates: dict[str, Any] = {}
-        if "cross_provider_base_url" in runtime_override_fields:
-            updates["base_url"] = (
+        if "cross_provider_endpoint_url" in runtime_override_fields:
+            cross_provider_endpoint_url = (
+                base_model.cross_provider_endpoint_url or ""
+            )
+            if model_profile.provider == "anthropic":
+                cross_provider_base_url, cross_provider_endpoint_query = (
+                    normalize_anthropic_endpoint_url(
+                        cross_provider_endpoint_url,
+                        required_message=(
+                            "The Anthropic model endpoint URL cannot be empty."
+                        ),
+                    )
+                )
+            elif model_profile.provider == "snowflake_cortex":
+                cross_provider_base_url, cross_provider_endpoint_query = (
+                    normalize_snowflake_cortex_endpoint_url(
+                        cross_provider_endpoint_url,
+                        full_endpoint=True,
+                        required_message=(
+                            "The Snowflake Cortex model endpoint URL cannot be empty."
+                        ),
+                    )
+                )
+            elif model_profile.provider == "openai_compatible":
+                cross_provider_base_url, cross_provider_endpoint_query = (
+                    normalize_openai_endpoint_url(
+                        cross_provider_endpoint_url,
+                        required_message="The model endpoint URL cannot be empty.",
+                    )
+                )
+            else:
+                raise ValueError(
+                    "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
+                    "provider-switched Anthropic or OpenAI-compatible profiles."
+                )
+            updates["base_url"] = cross_provider_base_url
+            updates["endpoint_query"] = cross_provider_endpoint_query
+        elif "cross_provider_base_url" in runtime_override_fields:
+            cross_provider_base_url = (
                 base_model.cross_provider_base_url or base_model.base_url
             )
+            if model_profile.provider == "snowflake_cortex":
+                cross_provider_base_url, _ = normalize_snowflake_cortex_endpoint_url(
+                    cross_provider_base_url,
+                    full_endpoint=False,
+                    required_message=(
+                        "The Snowflake Cortex model base URL cannot be empty."
+                    ),
+                )
+            updates["base_url"] = cross_provider_base_url
             updates["endpoint_query"] = (
                 base_model.cross_provider_endpoint_query
                 or base_model.endpoint_query
@@ -2237,6 +2444,13 @@ def rebase_model_profile_defaults(
             updates["runtime_override_fields"] = runtime_override_fields
         if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
             updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+        if (
+            model_profile.cross_provider_endpoint_url
+            != base_model.cross_provider_endpoint_url
+        ):
+            updates["cross_provider_endpoint_url"] = (
+                base_model.cross_provider_endpoint_url
+            )
         if (
             model_profile.cross_provider_endpoint_query
             != base_model.cross_provider_endpoint_query
@@ -2279,6 +2493,11 @@ def rebase_model_profile_defaults(
         updates["runtime_override_fields"] = runtime_override_fields
     if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
         updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+    if (
+        model_profile.cross_provider_endpoint_url
+        != base_model.cross_provider_endpoint_url
+    ):
+        updates["cross_provider_endpoint_url"] = base_model.cross_provider_endpoint_url
     if (
         model_profile.cross_provider_endpoint_query
         != base_model.cross_provider_endpoint_query
@@ -3127,6 +3346,8 @@ class RuntimeConfig:
             override may apply across profile provider boundaries.
         model_cross_provider_base_url: Generic runtime endpoint for provider-switched
             profiles.
+        model_cross_provider_endpoint_url: Unnormalized generic full endpoint for
+            provider-switched profiles.
         model_cross_provider_endpoint_query: Generic runtime endpoint query for
             provider-switched profiles.
         model_temperature_override: Whether temperature was overridden at runtime.
@@ -3162,6 +3383,7 @@ class RuntimeConfig:
     model_base_url_override: bool = False
     model_cross_provider_base_url_override: bool = False
     model_cross_provider_base_url: str | None = None
+    model_cross_provider_endpoint_url: str | None = None
     model_cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_temperature_override: bool = False
     model_disable_streaming_override: bool = False
@@ -3277,7 +3499,8 @@ class RuntimeConfig:
             and selected_override_profile.base_url
         )
         endpoint_url_satisfies_provider_switch = (
-            model_provider == "openai_compatible" and bool(generic_model_endpoint_url)
+            model_provider in OPENAI_COMPATIBLE_MODEL_PROVIDERS
+            and bool(generic_model_endpoint_url)
         )
         profile_endpoint_only_satisfies_provider_switch = (
             provider_changed
@@ -3287,14 +3510,14 @@ class RuntimeConfig:
         )
         provider_switch_requires_url = (
             provider_changed
-            and model_provider in {"ollama", "openai_compatible"}
+            and model_provider in {"ollama", *OPENAI_COMPATIBLE_MODEL_PROVIDERS}
             and not generic_model_base_url
             and not endpoint_url_satisfies_provider_switch
             and not profile_endpoint_satisfies_provider_switch
         )
         if provider_switch_requires_url:
             required_url_env = "DEEPAGENT_MODEL_BASE_URL"
-            if model_provider == "openai_compatible":
+            if model_provider in OPENAI_COMPATIBLE_MODEL_PROVIDERS:
                 required_url_env = (
                     "DEEPAGENT_MODEL_BASE_URL or DEEPAGENT_MODEL_ENDPOINT_URL"
                 )
@@ -3320,12 +3543,13 @@ class RuntimeConfig:
             )
 
         if (
-            model_provider == "openai_compatible"
+            model_provider in OPENAI_COMPATIBLE_MODEL_PROVIDERS
             and not generic_model_name
             and not model_defaults.name_is_explicit
         ):
+            provider_label = format_model_provider(model_provider)
             raise ValueError(
-                "OpenAI-compatible runtime must define DEEPAGENT_MODEL_NAME "
+                f"{provider_label} runtime must define DEEPAGENT_MODEL_NAME "
                 "or set a non-empty [model].name in deepagent.toml."
             )
         if (
@@ -3363,15 +3587,39 @@ class RuntimeConfig:
             file_config.model_profiles,
             model_name,
         )
-        cross_provider_model_base_url = (
-            generic_model_base_url if generic_model_base_url_override else None
+        cross_provider_profile_selected = bool(
+            model_name in file_config.model_profiles
+            and active_model_defaults.provider != model_provider
         )
+        cross_provider_model_base_url = (
+            generic_model_base_url
+            if generic_model_base_url_override and not generic_model_endpoint_url
+            else None
+        )
+        cross_provider_model_endpoint_url = generic_model_endpoint_url or None
         cross_provider_model_endpoint_query: tuple[tuple[str, str], ...] = ()
         model_endpoint_query = model_defaults.endpoint_query
         if (
+            generic_model_base_url_override
+            and not generic_model_endpoint_url
+            and active_model_defaults.provider == "snowflake_cortex"
+        ):
+            (
+                cross_provider_model_base_url,
+                cross_provider_model_endpoint_query,
+            ) = normalize_snowflake_cortex_endpoint_url(
+                generic_model_base_url,
+                full_endpoint=False,
+                required_message="The Snowflake Cortex model base URL cannot be empty.",
+            )
+        elif cross_provider_profile_selected and generic_model_base_url_override:
+            cross_provider_model_base_url = normalize_model_base_url(
+                generic_model_base_url,
+                required_message="The model base URL cannot be empty.",
+            )
+        if (
             generic_model_endpoint_url
-            and model_name in file_config.model_profiles
-            and active_model_defaults.provider != model_provider
+            and cross_provider_profile_selected
         ):
             if active_model_defaults.provider == "anthropic":
                 (
@@ -3382,6 +3630,15 @@ class RuntimeConfig:
                     required_message=(
                         "The Anthropic model endpoint URL cannot be empty."
                     ),
+                )
+            elif active_model_defaults.provider == "snowflake_cortex":
+                (
+                    cross_provider_model_base_url,
+                    cross_provider_model_endpoint_query,
+                ) = normalize_snowflake_cortex_endpoint_url(
+                    generic_model_endpoint_url,
+                    full_endpoint=True,
+                    required_message="The Snowflake Cortex model endpoint URL cannot be empty.",
                 )
             elif active_model_defaults.provider == "openai_compatible":
                 (
@@ -3396,7 +3653,12 @@ class RuntimeConfig:
                     "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
                     "provider-switched Anthropic or OpenAI-compatible profiles."
                 )
-        if model_provider == "anthropic":
+        if cross_provider_profile_selected and (
+            generic_model_base_url or generic_model_endpoint_url
+        ):
+            model_base_url = model_defaults.base_url
+            model_endpoint_query = model_defaults.endpoint_query
+        elif model_provider == "anthropic":
             if generic_model_endpoint_url:
                 model_base_url, model_endpoint_query = normalize_anthropic_endpoint_url(
                     generic_model_endpoint_url,
@@ -3419,18 +3681,42 @@ class RuntimeConfig:
                     if model_defaults.provider == "anthropic"
                     else ()
                 )
+        elif model_provider == "snowflake_cortex" and generic_model_endpoint_url:
+            model_base_url, model_endpoint_query = normalize_snowflake_cortex_endpoint_url(
+                generic_model_endpoint_url,
+                full_endpoint=True,
+                required_message="The Snowflake Cortex model endpoint URL cannot be empty.",
+            )
         elif model_provider == "openai_compatible" and generic_model_endpoint_url:
             model_base_url, model_endpoint_query = normalize_openai_endpoint_url(
                 generic_model_endpoint_url,
                 required_message="The model endpoint URL cannot be empty.",
             )
         else:
-            model_base_url = normalize_model_base_url(
+            selected_base_url = (
                 generic_model_base_url
                 or model_base_url_alias
-                or model_defaults.base_url,
-                required_message="The model base URL cannot be empty.",
+                or model_defaults.base_url
             )
+            if model_provider == "snowflake_cortex":
+                if generic_model_base_url:
+                    (
+                        model_base_url,
+                        model_endpoint_query,
+                    ) = normalize_snowflake_cortex_endpoint_url(
+                        selected_base_url,
+                        full_endpoint=False,
+                        required_message=(
+                            "The Snowflake Cortex model base URL cannot be empty."
+                        ),
+                    )
+                else:
+                    model_base_url = model_defaults.base_url
+            else:
+                model_base_url = normalize_model_base_url(
+                    selected_base_url,
+                    required_message="The model base URL cannot be empty.",
+                )
             if generic_model_base_url or model_base_url_alias:
                 model_endpoint_query = ()
         model_api_key_override = (
@@ -3444,7 +3730,11 @@ class RuntimeConfig:
             provider_specific_api_key = (
                 normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
                 if model_provider == "anthropic"
-                else None
+                else (
+                    normalize_optional_string(os.getenv("SNOWFLAKE_PAT"))
+                    if model_provider == "snowflake_cortex"
+                    else None
+                )
             )
             model_default_api_key = (
                 model_defaults.api_key
@@ -3517,6 +3807,7 @@ class RuntimeConfig:
             disable_streaming=model_disable_streaming,
             modalities=model_defaults.modalities,
             cross_provider_base_url=cross_provider_model_base_url,
+            cross_provider_endpoint_url=cross_provider_model_endpoint_url,
             cross_provider_endpoint_query=cross_provider_model_endpoint_query,
             runtime_override_fields=(
                 frozenset(
@@ -3533,7 +3824,14 @@ class RuntimeConfig:
                             ),
                             (
                                 "cross_provider_base_url",
-                                bool(cross_provider_model_base_url),
+                                bool(
+                                    cross_provider_model_base_url
+                                    and not cross_provider_model_endpoint_url
+                                ),
+                            ),
+                            (
+                                "cross_provider_endpoint_url",
+                                bool(cross_provider_model_endpoint_url),
                             ),
                             ("temperature", model_temperature_override),
                             ("disable_streaming", model_disable_streaming_override),
@@ -3548,13 +3846,18 @@ class RuntimeConfig:
             file_config.model_profiles,
             model_name,
         )
-        active_runtime_api_key = (
-            model_api_key_override
-            or (
-                normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
-                if active_runtime_model.provider == "anthropic"
+        active_runtime_provider_key = (
+            normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+            if active_runtime_model.provider == "anthropic"
+            else (
+                normalize_optional_string(os.getenv("SNOWFLAKE_PAT"))
+                if active_runtime_model.provider == "snowflake_cortex"
                 else None
             )
+        )
+        active_runtime_api_key = (
+            model_api_key_override
+            or active_runtime_provider_key
             or normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
             or active_runtime_model.api_key
         )
@@ -3562,6 +3865,11 @@ class RuntimeConfig:
             raise ValueError(
                 "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
                 "ANTHROPIC_API_KEY, or [model].api_key."
+            )
+        if active_runtime_model.provider == "snowflake_cortex" and not active_runtime_api_key:
+            raise ValueError(
+                "Snowflake Cortex runtime requires a CLI API key, SNOWFLAKE_PAT, "
+                "DEEPAGENT_MODEL_API_KEY, or [model].api_key."
             )
         rag_requested = file_config.rag.enabled and not overrides.disable_rag
         rag = None
@@ -3627,9 +3935,10 @@ class RuntimeConfig:
                 )
             ),
             model_cross_provider_base_url_override=bool(
-                cross_provider_model_base_url
+                cross_provider_model_base_url or cross_provider_model_endpoint_url
             ),
             model_cross_provider_base_url=cross_provider_model_base_url,
+            model_cross_provider_endpoint_url=cross_provider_model_endpoint_url,
             model_cross_provider_endpoint_query=(
                 cross_provider_model_endpoint_query
             ),
@@ -3767,6 +4076,11 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
             "model_cross_provider_base_url",
             None,
         ),
+        cross_provider_endpoint_url=getattr(
+            config,
+            "model_cross_provider_endpoint_url",
+            None,
+        ),
         cross_provider_endpoint_query=tuple(
             getattr(config, "model_cross_provider_endpoint_query", ())
         ),
@@ -3778,10 +4092,32 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
                         ("base_url", getattr(config, "model_base_url_override", False)),
                         (
                             "cross_provider_base_url",
-                            getattr(
-                                config,
-                                "model_cross_provider_base_url_override",
-                                False,
+                            bool(
+                                getattr(
+                                    config,
+                                    "model_cross_provider_base_url_override",
+                                    False,
+                                )
+                                and not getattr(
+                                    config,
+                                    "model_cross_provider_endpoint_url",
+                                    None,
+                                )
+                            ),
+                        ),
+                        (
+                            "cross_provider_endpoint_url",
+                            bool(
+                                getattr(
+                                    config,
+                                    "model_cross_provider_base_url_override",
+                                    False,
+                                )
+                                and getattr(
+                                    config,
+                                    "model_cross_provider_endpoint_url",
+                                    None,
+                                )
                             ),
                         ),
                         (
@@ -3834,6 +4170,10 @@ def model_api_key_for_profile(
         return config.model_api_key_override
     if model_profile.provider == "anthropic":
         provider_key = normalize_optional_string(os.getenv("ANTHROPIC_API_KEY"))
+        if provider_key:
+            return provider_key
+    if model_profile.provider == "snowflake_cortex":
+        provider_key = normalize_optional_string(os.getenv("SNOWFLAKE_PAT"))
         if provider_key:
             return provider_key
     generic_key = normalize_optional_string(os.getenv("DEEPAGENT_MODEL_API_KEY"))
@@ -3906,6 +4246,25 @@ def build_model(
             kwargs["default_query"] = default_query
             return AnthropicDefaultQueryChatAnthropic(**kwargs)
         return ChatAnthropic(**kwargs)
+
+    if resolved_profile.provider == "snowflake_cortex":
+        if not api_key:
+            raise ValueError(
+                "Snowflake Cortex runtime requires a CLI API key, SNOWFLAKE_PAT, "
+                "DEEPAGENT_MODEL_API_KEY, or [model].api_key."
+            )
+        kwargs = {
+            "model": selected_model,
+            "base_url": resolved_profile.base_url,
+            "api_key": api_key,
+            "temperature": resolved_profile.temperature,
+            "disable_streaming": resolved_profile.disable_streaming,
+            "extra_body": {"reasoning": {"effort": reasoning_level}},
+        }
+        default_query = model_endpoint_query_to_dict(resolved_profile.endpoint_query)
+        if default_query:
+            kwargs["default_query"] = default_query
+        return SnowflakeCortexChatOpenAI(**kwargs)
 
     kwargs: dict[str, Any] = {
         "model": selected_model,
@@ -4226,7 +4585,7 @@ def sanitize_tools_for_model(
     if model_provider == "anthropic":
         return [normalize_anthropic_tool_schema(tool) for tool in tools]
 
-    if model_provider != "openai_compatible":
+    if model_provider not in OPENAI_COMPATIBLE_MODEL_PROVIDERS:
         return list(tools)
 
     compatible_tools: list[Any] = []

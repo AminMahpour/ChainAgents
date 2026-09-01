@@ -1,6 +1,7 @@
 # Workspace Deep Agent
 
-Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible server.
+Local-first LangChain Deep Agent UI running on Ollama, OpenAI-compatible servers, or
+Snowflake Cortex.
 
 ## Available Surfaces
 
@@ -23,6 +24,17 @@ Local-first LangChain Deep Agent UI running on Ollama or any OpenAI-compatible s
 - `deepagent.toml` can define `[model]` with `provider`, `base_url` or OpenAI-compatible `endpoint_url`, `temperature`, `name`, optional `api_key`, and `reasoning_effort`
 - if `deepagent.toml` is missing, the runtime defaults to `http://127.0.0.1:11434`, `gpt-oss:20b`, and `medium`
 - `DEEPAGENT_MODEL_*` env vars override the TOML defaults, and `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain available as Ollama-only compatibility aliases
+- Snowflake Cortex uses the exact `snowflake_cortex` provider value (no aliases) and
+  requires a key. The credential order is CLI `--api-key`, `SNOWFLAKE_PAT`,
+  `DEEPAGENT_MODEL_API_KEY`, then `[model].api_key`.
+- Use `https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1` as the
+  Cortex base URL, or the full
+  `https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1/chat/completions`
+  endpoint URL.
+- Cortex requires `[rag.embedding].provider` to be `ollama` or
+  `openai_compatible`, with an appropriate embedding model and base URL, when RAG is
+  enabled; `auto` is not valid. Tool-call IDs are normalized only for Cortex outbound
+  requests.
 - DeepAgents manages conversation summarization in its base agent stack.
 - DeepAgents 0.7 no longer adds todo middleware by default, so ChainAgents
   explicitly restores it to preserve `write_todos`, `todos` state, and the

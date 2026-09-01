@@ -16,6 +16,14 @@ disable_streaming_for_tool_calls = false
 # name = "your-loaded-model-id"
 # api_key = ""
 #
+# For Snowflake Cortex, switch to the canonical provider value (no aliases):
+# provider = "snowflake_cortex"
+# base_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1"
+# endpoint_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"
+# name = "claude-sonnet-4-5"
+# api_key = ""  # required unless SNOWFLAKE_PAT or DEEPAGENT_MODEL_API_KEY is set
+# Credential order: CLI --api-key, SNOWFLAKE_PAT, DEEPAGENT_MODEL_API_KEY, then api_key.
+#
 # For Claude through Anthropic, switch to:
 # provider = "anthropic"
 # name = "claude-sonnet-4-6"
@@ -142,6 +150,9 @@ provider = "auto"
 #
 # For Anthropic chat models, do not leave provider = "auto"; set an explicit
 # Ollama or OpenAI-compatible embedding backend.
+# For Snowflake Cortex chat models, do not leave provider = "auto"; set an explicit
+# Ollama or OpenAI-compatible embedding backend with model and base_url.
+# Cortex normalizes outbound tool-call IDs only for its own Chat Completions requests.
 
 [[subagents]]
 name = "repo-researcher"
