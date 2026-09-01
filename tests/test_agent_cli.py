@@ -65,7 +65,8 @@ def test_configure_command_writes_canonical_snowflake_cortex_provider(
         [
             "snowflake_cortex",
             cortex_base_url,
-            *([""] * (len(chainagents_cli.CONFIGURE_PROMPTS) - 2)),
+            "claude-sonnet-4-5",
+            *([""] * (len(chainagents_cli.CONFIGURE_PROMPTS) - 3)),
         ]
     )
 
@@ -80,6 +81,174 @@ def test_configure_command_writes_canonical_snowflake_cortex_provider(
     parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert parsed["model"]["provider"] == "snowflake_cortex"
     assert parsed["model"]["base_url"] == cortex_base_url
+    assert parsed["model"]["name"] == "claude-sonnet-4-5"
+
+
+def test_configure_command_preserves_endpoint_only_snowflake_cortex_config(
+    tmp_path: Path,
+) -> None:
+    """Keep a valid Cortex endpoint URL when all current values are retained."""
+    config_path = tmp_path / "deepagent.toml"
+    endpoint_url = (
+        "https://acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"
+    )
+    config_path.write_text(
+        "\n".join(
+            [
+                "[model]",
+                'provider = "snowflake_cortex"',
+                f'endpoint_url = "{endpoint_url}"',
+                'name = "claude-sonnet-4-5"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO("\n" * len(chainagents_cli.CONFIGURE_PROMPTS)),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["endpoint_url"] == endpoint_url
+    assert "base_url" not in parsed["model"]
+
+
+def test_configure_command_clears_cortex_urls_when_switching_provider(
+    tmp_path: Path,
+) -> None:
+    """Do not retain Cortex URL fields after switching to Ollama."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+endpoint_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"
+name = "claude-sonnet-4-5"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    answers = "\n".join(
+        ["ollama", *([""] * (len(chainagents_cli.CONFIGURE_PROMPTS) - 1))]
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["provider"] == "ollama"
+    assert parsed["model"]["base_url"] == "http://127.0.0.1:11434"
+    assert "endpoint_url" not in parsed["model"]
+
+
+def test_configure_command_replaces_cortex_endpoint_with_edited_base_url(
+    tmp_path: Path,
+) -> None:
+    """Remove a stale Cortex endpoint URL when its base URL is edited."""
+    config_path = tmp_path / "deepagent.toml"
+    new_base_url = "https://new-account.snowflakecomputing.com/api/v2/cortex/v1"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://old-account.snowflakecomputing.com/api/v2/cortex/v1"
+endpoint_url = "https://old-account.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"
+name = "claude-sonnet-4-5"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    answers = "\n".join(
+        [
+            "",
+            new_base_url,
+            *([""] * (len(chainagents_cli.CONFIGURE_PROMPTS) - 2)),
+        ]
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["base_url"] == new_base_url
+    assert "endpoint_url" not in parsed["model"]
+
+
+def test_configure_command_preserves_unchanged_normalized_cortex_urls(
+    tmp_path: Path,
+) -> None:
+    """Keep a Cortex endpoint when its normalized base URL is unchanged."""
+    config_path = tmp_path / "deepagent.toml"
+    endpoint_url = (
+        "https://acme.snowflakecomputing.com/api/v2/cortex/v1/"
+        "chat/completions?trace=1"
+    )
+    config_path.write_text(
+        "\n".join(
+            [
+                "[model]",
+                'provider = "snowflake_cortex"',
+                'base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1/"',
+                f'endpoint_url = "{endpoint_url}"',
+                'name = "claude-sonnet-4-5"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO("\n" * len(chainagents_cli.CONFIGURE_PROMPTS)),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["endpoint_url"] == endpoint_url
+
+
+def test_configure_command_requires_a_snowflake_cortex_model(
+    tmp_path: Path,
+) -> None:
+    """Reject fresh Cortex setup that retains the Ollama model default."""
+    config_path = tmp_path / "deepagent.toml"
+    stderr = io.StringIO()
+    answers = "\n".join(
+        [
+            "snowflake_cortex",
+            "https://acme.snowflakecomputing.com/api/v2/cortex/v1",
+            *([""] * (len(chainagents_cli.CONFIGURE_PROMPTS) - 2)),
+        ]
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 1
+    assert not config_path.exists()
+    assert "Model name" in stderr.getvalue()
 
 
 def test_configure_command_requires_a_snowflake_cortex_base_url(

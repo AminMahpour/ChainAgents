@@ -3528,12 +3528,15 @@ class RuntimeConfig:
             and active_model_defaults.provider != model_provider
         )
         cross_provider_model_base_url = (
-            generic_model_base_url if generic_model_base_url_override else None
+            generic_model_base_url
+            if generic_model_base_url_override and not generic_model_endpoint_url
+            else None
         )
         cross_provider_model_endpoint_query: tuple[tuple[str, str], ...] = ()
         model_endpoint_query = model_defaults.endpoint_query
         if (
             generic_model_base_url_override
+            and not generic_model_endpoint_url
             and active_model_defaults.provider == "snowflake_cortex"
         ):
             (

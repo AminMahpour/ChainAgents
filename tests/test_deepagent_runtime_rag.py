@@ -296,6 +296,38 @@ api_key = "toml-pat"
     assert config.model_endpoint_query == (("trace", "1"),)
 
 
+def test_runtime_cortex_endpoint_override_supersedes_stale_base_url_env(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Prefer an explicit Cortex endpoint override over a stale base URL env."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "toml-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "http://stale.example/v1")
+
+    config = deepagent_runtime.RuntimeConfig.from_env(
+        deepagent_runtime.RuntimeConfigOverrides(
+            model_endpoint_url=(
+                "https://acme.snowflakecomputing.com/api/v2/cortex/v1/"
+                "chat/completions?trace=1"
+            ),
+        )
+    )
+
+    assert config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    assert config.model_endpoint_query == (("trace", "1"),)
+
+
 @pytest.mark.parametrize(
     ("field_name", "endpoint"),
     [

@@ -509,10 +509,20 @@ def toml_section_ranges(lines: list[str]) -> dict[str, tuple[int, int]]:
 def apply_toml_updates(
     original: str,
     updates: dict[tuple[str, str], Any],
+    *,
+    removals: set[tuple[str, str]] | None = None,
 ) -> str:
     """Apply known TOML scalar updates while preserving unrelated text."""
+    removals = removals or set()
     lines = original.splitlines()
-    section_order = list(dict.fromkeys(section for section, _ in updates))
+    section_order = list(
+        dict.fromkeys(
+            [
+                *(section for section, _ in updates),
+                *(section for section, _ in removals),
+            ]
+        )
+    )
     ranges = toml_section_ranges(lines)
 
     for section in section_order:
@@ -522,6 +532,8 @@ def apply_toml_updates(
             if update_section == section
         }
         if section not in ranges:
+            if not section_updates:
+                continue
             if lines and lines[-1] != "":
                 lines.append("")
             lines.append(f"[{section}]")
@@ -531,6 +543,19 @@ def apply_toml_updates(
             continue
 
         start, end = ranges[section]
+        section_removals = {
+            key
+            for removal_section, key in removals
+            if removal_section == section and key not in section_updates
+        }
+        for key in section_removals:
+            key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+            for index in range(start + 1, end):
+                if key_pattern.match(lines[index]):
+                    del lines[index]
+                    end -= 1
+                    ranges = toml_section_ranges(lines)
+                    break
         for key, value in section_updates.items():
             replacement = f"{key} = {toml_scalar(value)}"
             key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
@@ -577,6 +602,7 @@ def run_configure_command(
 
     print("Configure ChainAgents. Press Enter to keep the current value.", file=stdout)
     updates: dict[tuple[str, str], Any] = {}
+    removals: set[tuple[str, str]] = set()
     raw_current_model_provider = nested_config_value(
         current_config,
         section="model",
@@ -586,6 +612,11 @@ def run_configure_command(
         current_model_provider = normalize_model_provider(raw_current_model_provider)
     except ValueError:
         current_model_provider = None
+    current_model_endpoint_url = nested_config_value(
+        current_config,
+        section="model",
+        key="endpoint_url",
+    )
     selected_model_provider = current_model_provider
     for prompt in CONFIGURE_PROMPTS:
         current_value = nested_config_value(
@@ -594,12 +625,24 @@ def run_configure_command(
             key=prompt.key,
         )
         effective_prompt = prompt
+        provider_changed = selected_model_provider != current_model_provider
+        is_model_base_url = prompt.section == "model" and prompt.key == "base_url"
         is_cortex_base_url = bool(
-            prompt.section == "model"
-            and prompt.key == "base_url"
+            is_model_base_url
             and selected_model_provider == "snowflake_cortex"
         )
+        is_cortex_model_name = bool(
+            prompt.section == "model"
+            and prompt.key == "name"
+            and selected_model_provider == "snowflake_cortex"
+        )
+        if is_model_base_url and provider_changed:
+            current_value = None
         if is_cortex_base_url:
+            effective_prompt = replace(prompt, default=None)
+            if current_model_provider != "snowflake_cortex":
+                current_value = None
+        elif is_cortex_model_name:
             effective_prompt = replace(prompt, default=None)
             if current_model_provider != "snowflake_cortex":
                 current_value = None
@@ -612,8 +655,23 @@ def run_configure_command(
         )
         if prompt.section == "model" and prompt.key == "provider" and should_write:
             selected_model_provider = normalize_model_provider(value)
+            if selected_model_provider != current_model_provider:
+                removals.add(("model", "endpoint_url"))
         if is_cortex_base_url:
             if not should_write:
+                if (
+                    current_model_provider == "snowflake_cortex"
+                    and current_model_endpoint_url is not None
+                ):
+                    try:
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_model_endpoint_url,
+                            full_endpoint=True,
+                        )
+                    except ValueError as exc:
+                        print(f"Model endpoint URL: {exc}", file=stderr)
+                        return 1
+                    continue
                 print(
                     "Model base URL: Snowflake Cortex requires an explicit account URL.",
                     file=stderr,
@@ -627,10 +685,32 @@ def run_configure_command(
             except ValueError as exc:
                 print(f"Model base URL: {exc}", file=stderr)
                 return 1
+            normalized_current_value = None
+            if current_value is not None:
+                try:
+                    normalized_current_value, _ = (
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_value,
+                            full_endpoint=False,
+                        )
+                    )
+                except ValueError:
+                    pass
+            if (
+                current_model_endpoint_url is not None
+                and value != normalized_current_value
+            ):
+                removals.add(("model", "endpoint_url"))
+        if is_cortex_model_name and not should_write:
+            print(
+                "Model name: Snowflake Cortex requires an explicit model name.",
+                file=stderr,
+            )
+            return 1
         if should_write:
             updates[(prompt.section, prompt.key)] = value
 
-    updated = apply_toml_updates(original, updates)
+    updated = apply_toml_updates(original, updates, removals=removals)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(updated, encoding="utf-8")
     print(f"Configuration written to {config_path}", file=stdout)
