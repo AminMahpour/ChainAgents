@@ -627,25 +627,48 @@ def run_configure_command(
         effective_prompt = prompt
         provider_changed = selected_model_provider != current_model_provider
         is_model_base_url = prompt.section == "model" and prompt.key == "base_url"
+        is_model_name = prompt.section == "model" and prompt.key == "name"
         is_cortex_base_url = bool(
             is_model_base_url
             and selected_model_provider == "snowflake_cortex"
         )
-        is_cortex_model_name = bool(
-            prompt.section == "model"
-            and prompt.key == "name"
-            and selected_model_provider == "snowflake_cortex"
+        is_openai_compatible_base_url = bool(
+            is_model_base_url
+            and selected_model_provider == "openai_compatible"
+        )
+        requires_explicit_model_name = bool(
+            is_model_name
+            and selected_model_provider
+            in {"openai_compatible", "snowflake_cortex", "anthropic"}
         )
         if is_model_base_url and provider_changed:
             current_value = None
+        if is_model_name and provider_changed:
+            current_value = None
+        if is_model_base_url and selected_model_provider != "ollama":
+            effective_prompt = replace(prompt, default=None)
         if is_cortex_base_url:
-            effective_prompt = replace(prompt, default=None)
             if current_model_provider != "snowflake_cortex":
                 current_value = None
-        elif is_cortex_model_name:
+            elif current_model_endpoint_url is not None and current_value is not None:
+                try:
+                    normalize_snowflake_cortex_endpoint_url(
+                        current_model_endpoint_url,
+                        full_endpoint=True,
+                    )
+                except ValueError:
+                    pass
+                else:
+                    try:
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_value,
+                            full_endpoint=False,
+                        )
+                    except ValueError:
+                        current_value = None
+                        removals.add(("model", "base_url"))
+        elif requires_explicit_model_name:
             effective_prompt = replace(prompt, default=None)
-            if current_model_provider != "snowflake_cortex":
-                current_value = None
         value, should_write = read_config_prompt_value(
             effective_prompt,
             current_value=current_value,
@@ -656,7 +679,20 @@ def run_configure_command(
         if prompt.section == "model" and prompt.key == "provider" and should_write:
             selected_model_provider = normalize_model_provider(value)
             if selected_model_provider != current_model_provider:
+                removals.add(("model", "base_url"))
                 removals.add(("model", "endpoint_url"))
+                removals.add(("model", "api_key"))
+        if is_openai_compatible_base_url and not should_write:
+            if (
+                current_model_provider == "openai_compatible"
+                and str(current_model_endpoint_url or "").strip()
+            ):
+                continue
+            print(
+                "Model base URL: OpenAI-compatible providers require an explicit URL.",
+                file=stderr,
+            )
+            return 1
         if is_cortex_base_url:
             if not should_write:
                 if (
@@ -701,9 +737,10 @@ def run_configure_command(
                 and value != normalized_current_value
             ):
                 removals.add(("model", "endpoint_url"))
-        if is_cortex_model_name and not should_write:
+        if requires_explicit_model_name and not should_write:
+            provider_label = format_model_provider(selected_model_provider)
             print(
-                "Model name: Snowflake Cortex requires an explicit model name.",
+                f"Model name: {provider_label} requires an explicit model name.",
                 file=stderr,
             )
             return 1

@@ -2381,9 +2381,18 @@ def rebase_model_profile_defaults(
     if model_profile.provider != base_model.provider:
         updates: dict[str, Any] = {}
         if "cross_provider_base_url" in runtime_override_fields:
-            updates["base_url"] = (
+            cross_provider_base_url = (
                 base_model.cross_provider_base_url or base_model.base_url
             )
+            if model_profile.provider == "snowflake_cortex":
+                cross_provider_base_url, _ = normalize_snowflake_cortex_endpoint_url(
+                    cross_provider_base_url,
+                    full_endpoint=False,
+                    required_message=(
+                        "The Snowflake Cortex model base URL cannot be empty."
+                    ),
+                )
+            updates["base_url"] = cross_provider_base_url
             updates["endpoint_query"] = (
                 base_model.cross_provider_endpoint_query
                 or base_model.endpoint_query

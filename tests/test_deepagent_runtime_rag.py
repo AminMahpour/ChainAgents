@@ -538,6 +538,36 @@ model = "cortex"
     assert deepagent_runtime.model_api_key_for_profile(config, profile) == "profile-pat"
 
 
+def test_dynamic_cortex_profile_rejects_incompatible_generic_base_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Fail closed when a dynamic Cortex profile receives another provider URL."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local"
+
+[model.profiles.cortex]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "profile-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "http://ollama.example:11434")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    with pytest.raises(ValueError, match="Snowflake Cortex"):
+        deepagent_runtime.resolve_runtime_model_profile(config, "cortex")
+
+
 @pytest.mark.parametrize(
     ("cli_key", "snowflake_pat", "generic_key", "expected"),
     [
