@@ -657,7 +657,15 @@ def run_configure_command(
                         full_endpoint=True,
                     )
                 except ValueError:
-                    pass
+                    try:
+                        normalize_snowflake_cortex_endpoint_url(
+                            current_value,
+                            full_endpoint=False,
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        removals.add(("model", "endpoint_url"))
                 else:
                     try:
                         normalize_snowflake_cortex_endpoint_url(

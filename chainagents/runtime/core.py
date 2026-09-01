@@ -2026,6 +2026,8 @@ class ModelDefaults:
         disable_streaming: Whether to disable model streaming.
         cross_provider_base_url: Runtime endpoint override for provider-switched
             profiles.
+        cross_provider_endpoint_url: Unnormalized full runtime endpoint override for
+            provider-switched profiles.
         cross_provider_endpoint_query: Runtime endpoint query for provider-switched
             profiles.
         explicit_fields: Profile fields explicitly set in TOML.
@@ -2046,6 +2048,7 @@ class ModelDefaults:
     disable_streaming: DisableStreaming = False
     modalities: tuple[ModelModality, ...] = ("text",)
     cross_provider_base_url: str | None = None
+    cross_provider_endpoint_url: str | None = None
     cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     explicit_fields: frozenset[str] = field(
         default_factory=frozenset,
@@ -2380,7 +2383,44 @@ def rebase_model_profile_defaults(
     runtime_override_fields = base_model.runtime_override_fields
     if model_profile.provider != base_model.provider:
         updates: dict[str, Any] = {}
-        if "cross_provider_base_url" in runtime_override_fields:
+        if "cross_provider_endpoint_url" in runtime_override_fields:
+            cross_provider_endpoint_url = (
+                base_model.cross_provider_endpoint_url or ""
+            )
+            if model_profile.provider == "anthropic":
+                cross_provider_base_url, cross_provider_endpoint_query = (
+                    normalize_anthropic_endpoint_url(
+                        cross_provider_endpoint_url,
+                        required_message=(
+                            "The Anthropic model endpoint URL cannot be empty."
+                        ),
+                    )
+                )
+            elif model_profile.provider == "snowflake_cortex":
+                cross_provider_base_url, cross_provider_endpoint_query = (
+                    normalize_snowflake_cortex_endpoint_url(
+                        cross_provider_endpoint_url,
+                        full_endpoint=True,
+                        required_message=(
+                            "The Snowflake Cortex model endpoint URL cannot be empty."
+                        ),
+                    )
+                )
+            elif model_profile.provider == "openai_compatible":
+                cross_provider_base_url, cross_provider_endpoint_query = (
+                    normalize_openai_endpoint_url(
+                        cross_provider_endpoint_url,
+                        required_message="The model endpoint URL cannot be empty.",
+                    )
+                )
+            else:
+                raise ValueError(
+                    "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
+                    "provider-switched Anthropic or OpenAI-compatible profiles."
+                )
+            updates["base_url"] = cross_provider_base_url
+            updates["endpoint_query"] = cross_provider_endpoint_query
+        elif "cross_provider_base_url" in runtime_override_fields:
             cross_provider_base_url = (
                 base_model.cross_provider_base_url or base_model.base_url
             )
@@ -2404,6 +2444,13 @@ def rebase_model_profile_defaults(
             updates["runtime_override_fields"] = runtime_override_fields
         if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
             updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+        if (
+            model_profile.cross_provider_endpoint_url
+            != base_model.cross_provider_endpoint_url
+        ):
+            updates["cross_provider_endpoint_url"] = (
+                base_model.cross_provider_endpoint_url
+            )
         if (
             model_profile.cross_provider_endpoint_query
             != base_model.cross_provider_endpoint_query
@@ -2446,6 +2493,11 @@ def rebase_model_profile_defaults(
         updates["runtime_override_fields"] = runtime_override_fields
     if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
         updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+    if (
+        model_profile.cross_provider_endpoint_url
+        != base_model.cross_provider_endpoint_url
+    ):
+        updates["cross_provider_endpoint_url"] = base_model.cross_provider_endpoint_url
     if (
         model_profile.cross_provider_endpoint_query
         != base_model.cross_provider_endpoint_query
@@ -3294,6 +3346,8 @@ class RuntimeConfig:
             override may apply across profile provider boundaries.
         model_cross_provider_base_url: Generic runtime endpoint for provider-switched
             profiles.
+        model_cross_provider_endpoint_url: Unnormalized generic full endpoint for
+            provider-switched profiles.
         model_cross_provider_endpoint_query: Generic runtime endpoint query for
             provider-switched profiles.
         model_temperature_override: Whether temperature was overridden at runtime.
@@ -3329,6 +3383,7 @@ class RuntimeConfig:
     model_base_url_override: bool = False
     model_cross_provider_base_url_override: bool = False
     model_cross_provider_base_url: str | None = None
+    model_cross_provider_endpoint_url: str | None = None
     model_cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_temperature_override: bool = False
     model_disable_streaming_override: bool = False
@@ -3541,6 +3596,7 @@ class RuntimeConfig:
             if generic_model_base_url_override and not generic_model_endpoint_url
             else None
         )
+        cross_provider_model_endpoint_url = generic_model_endpoint_url or None
         cross_provider_model_endpoint_query: tuple[tuple[str, str], ...] = ()
         model_endpoint_query = model_defaults.endpoint_query
         if (
@@ -3751,6 +3807,7 @@ class RuntimeConfig:
             disable_streaming=model_disable_streaming,
             modalities=model_defaults.modalities,
             cross_provider_base_url=cross_provider_model_base_url,
+            cross_provider_endpoint_url=cross_provider_model_endpoint_url,
             cross_provider_endpoint_query=cross_provider_model_endpoint_query,
             runtime_override_fields=(
                 frozenset(
@@ -3767,7 +3824,14 @@ class RuntimeConfig:
                             ),
                             (
                                 "cross_provider_base_url",
-                                bool(cross_provider_model_base_url),
+                                bool(
+                                    cross_provider_model_base_url
+                                    and not cross_provider_model_endpoint_url
+                                ),
+                            ),
+                            (
+                                "cross_provider_endpoint_url",
+                                bool(cross_provider_model_endpoint_url),
                             ),
                             ("temperature", model_temperature_override),
                             ("disable_streaming", model_disable_streaming_override),
@@ -3871,9 +3935,10 @@ class RuntimeConfig:
                 )
             ),
             model_cross_provider_base_url_override=bool(
-                cross_provider_model_base_url
+                cross_provider_model_base_url or cross_provider_model_endpoint_url
             ),
             model_cross_provider_base_url=cross_provider_model_base_url,
+            model_cross_provider_endpoint_url=cross_provider_model_endpoint_url,
             model_cross_provider_endpoint_query=(
                 cross_provider_model_endpoint_query
             ),
@@ -4011,6 +4076,11 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
             "model_cross_provider_base_url",
             None,
         ),
+        cross_provider_endpoint_url=getattr(
+            config,
+            "model_cross_provider_endpoint_url",
+            None,
+        ),
         cross_provider_endpoint_query=tuple(
             getattr(config, "model_cross_provider_endpoint_query", ())
         ),
@@ -4022,10 +4092,32 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
                         ("base_url", getattr(config, "model_base_url_override", False)),
                         (
                             "cross_provider_base_url",
-                            getattr(
-                                config,
-                                "model_cross_provider_base_url_override",
-                                False,
+                            bool(
+                                getattr(
+                                    config,
+                                    "model_cross_provider_base_url_override",
+                                    False,
+                                )
+                                and not getattr(
+                                    config,
+                                    "model_cross_provider_endpoint_url",
+                                    None,
+                                )
+                            ),
+                        ),
+                        (
+                            "cross_provider_endpoint_url",
+                            bool(
+                                getattr(
+                                    config,
+                                    "model_cross_provider_base_url_override",
+                                    False,
+                                )
+                                and getattr(
+                                    config,
+                                    "model_cross_provider_endpoint_url",
+                                    None,
+                                )
                             ),
                         ),
                         (

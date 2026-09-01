@@ -568,6 +568,45 @@ api_key = "profile-pat"
         deepagent_runtime.resolve_runtime_model_profile(config, "cortex")
 
 
+def test_dynamic_cortex_profile_uses_generic_endpoint_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Apply a deferred full endpoint override to a dynamic Cortex profile."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local"
+
+[model.profiles.cortex]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "llama3.3-70b"
+api_key = "profile-pat"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "DEEPAGENT_MODEL_ENDPOINT_URL",
+        (
+            "https://override-account.snowflakecomputing.com/api/v2/cortex/v1/"
+            "chat/completions?trace=1"
+        ),
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    profile = deepagent_runtime.resolve_runtime_model_profile(config, "cortex")
+
+    assert profile.base_url == (
+        "https://override-account.snowflakecomputing.com/api/v2/cortex/v1"
+    )
+    assert profile.endpoint_query == (("trace", "1"),)
+
+
 @pytest.mark.parametrize(
     ("cli_key", "snowflake_pat", "generic_key", "expected"),
     [

@@ -425,6 +425,39 @@ def test_configure_command_ignores_invalid_base_when_endpoint_is_valid(
     assert "base_url" not in parsed["model"]
 
 
+def test_configure_command_removes_invalid_endpoint_when_base_is_valid(
+    tmp_path: Path,
+) -> None:
+    """Discard a stale Cortex endpoint when its base URL remains usable."""
+    config_path = tmp_path / "deepagent.toml"
+    base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[model]",
+                'provider = "snowflake_cortex"',
+                f'base_url = "{base_url}"',
+                'endpoint_url = "http://stale.example/v1/chat/completions"',
+                'name = "claude-sonnet-4-5"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO("\n" * len(chainagents_cli.CONFIGURE_PROMPTS)),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["model"]["base_url"] == base_url
+    assert "endpoint_url" not in parsed["model"]
+
+
 def test_configure_command_requires_a_snowflake_cortex_model(
     tmp_path: Path,
 ) -> None:
