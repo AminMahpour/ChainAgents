@@ -3105,8 +3105,8 @@ def test_tool_execution_resilience_middleware_returns_error_tool_message() -> No
     assert "without aborting the run" in str(result.content)
 
 
-def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path) -> None:
-    """Verify that tool execution middleware maps workspace path tool args.
+def test_tool_execution_middleware_preserves_native_filesystem_paths(tmp_path: Path) -> None:
+    """Verify native filesystem tools retain virtual paths for backend dispatch.
 
     Args:
         tmp_path: Path to the tmp.
@@ -3134,7 +3134,7 @@ def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path)
             The handler result.
         """
         assert updated_request.tool_call["args"] == {
-            "path": str(tmp_path / "skills/reviewer/SKILL.md")
+            "path": "/workspace/skills/reviewer/SKILL.md"
         }
         return ToolMessage(
             content="ok",
@@ -3840,7 +3840,8 @@ def test_get_agent_builds_compiled_subagents_for_nested_sync_subagents(
     assert "runnable" not in top_level_specs[1]
 
     assert manager_kwargs["model"] == "model:manager-model:medium"
-    assert manager_kwargs["system_prompt"] == "Manage the work."
+    assert manager_kwargs["system_prompt"].startswith("Manage the work.")
+    assert "Backend workspace contract:" in manager_kwargs["system_prompt"]
     assert manager_kwargs["skills"] == ["/workspace/manager-skills/"]
     assert manager_kwargs["tools"][0].name == "tools:manager-mcp"
 
@@ -5978,8 +5979,8 @@ def test_build_chainlit_command_catalog_includes_main_and_subagent_skills(
 
     assert [command.name for command in commands] == ["reviewer", "repo-guide"]
     assert commands[0].target == "skill"
-    assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
-    assert commands[1].value == str(tmp_path / "subskills/repo-guide/SKILL.md")
+    assert commands[0].value == "/workspace/skills/reviewer/SKILL.md"
+    assert commands[1].value == "/workspace/subskills/repo-guide/SKILL.md"
     assert notes == ()
 
 
@@ -6051,7 +6052,7 @@ def test_build_chainlit_command_catalog_uses_backend_workspace_root_when_project
     )
 
     assert len(commands) == 1
-    assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
+    assert commands[0].value == "/workspace/skills/reviewer/SKILL.md"
     assert notes == ()
 
 
@@ -6136,7 +6137,7 @@ def test_build_chainlit_command_catalog_prefers_main_agent_skill_over_subagent_s
     assert len(commands) == 1
     assert commands[0].target == "skill"
     assert commands[0].description == "Main reviewer"
-    assert commands[0].value == str(tmp_path / "skills/reviewer/SKILL.md")
+    assert commands[0].value == "/workspace/skills/reviewer/SKILL.md"
     assert len(notes) == 1
     assert "main agent skill" in notes[0]
 
@@ -6174,7 +6175,7 @@ def test_build_chainlit_command_catalog_uses_later_skill_source_in_same_bucket(
 
     assert len(commands) == 1
     assert commands[0].description == "Later reviewer"
-    assert commands[0].value == str(tmp_path / "skills-b/reviewer/SKILL.md")
+    assert commands[0].value == "/workspace/skills-b/reviewer/SKILL.md"
     assert notes == ()
 
 

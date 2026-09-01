@@ -1336,6 +1336,17 @@ async def on_chat_start() -> None:
         extensions_line += f"- Extensions config: `{extensions.config_path.name}`\n"
     if runtime.config.extensions.chainlit_startup_status_enabled:
         startup_model_profile = resolve_runtime_model_profile(runtime.config)
+        workspace_status_line = (
+            "- Real repo files live under `/workspace/`\n"
+            if runtime.backend_metadata.workspace_local
+            else "- `/workspace/` is provided by the configured backend\n"
+        )
+        if runtime.backend_metadata.execution_environment == "host":
+            execution_status_line = "- Host shell execution: enabled\n"
+        elif runtime.backend_metadata.execution_environment == "sandbox":
+            execution_status_line = "- Sandbox command execution: enabled\n"
+        else:
+            execution_status_line = "- Command execution: disabled\n"
         startup_message = cl.Message(
             content=(
                 "Workspace agent ready.\n\n"
@@ -1346,7 +1357,8 @@ async def on_chat_start() -> None:
                 f"{history_line}"
                 f"{rag_status_line(runtime)}"
                 f"{extensions_line}"
-                "- Real repo files live under `/workspace/`\n"
+                f"{workspace_status_line}"
+                f"{execution_status_line}"
                 "- Agent memory is available under `/memories/`"
             ),
             author="System",
@@ -1700,6 +1712,8 @@ async def on_message(message: cl.Message) -> None:
             runtime.config,
             prompt=agent_prompt,
         ),
+        backend=runtime.backend,
+        project_root=runtime.project_root,
     )
     await bridge.start()
 

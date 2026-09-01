@@ -18,6 +18,7 @@ from chainagents.exports.generated_files import (
     GENERATED_FILE_PATH_RE,
     GENERATED_OUTPUTS_DIRECTORY,
     MAX_GENERATED_FILES,
+    generated_file_downloads_for_backend,
 )
 
 
@@ -304,6 +305,40 @@ def attach_response_export_actions(
         message.elements = [*existing_elements, *generated_elements]
 
 
+async def attach_response_export_actions_for_backend(
+    message: cl.Message,
+    *,
+    prompt: str,
+    response_text: str,
+    backend: object,
+    generated_file_paths: Iterable[str | Path] = (),
+    project_root: Path | None = None,
+) -> None:
+    """Attach exports and backend-aware generated file elements."""
+    existing_elements = list(getattr(message, "elements", []) or [])
+    attach_response_export_actions(
+        message,
+        prompt=prompt,
+        response_text=response_text,
+        generated_file_paths=(),
+        project_root=project_root,
+    )
+    message.elements = existing_elements
+    raw_paths = [str(path) for path in generated_file_paths if str(path).strip()]
+    raw_paths.extend(
+        match.group("path")
+        for match in GENERATED_FILE_PATH_RE.finditer(response_text)
+        if match.group("path").strip()
+    )
+    generated_elements = await generated_file_elements_from_paths_async(
+        raw_paths,
+        backend=backend,
+        project_root=project_root,
+    )
+    if generated_elements:
+        message.elements = [*existing_elements, *generated_elements]
+
+
 def generated_file_elements_from_text(
     text: str,
     *,
@@ -371,6 +406,37 @@ def generated_file_elements_from_paths(
     return elements
 
 
+async def generated_file_elements_from_paths_async(
+    raw_paths: Iterable[str | Path],
+    *,
+    backend: object,
+    project_root: Path | None = None,
+) -> list[File]:
+    """Return local-path or byte-backed elements through the active backend."""
+    root = (project_root or Path.cwd()).resolve()
+    downloads = await generated_file_downloads_for_backend(
+        [str(path) for path in raw_paths if str(path).strip()],
+        backend=backend,
+        project_root=root,
+    )
+    elements: list[File] = []
+    for download in downloads:
+        file_kwargs: dict[str, object] = {
+            "thread_id": _current_chainlit_thread_id(),
+            "name": download.name,
+            "display": "inline",
+            "mime": download.mime_type,
+        }
+        if download.local_path is not None:
+            file_kwargs["path"] = download.local_path.as_posix()
+        elif download.content is not None:
+            file_kwargs["content"] = download.content
+        else:
+            continue
+        elements.append(File(**file_kwargs))
+    return elements
+
+
 def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) -> Path | None:
     """Resolve one generated file path if it points to a safe existing file."""
     path_text = _clean_generated_file_path(raw_path)
@@ -378,28 +444,28 @@ def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) ->
         return None
 
     absolute_candidate = Path(path_text)
+    output_root = project_root / GENERATED_OUTPUTS_DIRECTORY
     if absolute_candidate.is_absolute():
         resolved_absolute = _resolve_existing_project_file(
             absolute_candidate,
-            project_root=project_root,
+            project_root=output_root,
         )
         if resolved_absolute is not None:
             return resolved_absolute
 
-    if path_text == "/workspace":
+    workspace_outputs_prefix = f"/workspace/{GENERATED_OUTPUTS_DIRECTORY.as_posix()}"
+    if path_text == workspace_outputs_prefix:
         return None
-    if path_text.startswith("/workspace/"):
-        candidate = project_root / path_text.removeprefix("/workspace/")
+    if path_text.startswith(f"{workspace_outputs_prefix}/"):
+        candidate = output_root / path_text.removeprefix(f"{workspace_outputs_prefix}/")
     elif path_text == GENERATED_OUTPUTS_DIRECTORY.as_posix():
         return None
     elif path_text.startswith(f"{GENERATED_OUTPUTS_DIRECTORY.as_posix()}/"):
         candidate = project_root / path_text
     else:
-        candidate = Path(path_text)
-        if not candidate.is_absolute():
-            candidate = project_root / candidate
+        return None
 
-    return _resolve_existing_project_file(candidate, project_root=project_root)
+    return _resolve_existing_project_file(candidate, project_root=output_root)
 
 
 def _resolve_existing_project_file(candidate: Path, *, project_root: Path) -> Path | None:

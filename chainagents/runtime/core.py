@@ -30,8 +30,6 @@ from deepagents.backends import (
     BackendProtocol,
     CompositeBackend,
     FilesystemBackend,
-    StateBackend,
-    StoreBackend,
 )
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import _list_skills
@@ -68,6 +66,15 @@ from chainagents.runtime.reflection import (
     ReflectionConfig,
     normalize_reflection_config,
 )
+from chainagents.runtime.backends import (
+    BackendBundle,
+    BackendMetadata,
+    DeepAgentsBackendConfig,
+    build_deepagent_backend as _build_deepagent_backend,
+    build_runtime_backend_bundle,
+    close_backend_bundle_after_failure,
+    parse_backend_config,
+)
 
 
 ModelProvider = Literal["ollama", "openai_compatible", "snowflake_cortex", "anthropic"]
@@ -98,6 +105,9 @@ DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS = (
     "edit_file",
     "glob",
     "grep",
+)
+NATIVE_DEEPAGENT_FILESYSTEM_TOOLS = frozenset(
+    (*DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS, "delete", "execute")
 )
 AGENT_MEMORY_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -135,18 +145,26 @@ SYSTEM_PROMPT_MEMORY_LINE = (
     "- Use `/memories/` for agent memory. Persistence depends on runtime configuration."
 )
 STATELESS_SYSTEM_PROMPT_MEMORY_LINE = "- Agent memory is disabled for this runtime."
+SYSTEM_PROMPT_WORKSPACE_LINE = (
+    f"- Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`."
+)
+SYSTEM_PROMPT_OUTPUTS_LINE = (
+    "- Write downloadable generated files under `/workspace/.files/outputs/`, "
+    f"which maps to `{PROJECT_ROOT / GENERATED_OUTPUTS_DIRECTORY}`."
+)
+SYSTEM_PROMPT_EXECUTION_LINE = "- You do not have host shell execution."
 
 SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
-- Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
-- Write downloadable generated files under `/workspace/.files/outputs/`, which maps to `{PROJECT_ROOT / GENERATED_OUTPUTS_DIRECTORY}`.
+{SYSTEM_PROMPT_WORKSPACE_LINE}
+{SYSTEM_PROMPT_OUTPUTS_LINE}
 {SYSTEM_PROMPT_MEMORY_LINE}
 - Use any other absolute path only for ephemeral scratch work.
 
 Operating constraints:
-- You do not have host shell execution.
+{SYSTEM_PROMPT_EXECUTION_LINE}
 - Read existing files before editing them.
 - Keep edits scoped to the user request.
 - When you finish, explain the result clearly and concisely.
@@ -993,7 +1011,36 @@ WORKSPACE_PATH_TOOL_ARG_KEYS = {
 }
 
 
-def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
+def _map_workspace_path_for_backend(value: str, backend: BackendProtocol) -> str:
+    """Map a virtual path only when its most-specific route is virtual local FS."""
+    normalized = value.strip().replace("\\", "/")
+    if normalized != "/workspace" and not normalized.startswith("/workspace/"):
+        return value
+    matching_routes = [
+        (prefix, node)
+        for prefix, node in getattr(backend, "routes", {}).items()
+        if normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+    ]
+    if not matching_routes:
+        return value
+    prefix, node = max(matching_routes, key=lambda item: len(item[0]))
+    if not isinstance(node, FilesystemBackend) or not node.virtual_mode:
+        return value
+    relative = PurePosixPath(normalized.removeprefix(prefix.rstrip("/")).lstrip("/"))
+    root = node.cwd.resolve()
+    local_path = (root / Path(*relative.parts)).resolve()
+    try:
+        local_path.relative_to(root)
+    except ValueError:
+        return value
+    return str(local_path)
+
+
+def _map_workspace_tool_path_value(
+    value: Any,
+    project_root: Path,
+    backend: BackendProtocol | None = None,
+) -> Any:
     """Map one virtual workspace path value to a local path.
 
     Args:
@@ -1004,15 +1051,28 @@ def _map_workspace_tool_path_value(value: Any, project_root: Path) -> Any:
         The mapped value.
     """
     if isinstance(value, str):
+        if backend is not None:
+            return _map_workspace_path_for_backend(value, backend)
         return virtual_workspace_path_to_local(value, project_root)
     if isinstance(value, list):
-        return [_map_workspace_tool_path_value(item, project_root) for item in value]
+        return [
+            _map_workspace_tool_path_value(item, project_root, backend)
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_map_workspace_tool_path_value(item, project_root) for item in value)
+        return tuple(
+            _map_workspace_tool_path_value(item, project_root, backend)
+            for item in value
+        )
     return value
 
 
-def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None) -> Any:
+def map_workspace_paths_in_tool_args(
+    args: Any,
+    project_root: Path | None = None,
+    *,
+    backend: BackendProtocol | None = None,
+) -> Any:
     """Map workspace paths in tool args.
 
     Args:
@@ -1029,20 +1089,28 @@ def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None
     mapped = dict(args)
     for key, value in args.items():
         if str(key).lower() in WORKSPACE_PATH_TOOL_ARG_KEYS:
-            mapped[key] = _map_workspace_tool_path_value(value, root)
+            mapped[key] = _map_workspace_tool_path_value(value, root, backend)
     return mapped
 
 
 class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
     """Wrap tool execution with workspace path mapping and recoverable errors."""
 
-    def __init__(self, *, project_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        project_root: Path | None = None,
+        map_workspace_paths: bool = True,
+        backend: BackendProtocol | None = None,
+    ) -> None:
         """Initialize the tool execution resilience middleware instance.
 
         Args:
             project_root: Project root used to resolve local paths.
         """
         self.project_root = (project_root or PROJECT_ROOT).resolve()
+        self.map_workspace_paths = map_workspace_paths
+        self.backend = backend
 
     def _map_workspace_path_args(self, request: ToolCallRequest) -> None:
         """Map virtual workspace paths inside tool-call arguments.
@@ -1050,8 +1118,17 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         Args:
             request: The request value.
         """
+        if not self.map_workspace_paths:
+            return
+        tool_name = str(request.tool_call.get("name") or "").strip()
+        if tool_name in NATIVE_DEEPAGENT_FILESYSTEM_TOOLS:
+            return
         args = request.tool_call.get("args")
-        mapped_args = map_workspace_paths_in_tool_args(args, self.project_root)
+        mapped_args = map_workspace_paths_in_tool_args(
+            args,
+            self.project_root,
+            backend=self.backend,
+        )
         if mapped_args is not args:
             request.tool_call["args"] = mapped_args
 
@@ -1423,7 +1500,16 @@ def build_agent_middleware(
             tools=filesystem_tools,
         )
     )
-    middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
+    workspace_backend = getattr(backend, "routes", {}).get("/workspace/")
+    workspace_is_local = isinstance(workspace_backend, FilesystemBackend)
+    resilience_root = workspace_backend.cwd if workspace_is_local else project_root
+    middleware.append(
+        ToolExecutionResilienceMiddleware(
+            project_root=resilience_root,
+            map_workspace_paths=(workspace_is_local or workspace_backend is None),
+            backend=backend,
+        )
+    )
     return middleware
 
 
@@ -1582,6 +1668,7 @@ class SubagentConfig:
         tools: list[Any] | None = None,
         middleware: list[AgentMiddleware[Any, Any, Any]] | None = None,
         model: Any | None = None,
+        system_prompt: str | None = None,
     ) -> dict[str, Any]:
         """Convert this object to deepagents spec.
 
@@ -1596,7 +1683,7 @@ class SubagentConfig:
         spec: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
-            "system_prompt": self.system_prompt,
+            "system_prompt": system_prompt or self.system_prompt,
         }
         if self.skills:
             spec["skills"] = list(self.skills)
@@ -2528,6 +2615,7 @@ class FileConfig:
     model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
     langfuse: LangfuseConfig = LangfuseConfig()
     rag: RagConfig = RagConfig()
+    backend: DeepAgentsBackendConfig | None = None
 
 
 def parse_langfuse_config(raw_config: dict[str, Any]) -> LangfuseConfig:
@@ -3222,6 +3310,69 @@ def system_prompt_for_agent_state(
     )
 
 
+def system_prompt_for_backend(
+    base_prompt: str,
+    metadata: BackendMetadata,
+    *,
+    project_root: Path,
+) -> str:
+    """Return workspace and execution instructions for the active backend."""
+    if metadata.workspace_local:
+        if metadata.workspace_root is not None:
+            workspace_line = (
+                "- Use `/workspace/` for real project files. "
+                f"This route maps to `{metadata.workspace_root}`."
+            )
+        else:
+            workspace_line = (
+                "- `/workspace/` uses the configured unrestricted host filesystem backend."
+            )
+    else:
+        workspace_line = "- `/workspace/` is provided by the configured backend."
+    if metadata.outputs_local:
+        if metadata.outputs_root is not None:
+            outputs_line = (
+                "- Write downloadable generated files under `/workspace/.files/outputs/`, "
+                f"which maps to `{metadata.outputs_root}`."
+            )
+        else:
+            outputs_line = (
+                "- Write downloadable generated files under `/workspace/.files/outputs/` "
+                "using the configured unrestricted host filesystem backend."
+            )
+    else:
+        outputs_line = (
+            "- Write downloadable generated files under `/workspace/.files/outputs/` "
+            "on the configured backend."
+        )
+    if metadata.execution_environment == "host":
+        execution_line = "- Host shell execution is enabled by the configured backend."
+    elif metadata.execution_environment == "sandbox":
+        execution_line = "- Sandbox command execution is enabled by the configured backend."
+    elif metadata.execution_capable:
+        execution_line = "- Command execution is enabled by the configured backend."
+    else:
+        execution_line = SYSTEM_PROMPT_EXECUTION_LINE
+    prompt = (
+        base_prompt.replace(SYSTEM_PROMPT_WORKSPACE_LINE, workspace_line)
+        .replace(SYSTEM_PROMPT_OUTPUTS_LINE, outputs_line)
+        .replace(SYSTEM_PROMPT_EXECUTION_LINE, execution_line)
+    )
+    if not any(
+        line in base_prompt
+        for line in (
+            SYSTEM_PROMPT_WORKSPACE_LINE,
+            SYSTEM_PROMPT_OUTPUTS_LINE,
+            SYSTEM_PROMPT_EXECUTION_LINE,
+        )
+    ):
+        prompt = (
+            f"{prompt.rstrip()}\n\nBackend workspace contract:\n"
+            f"{workspace_line}\n{outputs_line}\n{execution_line}"
+        )
+    return prompt
+
+
 def load_file_config(config_path: str | Path | None = None) -> FileConfig:
     """Load file config.
 
@@ -3247,6 +3398,7 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
             model_profiles={},
             langfuse=LangfuseConfig(),
             rag=RagConfig(),
+            backend=None,
         )
 
     with resolved_config_path.open("rb") as fh:
@@ -3254,12 +3406,19 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
 
     model_defaults = parse_model_defaults(raw_config)
     raw_model = raw_config.get("model", {})
+    extensions = parse_extensions_config(raw_config, resolved_config_path)
     return FileConfig(
         model=model_defaults,
-        extensions=parse_extensions_config(raw_config, resolved_config_path),
+        extensions=extensions,
         model_profiles=parse_model_profiles(raw_model, base=model_defaults),
         langfuse=parse_langfuse_config(raw_config),
         rag=parse_rag_config(raw_config, resolved_config_path),
+        backend=parse_backend_config(
+            raw_config,
+            resolved_config_path,
+            agent_state=extensions.agent_state,
+            execute_tool_enabled=extensions.execute_tool_enabled,
+        ),
     )
 
 
@@ -3387,6 +3546,7 @@ class RuntimeConfig:
     model_cross_provider_endpoint_query: tuple[tuple[str, str], ...] = ()
     model_temperature_override: bool = False
     model_disable_streaming_override: bool = False
+    backend: DeepAgentsBackendConfig | None = None
 
     @classmethod
     def from_env(
@@ -3944,6 +4104,7 @@ class RuntimeConfig:
             ),
             model_temperature_override=model_temperature_override,
             model_disable_streaming_override=model_disable_streaming_override,
+            backend=file_config.backend,
         )
 
 
@@ -4344,8 +4505,10 @@ def build_deepagent_backend(
     project_root: Path | None = None,
     include_memories: bool = True,
     memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE,
+    backend_config: DeepAgentsBackendConfig | None = None,
+    store: Any | None = None,
 ) -> CompositeBackend:
-    """Build deepagent backend.
+    """Compatibility re-export for the focused backend factory.
 
     Args:
         project_root: Project root used to resolve local paths.
@@ -4355,31 +4518,12 @@ def build_deepagent_backend(
     Returns:
         The constructed deepagent backend.
     """
-    resolved_project_root = project_root or PROJECT_ROOT
-    artifacts_root = deepagent_artifacts_root(resolved_project_root)
-    outputs_root = generated_outputs_root(resolved_project_root)
-    routes = {
-        deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
-            root_dir=str(artifacts_root),
-            virtual_mode=True,
-        ),
-        generated_outputs_route_prefix(resolved_project_root): FilesystemBackend(
-            root_dir=str(outputs_root),
-            virtual_mode=True,
-        ),
-        "/workspace/": FilesystemBackend(
-            root_dir=str(resolved_project_root),
-            virtual_mode=True,
-        ),
-    }
-    if include_memories:
-        routes["/memories/"] = StoreBackend(
-            namespace=lambda _runtime: (memory_namespace,)
-        )
-    return CompositeBackend(
-        default=StateBackend(),
-        routes=routes,
-        artifacts_root=str(artifacts_root),
+    return _build_deepagent_backend(
+        project_root=project_root or PROJECT_ROOT,
+        include_memories=include_memories,
+        memory_namespace=memory_namespace,
+        backend_config=backend_config,
+        store=store,
     )
 
 
@@ -4440,7 +4584,7 @@ def _load_skill_command_bucket(
             metadata = SkillCommandMetadata(
                 name=command_name,
                 description=str(skill["description"]).strip(),
-                path=virtual_workspace_path_to_local(str(skill["path"]), project_root),
+                path=str(skill["path"]),
                 source=source,
                 owner=owner,
             )
@@ -4734,6 +4878,7 @@ def build_static_sync_subagent_spec(
     reasoning_level: ReasoningLevel,
     inherited_model: ModelDefaults,
     project_root: Path | None,
+    backend_metadata: BackendMetadata | None = None,
     reasoning_level_is_explicit: bool = False,
 ) -> dict[str, Any]:
     """Build a sync subagent spec for configured graph creation."""
@@ -4780,6 +4925,15 @@ def build_static_sync_subagent_spec(
             tools=subagent_tools,
             middleware=middleware,
             model=subagent_model,
+            system_prompt=(
+                system_prompt_for_backend(
+                    subagent.system_prompt,
+                    backend_metadata,
+                    project_root=project_root or PROJECT_ROOT,
+                )
+                if backend_metadata is not None
+                else None
+            ),
         )
 
     child_specs = [
@@ -4793,6 +4947,7 @@ def build_static_sync_subagent_spec(
             reasoning_level_is_explicit=reasoning_level_is_explicit,
             inherited_model=effective_model,
             project_root=project_root,
+            backend_metadata=backend_metadata,
         )
         for child in nested_child_subagents(subagent, registry)
     ]
@@ -4803,7 +4958,15 @@ def build_static_sync_subagent_spec(
             effective_model,
         ),
         "tools": effective_tools or None,
-        "system_prompt": subagent.system_prompt,
+        "system_prompt": (
+            system_prompt_for_backend(
+                subagent.system_prompt,
+                backend_metadata,
+                project_root=project_root or PROJECT_ROOT,
+            )
+            if backend_metadata is not None
+            else subagent.system_prompt
+        ),
         "middleware": middleware,
         "backend": backend,
         "skills": list(subagent.skills) or None,
@@ -4827,6 +4990,7 @@ def build_graph_subagent_specs(
     backend: Any | None = None,
     project_root: Path | None = None,
     inherited_tools: list[Any] | None = None,
+    backend_metadata: BackendMetadata | None = None,
 ) -> list[Any]:
     """Build graph subagent specs.
 
@@ -4863,6 +5027,7 @@ def build_graph_subagent_specs(
             reasoning_level_is_explicit=config.model_reasoning_override,
             inherited_model=inherited_model,
             project_root=project_root,
+            backend_metadata=backend_metadata,
         )
         for subagent in config.extensions.subagents
     ]
@@ -4893,6 +5058,9 @@ def create_configured_graph(
     include_async_subagents: bool,
     system_prompt: str = SYSTEM_PROMPT,
     apply_custom_instruction: bool = False,
+    config: RuntimeConfig | None = None,
+    backend: CompositeBackend | None = None,
+    backend_metadata: BackendMetadata | None = None,
 ) -> Any:
     """Create configured graph.
 
@@ -4904,10 +5072,60 @@ def create_configured_graph(
     Returns:
         The created configured graph.
     """
-    config = RuntimeConfig.from_env()
-    backend = build_deepagent_backend(
-        include_memories=config.agent_state == "stateful",
-        memory_namespace=config.extensions.agent_memory_namespace,
+    config = config or RuntimeConfig.from_env()
+    backend_bundle = None
+    if backend is None:
+        backend_bundle = build_runtime_backend_bundle(
+            backend_config=config.backend,
+            project_root=PROJECT_ROOT,
+            include_memories=config.agent_state == "stateful",
+            memory_namespace=config.extensions.agent_memory_namespace,
+        )
+        backend = backend_bundle.backend
+    try:
+        return _create_configured_graph_with_backend(
+            config=config,
+            include_async_subagents=include_async_subagents,
+            system_prompt=system_prompt,
+            apply_custom_instruction=apply_custom_instruction,
+            backend=backend,
+            backend_metadata=backend_metadata,
+            backend_bundle=backend_bundle,
+        )
+    except BaseException:
+        if backend_bundle is not None:
+            close_backend_bundle_after_failure(backend_bundle)
+        raise
+
+
+def _create_configured_graph_with_backend(
+    *,
+    config: RuntimeConfig,
+    include_async_subagents: bool,
+    system_prompt: str,
+    apply_custom_instruction: bool,
+    backend: CompositeBackend,
+    backend_metadata: BackendMetadata | None,
+    backend_bundle: BackendBundle | None,
+) -> Any:
+    """Finish graph construction after backend ownership is established."""
+    backend_metadata = backend_metadata or (
+        backend_bundle.metadata
+        if backend_bundle is not None
+        else BackendMetadata(
+            default_type=getattr(getattr(backend, "default", None), "type", "state"),
+            routes=(),
+            execution_capable=False,
+            workspace_local=isinstance(backend.routes.get("/workspace/"), FilesystemBackend),
+            workspace_root=(
+                backend.routes["/workspace/"].cwd
+                if (
+                    isinstance(backend.routes.get("/workspace/"), FilesystemBackend)
+                    and backend.routes["/workspace/"].virtual_mode
+                )
+                else None
+            ),
+        )
     )
     tools: list[Any] = []
     if config.extensions.chainlit_generative_ui_enabled:
@@ -4934,6 +5152,7 @@ def create_configured_graph(
         backend=backend,
         project_root=PROJECT_ROOT,
         inherited_tools=main_tools,
+        backend_metadata=backend_metadata,
     )
     agent_kwargs: dict[str, Any] = {
         "model": build_model_for_profile(
@@ -4944,7 +5163,14 @@ def create_configured_graph(
         "tools": main_tools or None,
         "system_prompt": compose_rag_system_prompt(
             compose_agent_system_prompt(
-                system_prompt_for_agent_state(system_prompt, config.agent_state),
+                system_prompt_for_agent_state(
+                    system_prompt_for_backend(
+                        system_prompt,
+                        backend_metadata,
+                        project_root=PROJECT_ROOT,
+                    ),
+                    config.agent_state,
+                ),
                 (
                     config.extensions.custom_instruction
                     if apply_custom_instruction
@@ -4968,7 +5194,11 @@ def create_configured_graph(
     memory_files = stateful_agent_memory_files(config)
     if memory_files is not None:
         agent_kwargs["memory"] = memory_files
-    return create_deep_agent_with_configured_summarization(config, **agent_kwargs)
+    graph = create_deep_agent_with_configured_summarization(config, **agent_kwargs)
+    if backend_bundle is not None:
+        setattr(graph, "_chainagents_backend_bundle", backend_bundle)
+        setattr(graph, "aclose_chainagents_resources", backend_bundle.close)
+    return graph
 
 
 @dataclass(frozen=True)
@@ -5019,11 +5249,10 @@ class AgentRuntime:
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
+        self._backend_bundle: BackendBundle | None = None
         self._exit_stack.push_async_callback(self.close_all_mcp_sessions)
-        self._chainlit_commands, self._chainlit_command_notes = build_chainlit_command_catalog(
-            config.extensions,
-            project_root=self.project_root,
-        )
+        self._chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
+        self._chainlit_command_notes: tuple[str, ...] = ()
 
     @classmethod
     async def get(cls) -> "AgentRuntime":
@@ -5035,7 +5264,17 @@ class AgentRuntime:
         async with cls._instance_lock:
             if cls._instance is None:
                 instance = cls(RuntimeConfig.from_env())
-                await instance._initialize()
+                try:
+                    await instance._initialize()
+                except BaseException:
+                    try:
+                        await instance.close()
+                    except Exception as cleanup_exc:
+                        logger.error(
+                            "Runtime startup cleanup failed (%s).",
+                            type(cleanup_exc).__name__,
+                        )
+                    raise
                 cls._instance = instance
             return cls._instance
 
@@ -5056,7 +5295,17 @@ class AgentRuntime:
             The created the agent runtime.
         """
         instance = cls(config or RuntimeConfig.from_env(), project_root=project_root)
-        await instance._initialize()
+        try:
+            await instance._initialize()
+        except BaseException:
+            try:
+                await instance.close()
+            except Exception as cleanup_exc:
+                logger.error(
+                    "Runtime startup cleanup failed (%s).",
+                    type(cleanup_exc).__name__,
+                )
+            raise
         return instance
 
     @classmethod
@@ -5136,6 +5385,29 @@ class AgentRuntime:
         return self._chainlit_command_notes
 
     @property
+    def backend(self) -> CompositeBackend:
+        """Return the initialized shared DeepAgents backend."""
+        return self._ensure_backend_bundle().backend
+
+    @property
+    def backend_metadata(self) -> BackendMetadata:
+        """Return non-sensitive metadata for the shared backend."""
+        return self._ensure_backend_bundle().metadata
+
+    def _ensure_backend_bundle(self) -> BackendBundle:
+        """Build the shared backend once after persistence handles are available."""
+        if self._backend_bundle is None:
+            self._backend_bundle = build_runtime_backend_bundle(
+                backend_config=self.config.backend,
+                project_root=self.project_root,
+                include_memories=self.config.agent_state == "stateful",
+                memory_namespace=self.config.extensions.agent_memory_namespace,
+                store=self._store,
+            )
+            self._exit_stack.push_async_callback(self._backend_bundle.close)
+        return self._backend_bundle
+
+    @property
     def rag_status(self) -> RagStatus:
         """Return the current RAG service status.
 
@@ -5177,6 +5449,17 @@ class AgentRuntime:
                 AsyncPostgresSaver.from_conn_string(self.config.database_url)
             )
             await self.checkpointer.setup()
+
+        self._ensure_backend_bundle()
+        (
+            self._chainlit_commands,
+            self._chainlit_command_notes,
+        ) = await asyncio.to_thread(
+            build_chainlit_command_catalog,
+            self.config.extensions,
+            backend=self.backend,
+            project_root=None,
+        )
 
         if self.config.rag is not None:
             self._rag_service = WorkspaceDocsRAG(
@@ -5296,6 +5579,11 @@ class AgentRuntime:
                 tools=subagent_tools,
                 middleware=middleware,
                 model=subagent_model,
+                system_prompt=system_prompt_for_backend(
+                    subagent.system_prompt,
+                    self.backend_metadata,
+                    project_root=self.project_root,
+                ),
             )
 
         child_specs = [
@@ -5319,7 +5607,11 @@ class AgentRuntime:
                 model_profile=effective_model,
             ),
             "tools": effective_tools or None,
-            "system_prompt": subagent.system_prompt,
+            "system_prompt": system_prompt_for_backend(
+                subagent.system_prompt,
+                self.backend_metadata,
+                project_root=self.project_root,
+            ),
             "middleware": middleware,
             "backend": backend,
             "skills": list(subagent.skills) or None,
@@ -5407,11 +5699,7 @@ class AgentRuntime:
                     selected_model_profile.provider,
                     raw_main_tools,
                 )
-                backend = build_deepagent_backend(
-                    project_root=self.project_root,
-                    include_memories=self.config.agent_state == "stateful",
-                    memory_namespace=self.config.extensions.agent_memory_namespace,
-                )
+                backend = self.backend
                 middleware = build_agent_middleware(
                     backend=backend,
                     config=self.config,
@@ -5442,7 +5730,11 @@ class AgentRuntime:
                     "system_prompt": compose_rag_system_prompt(
                         compose_agent_system_prompt(
                             system_prompt_for_agent_state(
-                                SYSTEM_PROMPT,
+                                system_prompt_for_backend(
+                                    SYSTEM_PROMPT,
+                                    self.backend_metadata,
+                                    project_root=self.project_root,
+                                ),
                                 self.config.agent_state,
                             ),
                             self.config.extensions.custom_instruction,

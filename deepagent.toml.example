@@ -51,6 +51,16 @@ thinking = "auto"
 # Set true to attach Langfuse's LangChain callback handler to agent runs.
 enabled = false
 
+# Optional native DeepAgents backend configuration is documented in backends.md.
+# Omitting [backend] preserves the existing local composite backend. Example:
+# [backend]
+# type = "state"
+#
+# [[backend.routes]]
+# path = "/reference/"
+# type = "context_hub"
+# identifier = "owner/agent-repo"
+
 [mcp]
 tool_name_prefix = true
 stateful = true

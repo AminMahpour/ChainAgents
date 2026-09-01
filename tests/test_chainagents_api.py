@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
+from deepagents.backends.protocol import FileDownloadResponse, LsResult
 
 import chainagents_api
 from chainagents.runtime.reflection import ReflectionConfig
@@ -92,6 +93,16 @@ class _FakeRuntime:
         self.upload_requests: list[dict[str, Any]] = []
         self.upload_paths: list[Any] = []
         self.operations: list[str] = []
+        self.backend_metadata = SimpleNamespace(
+            to_status=lambda: {
+                "default_type": "state",
+                "routes": [
+                    {"path": "/workspace/", "type": "filesystem"},
+                ],
+                "execution_capable": False,
+                "workspace_local": True,
+            }
+        )
         self.config = SimpleNamespace(
             default_reasoning="medium",
             model_name="fake-model",
@@ -206,6 +217,14 @@ def test_status_reports_runtime_configuration() -> None:
         "agent_state": "stateful",
         "recursion_limit": 100,
         "persistence_mode": "memory",
+        "backend": {
+            "default_type": "state",
+            "routes": [
+                {"path": "/workspace/", "type": "filesystem"},
+            ],
+            "execution_capable": False,
+            "workspace_local": True,
+        },
         "ui_api_version": 1,
         "models": [
             {
@@ -1121,6 +1140,82 @@ def test_generated_file_download_survives_app_recreation(tmp_path: Path) -> None
         assert "summary.csv" in response.headers["content-disposition"]
         assert response.headers["cache-control"] == "no-store"
         assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_remote_generated_file_stream_and_download_use_backend_bytes(tmp_path: Path) -> None:
+    virtual_path = "/workspace/.files/outputs/reports/remote.txt"
+
+    class RemoteBackend:
+        async def als(self, path: str):
+            assert path == "/workspace/.files/outputs/reports/"
+            return LsResult(
+                entries=[
+                    {
+                        "path": virtual_path,
+                        "is_dir": False,
+                        "size": 13,
+                        "modified_at": "",
+                    }
+                ]
+            )
+
+        async def adownload_files(self, paths: list[str]):
+            return [
+                FileDownloadResponse(path=path, content=b"remote output")
+                if path == virtual_path
+                else FileDownloadResponse(path=path, error="file_not_found")
+                for path in paths
+            ]
+
+    runtime = _FakeRuntime(
+        _FakeAgent(
+            [
+                _raw_event(
+                    (
+                        (),
+                        "messages",
+                        (_Token(f"Saved `{virtual_path}`."), {}),
+                    )
+                )
+            ]
+        )
+    )
+    runtime.project_root = tmp_path
+    runtime.backend = RemoteBackend()
+    runtime.backend_metadata = SimpleNamespace(
+        workspace_local=False,
+        execution_capable=False,
+        to_status=lambda: {
+            "default_type": "context_hub",
+            "routes": [{"path": "/workspace/", "type": "context_hub"}],
+            "execution_capable": False,
+            "workspace_local": False,
+        },
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app) as client:
+        stream_response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "create output", "thread_id": "thread-1"},
+        )
+        download_response = client.get("/api/generated-files/reports/remote.txt")
+        traversal_response = client.get("/api/generated-files/../secret.txt")
+
+    lines = [json.loads(line) for line in stream_response.iter_lines()]
+    generated = next(line for line in lines if line["kind"] == "generated_files")
+    assert generated["files"] == [
+        {
+            "name": "remote.txt",
+            "mime_type": "text/plain",
+            "size_bytes": 13,
+            "download_url": "/api/generated-files/reports/remote.txt",
+        }
+    ]
+    assert download_response.status_code == 200
+    assert download_response.content == b"remote output"
+    assert download_response.headers["content-disposition"].startswith("attachment;")
+    assert traversal_response.status_code == 404
 
 
 def test_stream_requires_thread_id() -> None:
