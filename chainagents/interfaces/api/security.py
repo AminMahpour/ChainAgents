@@ -9,6 +9,7 @@ import secrets
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from starlette._utils import get_route_path
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -80,7 +81,8 @@ class ApiTrustMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        path = scope.get("path", "")
+        # Use the router's root_path boundary rules for mounts and URL prefixes.
+        path = get_route_path(scope)
         if scope["method"] in {"GET", "HEAD"} and (
             path == "/health"
             or (

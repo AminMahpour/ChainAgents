@@ -581,3 +581,92 @@ def test_validation_preserves_actionable_local_message(monkeypatch):
         assert error["loc"] == ["body", "thread_id"]
         assert "256" in error["msg"]
         assert "input" not in error
+
+
+@pytest.mark.parametrize("deployment", ["root_path", "mount"])
+@pytest.mark.parametrize("token", [None, "test-token"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/status",
+        "/openapi.json",
+        "/docs",
+        "/redoc",
+        "/api/generated-files/report.txt",
+    ],
+)
+def test_prefixed_sensitive_routes_require_authorization(
+    tmp_path, deployment, token, path
+):
+    from fastapi import FastAPI
+    from chainagents.interfaces.api.security import ApiSecurityConfig
+
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("public shell")
+    output = tmp_path / ".files" / "outputs" / "report.txt"
+    output.parent.mkdir(parents=True)
+    output.write_text("private report")
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.project_root = tmp_path
+    child = api.create_app(
+        runtime=runtime, ui_dir=ui, security=ApiSecurityConfig(token=token)
+    )
+    # Mounted apps do not receive their parent's lifespan events. Supply the
+    # injected fake runtime directly without constructing any runtime resources.
+    child.state.runtime = runtime
+    if deployment == "mount":
+        app = FastAPI()
+        app.mount("/prefix", child)
+        root_path = ""
+    else:
+        app = child
+        root_path = "/prefix"
+
+    with TestClient(
+        app,
+        root_path=root_path,
+        client=("192.0.2.1", 1),
+        base_url="http://evil.example",
+    ) as client:
+        assert client.get(f"/prefix{path}").status_code == (401 if token else 403)
+        assert client.get("/prefix/").text == "public shell"
+        assert client.get("/prefix/health").json() == {"status": "ok"}
+        if token:
+            response = client.get(
+                f"/prefix{path}", headers={"Authorization": "Bearer test-token"}
+            )
+            assert response.status_code == 200
+            if path.endswith("report.txt"):
+                assert response.text == "private report"
+
+    if token is None:
+        with TestClient(
+            app,
+            root_path=root_path,
+            client=("127.0.0.1", 1),
+            base_url="http://127.0.0.1",
+        ) as client:
+            response = client.get(
+                f"/prefix{path}", headers={"Origin": "http://127.0.0.1"}
+            )
+            assert response.status_code == 200
+            if path.endswith("report.txt"):
+                assert response.text == "private report"
+
+
+@pytest.mark.parametrize("token", [None, "test-token"])
+def test_root_path_partial_prefix_keeps_sensitive_route_protected(tmp_path, token):
+    from chainagents.interfaces.api.security import ApiSecurityConfig
+
+    (tmp_path / "index.html").write_text("public shell")
+    app = api.create_app(
+        runtime=_FakeRuntime(_FakeAgent([])),
+        ui_dir=tmp_path,
+        security=ApiSecurityConfig(token=token),
+    )
+    # Starlette does not strip '/ap' from '/api/status': there is no slash boundary.
+    with TestClient(
+        app, root_path="/ap", client=("192.0.2.1", 1), base_url="http://evil.example"
+    ) as client:
+        assert client.get("/api/status").status_code == (401 if token else 403)
