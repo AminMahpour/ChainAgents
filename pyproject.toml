@@ -72,7 +72,6 @@ select = ["E4", "E7", "E9", "F"]
 [tool.ruff.lint.per-file-ignores]
 # These modules install warning filters before importing warning-producing libraries.
 "chainagents/interfaces/chainlit/app.py" = ["E402"]
-"chainagents/runtime/core.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.12"

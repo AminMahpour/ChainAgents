@@ -1039,7 +1039,7 @@ Current scope of this config support:
   configured backend must also implement sandbox execution
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
-- if you need custom Python tools, extend [chainagents/runtime/core.py](chainagents/runtime/core.py)
+- if you need custom Python tools, define them alongside the generated UI tool in [chainagents/runtime/commands.py](chainagents/runtime/commands.py), then register them in [graph.py](chainagents/runtime/graph.py) for static graphs and [lifecycle.py](chainagents/runtime/lifecycle.py) for live runtime agents
 
 See [deepagent.toml.example](deepagent.toml.example) for a portable baseline and
 the sections above for optional MCP and subagent examples.
@@ -1059,6 +1059,32 @@ the sections above for optional MCP and subagent examples.
 - When `[agent].state = "stateless"`, thread IDs still identify requests and MCP/RAG scopes, but the agent graph does not checkpoint conversation state, receive a LangGraph store, or expose `/memories/`.
 - MCP stateful sessions are process-local. They survive tool calls in the same thread, but not an app restart.
 - On startup, the UI shows how many skill sources, MCP servers, custom subagents, and async subagents were loaded from `deepagent.toml`.
+
+
+## Runtime module structure
+
+The public runtime API is `chainagents.runtime`. `runtime/core.py` explicitly
+re-exports the same objects for compatibility, and `deepagent_runtime` remains an
+alias of that facade.
+
+| Modules in `chainagents/runtime/` | Responsibility |
+| --- | --- |
+| `constants.py`, `types.py` | Shared defaults, workspace root, and configuration records |
+| `model_config.py` | Provider settings, endpoint normalization, and model profiles |
+| `extension_config.py`, `config.py` | Extension parsing and TOML/environment configuration |
+| `providers.py`, `models.py` | Provider adapters and configured model construction |
+| `backends.py` | Workspace paths and filesystem/storage backend routing |
+| `middleware.py` | Tool resilience and summarization middleware |
+| `commands.py` | Generated UI tools and skill command discovery |
+| `graph.py` | Tool schemas, nested subagents, and static graph assembly |
+| `tracing.py` | Langfuse callbacks and LangGraph run configuration |
+| `lifecycle.py`, `reflection.py` | Agent/MCP/persistence lifecycle and correction reflection |
+
+Implementation modules import their lower-level owners directly; they never import
+`core.py` or the package facade. Cross-module function calls resolve through the
+owning module so tests can patch that owner (for example,
+`chainagents.runtime.models.build_model`). Facade globals are not patch seams.
+Warning filters are installed by the runtime package before SDK imports.
 
 ## License
 

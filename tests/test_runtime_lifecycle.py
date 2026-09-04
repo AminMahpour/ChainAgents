@@ -8,6 +8,11 @@ import anyio
 import pytest
 
 import deepagent_runtime as core
+import chainagents.runtime.config as runtime_config
+import chainagents.runtime.lifecycle as runtime_lifecycle
+import chainagents.runtime.middleware as runtime_middleware
+from langgraph.store.memory import InMemoryStore
+from langgraph.checkpoint.memory import MemorySaver
 from test_deepagent_runtime_rag import make_runtime_config, make_extensions_config
 
 
@@ -15,10 +20,10 @@ from test_deepagent_runtime_rag import make_runtime_config, make_extensions_conf
 def runtime(tmp_path, monkeypatch):
     config = replace(make_runtime_config(tmp_path), rag=None, rag_requested=False)
     instance = core.AgentRuntime(config, project_root=tmp_path)
-    instance._store = core.InMemoryStore()
-    instance._checkpointer = core.MemorySaver()
+    instance._store = InMemoryStore()
+    instance._checkpointer = MemorySaver()
     monkeypatch.setattr(instance, '_build_model', lambda *a, **kw: object())
-    monkeypatch.setattr(core, 'create_deep_agent_with_configured_summarization', lambda *a, **kw: object())
+    monkeypatch.setattr(runtime_middleware, 'create_deep_agent_with_configured_summarization', lambda *a, **kw: object())
     return instance
 
 
@@ -38,7 +43,7 @@ def test_stateful_context_closes_on_its_owner_task(runtime, monkeypatch):
     runtime._mcp_client = SimpleNamespace(session=session, callbacks=None, tool_interceptors=[])
     async def load(*a, **kw):
         return []
-    monkeypatch.setattr(core, 'load_mcp_tools', load)
+    monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', load)
 
     async def exercise():
         await asyncio.create_task(runtime.get_agent('medium', thread_id='thread', mcp_session_id='session'))
@@ -81,9 +86,9 @@ def test_factory_unwinds_resources_after_failed_or_cancelled_startup(runtime, mo
             await asyncio.Event().wait()
         raise ValueError('startup failed')
 
-    monkeypatch.setattr(core.AgentRuntime, '_instance', None)
-    monkeypatch.setattr(core.AgentRuntime, '_initialize', initialize)
-    monkeypatch.setattr(core.RuntimeConfig, 'from_env', lambda: runtime.config)
+    monkeypatch.setattr(runtime_lifecycle.AgentRuntime, '_instance', None)
+    monkeypatch.setattr(runtime_lifecycle.AgentRuntime, '_initialize', initialize)
+    monkeypatch.setattr(runtime_config.RuntimeConfig, 'from_env', lambda: runtime.config)
     async def exercise():
         task = asyncio.create_task(getattr(core.AgentRuntime, factory)())
         await entered.wait()
@@ -135,7 +140,7 @@ def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, c
         if cancel:
             await asyncio.Event().wait()
         raise ValueError('tool loading failed')
-    monkeypatch.setattr(core, 'load_mcp_tools', load)
+    monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', load)
     async def exercise():
         task = asyncio.create_task(runtime.get_agent('medium', thread_id='thread', mcp_session_id='session'))
         await entered.wait()
@@ -149,7 +154,7 @@ def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, c
         assert not runtime._agents
         async def succeeds(*a, **kw):
             return []
-        monkeypatch.setattr(core, 'load_mcp_tools', succeeds)
+        monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', succeeds)
         await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session')
         await runtime.close()
         assert closed == [True, True]
@@ -177,7 +182,7 @@ def test_mcp_session_startup_unwinds_owner_and_allows_retry(runtime, monkeypatch
     runtime._mcp_client = SimpleNamespace(session=session, callbacks=None, tool_interceptors=[])
     async def load(*a, **kw):
         return []
-    monkeypatch.setattr(core, 'load_mcp_tools', load)
+    monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', load)
     async def exercise():
         nonlocal fail
         task = asyncio.create_task(runtime.get_agent('medium', thread_id='thread', mcp_session_id='session'))

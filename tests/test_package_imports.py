@@ -56,7 +56,9 @@ def test_legacy_imports_alias_moved_modules() -> None:
     assert response_exports.__name__ == "chainagents.exports.response"
     assert agent_stream_events.__name__ == "chainagents.events.stream"
     assert agent_commands.__name__ == "chainagents.commands.native"
-    assert chainlit_persistence.__name__ == "chainagents.interfaces.chainlit.persistence"
+    assert (
+        chainlit_persistence.__name__ == "chainagents.interfaces.chainlit.persistence"
+    )
 
 
 def test_default_dependencies_do_not_include_chromadb() -> None:
@@ -104,3 +106,116 @@ def test_default_project_root_uses_user_cwd_for_installed_package(
     )
 
     assert resolved == working_directory.resolve()
+
+
+def test_runtime_facades_preserve_owner_identity() -> None:
+    """Bind supported objects once, including private legacy helper access."""
+    import importlib
+    import chainagents.runtime as runtime
+    import deepagent_runtime as legacy
+
+    owners = {
+        "constants": ["PROJECT_ROOT", "SYSTEM_PROMPT", "_resolve_default_project_root"],
+        "types": ["AppSettings", "ModelDefaults", "SubagentConfig", "AgentCacheKey"],
+        "model_config": ["normalize_model_provider", "parse_model_profiles"],
+        "extension_config": ["parse_extensions_config"],
+        "config": ["RuntimeConfig", "load_file_config"],
+        "providers": ["OpenAICompatibleChatOpenAI", "SnowflakeCortexChatOpenAI"],
+        "models": ["build_model", "build_model_for_profile"],
+        "backends": ["build_deepagent_backend"],
+        "middleware": ["ToolExecutionResilienceMiddleware"],
+        "commands": ["create_render_chainlit_ui_tool"],
+        "graph": ["create_configured_graph"],
+        "tracing": ["build_langgraph_run_config"],
+        "lifecycle": ["AgentRuntime"],
+    }
+    assert legacy is runtime_core
+    for module_name, names in owners.items():
+        owner = importlib.import_module(f"chainagents.runtime.{module_name}")
+        for name in names:
+            assert getattr(runtime_core, name) is getattr(owner, name)
+            if not name.startswith("_"):
+                assert getattr(runtime, name) is getattr(owner, name)
+                assert name in runtime.__all__
+
+
+def test_runtime_implementation_imports_form_an_acyclic_graph() -> None:
+    """Keep implementation dependencies directed away from the public facade."""
+    import ast
+
+    runtime_directory = Path(runtime_core.__file__).parent
+    dependencies: dict[str, set[str]] = {}
+    for path in runtime_directory.glob("*.py"):
+        if path.stem in {"core", "__init__"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        dependencies[path.stem] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert node.module not in {
+                    "chainagents.runtime",
+                    "chainagents.runtime.core",
+                }
+                if node.module and node.module.startswith("chainagents.runtime."):
+                    dependencies[path.stem].add(node.module.rsplit(".", 1)[-1])
+                elif node.level:
+                    dependencies[path.stem].update(
+                        [node.module]
+                        if node.module
+                        else [alias.name for alias in node.names]
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name not in {
+                        "deepagent_runtime",
+                        "chainagents.runtime",
+                        "chainagents.runtime.core",
+                    }
+                    if alias.name.startswith("chainagents.runtime."):
+                        dependencies[path.stem].add(alias.name.rsplit(".", 1)[-1])
+        assert not ({"core", "__init__"} & dependencies[path.stem])
+
+    def visit(name: str, ancestors: frozenset[str]) -> None:
+        assert name not in ancestors, f"Runtime import cycle through {name}"
+        for dependency in dependencies.get(name, set()):
+            visit(dependency, ancestors | {name})
+
+    for name in dependencies:
+        visit(name, frozenset())
+
+    facade = ast.parse(Path(runtime_core.__file__).read_text(encoding="utf-8"))
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.ClassDef)) for node in ast.walk(facade)
+    )
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and any(alias.name == "*" for alias in node.names)
+        for node in ast.walk(facade)
+    )
+
+
+def test_runtime_installs_warning_filters_before_provider_sdk_imports() -> None:
+    """Direct submodule imports must also initialize warning filters first."""
+    import subprocess
+    import sys
+
+    script = """
+import importlib
+import sys
+from chainagents.util import langchain_warnings
+
+original_install = langchain_warnings.install_langchain_warning_filters
+installed = []
+
+def install():
+    assert "deepagents" not in sys.modules
+    assert "langchain_openai" not in sys.modules
+    original_install()
+    installed.append(True)
+
+langchain_warnings.install_langchain_warning_filters = install
+importlib.import_module("chainagents.runtime.providers")
+assert installed
+assert "langchain_openai" in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True)
