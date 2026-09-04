@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -341,6 +342,81 @@ def test_ingest_uploaded_files_adds_thread_scoped_results(
     assert search_result["results"][0]["path"] == "uploaded/notes.md"
 
 
+def test_thread_traversal_id_cannot_replace_workspace_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a traversal-like thread ID cannot address the workspace index."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    (tmp_path / "README.md").write_text("workspace release guide", encoding="utf-8")
+    upload_source = tmp_path / "notes.md"
+    upload_source.write_text("uploaded rag notes", encoding="utf-8")
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    assert service.rebuild().ready is True
+    workspace_index_before = service.collection_directory.joinpath("index.json").read_bytes()
+    workspace_manifest_before = service.manifest_path.read_bytes()
+
+    result = service.ingest_uploaded_files(
+        thread_id="..",
+        uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+    )
+
+    assert result.success is True
+    assert service._thread_upload_root("..").resolve().is_relative_to(
+        service.uploads_root.resolve()
+    )
+    assert (
+        service.collection_directory.joinpath("index.json").read_bytes()
+        == workspace_index_before
+    )
+    assert service.manifest_path.read_bytes() == workspace_manifest_before
+
+
+def test_lossy_equivalent_thread_ids_keep_uploads_isolated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify punctuation in a thread ID cannot collide with a literal underscore."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    first_source = tmp_path / "colon.md"
+    first_source.write_text("release notes for colon", encoding="utf-8")
+    second_source = tmp_path / "underscore.md"
+    second_source.write_text("release notes for underscore", encoding="utf-8")
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+
+    service.ingest_uploaded_files(
+        thread_id="team:1",
+        uploads=[UploadedRagFile(path=first_source, name="colon.md")],
+    )
+    service.ingest_uploaded_files(
+        thread_id="team_1",
+        uploads=[UploadedRagFile(path=second_source, name="underscore.md")],
+    )
+
+    first_root = service._thread_upload_root("team:1")
+    second_root = service._thread_upload_root("team_1")
+    assert first_root != second_root
+    assert first_root.name == hashlib.sha256(b"team:1").hexdigest()
+    assert {
+        result["path"]
+        for result in service.search(query="release notes", top_k=10, thread_id="team:1")[
+            "results"
+        ]
+        if str(result["path"]).startswith("uploaded/")
+    } == {"uploaded/colon.md"}
+    assert {
+        result["path"]
+        for result in service.search(query="release notes", top_k=10, thread_id="team_1")[
+            "results"
+        ]
+        if str(result["path"]).startswith("uploaded/")
+    } == {"uploaded/underscore.md"}
+
+
 def test_clone_thread_uploads_isolated_and_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -376,6 +452,140 @@ def test_clone_thread_uploads_isolated_and_idempotent(
     target_files = service._thread_upload_files_directory("../../branch-thread")
     assert target_files.resolve().is_relative_to(service.uploads_root.resolve())
     assert [path.name for path in target_files.iterdir()] == ["notes.md"]
+
+
+def test_clone_thread_uploads_remains_isolated_after_service_recreation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify cloned uploads reload independently after a service restart."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    shared_source = tmp_path / "shared.md"
+    shared_source.write_text("release notes shared by branch", encoding="utf-8")
+    target_source = tmp_path / "target.md"
+    target_source.write_text("release notes for target only", encoding="utf-8")
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    service.ingest_uploaded_files(
+        thread_id="source-thread",
+        uploads=[UploadedRagFile(path=shared_source, name="shared.md")],
+    )
+    assert service.clone_thread_uploads(
+        source_thread_id="source-thread",
+        target_thread_id="target-thread",
+    ).success
+    service.ingest_uploaded_files(
+        thread_id="target-thread",
+        uploads=[UploadedRagFile(path=target_source, name="target.md")],
+    )
+
+    reloaded = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    source_paths = {
+        result["path"]
+        for result in reloaded.search(
+            query="release notes",
+            top_k=10,
+            thread_id="source-thread",
+        )["results"]
+        if str(result["path"]).startswith("uploaded/")
+    }
+    target_paths = {
+        result["path"]
+        for result in reloaded.search(
+            query="release notes",
+            top_k=10,
+            thread_id="target-thread",
+        )["results"]
+        if str(result["path"]).startswith("uploaded/")
+    }
+
+    assert source_paths == {"uploaded/shared.md"}
+    assert target_paths == {"uploaded/shared.md", "uploaded/target.md"}
+
+
+def test_ingest_rejects_symlinked_thread_scope_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ingestion rejects a thread storage symlink before copying data."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    upload_source = tmp_path / "notes.md"
+    upload_source.write_text("release notes", encoding="utf-8")
+    outside_scope = tmp_path / "outside-scope"
+    outside_scope.mkdir()
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    service.uploads_root.mkdir(parents=True)
+    service._thread_upload_root("thread-1").symlink_to(
+        outside_scope,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        service.ingest_uploaded_files(
+            thread_id="thread-1",
+            uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+        )
+
+    assert list(outside_scope.iterdir()) == []
+
+
+def test_ingest_rejects_symlinked_upload_parent_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ingestion rejects a symlinked persistence parent."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    upload_source = tmp_path / "notes.md"
+    upload_source.write_text("release notes", encoding="utf-8")
+    outside_persist = tmp_path / "outside-persist"
+    outside_persist.mkdir()
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    service.persist_directory.symlink_to(outside_persist, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        service.ingest_uploaded_files(
+            thread_id="thread-1",
+            uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+        )
+
+    assert list(outside_persist.iterdir()) == []
+
+
+def test_ingest_rejects_symlinked_collection_before_copy_or_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ingestion validates the whole scope before copying or rebuilding."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    upload_source = tmp_path / "notes.md"
+    upload_source.write_text("release notes", encoding="utf-8")
+    outside_collection = tmp_path / "outside-collection"
+    outside_collection.mkdir()
+    marker = outside_collection / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    service = WorkspaceDocsRAG(make_resolved_rag_config(tmp_path), project_root=tmp_path)
+    thread_root = service._thread_upload_root("thread-1")
+    thread_root.mkdir(parents=True)
+    service._thread_upload_collection_directory("thread-1").symlink_to(
+        outside_collection,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        service.ingest_uploaded_files(
+            thread_id="thread-1",
+            uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+        )
+
+    assert service._thread_upload_files_directory("thread-1").exists() is False
+    assert marker.read_text(encoding="utf-8") == "keep"
 
 
 def test_ingest_uploaded_files_rejects_unsupported_extensions(
