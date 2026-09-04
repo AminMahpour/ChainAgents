@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -157,6 +158,144 @@ def test_parse_rag_config_defaults(tmp_path: Path) -> None:
     assert config.include_globs == DEFAULT_RAG_INCLUDE_GLOBS
     assert config.exclude_globs == DEFAULT_RAG_EXCLUDE_GLOBS
     assert config.persist_directory == (tmp_path / ".rag").resolve()
+
+
+def test_parsed_rag_config_rejects_symlinked_persist_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify parsed relative storage retains ancestors for symlink checks."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside_persist = tmp_path / "outside-persist"
+    outside_persist.mkdir()
+    (project_root / "cache-link").symlink_to(
+        outside_persist,
+        target_is_directory=True,
+    )
+    upload_source = project_root / "notes.md"
+    upload_source.write_text("release notes", encoding="utf-8")
+    parsed = parse_rag_config(
+        {
+            "rag": {
+                "enabled": True,
+                "persist_directory": "cache-link/.rag",
+            }
+        },
+        project_root / "deepagent.toml",
+    )
+    resolved = resolve_rag_config(
+        parsed,
+        model_provider="ollama",
+        model_base_url="http://127.0.0.1:11434",
+    )
+    assert resolved is not None
+
+    with pytest.raises(ValueError, match="symlink"):
+        service = WorkspaceDocsRAG(resolved, project_root=project_root)
+        service.ingest_uploaded_files(
+            thread_id="thread-1",
+            uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+        )
+
+    assert list(outside_persist.iterdir()) == []
+
+
+def test_ingest_rechecks_symlinked_persist_ancestor_added_after_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify upload operations recheck configured storage ancestors."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    persist_parent = project_root / "cache-link"
+    config = replace(
+        make_resolved_rag_config(project_root),
+        persist_directory=persist_parent / ".rag",
+    )
+    service = WorkspaceDocsRAG(config, project_root=project_root)
+    outside_persist = tmp_path / "outside-persist"
+    outside_persist.mkdir()
+    persist_parent.symlink_to(outside_persist, target_is_directory=True)
+    upload_source = project_root / "notes.md"
+    upload_source.write_text("release notes", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="symlink"):
+        service.ingest_uploaded_files(
+            thread_id="thread-1",
+            uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+        )
+
+    assert list(outside_persist.iterdir()) == []
+
+
+def test_trusted_project_root_symlink_can_be_canonicalized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a trusted project/config root may use a platform-style alias."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    canonical_project_root = tmp_path / "canonical-project"
+    canonical_project_root.mkdir()
+    project_alias = tmp_path / "project-alias"
+    project_alias.symlink_to(canonical_project_root, target_is_directory=True)
+    upload_source = canonical_project_root / "notes.md"
+    upload_source.write_text("release notes", encoding="utf-8")
+    parsed = parse_rag_config(
+        {"rag": {"enabled": True}},
+        project_alias / "deepagent.toml",
+    )
+    resolved = resolve_rag_config(
+        parsed,
+        model_provider="ollama",
+        model_base_url="http://127.0.0.1:11434",
+    )
+    assert resolved is not None
+
+    service = WorkspaceDocsRAG(resolved, project_root=project_alias)
+    result = service.ingest_uploaded_files(
+        thread_id="thread-1",
+        uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+    )
+
+    assert result.success is True
+    assert service.persist_directory == canonical_project_root / ".rag"
+
+
+def test_explicit_external_persist_directory_remains_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a clean explicit path outside the project remains usable."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    external_persist = tmp_path / "external" / "rag"
+    config = replace(
+        make_resolved_rag_config(project_root),
+        persist_directory=external_persist,
+    )
+    upload_source = project_root / "notes.md"
+    upload_source.write_text("release notes", encoding="utf-8")
+
+    service = WorkspaceDocsRAG(config, project_root=project_root)
+    result = service.ingest_uploaded_files(
+        thread_id="thread-1",
+        uploads=[UploadedRagFile(path=upload_source, name="notes.md")],
+    )
+
+    assert result.success is True
+    assert service.persist_directory == external_persist
 
 
 def test_resolve_rag_config_auto_ollama_defaults(tmp_path: Path) -> None:

@@ -413,6 +413,7 @@ class RagConfig:
         chunk_overlap: The chunk overlap value.
         top_k: Maximum number of search results to return.
         embedding: The embedding value.
+        persist_directory_anchor: Trusted base for relative persistence paths.
     """
 
     enabled: bool = False
@@ -423,6 +424,7 @@ class RagConfig:
     chunk_overlap: int = DEFAULT_RAG_CHUNK_OVERLAP
     top_k: int = DEFAULT_RAG_TOP_K
     embedding: RagEmbeddingConfig = RagEmbeddingConfig()
+    persist_directory_anchor: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -439,6 +441,7 @@ class ResolvedRagConfig:
         top_k: Maximum number of search results to return.
         embedding: The embedding value.
         collection_name: The collection name value.
+        persist_directory_anchor: Trusted base for relative persistence paths.
     """
 
     enabled: bool
@@ -450,6 +453,7 @@ class ResolvedRagConfig:
     top_k: int
     embedding: ResolvedRagEmbeddingConfig
     collection_name: str = RAG_COLLECTION_NAME
+    persist_directory_anchor: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -593,7 +597,7 @@ def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig
     if raw_rag and not isinstance(raw_rag, dict):
         raise ValueError("The top-level 'rag' config must be a table/object.")
 
-    base_dir = config_path.parent
+    base_dir = config_path.parent.absolute()
     raw_embedding = raw_rag.get("embedding", {})
     if raw_embedding and not isinstance(raw_embedding, dict):
         raise ValueError("The '[rag.embedding]' config must be a table/object.")
@@ -602,8 +606,10 @@ def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig
         raw_rag.get("persist_directory", DEFAULT_RAG_PERSIST_DIRECTORY)
     ).strip()
     persist_directory = Path(persist_directory_raw or DEFAULT_RAG_PERSIST_DIRECTORY)
+    persist_directory_anchor: Path | None = None
     if not persist_directory.is_absolute():
-        persist_directory = (base_dir / persist_directory).resolve()
+        persist_directory = (base_dir / persist_directory).absolute()
+        persist_directory_anchor = base_dir
 
     chunk_size = normalize_int(
         raw_rag.get("chunk_size"),
@@ -623,6 +629,7 @@ def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig
     return RagConfig(
         enabled=normalize_bool(raw_rag.get("enabled"), field_name="rag.enabled", default=False),
         persist_directory=persist_directory,
+        persist_directory_anchor=persist_directory_anchor,
         include_globs=normalize_glob_list(
             raw_rag.get("include_globs"),
             field_name="rag.include_globs",
@@ -703,6 +710,7 @@ def resolve_rag_config(
     return ResolvedRagConfig(
         enabled=True,
         persist_directory=config.persist_directory,
+        persist_directory_anchor=config.persist_directory_anchor,
         include_globs=config.include_globs,
         exclude_globs=config.exclude_globs,
         chunk_size=config.chunk_size,
@@ -785,9 +793,14 @@ class WorkspaceDocsRAG:
             project_root: Project root used to resolve local paths.
         """
         self.config = config
-        self.project_root = project_root.resolve()
+        lexical_project_root = project_root.absolute()
+        self.project_root = lexical_project_root.resolve()
         self._configured_persist_directory = config.persist_directory.absolute()
-        self.persist_directory = self._configured_persist_directory.resolve()
+        self._persist_directory_anchor = self._select_persist_directory_anchor(
+            config.persist_directory_anchor,
+            project_root=lexical_project_root,
+        )
+        self.persist_directory = self._validated_persist_directory()
         self.collection_directory = self.persist_directory / VECTOR_STORE_DIRECTORY_NAME
         self.manifest_path = self.persist_directory / "manifest.json"
         self.uploads_root = self.persist_directory / RAG_UPLOADS_DIRECTORY_NAME
@@ -1594,11 +1607,7 @@ class WorkspaceDocsRAG:
 
     def _assert_safe_upload_storage_path(self, path: Path) -> Path:
         """Return a contained upload path after rejecting existing symlinks."""
-        if self._configured_persist_directory.is_symlink():
-            raise ValueError(
-                "RAG upload storage cannot contain symlinks: "
-                f"{self._configured_persist_directory}"
-            )
+        self._validated_persist_directory()
 
         try:
             relative_path = path.relative_to(self.uploads_root)
@@ -1618,6 +1627,50 @@ class WorkspaceDocsRAG:
         if not resolved_path.is_relative_to(resolved_root):
             raise ValueError("RAG upload storage must remain inside its upload root.")
         return path
+
+    def _select_persist_directory_anchor(
+        self,
+        configured_anchor: Path | None,
+        *,
+        project_root: Path,
+    ) -> Path:
+        """Select the trusted lexical base for persistence ancestry checks."""
+        if configured_anchor is not None:
+            return configured_anchor.absolute()
+
+        try:
+            self._configured_persist_directory.relative_to(project_root)
+        except ValueError:
+            parts = self._configured_persist_directory.parts
+            if len(parts) <= 1:
+                return Path(self._configured_persist_directory.anchor)
+            return Path(parts[0]) / parts[1]
+        return project_root
+
+    def _validated_persist_directory(self) -> Path:
+        """Resolve a trusted prefix while rejecting symlinked descendants."""
+        try:
+            relative_path = self._configured_persist_directory.relative_to(
+                self._persist_directory_anchor
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "RAG persistence storage must descend from its trusted path anchor."
+            ) from exc
+
+        current = self._persist_directory_anchor.resolve(strict=False)
+        for part in relative_path.parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                current = current.parent
+                continue
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(
+                    f"RAG upload storage cannot contain symlinks: {current}"
+                )
+        return current
 
     def _uploaded_display_path(self, path: Path) -> str:
         """Return the uploaded display path.
