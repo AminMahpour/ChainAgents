@@ -66,6 +66,9 @@ from chainagents.rag.runtime import (
 )
 from chainagents.runtime.reflection import (
     ReflectionConfig,
+    ReflectionProposal,
+    append_reflection_lesson,
+    canonical_reflection_lesson,
     normalize_reflection_config,
 )
 
@@ -5069,6 +5072,98 @@ class AgentRuntime:
             config.extensions,
             project_root=self.project_root,
         )
+
+    async def save_reflection(self, proposal: ReflectionProposal) -> None:
+        """Persist a confirmed lesson to configured memory and verify the full write.
+
+        The runtime lock serializes reflection read/modify/write operations. Storage
+        errors propagate as RuntimeError; cancellation remains retryable by callers.
+        """
+        config = self.config.extensions.agent_reflection
+        if self.config.agent_state != "stateful" or not config.enabled:
+            raise ValueError("Reflection saving requires an enabled stateful runtime.")
+        if proposal.memory_file != config.memory_file:
+            raise ValueError(
+                "Reflection memory file does not match runtime configuration."
+            )
+        if (
+            not proposal.lesson.strip()
+            or len(proposal.lesson.strip()) > config.max_lesson_chars
+        ):
+            raise ValueError("Reflection lesson exceeds runtime validation limits.")
+        lesson = canonical_reflection_lesson(proposal.lesson)
+        # CompositeBackend strips the /memories prefix, retaining the leading /.
+        path = config.memory_file.removeprefix("/memories")
+        namespace = (self.config.extensions.agent_memory_namespace,)
+        async with self._agent_lock:
+            try:
+                backend = StoreBackend(namespace=lambda _: namespace, store=self.store)
+
+                async def read_content(*, allow_missing: bool = False) -> str:
+                    parts: list[str] = []
+                    offset = 0
+                    while True:
+                        result = await backend.aread(path, offset=offset)
+                        if result.error:
+                            # Do not mistake permission errors or invalid data for a
+                            # missing file and overwrite existing memory.
+                            if (
+                                allow_missing
+                                and offset == 0
+                                and result.error == f"File '{path}' not found"
+                                and await self.store.aget(namespace, path) is None
+                            ):
+                                return ""
+                            raise RuntimeError("Reflection memory could not be read.")
+                        data = result.file_data
+                        if (
+                            data is None
+                            or not isinstance(data.get("content"), str)
+                            or data.get("encoding", "utf-8") != "utf-8"
+                        ):
+                            raise RuntimeError("Reflection memory is not valid text.")
+                        parts.append(data["content"])
+                        if result.next_offset is None:
+                            break
+                        if result.next_offset <= offset:
+                            raise RuntimeError(
+                                "Reflection memory pagination did not advance."
+                            )
+                        offset = result.next_offset
+                    # StoreBackend's text reader normalizes CR/CRLF. Recover the
+                    # original string through the supported store API so adding a
+                    # lesson does not rewrite existing memory's line endings.
+                    item = await self.store.aget(namespace, path)
+                    raw = item.value.get("content") if item is not None else None
+                    if isinstance(raw, list) and all(
+                        isinstance(line, str) for line in raw
+                    ):
+                        raw = "\n".join(raw)
+                    if not isinstance(raw, str):
+                        raise RuntimeError("Reflection memory is not valid text.")
+                    normalized = (
+                        raw.replace("\r\n", "\n").replace("\r", "\n")
+                        if raw.strip()
+                        else raw
+                    )
+                    if normalized != "".join(parts):
+                        raise RuntimeError(
+                            "Reflection memory changed while being read."
+                        )
+                    return raw
+
+                existing = await read_content(allow_missing=True)
+                updated = append_reflection_lesson(existing, lesson)
+                if updated != existing:
+                    result = await backend.awrite(path, updated)
+                    if result.error:
+                        raise RuntimeError("Reflection memory could not be written.")
+                if await read_content() != updated:
+                    raise RuntimeError(
+                        "Reflection memory readback did not match the saved content."
+                    )
+            except Exception as exc:
+                raise RuntimeError("Reflection persistence failed.") from exc
 
     @classmethod
     async def get(cls) -> "AgentRuntime":

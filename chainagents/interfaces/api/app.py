@@ -60,7 +60,7 @@ from chainagents.runtime import (
 from chainagents.runtime.reflection import (
     ReflectionCollector,
     ReflectionProposal,
-    reflection_save_prompt,
+    reflection_save_prompt as reflection_save_prompt,
 )
 
 
@@ -776,29 +776,13 @@ def create_app(
         reflection_thread_id = f"{context.thread_id}:reflection"
         saved = False
         try:
-            agent = await active_runtime.get_agent(
-                context.reasoning_level,
-                model_name=context.model_name,
-                reasoning_level_is_explicit=context.reasoning_level_is_explicit,
-                thread_id=reflection_thread_id,
-                async_subagent_url_override=context.async_subagent_url,
-                mcp_session_id=context.mcp_session_id,
-            )
-            await agent.ainvoke(
-                {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": reflection_save_prompt(proposal),
-                        }
-                    ]
-                },
-                config=build_langgraph_run_config(
-                    active_runtime.config,
-                    thread_id=reflection_thread_id,
-                ),
-            )
+            await active_runtime.save_reflection(proposal)
             saved = True
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Reflection could not be saved. Please retry.",
+            ) from exc
         finally:
             if not saved:
                 store_pending_reflection(confirmation_token, pending_reflection)

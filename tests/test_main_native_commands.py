@@ -889,48 +889,41 @@ async def test_ask_to_save_reflection_lesson_dismiss_does_not_save(
 
 
 @pytest.mark.anyio
-async def test_save_reflection_lesson_invokes_agent_in_reflection_thread(
-    monkeypatch,
+@pytest.mark.parametrize("fail", [False, True])
+async def test_save_reflection_lesson_confirms_only_after_persistence(
+    monkeypatch, fail
 ) -> None:
-    """Verify confirmed reflections are saved by a hidden agent run."""
-    captured: dict[str, object] = {}
-
-    class _Agent:
-        async def ainvoke(self, payload, *, config):
-            captured["payload"] = payload
-            captured["config"] = config
-            return {"messages": []}
+    """Show a success message only after the shared deterministic save completes."""
+    saved = []
+    messages = []
 
     class _Runtime:
-        config = SimpleNamespace(recursion_limit=100)
+        async def save_reflection(self, proposal):
+            if fail:
+                raise RuntimeError("store unavailable")
+            saved.append(proposal)
 
         async def get_agent(self, *args, **kwargs):
-            captured["agent_args"] = args
-            captured["agent_kwargs"] = kwargs
-            return _Agent()
-
-    messages: list[_DummyMessage] = []
+            pytest.fail("Persistence must not invoke an agent")
 
     class _Message(_DummyMessage):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             messages.append(self)
+            if kwargs["content"].startswith("Saved"):
+                assert saved
 
     monkeypatch.setattr(main.cl, "Message", _Message)
-
     proposal = ReflectionProposal(
         reason="correction",
         memory_file="/memories/AGENTS.md",
-        lesson="- Correction: remember the generated output directory.",
-        trigger="That was wrong.",
+        lesson="- Remember the output directory.",
+        trigger="Wrong",
     )
-
     await main.save_reflection_lesson(
         runtime=_Runtime(),
         settings=AppSettings(
-            model_name="fake-model",
-            reasoning_level="medium",
-            thread_id="thread-1",
+            model_name="fake-model", reasoning_level="medium", thread_id="t"
         ),
         proposal=proposal,
         reasoning_level="high",
@@ -938,22 +931,14 @@ async def test_save_reflection_lesson_invokes_agent_in_reflection_thread(
         async_url_override=None,
         mcp_session_id="mcp-session",
     )
-
-    assert captured["agent_args"] == ("high",)
-    assert captured["agent_kwargs"] == {
-        "model_name": "other-model",
-        "thread_id": "thread-1:reflection",
-        "async_subagent_url_override": None,
-        "mcp_session_id": "mcp-session",
-    }
-    assert captured["config"] == {
-        "configurable": {"thread_id": "thread-1:reflection"},
-        "recursion_limit": 100,
-    }
-    prompt = captured["payload"]["messages"][0]["content"]
-    assert "Target memory file: /memories/AGENTS.md" in prompt
-    assert "Lessons learned from corrections" in prompt
-    assert messages[-1].kwargs["content"] == "Saved lesson to `/memories/AGENTS.md`."
+    if fail:
+        assert not saved
+        assert "could not be saved" in messages[-1].kwargs["content"]
+    else:
+        assert saved == [proposal]
+        assert (
+            messages[-1].kwargs["content"] == "Saved lesson to `/memories/AGENTS.md`."
+        )
 
 
 @pytest.mark.anyio

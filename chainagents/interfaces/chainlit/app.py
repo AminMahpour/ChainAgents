@@ -57,7 +57,7 @@ from chainagents.runtime.reflection import (
     ReflectionCollector,
     ReflectionProposal,
     format_reflection_proposal,
-    reflection_save_prompt,
+    reflection_save_prompt as reflection_save_prompt,
 )
 from chainagents.rag.runtime import UploadedRagFile
 from chainagents.exports.response import (
@@ -432,28 +432,15 @@ async def save_reflection_lesson(
     async_url_override: str | None,
     mcp_session_id: str | None,
 ) -> None:
-    """Ask the configured agent to save a confirmed reflection lesson."""
-    reflection_thread_id = f"{settings.thread_id}:reflection"
-    agent = await runtime.get_agent(
-        reasoning_level,
-        model_name=model_name,
-        thread_id=reflection_thread_id,
-        async_subagent_url_override=async_url_override,
-        mcp_session_id=mcp_session_id,
-    )
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": reflection_save_prompt(proposal),
-            }
-        ]
-    }
-    config = build_langgraph_run_config(
-        runtime.config,
-        thread_id=reflection_thread_id,
-    )
-    await agent.ainvoke(payload, config=config)
+    """Save a confirmed lesson and report success only after verified persistence."""
+    try:
+        await runtime.save_reflection(proposal)
+    except Exception:
+        await cl.Message(
+            content="Reflection could not be saved. Please retry.",
+            author="System",
+        ).send()
+        return
     await cl.Message(
         content=f"Saved lesson to `{proposal.memory_file}`.",
         author="System",

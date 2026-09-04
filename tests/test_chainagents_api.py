@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import chainagents_api
+from chainagents.runtime import core
 from chainagents.runtime.reflection import ReflectionConfig
 from rag_runtime import RagUploadResult
 
@@ -175,6 +177,18 @@ class _FakeRuntime:
             indexed_files=len(uploads),
             chunk_count=len(uploads),
         )
+
+
+def _enable_reflection_storage(runtime):
+    runtime.config.extensions.agent_reflection = ReflectionConfig(enabled=True)
+    runtime.config.extensions.agent_memory_namespace = "api-reflections"
+    runtime._agent_lock = asyncio.Lock()
+    runtime.store = core.InMemoryStore()
+
+    async def save(proposal):
+        await core.AgentRuntime.save_reflection(runtime, proposal)
+
+    runtime.save_reflection = save
 
 
 def test_health_reports_ok() -> None:
@@ -1680,15 +1694,11 @@ def test_multipart_rejects_images_for_text_only_model() -> None:
     assert runtime.requests == []
 
 
-def test_reflection_save_validates_and_runs_hidden_reflection_thread() -> None:
-    """Verify confirmed proposals use the existing hidden save workflow."""
+def test_reflection_save_persists_without_model_and_consumes_token_once() -> None:
+    """Verify confirmed proposals persist before success without invoking a model."""
     agent = _FakeAgent([])
     runtime = _FakeRuntime(agent)
-    runtime.config.extensions.agent_reflection = ReflectionConfig(
-        enabled=True,
-        memory_file="/memories/AGENTS.md",
-        max_lesson_chars=700,
-    )
+    _enable_reflection_storage(runtime)
     app = chainagents_api.create_app(runtime=runtime)
 
     with TestClient(app) as client:
@@ -1698,9 +1708,7 @@ def test_reflection_save_validates_and_runs_hidden_reflection_thread() -> None:
         )
         proposal = next(
             line["proposal"]
-            for line in (
-                json.loads(line) for line in stream_response.iter_lines()
-            )
+            for line in (json.loads(line) for line in stream_response.iter_lines())
             if line["kind"] == "reflection_proposal"
         )
         assert proposal["confirmation_token"]
@@ -1724,39 +1732,10 @@ def test_reflection_save_validates_and_runs_hidden_reflection_thread() -> None:
         "memory_file": "/memories/AGENTS.md",
         "thread_id": "thread-1:reflection",
     }
-    assert runtime.requests == [
-        {
-            "args": ("high",),
-            "kwargs": {
-                "model_name": "other-model",
-                "reasoning_level_is_explicit": True,
-                "thread_id": "thread-1:reflection",
-                "async_subagent_url_override": None,
-                "mcp_session_id": None,
-            },
-        }
-    ]
-    assert agent.invoke_payload == {
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "A user confirmed this compact lesson should be saved to long-term "
-                    "agent memory.\n\nTarget memory file: /memories/AGENTS.md\n\n"
-                    "Update that file under a section named `Lessons learned from "
-                    "corrections`. If the section or file does not exist, create it. "
-                    "Add exactly one concise bullet unless an equivalent lesson already "
-                    "exists. Do not include this instruction text.\n\nLesson:\n"
-                    "- Correction: That was wrong. Next time, verify the corrected "
-                    "behavior before relying on the earlier assumption."
-                ),
-            }
-        ]
-    }
-    assert agent.invoke_config == {
-        "configurable": {"thread_id": "thread-1:reflection"},
-        "recursion_limit": 100,
-    }
+    assert runtime.requests == []
+    assert agent.invoke_payload is None
+    item = asyncio.run(runtime.store.aget(("api-reflections",), "/AGENTS.md"))
+    assert item.value["content"].count(proposal["lesson"]) == 1
 
 
 def test_reflection_save_rejects_proposal_not_issued_by_stream() -> None:
@@ -1788,49 +1767,55 @@ def test_reflection_save_rejects_proposal_not_issued_by_stream() -> None:
     assert runtime.requests == []
 
 
-def test_reflection_save_token_remains_retryable_after_agent_error() -> None:
-    """Verify a failed hidden save does not consume its issued proposal."""
+def test_reflection_tool_failure_is_not_success_and_token_can_retry() -> None:
+    """A model reporting a failed write must not count as confirmed persistence."""
 
-    class _FlakyReflectionAgent(_FakeAgent):
-        def __init__(self) -> None:
-            super().__init__([])
-            self.invoke_attempts = 0
-
+    class _ReportedFailureAgent(_FakeAgent):
         async def ainvoke(self, payload, *, config):
-            self.invoke_attempts += 1
-            if self.invoke_attempts == 1:
-                raise RuntimeError("temporary save failure")
-            return await super().ainvoke(payload, config=config)
+            return {
+                "messages": [
+                    {"type": "tool", "status": "error", "content": "write failed"}
+                ]
+            }
 
-    agent = _FlakyReflectionAgent()
-    runtime = _FakeRuntime(agent)
-    runtime.config.extensions.agent_reflection = ReflectionConfig(
-        enabled=True,
-        memory_file="/memories/AGENTS.md",
-        max_lesson_chars=700,
-    )
+    class _FlakyStore(core.InMemoryStore):
+        fail = True
+
+        async def aput(self, *args, **kwargs):
+            if self.fail:
+                raise OSError("temporary save failure")
+            return await super().aput(*args, **kwargs)
+
+    runtime = _FakeRuntime(_ReportedFailureAgent([]))
+    _enable_reflection_storage(runtime)
+    runtime.store = _FlakyStore()
     app = chainagents_api.create_app(runtime=runtime)
-
     with TestClient(app, raise_server_exceptions=False) as client:
-        stream_response = client.post(
+        response = client.post(
             "/api/agent/stream",
             json={"prompt": "That was wrong", "thread_id": "thread-1"},
         )
         proposal = next(
-            line["proposal"]
-            for line in (
-                json.loads(line) for line in stream_response.iter_lines()
-            )
-            if line["kind"] == "reflection_proposal"
+            json.loads(line)["proposal"]
+            for line in response.iter_lines()
+            if json.loads(line)["kind"] == "reflection_proposal"
         )
-        assert proposal["confirmation_token"]
+        runtime.requests.clear()
         payload = {"thread_id": "thread-1", "proposal": proposal}
         failed_response = client.post("/api/reflections/save", json=payload)
+        runtime.store.fail = False
         retry_response = client.post("/api/reflections/save", json=payload)
-
-    assert failed_response.status_code == 500
+        replay_response = client.post("/api/reflections/save", json=payload)
+    assert failed_response.status_code == 503
+    assert (
+        failed_response.json()["detail"]
+        == "Reflection could not be saved. Please retry."
+    )
     assert retry_response.status_code == 200
-    assert agent.invoke_attempts == 2
+    assert replay_response.status_code == 409
+    assert runtime.requests == []
+    item = asyncio.run(runtime.store.aget(("api-reflections",), "/AGENTS.md"))
+    assert item.value["content"].count(proposal["lesson"]) == 1
 
 
 def test_reflection_save_rejects_disabled_or_mismatched_proposals() -> None:
@@ -1916,3 +1901,62 @@ def test_api_parser_accepts_ui_directory() -> None:
     args = chainagents_api.build_parser().parse_args(["--ui-dir", "/tmp/sparxui"])
 
     assert args.ui_dir == "/tmp/sparxui"
+
+
+@pytest.mark.parametrize("after_write", [False, True])
+def test_reflection_confirmation_is_retryable_after_cancellation(after_write) -> None:
+    """Cancellation before or after a write restores the token and retries only once."""
+    import httpx
+
+    async def exercise():
+        reached_save = asyncio.Event()
+        block_save = asyncio.Event()
+
+        class _BlockingStore(core.InMemoryStore):
+            block = True
+
+            async def aput(self, *args, **kwargs):
+                if after_write:
+                    await super().aput(*args, **kwargs)
+                if self.block:
+                    reached_save.set()
+                    await block_save.wait()
+                if not after_write:
+                    await super().aput(*args, **kwargs)
+
+        runtime = _FakeRuntime(_FakeAgent([]))
+        _enable_reflection_storage(runtime)
+        runtime.store = _BlockingStore()
+        app = chainagents_api.create_app(runtime=runtime)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+            ) as client:
+                response = await client.post(
+                    "/api/agent/stream",
+                    json={"prompt": "That was wrong", "thread_id": "thread-1"},
+                )
+                proposal = next(
+                    json.loads(line)["proposal"]
+                    for line in response.iter_lines()
+                    if json.loads(line)["kind"] == "reflection_proposal"
+                )
+                runtime.requests.clear()
+                payload = {"thread_id": "thread-1", "proposal": proposal}
+                task = asyncio.create_task(
+                    client.post("/api/reflections/save", json=payload)
+                )
+                await asyncio.wait_for(reached_save.wait(), timeout=2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                runtime.store.block = False
+                retry = await client.post("/api/reflections/save", json=payload)
+                replay = await client.post("/api/reflections/save", json=payload)
+                assert retry.status_code == 200
+                assert replay.status_code == 409
+                assert runtime.requests == []
+                item = await runtime.store.aget(("api-reflections",), "/AGENTS.md")
+                assert item.value["content"].count(proposal["lesson"]) == 1
+
+    asyncio.run(exercise())
