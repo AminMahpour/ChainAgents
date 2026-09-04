@@ -40,7 +40,8 @@ DEFAULT_RAG_TOP_K = 4
 DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 RAG_MANIFEST_VERSION = 1
 RAG_COLLECTION_NAME = "workspace_docs"
-RAG_UPLOADS_DIRECTORY_NAME = "uploads"
+# Keep hashed scopes wholly separate from every legacy sanitized thread name.
+RAG_UPLOADS_DIRECTORY_NAME = "uploads-v2"
 RAG_UPLOAD_FILES_DIRECTORY_NAME = "files"
 RAG_UPLOAD_COLLECTION_DIRECTORY_NAME = "vectorstore"
 RAG_UPLOAD_MANIFEST_FILENAME = "manifest.json"

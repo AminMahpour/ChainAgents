@@ -556,6 +556,75 @@ def test_lossy_equivalent_thread_ids_keep_uploads_isolated(
     } == {"uploaded/underscore.md"}
 
 
+@pytest.mark.parametrize(
+    "operation", ["search", "ingest", "clone-source", "clone-target", "restart"]
+)
+def test_digest_shaped_legacy_uploads_are_never_adopted_or_modified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """Keep all old uploads intact even when their name equals a new thread digest."""
+    monkeypatch.setattr(rag_runtime, "RecursiveCharacterTextSplitter", DummySplitter)
+    monkeypatch.setattr(rag_runtime, "OllamaEmbeddings", lambda **_: DummyEmbeddings())
+    config = make_resolved_rag_config(tmp_path)
+    legacy_root = config.persist_directory / "uploads"
+    legacy_files = legacy_root / hashlib.sha256(b"new-thread").hexdigest() / "files"
+    legacy_files.mkdir(parents=True)
+    (legacy_files / "old-private.md").write_text("legacy confidential release rag data")
+    (legacy_files.parent / "empty-directory").mkdir()
+
+    def legacy_snapshot():
+        return {
+            str(path.relative_to(legacy_root)): (
+                path.stat().st_ino,
+                path.stat().st_mtime_ns,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in [legacy_root, *legacy_root.rglob("*")]
+        }
+
+    before = legacy_snapshot()
+    service = WorkspaceDocsRAG(config, project_root=tmp_path)
+    source = tmp_path / "fresh.md"
+    source.write_text("fresh release rag content")
+    expected = set()
+    if operation in {"ingest", "clone-target", "restart"}:
+        source_thread = "clean-source" if operation == "clone-target" else "new-thread"
+        assert service.ingest_uploaded_files(
+            thread_id=source_thread,
+            uploads=[UploadedRagFile(path=source, name="fresh.md")],
+        ).success
+        expected = {"uploaded/fresh.md"}
+    if operation == "clone-source":
+        result = service.clone_thread_uploads(
+            source_thread_id="new-thread", target_thread_id="branch"
+        )
+        assert result.added_files == ()
+        assert not service._thread_upload_files_directory("branch").exists()
+    elif operation == "clone-target":
+        result = service.clone_thread_uploads(
+            source_thread_id="clean-source", target_thread_id="new-thread"
+        )
+        assert result.success
+        assert result.added_files == ("fresh.md",)
+    elif operation == "restart":
+        service = WorkspaceDocsRAG(config, project_root=tmp_path)
+
+    uploaded_paths = {
+        result["path"]
+        for result in service.search(
+            query="release rag", thread_id="new-thread", top_k=10
+        )["results"]
+        if result["path"].startswith("uploaded/")
+    }
+    assert uploaded_paths == expected
+    assert legacy_snapshot() == before
+    assert service.uploads_root.parent == legacy_root.parent
+    assert service.uploads_root != legacy_root
+    assert not service.uploads_root.is_relative_to(legacy_root)
+
+
 def test_clone_thread_uploads_isolated_and_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
