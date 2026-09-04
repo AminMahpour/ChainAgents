@@ -806,6 +806,7 @@ async def test_ask_to_save_reflection_lesson_uses_ask_action_message(
 
     async def fake_save_reflection_lesson(**kwargs):
         saved.update(kwargs)
+        return True
 
     monkeypatch.setattr(main.cl, "AskActionMessage", _AskActionMessage)
     monkeypatch.setattr(main, "save_reflection_lesson", fake_save_reflection_lesson)
