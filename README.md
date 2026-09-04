@@ -215,7 +215,11 @@ uv run chainagents-api --host 127.0.0.1 --port 8000
 ```
 
 The API uses the same `deepagent.toml` and environment settings as the Chainlit
-and CLI entrypoints. Useful endpoints include:
+and CLI entrypoints. It serves one trusted owner: tokenless access requires a
+loopback peer and safe local Host/Origin, while remote binds require
+`CHAINAGENTS_API_TOKEN` and bearer Authorization headers. See
+[API access, browser deployment, and request limits](docs/API_SECURITY.md).
+Useful endpoints include:
 
 ```bash
 curl http://127.0.0.1:8000/health

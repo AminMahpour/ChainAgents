@@ -8,6 +8,7 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -20,7 +21,8 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
@@ -38,6 +40,12 @@ from chainagents.exports.generated_files import (
     resolve_generated_download,
 )
 from chainagents.exports.response import build_pdf_bytes
+from chainagents.interfaces.api.security import (
+    ApiSecurityConfig,
+    ApiTrustMiddleware,
+    RequestBodyLimitMiddleware,
+    is_loopback,
+)
 from chainagents.interfaces.uploads import (
     MAX_UPLOAD_FILE_BYTES,
     MAX_UPLOAD_FILES,
@@ -71,19 +79,28 @@ MAX_RESPONSE_PDF_LINES = 2_000
 MAX_CONCURRENT_RESPONSE_PDF_EXPORTS = 1
 MAX_HISTORY_MESSAGES = 200
 MAX_PENDING_REFLECTIONS = 128
+MAX_TEXT_LENGTH = 100_000
+MAX_HISTORY_TEXT_LENGTH = 1_000_000
+MAX_IDENTIFIER_LENGTH = 256
+MAX_IMAGE_URL_LENGTH = 4 * ((MAX_UPLOAD_FILE_BYTES + 2) // 3) + 128
+logger = logging.getLogger(__name__)
 
 
 class AgentImageUrl(BaseModel):
     """Validated data URL used for replayable image history."""
 
-    url: str
+    url: str = Field(..., max_length=MAX_IMAGE_URL_LENGTH)
 
     @field_validator("url")
     @classmethod
     def validate_url(cls, value: str) -> str:
         """Accept only bounded base64 data URLs for supported image formats."""
         prefix, separator, encoded = value.partition(",")
-        if not separator or not prefix.startswith("data:") or not prefix.endswith(";base64"):
+        if (
+            not separator
+            or not prefix.startswith("data:")
+            or not prefix.endswith(";base64")
+        ):
             raise ValueError("history images must use base64 data URLs")
         mime_type = prefix[5:-7].lower()
         if mime_type not in SUPPORTED_IMAGE_MIME_TYPES:
@@ -101,7 +118,7 @@ class AgentTextContentPart(BaseModel):
     """Text content in replayable message history."""
 
     type: Literal["text"]
-    text: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1, max_length=MAX_TEXT_LENGTH)
 
 
 class AgentImageContentPart(BaseModel):
@@ -121,7 +138,10 @@ class AgentHistoryMessage(BaseModel):
     """Caller-owned user or assistant message on a selected local branch."""
 
     role: Literal["user", "assistant"]
-    content: str | list[AgentHistoryContentPart]
+    content: (
+        Annotated[str, Field(max_length=MAX_TEXT_LENGTH)]
+        | Annotated[list[AgentHistoryContentPart], Field(max_length=100)]
+    )
 
     @model_validator(mode="after")
     def validate_content(self) -> "AgentHistoryMessage":
@@ -141,22 +161,34 @@ class AgentHistoryMessage(BaseModel):
 class AgentRunRequest(BaseModel):
     """HTTP request body for running the agent."""
 
-    prompt: str = Field(..., min_length=1)
-    command: str | None = None
-    thread_id: str = Field(..., min_length=1)
-    model: str | None = None
+    prompt: str = Field(..., min_length=1, max_length=MAX_TEXT_LENGTH)
+    command: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
+    thread_id: str = Field(..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
+    model: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
     reasoning: ReasoningLevel | None = None
-    async_subagent_url: str | None = None
-    mcp_session_id: str | None = None
+    async_subagent_url: str | None = Field(default=None, max_length=2048)
+    mcp_session_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
     history: list[AgentHistoryMessage] = Field(
         default_factory=list,
         max_length=MAX_HISTORY_MESSAGES,
     )
-    source_thread_id: str | None = None
+    source_thread_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
 
     @model_validator(mode="after")
     def validate_history_image_count(self) -> "AgentRunRequest":
         """Bound replay images to the same aggregate limit as uploads."""
+        text_length = sum(
+            len(message.content)
+            if isinstance(message.content, str)
+            else sum(
+                len(part.text)
+                for part in message.content
+                if isinstance(part, AgentTextContentPart)
+            )
+            for message in self.history
+        )
+        if text_length > MAX_HISTORY_TEXT_LENGTH:
+            raise ValueError("history text exceeds the aggregate character limit")
         image_count = sum(
             isinstance(part, AgentImageContentPart)
             for message in self.history
@@ -249,23 +281,23 @@ class ReflectionProposalRequest(BaseModel):
     """Client-confirmed reflection proposal emitted by an earlier stream."""
 
     reason: Literal["correction", "tool_failure"]
-    memory_file: str = Field(..., min_length=1)
-    lesson: str = Field(..., min_length=1)
-    trigger: str = Field(..., min_length=1)
-    tool_name: str = ""
-    tool_result: str = ""
-    confirmation_token: str = Field(..., min_length=1)
+    memory_file: str = Field(..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
+    lesson: str = Field(..., min_length=1, max_length=MAX_TEXT_LENGTH)
+    trigger: str = Field(..., min_length=1, max_length=MAX_TEXT_LENGTH)
+    tool_name: str = Field(default="", max_length=MAX_IDENTIFIER_LENGTH)
+    tool_result: str = Field(default="", max_length=MAX_TEXT_LENGTH)
+    confirmation_token: str = Field(..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
 
 
 class ReflectionSaveRequest(BaseModel):
     """Request to save one validated reflection proposal."""
 
-    thread_id: str = Field(..., min_length=1)
+    thread_id: str = Field(..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
     proposal: ReflectionProposalRequest
-    model: str | None = None
+    model: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
     reasoning: ReasoningLevel | None = None
-    async_subagent_url: str | None = None
-    mcp_session_id: str | None = None
+    async_subagent_url: str | None = Field(default=None, max_length=2048)
+    mcp_session_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
 
 
 class ReflectionSaveResponse(BaseModel):
@@ -322,6 +354,7 @@ class PendingReflection:
 def create_app(
     runtime: Any | None = None,
     ui_dir: str | Path | None = None,
+    security: ApiSecurityConfig | None = None,
 ) -> FastAPI:
     """Create the FastAPI app.
 
@@ -331,6 +364,7 @@ def create_app(
     Returns:
         The configured FastAPI app.
     """
+    security_config = security if security is not None else ApiSecurityConfig.from_env()
     managed_runtime: AgentRuntime | None = None
     configured_ui_directory = _resolve_ui_directory(ui_dir)
     pending_reflections: OrderedDict[str, PendingReflection] = OrderedDict()
@@ -380,6 +414,27 @@ def create_app(
         version="1.1.0",
         lifespan=lifespan,
     )
+
+    app.add_middleware(RequestBodyLimitMiddleware)
+    app.add_middleware(
+        ApiTrustMiddleware,
+        config=security_config,
+        public_static=configured_ui_directory is not None,
+    )
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(
+            status_code=500, content={"detail": _safe_backend_error(exc)}
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422, content={"detail": _safe_validation_errors(exc)}
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -506,7 +561,12 @@ def create_app(
             async with pdf_render_semaphore:
                 pdf_content = await run_in_threadpool(build_pdf_bytes, content)
         except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=503,
+                detail=_safe_backend_error(
+                    exc, "PDF export is unavailable. Check the server logs."
+                ),
+            ) from exc
 
         return Response(
             content=pdf_content,
@@ -584,7 +644,9 @@ def create_app(
                 status_code=422,
                 detail="A prompt or at least one attachment is required.",
             )
-        image_uploads = [upload for upload in normalized_uploads if upload.kind == "image"]
+        image_uploads = [
+            upload for upload in normalized_uploads if upload.kind == "image"
+        ]
         rag_uploads = [upload for upload in normalized_uploads if upload.kind == "rag"]
         temporary_directory = tempfile.TemporaryDirectory(
             prefix="chainagents-api-uploads-"
@@ -631,7 +693,9 @@ def create_app(
             )
         except ValidationError as exc:
             temporary_directory.cleanup()
-            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+            raise HTTPException(
+                status_code=422, detail=_safe_validation_errors(exc)
+            ) from exc
         except Exception:
             temporary_directory.cleanup()
             raise
@@ -674,7 +738,9 @@ def create_app(
                     else ""
                 )
                 final_prompt = f"{active_context.prompt}{prompt_note}"
-                image_parts = tuple(image_content_part(upload) for upload in image_uploads)
+                image_parts = tuple(
+                    image_content_part(upload) for upload in image_uploads
+                )
                 active_context = replace(
                     active_context,
                     prompt=final_prompt,
@@ -692,7 +758,7 @@ def create_app(
                 yield _json_line(
                     {
                         "kind": "error",
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error": _safe_backend_error(exc),
                         "thread_id": active_context.thread_id,
                         "model": active_context.model_name,
                         "reasoning": active_context.reasoning_level,
@@ -781,7 +847,9 @@ def create_app(
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
-                detail="Reflection could not be saved. Please retry.",
+                detail=_safe_backend_error(
+                    exc, "Reflection could not be saved. Please retry."
+                ),
             ) from exc
         finally:
             if not saved:
@@ -830,6 +898,10 @@ async def _read_multipart_uploads(files: list[UploadFile]) -> list[NormalizedUpl
     uploads: list[NormalizedUpload] = []
     for upload in files:
         try:
+            if len(upload.filename or "") > MAX_IDENTIFIER_LENGTH:
+                raise HTTPException(
+                    status_code=422, detail="Uploaded filename exceeds 256 characters."
+                )
             data = await upload.read(MAX_UPLOAD_FILE_BYTES + 1)
             uploads.append(
                 normalize_upload(
@@ -854,7 +926,9 @@ def _parse_history_form(history: str | None) -> list[dict[str, Any]]:
     try:
         value = json.loads(history)
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=422, detail="history must be valid JSON") from exc
+        raise HTTPException(
+            status_code=422, detail="history must be valid JSON"
+        ) from exc
     if not isinstance(value, list):
         raise HTTPException(status_code=422, detail="history must be a JSON array")
     return value
@@ -944,7 +1018,7 @@ async def _agent_stream_lines(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        reflection_collector.mark_run_failed(exc)
+        reflection_collector.mark_run_failed(RuntimeError("Agent operation failed."))
         if not generated_files_emitted:
             generated_files_line = _generated_files_line(
                 runtime,
@@ -966,7 +1040,7 @@ async def _agent_stream_lines(
         yield _json_line(
             {
                 "kind": "error",
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": _safe_backend_error(exc),
                 "thread_id": context.thread_id,
                 "model": context.model_name,
                 "reasoning": context.reasoning_level,
@@ -1045,7 +1119,17 @@ def _attachment_status_payload(result: RagUploadResult) -> dict[str, Any]:
         message = f"Indexed {count} uploaded {noun} for this thread."
         status = "complete"
     else:
-        message = result.reason or "No supported RAG files were indexed."
+        message = (
+            result.reason
+            if result.reason
+            in {
+                "Knowledge index is unavailable.",
+                "No supported text files were uploaded.",
+            }
+            else "No supported RAG files were indexed. Check the server logs."
+        )
+        if result.reason != message:
+            logger.warning("RAG ingestion unavailable: %s", result.reason)
         status = "error"
     return {
         "kind": "attachment_status",
@@ -1073,6 +1157,24 @@ def _run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
 
     thread_id = _required_text(request.thread_id, "thread_id")
     model_name = _optional_text(request.model) or runtime.config.model_name
+    if model_name not in runtime.config.model_choices:
+        raise HTTPException(
+            status_code=422, detail="model must be a configured model choice."
+        )
+    requested_url = _optional_text(request.async_subagent_url)
+    configured_urls = {
+        getattr(subagent, "url", None)
+        for subagent in getattr(runtime.config.extensions, "async_subagents", ())
+    }
+    if requested_url is not None and requested_url not in configured_urls:
+        raise HTTPException(
+            status_code=422,
+            detail="async_subagent_url must match a configured destination.",
+        )
+    if _optional_text(request.mcp_session_id) not in {None, thread_id}:
+        raise HTTPException(
+            status_code=422, detail="mcp_session_id must match thread_id."
+        )
     try:
         reasoning_level = normalize_reasoning_level(
             request.reasoning,
@@ -1087,8 +1189,8 @@ def _run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
         model_name=model_name,
         reasoning_level=reasoning_level,
         reasoning_level_is_explicit=request.reasoning is not None,
-        async_subagent_url=_optional_text(request.async_subagent_url),
-        mcp_session_id=_optional_text(request.mcp_session_id),
+        async_subagent_url=None,
+        mcp_session_id=thread_id,
         history=tuple(_history_message_payload(message) for message in request.history),
         source_thread_id=_optional_text(request.source_thread_id),
     )
@@ -1127,13 +1229,17 @@ async def _prepare_run_context(
             mcp_session_id=context.mcp_session_id,
         )
     except ValueError as exc:
-        return replace(context, command_error=str(exc), command_error_status=422)
+        return replace(
+            context,
+            command_error=_safe_command_validation_error(exc),
+            command_error_status=422,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         return replace(
             context,
-            command_error=f"{type(exc).__name__}: {exc}",
+            command_error=_safe_backend_error(exc),
             command_error_status=500,
         )
     if result.target == "unknown":
@@ -1167,7 +1273,10 @@ async def _clone_branch_rag_before_commands(
     except ValueError as exc:
         return replace(
             context,
-            command_error=str(exc),
+            command_error=_safe_backend_error(
+                exc,
+                "Branch uploads could not be copied. Check the source and target threads.",
+            ),
             command_error_status=422,
             source_thread_id=None,
         )
@@ -1176,7 +1285,7 @@ async def _clone_branch_rag_before_commands(
     except Exception as exc:
         return replace(
             context,
-            command_error=f"{type(exc).__name__}: {exc}",
+            command_error=_safe_backend_error(exc),
             command_error_status=500,
             source_thread_id=None,
         )
@@ -1215,7 +1324,10 @@ def _validate_image_modalities(
     try:
         selected_model = resolve_runtime_model_profile(runtime.config, model_name)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail=_safe_backend_error(exc, "Selected model configuration is invalid."),
+        ) from exc
     if "image" not in selected_model.modalities:
         raise HTTPException(
             status_code=422,
@@ -1347,10 +1459,46 @@ def _json_line(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
 
 
+def _safe_backend_error(
+    exc: Exception, message: str = "Agent operation failed. Please retry."
+) -> str:
+    logger.error(message, exc_info=(type(exc), exc, exc.__traceback__))
+    return message
+
+
+def _safe_command_validation_error(exc: ValueError) -> str:
+    # Runtime command JSON validation has a stable correction message. Other
+    # ValueErrors can originate from an MCP backend and must not be echoed.
+    message = str(exc)
+    if message.startswith("Command arguments") and message.endswith(
+        "must be valid JSON."
+    ):
+        return "Command arguments must be valid JSON."
+    return _safe_backend_error(exc, "Command arguments could not be validated.")
+
+
+def _safe_validation_errors(
+    exc: ValidationError | RequestValidationError,
+) -> list[dict[str, Any]]:
+    """Keep local schema feedback without echoing inputs or exception objects.
+
+    These errors originate in the API request models, whose custom validators
+    use fixed correction messages, never in runtime/backend exception handlers.
+    """
+    return [
+        {
+            "loc": error["loc"],
+            "type": error["type"],
+            "msg": str(error["msg"])[:256],
+        }
+        for error in exc.errors()[:20]
+    ]
+
+
 def _agent_error(exc: Exception) -> HTTPException:
     return HTTPException(
         status_code=500,
-        detail=f"{type(exc).__name__}: {exc}",
+        detail=_safe_backend_error(exc),
     )
 
 
@@ -1380,7 +1528,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     """Run the API server from the console script."""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    security = ApiSecurityConfig.from_env()
+    if (
+        security.token is None
+        and args.host != "localhost"
+        and not is_loopback(args.host)
+    ):
+        parser.error("Non-loopback binds require CHAINAGENTS_API_TOKEN.")
 
     if args.ui_dir is not None:
         os.environ["CHAINAGENTS_UI_DIR"] = args.ui_dir
@@ -1393,6 +1549,7 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         reload=args.reload,
+        proxy_headers=False,
     )
 
 
