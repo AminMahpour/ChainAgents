@@ -5,6 +5,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from chainagents.runtime import core as runtime_core
+
 
 def dependency_name(requirement: str) -> str:
     """Return the normalized package name from a dependency requirement."""
@@ -67,3 +69,38 @@ def test_default_dependencies_do_not_include_chromadb() -> None:
 
     assert "chromadb" not in dependency_names
     assert "langchain-chroma" not in dependency_names
+
+
+def test_default_project_root_keeps_source_checkout(tmp_path: Path) -> None:
+    """Keep source checkouts as the workspace even when launched elsewhere."""
+    source_root = tmp_path / "source"
+    (source_root / "chainagents/runtime").mkdir(parents=True)
+    (source_root / "pyproject.toml").write_text(
+        '[project]\nname = "ChainAgents"\n',
+        encoding="utf-8",
+    )
+    working_directory = tmp_path / "user-workspace"
+    working_directory.mkdir()
+
+    resolved = runtime_core._resolve_default_project_root(
+        module_file=source_root / "chainagents/runtime/core.py",
+        working_directory=working_directory,
+    )
+
+    assert resolved == source_root.resolve()
+
+
+def test_default_project_root_uses_user_cwd_for_installed_package(
+    tmp_path: Path,
+) -> None:
+    """Avoid treating an installed package's site-packages as the workspace."""
+    site_packages = tmp_path / "venv/lib/python3.12/site-packages"
+    working_directory = tmp_path / "user-workspace"
+    working_directory.mkdir()
+
+    resolved = runtime_core._resolve_default_project_root(
+        module_file=site_packages / "chainagents/runtime/core.py",
+        working_directory=working_directory,
+    )
+
+    assert resolved == working_directory.resolve()

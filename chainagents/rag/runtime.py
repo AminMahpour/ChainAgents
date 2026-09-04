@@ -1360,7 +1360,6 @@ class WorkspaceDocsRAG:
             The rebuilt object or status.
         """
         self._validate_thread_upload_scope(thread_id)
-        files_directory = self._thread_upload_files_directory(thread_id)
         source_paths = self._thread_upload_source_paths(thread_id)
         collection_directory = self._thread_upload_collection_directory(thread_id)
         manifest_path = self._thread_upload_manifest_path(thread_id)
@@ -1475,7 +1474,6 @@ class WorkspaceDocsRAG:
         if not JsonVectorStore.index_exists(collection_directory):
             return False
 
-        files_directory = self._thread_upload_files_directory(thread_id)
         source_paths = self._thread_upload_source_paths(thread_id)
         current_signature = self._signature_for_paths(
             source_paths,

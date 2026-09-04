@@ -22,7 +22,6 @@ from chainlit.types import ThreadDict
 
 from chainagents.commands.native import (
     ParsedNativeCommand,
-    build_skill_command_prompt,
     dumps_tool_result,
     parse_native_command,
     resolve_native_command,

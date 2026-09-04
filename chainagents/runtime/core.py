@@ -103,7 +103,31 @@ DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS = (
     "grep",
 )
 AGENT_MEMORY_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_default_project_root(
+    *,
+    module_file: Path,
+    working_directory: Path | None = None,
+) -> Path:
+    """Resolve the default user workspace for source and installed runtimes.
+
+    Args:
+        module_file: Path to this runtime module.
+        working_directory: Process working directory used by installed packages.
+
+    Returns:
+        The source checkout root, or the user's working directory for an install.
+    """
+    source_root = module_file.resolve().parents[2]
+    if (source_root / "pyproject.toml").is_file() and (
+        source_root / "chainagents"
+    ).is_dir():
+        return source_root
+    return (working_directory or Path.cwd()).resolve()
+
+
+PROJECT_ROOT = _resolve_default_project_root(module_file=Path(__file__))
 DEEPAGENT_ARTIFACTS_DIRECTORY = Path(".files/deepagent")
 GENERATED_OUTPUTS_DIRECTORY = Path(".files/outputs")
 AGENTS_MD_FILENAME = "AGENTS.md"
@@ -4593,11 +4617,13 @@ def sanitize_tools_for_model(
 
     compatible_tools: list[Any] = []
     skipped_tool_names: list[str] = []
-    for tool in tools:
-        if tool_supports_openai_compatible_schema(tool):
-            compatible_tools.append(tool)
+    for candidate_tool in tools:
+        if tool_supports_openai_compatible_schema(candidate_tool):
+            compatible_tools.append(candidate_tool)
             continue
-        skipped_tool_names.append(getattr(tool, "name", type(tool).__name__))
+        skipped_tool_names.append(
+            getattr(candidate_tool, "name", type(candidate_tool).__name__)
+        )
 
     if skipped_tool_names:
         logger.warning(
