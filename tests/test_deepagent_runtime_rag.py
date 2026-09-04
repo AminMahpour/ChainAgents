@@ -5103,6 +5103,10 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         )
     )
     runtime._mcp_client = FakeMCPClient()
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+    monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent_with_configured_summarization", lambda *args, **kwargs: object())
 
     async def exercise_runtime():
         """Exercise runtime agent loading for a Chainlit session.
@@ -5125,24 +5129,28 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
             thread_id="thread-1",
             mcp_session_id="session-2",
         )
-        runtime._agents[("medium", "thread-1", None, "session-1")] = object()
-        runtime._agents[("medium", "thread-1", None, "session-2")] = object()
+        first = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-1")
+        other = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-2")
         await runtime.close_mcp_session("session-1")
         assert len(closed_sessions) == 1
         assert ("session-1", "repo") not in runtime._mcp_sessions
         assert ("session-1", ("repo",)) not in runtime._mcp_tools_cache
-        assert ("medium", "thread-1", None, "session-1") not in runtime._agents
-        assert ("medium", "thread-1", None, "session-2") in runtime._agents
+        assert first not in runtime._agents.values()
+        assert other in runtime._agents.values()
+        reopened = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-1")
+        assert reopened is not first
+        assert await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-2") is other
         await runtime.close_mcp_session("session-2")
+        await runtime.close_mcp_session("session-1")
         return session_1_tools_first, session_1_tools_second, session_2_tools
 
     session_1_tools_first, session_1_tools_second, session_2_tools = asyncio.run(
         exercise_runtime()
     )
 
-    assert len(created_sessions) == 2
-    assert len(load_calls) == 2
-    assert len(closed_sessions) == 2
+    assert len(created_sessions) == 3
+    assert len(load_calls) == 3
+    assert len(closed_sessions) == 3
     assert session_1_tools_first[0].session is session_1_tools_second[0].session
     assert session_1_tools_first[0].session is not session_2_tools[0].session
     assert closed_sessions[0] is session_1_tools_first[0].session
@@ -5151,6 +5159,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
 
 def test_rebuild_rag_index_clears_cached_agents(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """Verify that rebuild RAG index clears cached agents.
 
@@ -5182,9 +5191,17 @@ def test_rebuild_rag_index_clears_cached_agents(
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     runtime._rag_service = RebuildableRAG()
-    runtime._agents[("medium", "thread-1", None)] = object()
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+    monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(deepagent_runtime, "create_deep_agent_with_configured_summarization", lambda *args, **kwargs: object())
 
-    status = asyncio.run(runtime.rebuild_rag_index())
+    async def exercise():
+        await runtime.get_agent("medium", thread_id="thread-1")
+        assert runtime._agents
+        return await runtime.rebuild_rag_index()
+
+    status = asyncio.run(exercise())
 
     assert status.ready is True
     assert runtime._agents == {}

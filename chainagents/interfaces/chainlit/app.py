@@ -1784,3 +1784,16 @@ async def on_chat_end() -> None:
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()
+
+    runtime = AgentRuntime.current()
+    if runtime is not None:
+        raw_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
+        thread_id = (
+            str(raw_settings.get("thread_id") or "").strip()
+            if isinstance(raw_settings, dict)
+            else ""
+        ) or current_chainlit_thread_id()
+        await runtime.close_conversation(
+            thread_id=thread_id or None,
+            mcp_session_id=current_mcp_session_id() or None,
+        )

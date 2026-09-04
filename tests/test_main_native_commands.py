@@ -1093,3 +1093,21 @@ async def test_handle_native_command_uses_selected_skill_command_input() -> None
 
     assert result is not None
     assert "User request:\ninspect this diff" in result
+
+
+def test_chat_end_releases_session_and_current_thread(monkeypatch):
+    """The stored MCP ID and runtime thread can differ from Chainlit's thread."""
+    import asyncio
+    released = []
+    async def close_conversation(**kwargs):
+        released.append(kwargs)
+    runtime = SimpleNamespace(close_conversation=close_conversation)
+    monkeypatch.setattr(main.AgentRuntime, 'current', lambda: runtime)
+    data = {
+        main.SESSION_MCP_SESSION_ID_KEY: 'actual-session',
+        main.SESSION_SETTINGS_KEY: {'thread_id': 'runtime-thread'},
+    }
+    monkeypatch.setattr(main.cl, 'user_session', SimpleNamespace(get=data.get))
+    monkeypatch.setattr(main, 'current_chainlit_thread_id', lambda: 'chainlit-thread')
+    asyncio.run(main.on_chat_end())
+    assert released == [{'thread_id': 'runtime-thread', 'mcp_session_id': 'actual-session'}]

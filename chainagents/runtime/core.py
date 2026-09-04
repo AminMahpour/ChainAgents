@@ -4990,6 +4990,54 @@ class AppSettings:
     show_tool_calls: bool = True
 
 
+@dataclass(frozen=True)
+class AgentCacheKey:
+    """Identify a graph by its model, conversation, and transport scope."""
+
+    reasoning_level: ReasoningLevel
+    reasoning_level_is_explicit: bool
+    model_name: str
+    thread_id: str | None
+    async_subagent_url_override: str | None
+    mcp_scope: str | None
+
+
+class _MCPSessionOwner:
+    """Enter and exit transport cancel scopes on the same long-lived task."""
+
+    def __init__(self, context: Any) -> None:
+        self._ready = asyncio.get_running_loop().create_future()
+        self._stop = asyncio.Event()
+        self._task = asyncio.create_task(self._run(context))
+
+    async def _run(self, context: Any) -> None:
+        try:
+            async with context as session:
+                self._ready.set_result(session)
+                await self._stop.wait()
+        except BaseException as exc:
+            if not self._ready.done():
+                self._ready.set_exception(exc)
+            else:
+                raise
+
+    async def session(self) -> Any:
+        try:
+            return await asyncio.shield(self._ready)
+        except BaseException:
+            await self.aclose()
+            # Retrieve a startup error even when the requesting task was cancelled.
+            if self._ready.done():
+                self._ready.exception()
+            raise
+
+    async def aclose(self) -> None:
+        self._stop.set()
+        if not self._ready.done():
+            self._task.cancel()
+        await asyncio.shield(self._task)
+
+
 class AgentRuntime:
     """Own configured agents, MCP sessions, persistence handles, and RAG state."""
 
@@ -5008,14 +5056,11 @@ class AgentRuntime:
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
         self._mcp_lock = asyncio.Lock()
-        self._agents: dict[
-            tuple[ReasoningLevel, str, str | None, str | None, str | None],
-            object,
-        ] = {}
+        self._agents: dict[AgentCacheKey, object] = {}
         self._mcp_client: MultiServerMCPClient | None = None
         self._mcp_tools_cache: dict[tuple[str | None, tuple[str, ...]], list[Any]] = {}
         self._mcp_sessions: dict[tuple[str | None, str], Any] = {}
-        self._mcp_session_stacks: dict[str | None, AsyncExitStack] = {}
+        self._mcp_session_owners: dict[tuple[str | None, str], _MCPSessionOwner] = {}
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
@@ -5035,7 +5080,11 @@ class AgentRuntime:
         async with cls._instance_lock:
             if cls._instance is None:
                 instance = cls(RuntimeConfig.from_env())
-                await instance._initialize()
+                try:
+                    await instance._initialize()
+                except BaseException:
+                    await instance.close()
+                    raise
                 cls._instance = instance
             return cls._instance
 
@@ -5056,7 +5105,11 @@ class AgentRuntime:
             The created the agent runtime.
         """
         instance = cls(config or RuntimeConfig.from_env(), project_root=project_root)
-        await instance._initialize()
+        try:
+            await instance._initialize()
+        except BaseException:
+            await instance.close()
+            raise
         return instance
 
     @classmethod
@@ -5383,13 +5436,13 @@ class AgentRuntime:
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
-        cache_key = (
-            effective_reasoning_level,
-            reasoning_level_is_explicit,
-            selected_model,
-            thread_id,
-            async_subagent_url_override,
-            mcp_scope,
+        cache_key = AgentCacheKey(
+            reasoning_level=effective_reasoning_level,
+            reasoning_level_is_explicit=reasoning_level_is_explicit,
+            model_name=selected_model,
+            thread_id=thread_id,
+            async_subagent_url_override=async_subagent_url_override,
+            mcp_scope=mcp_scope,
         )
         async with self._agent_lock:
             agent = self._agents.get(cache_key)
@@ -5724,12 +5777,9 @@ class AgentRuntime:
         if self._mcp_client is None:
             raise RuntimeError("MCP client is not initialized.")
 
-        stack = self._mcp_session_stacks.get(scope)
-        if stack is None:
-            stack = AsyncExitStack()
-            self._mcp_session_stacks[scope] = stack
-
-        session = await stack.enter_async_context(self._mcp_client.session(server_name))
+        owner = _MCPSessionOwner(self._mcp_client.session(server_name))
+        session = await owner.session()
+        self._mcp_session_owners[cache_key] = owner
         self._mcp_sessions[cache_key] = session
         return session
 
@@ -5764,26 +5814,36 @@ class AgentRuntime:
             if cached is not None:
                 return list(cached)
 
-            tools: list[Any] = []
-            for server_name in cache_key[1]:
-                if self.config.extensions.mcp_stateful:
-                    session = await self._get_stateful_mcp_session(
-                        server_name=server_name,
-                        thread_id=thread_id,
-                        mcp_session_id=mcp_session_id,
-                    )
-                    tools.extend(
-                        await load_mcp_tools(
-                            session,
-                            callbacks=self._mcp_client.callbacks,
-                            tool_interceptors=self._mcp_client.tool_interceptors,
+            existing_sessions = set(self._mcp_sessions)
+            try:
+                tools: list[Any] = []
+                for server_name in cache_key[1]:
+                    if self.config.extensions.mcp_stateful:
+                        session = await self._get_stateful_mcp_session(
                             server_name=server_name,
-                            tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
+                            thread_id=thread_id,
+                            mcp_session_id=mcp_session_id,
                         )
-                    )
-                    continue
+                        tools.extend(
+                            await load_mcp_tools(
+                                session,
+                                callbacks=self._mcp_client.callbacks,
+                                tool_interceptors=self._mcp_client.tool_interceptors,
+                                server_name=server_name,
+                                tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
+                            )
+                        )
+                        continue
 
-                tools.extend(await self._mcp_client.get_tools(server_name=server_name))
+                    tools.extend(await self._mcp_client.get_tools(server_name=server_name))
+
+            except BaseException:
+                owners = []
+                for key in set(self._mcp_sessions) - existing_sessions:
+                    self._mcp_sessions.pop(key)
+                    owners.append(self._mcp_session_owners.pop(key))
+                await self._close_mcp_owners(owners)
+                raise
 
             self._mcp_tools_cache[cache_key] = tools
             return list(tools)
@@ -5839,10 +5899,14 @@ class AgentRuntime:
             self._agents = {
                 key: agent
                 for key, agent in self._agents.items()
-                if len(key) < 4 or key[3] != mcp_scope
+                if key.mcp_scope != mcp_scope
             }
             async with self._mcp_lock:
-                stack = self._mcp_session_stacks.pop(mcp_scope, None)
+                owners = [
+                    self._mcp_session_owners.pop(key)
+                    for key in list(self._mcp_session_owners)
+                    if key[0] == mcp_scope
+                ]
                 self._mcp_sessions = {
                     key: session
                     for key, session in self._mcp_sessions.items()
@@ -5854,28 +5918,50 @@ class AgentRuntime:
                     if key[0] != mcp_scope
                 }
 
-        if stack is not None:
-            await stack.aclose()
+        await self._close_mcp_owners(owners)
+
+    async def close_conversation(
+        self, *, thread_id: str | None, mcp_session_id: str | None = None
+    ) -> None:
+        """Release conversation graphs and any stateful MCP transport resources."""
+        await self.close_mcp_session(mcp_session_id or thread_id)
+        if thread_id:
+            async with self._agent_lock:
+                self._agents = {
+                    key: agent for key, agent in self._agents.items()
+                    if key.thread_id != thread_id or key.mcp_scope is not None
+                }
+
+    @staticmethod
+    async def _close_mcp_owners(owners: list[_MCPSessionOwner]) -> None:
+        # Each owner closes independently; one broken transport must not leak others.
+        results = await asyncio.gather(
+            *(owner.aclose() for owner in owners), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def close_all_mcp_sessions(self) -> None:
         """Close all MCP sessions."""
         async with self._agent_lock:
             async with self._mcp_lock:
-                stacks = list(self._mcp_session_stacks.values())
-                self._mcp_session_stacks.clear()
+                owners = list(self._mcp_session_owners.values())
+                self._mcp_session_owners.clear()
                 self._mcp_sessions.clear()
                 self._mcp_tools_cache.clear()
                 self._agents.clear()
 
-        for stack in stacks:
-            await stack.aclose()
+        await self._close_mcp_owners(owners)
 
     async def close(self) -> None:
         """Close the agent runtime."""
-        await self._exit_stack.aclose()
-        self._checkpointer = None
-        self._store = None
-        self._mcp_client = None
+        try:
+            await self._exit_stack.aclose()
+        finally:
+            self._checkpointer = None
+            self._store = None
+            self._mcp_client = None
 
     def _build_backend(self, runtime):
         """Build the Deep Agent backend for the current runtime settings.
