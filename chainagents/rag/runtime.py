@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-import re
 import shutil
 import threading
 from dataclasses import dataclass
@@ -40,7 +40,8 @@ DEFAULT_RAG_TOP_K = 4
 DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 RAG_MANIFEST_VERSION = 1
 RAG_COLLECTION_NAME = "workspace_docs"
-RAG_UPLOADS_DIRECTORY_NAME = "uploads"
+# Keep hashed scopes wholly separate from every legacy sanitized thread name.
+RAG_UPLOADS_DIRECTORY_NAME = "uploads-v2"
 RAG_UPLOAD_FILES_DIRECTORY_NAME = "files"
 RAG_UPLOAD_COLLECTION_DIRECTORY_NAME = "vectorstore"
 RAG_UPLOAD_MANIFEST_FILENAME = "manifest.json"
@@ -413,6 +414,7 @@ class RagConfig:
         chunk_overlap: The chunk overlap value.
         top_k: Maximum number of search results to return.
         embedding: The embedding value.
+        persist_directory_anchor: Trusted base for relative persistence paths.
     """
 
     enabled: bool = False
@@ -423,6 +425,7 @@ class RagConfig:
     chunk_overlap: int = DEFAULT_RAG_CHUNK_OVERLAP
     top_k: int = DEFAULT_RAG_TOP_K
     embedding: RagEmbeddingConfig = RagEmbeddingConfig()
+    persist_directory_anchor: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -439,6 +442,7 @@ class ResolvedRagConfig:
         top_k: Maximum number of search results to return.
         embedding: The embedding value.
         collection_name: The collection name value.
+        persist_directory_anchor: Trusted base for relative persistence paths.
     """
 
     enabled: bool
@@ -450,6 +454,7 @@ class ResolvedRagConfig:
     top_k: int
     embedding: ResolvedRagEmbeddingConfig
     collection_name: str = RAG_COLLECTION_NAME
+    persist_directory_anchor: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -593,7 +598,7 @@ def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig
     if raw_rag and not isinstance(raw_rag, dict):
         raise ValueError("The top-level 'rag' config must be a table/object.")
 
-    base_dir = config_path.parent
+    base_dir = config_path.parent.absolute()
     raw_embedding = raw_rag.get("embedding", {})
     if raw_embedding and not isinstance(raw_embedding, dict):
         raise ValueError("The '[rag.embedding]' config must be a table/object.")
@@ -602,8 +607,10 @@ def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig
         raw_rag.get("persist_directory", DEFAULT_RAG_PERSIST_DIRECTORY)
     ).strip()
     persist_directory = Path(persist_directory_raw or DEFAULT_RAG_PERSIST_DIRECTORY)
+    persist_directory_anchor: Path | None = None
     if not persist_directory.is_absolute():
-        persist_directory = (base_dir / persist_directory).resolve()
+        persist_directory = (base_dir / persist_directory).absolute()
+        persist_directory_anchor = base_dir
 
     chunk_size = normalize_int(
         raw_rag.get("chunk_size"),
@@ -623,6 +630,7 @@ def parse_rag_config(raw_config: dict[str, Any], config_path: Path) -> RagConfig
     return RagConfig(
         enabled=normalize_bool(raw_rag.get("enabled"), field_name="rag.enabled", default=False),
         persist_directory=persist_directory,
+        persist_directory_anchor=persist_directory_anchor,
         include_globs=normalize_glob_list(
             raw_rag.get("include_globs"),
             field_name="rag.include_globs",
@@ -703,6 +711,7 @@ def resolve_rag_config(
     return ResolvedRagConfig(
         enabled=True,
         persist_directory=config.persist_directory,
+        persist_directory_anchor=config.persist_directory_anchor,
         include_globs=config.include_globs,
         exclude_globs=config.exclude_globs,
         chunk_size=config.chunk_size,
@@ -785,8 +794,14 @@ class WorkspaceDocsRAG:
             project_root: Project root used to resolve local paths.
         """
         self.config = config
-        self.project_root = project_root.resolve()
-        self.persist_directory = config.persist_directory.resolve()
+        lexical_project_root = project_root.absolute()
+        self.project_root = lexical_project_root.resolve()
+        self._configured_persist_directory = config.persist_directory.absolute()
+        self._persist_directory_anchor = self._select_persist_directory_anchor(
+            config.persist_directory_anchor,
+            project_root=lexical_project_root,
+        )
+        self.persist_directory = self._validated_persist_directory()
         self.collection_directory = self.persist_directory / VECTOR_STORE_DIRECTORY_NAME
         self.manifest_path = self.persist_directory / "manifest.json"
         self.uploads_root = self.persist_directory / RAG_UPLOADS_DIRECTORY_NAME
@@ -908,6 +923,8 @@ class WorkspaceDocsRAG:
             )
 
         with self._lock:
+            self._validate_thread_upload_scope(source_id)
+            self._validate_thread_upload_scope(target_id)
             source_directory = self._thread_upload_files_directory(source_id)
             target_directory = self._thread_upload_files_directory(target_id)
             if target_directory.is_dir() and any(target_directory.iterdir()):
@@ -922,11 +939,7 @@ class WorkspaceDocsRAG:
                     reason="Source thread has no uploaded files.",
                 )
 
-            source_files = [
-                path
-                for path in sorted(source_directory.iterdir(), key=lambda item: item.name)
-                if path.is_file() and self._supports_uploaded_file(path.name)
-            ]
+            source_files = self._thread_upload_source_paths(source_id)
             if not source_files:
                 return RagUploadResult(
                     thread_id=target_id,
@@ -935,7 +948,9 @@ class WorkspaceDocsRAG:
 
             target_directory.mkdir(parents=True, exist_ok=True)
             for source_path in source_files:
-                shutil.copy2(source_path, target_directory / source_path.name)
+                destination = target_directory / source_path.name
+                self._assert_safe_upload_storage_path(destination)
+                shutil.copy2(source_path, destination)
             indexed_files, chunk_count = self._rebuild_thread_uploads_locked(target_id)
             return RagUploadResult(
                 thread_id=target_id,
@@ -1317,6 +1332,7 @@ class WorkspaceDocsRAG:
         Returns:
             The stored value.
         """
+        self._validate_thread_upload_scope(thread_id)
         files_directory = self._thread_upload_files_directory(thread_id)
         files_directory.mkdir(parents=True, exist_ok=True)
 
@@ -1329,6 +1345,7 @@ class WorkspaceDocsRAG:
                 continue
 
             destination = self._unique_upload_destination(files_directory, upload_name)
+            self._assert_safe_upload_storage_path(destination)
             shutil.copy2(upload.path, destination)
             added_files.append(destination.name)
 
@@ -1343,8 +1360,8 @@ class WorkspaceDocsRAG:
         Returns:
             The rebuilt object or status.
         """
-        files_directory = self._thread_upload_files_directory(thread_id)
-        source_paths = sorted(path for path in files_directory.glob("*") if path.is_file())
+        self._validate_thread_upload_scope(thread_id)
+        source_paths = self._thread_upload_source_paths(thread_id)
         collection_directory = self._thread_upload_collection_directory(thread_id)
         manifest_path = self._thread_upload_manifest_path(thread_id)
 
@@ -1437,8 +1454,8 @@ class WorkspaceDocsRAG:
         Returns:
             True when the thread has uploaded files; otherwise, False.
         """
-        files_directory = self._thread_upload_files_directory(thread_id)
-        return files_directory.exists() and any(path.is_file() for path in files_directory.glob("*"))
+        self._validate_thread_upload_scope(thread_id)
+        return bool(self._thread_upload_source_paths(thread_id))
 
     def _thread_upload_manifest_is_current_locked(self, thread_id: str) -> bool:
         """Return whether the thread upload manifest matches uploaded files.
@@ -1449,6 +1466,7 @@ class WorkspaceDocsRAG:
         Returns:
             True when the upload manifest is current; otherwise, False.
         """
+        self._validate_thread_upload_scope(thread_id)
         manifest = self._read_json(self._thread_upload_manifest_path(thread_id))
         if manifest is None:
             return False
@@ -1457,8 +1475,7 @@ class WorkspaceDocsRAG:
         if not JsonVectorStore.index_exists(collection_directory):
             return False
 
-        files_directory = self._thread_upload_files_directory(thread_id)
-        source_paths = sorted(path for path in files_directory.glob("*") if path.is_file())
+        source_paths = self._thread_upload_source_paths(thread_id)
         current_signature = self._signature_for_paths(
             source_paths,
             display_path_for=self._uploaded_display_path,
@@ -1474,6 +1491,7 @@ class WorkspaceDocsRAG:
         Returns:
             The loaded value.
         """
+        self._validate_thread_upload_scope(thread_id)
         store = self._uploaded_vectorstores.get(thread_id)
         if store is not None:
             return store
@@ -1494,7 +1512,9 @@ class WorkspaceDocsRAG:
         Returns:
             The thread upload root.
         """
-        return self.uploads_root / self._normalize_thread_id(thread_id)
+        normalized_thread_id = self._normalize_thread_id(thread_id)
+        directory_name = hashlib.sha256(normalized_thread_id.encode("utf-8")).hexdigest()
+        return self._assert_safe_upload_storage_path(self.uploads_root / directory_name)
 
     def _thread_upload_files_directory(self, thread_id: str) -> Path:
         """Return the thread upload files directory.
@@ -1505,7 +1525,9 @@ class WorkspaceDocsRAG:
         Returns:
             The thread upload files directory.
         """
-        return self._thread_upload_root(thread_id) / RAG_UPLOAD_FILES_DIRECTORY_NAME
+        return self._assert_safe_upload_storage_path(
+            self._thread_upload_root(thread_id) / RAG_UPLOAD_FILES_DIRECTORY_NAME
+        )
 
     def _thread_upload_collection_directory(self, thread_id: str) -> Path:
         """Return the thread upload collection directory.
@@ -1516,7 +1538,9 @@ class WorkspaceDocsRAG:
         Returns:
             The thread upload collection directory.
         """
-        return self._thread_upload_root(thread_id) / RAG_UPLOAD_COLLECTION_DIRECTORY_NAME
+        return self._assert_safe_upload_storage_path(
+            self._thread_upload_root(thread_id) / RAG_UPLOAD_COLLECTION_DIRECTORY_NAME
+        )
 
     def _thread_upload_manifest_path(self, thread_id: str) -> Path:
         """Return the thread upload manifest path.
@@ -1527,7 +1551,9 @@ class WorkspaceDocsRAG:
         Returns:
             The thread upload manifest path.
         """
-        return self._thread_upload_root(thread_id) / RAG_UPLOAD_MANIFEST_FILENAME
+        return self._assert_safe_upload_storage_path(
+            self._thread_upload_root(thread_id) / RAG_UPLOAD_MANIFEST_FILENAME
+        )
 
     def _normalize_thread_id(self, thread_id: str) -> str:
         """Normalize thread ID.
@@ -1537,9 +1563,113 @@ class WorkspaceDocsRAG:
 
         Returns:
             The normalized value.
+
+        Raises:
+            ValueError: If the supplied value is empty.
         """
-        normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", thread_id.strip())
-        return normalized or "thread"
+        normalized = thread_id.strip()
+        if not normalized:
+            raise ValueError("A non-empty thread ID is required for uploaded RAG files.")
+        return normalized
+
+    def _validate_thread_upload_scope(self, thread_id: str) -> None:
+        """Reject unsafe links anywhere in a thread's fixed storage scope."""
+        thread_root = self._thread_upload_root(thread_id)
+        files_directory = self._thread_upload_files_directory(thread_id)
+        collection_directory = self._thread_upload_collection_directory(thread_id)
+        fixed_paths = (
+            thread_root,
+            files_directory,
+            collection_directory,
+            collection_directory / VECTOR_STORE_INDEX_FILENAME,
+            self._thread_upload_manifest_path(thread_id),
+        )
+        for path in fixed_paths:
+            self._assert_safe_upload_storage_path(path)
+
+        if files_directory.is_dir():
+            for path in files_directory.iterdir():
+                self._assert_safe_upload_storage_path(path)
+
+    def _thread_upload_source_paths(self, thread_id: str) -> list[Path]:
+        """Return supported regular files after validating the upload scope."""
+        files_directory = self._thread_upload_files_directory(thread_id)
+        if not files_directory.exists():
+            return []
+
+        source_paths: list[Path] = []
+        for path in sorted(files_directory.iterdir(), key=lambda item: item.name):
+            self._assert_safe_upload_storage_path(path)
+            if path.is_file() and self._supports_uploaded_file(path.name):
+                source_paths.append(path)
+        return source_paths
+
+    def _assert_safe_upload_storage_path(self, path: Path) -> Path:
+        """Return a contained upload path after rejecting existing symlinks."""
+        self._validated_persist_directory()
+
+        try:
+            relative_path = path.relative_to(self.uploads_root)
+        except ValueError as exc:
+            raise ValueError("RAG upload storage must remain inside its upload root.") from exc
+
+        current = self.uploads_root
+        for part in relative_path.parts:
+            if current.is_symlink():
+                raise ValueError(f"RAG upload storage cannot contain symlinks: {current}")
+            current = current / part
+        if current.is_symlink():
+            raise ValueError(f"RAG upload storage cannot contain symlinks: {current}")
+
+        resolved_root = self.uploads_root.resolve(strict=False)
+        resolved_path = path.resolve(strict=False)
+        if not resolved_path.is_relative_to(resolved_root):
+            raise ValueError("RAG upload storage must remain inside its upload root.")
+        return path
+
+    def _select_persist_directory_anchor(
+        self,
+        configured_anchor: Path | None,
+        *,
+        project_root: Path,
+    ) -> Path:
+        """Select the trusted lexical base for persistence ancestry checks."""
+        if configured_anchor is not None:
+            return configured_anchor.absolute()
+
+        try:
+            self._configured_persist_directory.relative_to(project_root)
+        except ValueError:
+            parts = self._configured_persist_directory.parts
+            if len(parts) <= 1:
+                return Path(self._configured_persist_directory.anchor)
+            return Path(parts[0]) / parts[1]
+        return project_root
+
+    def _validated_persist_directory(self) -> Path:
+        """Resolve a trusted prefix while rejecting symlinked descendants."""
+        try:
+            relative_path = self._configured_persist_directory.relative_to(
+                self._persist_directory_anchor
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "RAG persistence storage must descend from its trusted path anchor."
+            ) from exc
+
+        current = self._persist_directory_anchor.resolve(strict=False)
+        for part in relative_path.parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                current = current.parent
+                continue
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(
+                    f"RAG upload storage cannot contain symlinks: {current}"
+                )
+        return current
 
     def _uploaded_display_path(self, path: Path) -> str:
         """Return the uploaded display path.

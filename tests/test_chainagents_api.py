@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import chainagents_api
+from chainagents.runtime import core
 from chainagents.runtime.reflection import ReflectionConfig
 from rag_runtime import RagUploadResult
 
@@ -177,12 +179,24 @@ class _FakeRuntime:
         )
 
 
+def _enable_reflection_storage(runtime):
+    runtime.config.extensions.agent_reflection = ReflectionConfig(enabled=True)
+    runtime.config.extensions.agent_memory_namespace = "api-reflections"
+    runtime._agent_lock = asyncio.Lock()
+    runtime.store = core.InMemoryStore()
+
+    async def save(proposal):
+        await core.AgentRuntime.save_reflection(runtime, proposal)
+
+    runtime.save_reflection = save
+
+
 def test_health_reports_ok() -> None:
     """Verify the health endpoint reports that the API process is alive."""
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.get("/health")
 
     assert response.status_code == 200
@@ -194,7 +208,7 @@ def test_status_reports_runtime_configuration() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.get("/api/status")
 
     assert response.status_code == 200
@@ -291,7 +305,7 @@ def test_export_response_pdf_returns_downloadable_pdf(
         raising=False,
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/exports/pdf",
             json={"content": "# Exported response", "filename": "response-message-123"},
@@ -354,7 +368,7 @@ def test_export_response_pdf_serializes_concurrent_renders(
         raising=False,
     )
 
-    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client, ThreadPoolExecutor(max_workers=2) as pool:
         first_response = pool.submit(
             client.post,
             "/api/exports/pdf",
@@ -382,7 +396,7 @@ def test_export_response_pdf_rejects_blank_content() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/exports/pdf",
             json={"content": "   ", "filename": "response"},
@@ -410,7 +424,7 @@ def test_export_response_pdf_rejects_oversized_content(
         raising=False,
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/exports/pdf",
             json={"content": "a" * 100_001, "filename": "response"},
@@ -439,7 +453,7 @@ def test_export_response_pdf_rejects_structurally_expensive_content(
         raising=False,
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/exports/pdf",
             json={
@@ -472,7 +486,7 @@ def test_export_response_pdf_reports_renderer_failure(
         raising=False,
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/exports/pdf",
             json={"content": "response", "filename": "response"},
@@ -480,7 +494,7 @@ def test_export_response_pdf_reports_renderer_failure(
 
     assert response.status_code == 503
     assert response.json() == {
-        "detail": "PDF export requires WeasyPrint native libraries."
+        "detail": "PDF export is unavailable. Check the server logs."
     }
 
 
@@ -495,7 +509,7 @@ def test_invoke_runs_prompt_through_agent() -> None:
     runtime = _FakeRuntime(agent)
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/invoke",
             json={
@@ -503,7 +517,7 @@ def test_invoke_runs_prompt_through_agent() -> None:
                 "thread_id": "thread-1",
                 "model": "other-model",
                 "reasoning": "high",
-                "mcp_session_id": "session-1",
+                "mcp_session_id": "thread-1",
             },
         )
 
@@ -522,7 +536,7 @@ def test_invoke_runs_prompt_through_agent() -> None:
                 "reasoning_level_is_explicit": True,
                 "thread_id": "thread-1",
                 "async_subagent_url_override": None,
-                "mcp_session_id": "session-1",
+                "mcp_session_id": "thread-1",
             },
         }
     ]
@@ -538,7 +552,7 @@ def test_invoke_requires_thread_id() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/invoke",
             json={"prompt": "hello"},
@@ -556,7 +570,7 @@ def test_invoke_replays_selected_history_and_clones_source_rag_scope() -> None:
     app = chainagents_api.create_app(runtime=runtime)
     image_data = base64.b64encode(b"small-png").decode("ascii")
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/invoke",
             json={
@@ -611,7 +625,7 @@ def test_stateful_history_requires_a_distinct_source_thread() -> None:
     app = chainagents_api.create_app(runtime=runtime)
     history = [{"role": "user", "content": "first question"}]
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         missing_source = client.post(
             "/api/agent/invoke",
             json={
@@ -641,7 +655,7 @@ def test_stateful_history_rejects_an_existing_target_checkpoint() -> None:
     runtime.checkpointer.existing_threads.add("branch-thread")
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/invoke",
             json={
@@ -673,7 +687,7 @@ def test_branch_replay_rejects_rag_dirty_target_before_commands() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/invoke",
             json={
@@ -698,7 +712,7 @@ def test_stateless_history_allows_normal_continuation_replay() -> None:
     runtime.config.agent_state = "stateless"
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/invoke",
             json={
@@ -717,7 +731,7 @@ def test_history_rejects_server_owned_roles_and_remote_images() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         system_response = client.post(
             "/api/agent/invoke",
             json={
@@ -777,7 +791,7 @@ def test_history_images_require_a_multimodal_model() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/invoke",
             json={
@@ -814,7 +828,7 @@ def test_history_rejects_excessive_messages_and_images() -> None:
         "image_url": {"url": f"data:image/png;base64,{image_data}"},
     }
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         excessive_messages = client.post(
             "/api/agent/invoke",
             json={
@@ -854,7 +868,7 @@ def test_stream_returns_ndjson_agent_events() -> None:
     runtime = _FakeRuntime(agent)
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         with client.stream(
             "POST",
             "/api/agent/stream",
@@ -938,7 +952,7 @@ def test_stream_emits_generated_files_after_successful_output_write(
     runtime.project_root = tmp_path
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "create a report", "thread_id": "thread-1"},
@@ -1007,7 +1021,7 @@ def test_stream_ignores_failed_or_missing_output_writes(tmp_path: Path) -> None:
     runtime.project_root = tmp_path
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "write files", "thread_id": "thread-1"},
@@ -1038,7 +1052,7 @@ def test_stream_emits_existing_output_referenced_by_response(tmp_path: Path) -> 
     runtime.project_root = tmp_path
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "create a chart", "thread_id": "thread-1"},
@@ -1087,7 +1101,7 @@ def test_stream_emits_verified_files_before_later_run_error(tmp_path: Path) -> N
     runtime.project_root = tmp_path
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "create partial output", "thread_id": "thread-1"},
@@ -1096,7 +1110,7 @@ def test_stream_emits_verified_files_before_later_run_error(tmp_path: Path) -> N
     lines = [json.loads(line) for line in response.iter_lines()]
     assert [line["kind"] for line in lines[-2:]] == ["generated_files", "error"]
     assert lines[-2]["files"][0]["download_url"] == "/api/generated-files/partial.txt"
-    assert lines[-1]["error"] == "RuntimeError: late failure"
+    assert lines[-1]["error"] == "Agent operation failed. Please retry."
 
 
 def test_generated_file_download_survives_app_recreation(tmp_path: Path) -> None:
@@ -1111,7 +1125,7 @@ def test_generated_file_download_survives_app_recreation(tmp_path: Path) -> None
         runtime.project_root = tmp_path
         app = chainagents_api.create_app(runtime=runtime)
 
-        with TestClient(app) as client:
+        with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
             response = client.get(download_url)
 
         assert response.status_code == 200
@@ -1128,7 +1142,7 @@ def test_stream_requires_thread_id() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "hello"},
@@ -1152,7 +1166,7 @@ def test_stream_transforms_configured_prompt_command() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "/review api.py", "thread_id": "thread-1"},
@@ -1178,7 +1192,7 @@ def test_stream_transforms_separately_selected_configured_command() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={
@@ -1209,7 +1223,7 @@ def test_stream_emits_direct_mcp_command_result_without_agent_run() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "/lookup topic", "thread_id": "thread-1"},
@@ -1228,7 +1242,7 @@ def test_stream_returns_typed_error_for_unknown_command() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream",
             json={"prompt": "/missing value", "thread_id": "thread-1"},
@@ -1262,7 +1276,7 @@ def test_native_command_validation_failure_uses_typed_endpoint_errors() -> None:
     runtime.command_error = ValueError("Command arguments must be valid JSON.")
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1", raise_server_exceptions=False) as client:
         invoke_response = client.post(
             "/api/agent/invoke",
             json={"prompt": "/lookup malformed", "thread_id": "invoke-thread"},
@@ -1303,7 +1317,7 @@ def test_native_command_execution_failure_uses_typed_endpoint_errors() -> None:
     runtime.command_error = RuntimeError("MCP service unavailable.")
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1", raise_server_exceptions=False) as client:
         invoke_response = client.post(
             "/api/agent/invoke",
             json={"prompt": "/lookup topic", "thread_id": "invoke-thread"},
@@ -1314,12 +1328,12 @@ def test_native_command_execution_failure_uses_typed_endpoint_errors() -> None:
         )
 
     assert invoke_response.status_code == 500
-    assert invoke_response.json() == {"detail": "RuntimeError: MCP service unavailable."}
+    assert invoke_response.json() == {"detail": "Agent operation failed. Please retry."}
     assert stream_response.status_code == 200
     assert [json.loads(line) for line in stream_response.iter_lines()] == [
         {
             "kind": "error",
-            "error": "RuntimeError: MCP service unavailable.",
+            "error": "Agent operation failed. Please retry.",
             "thread_id": "stream-thread",
             "model": "fake-model",
             "reasoning": "medium",
@@ -1341,7 +1355,7 @@ def test_multipart_validates_images_before_executing_native_commands() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={"prompt": "/lookup topic", "thread_id": "thread-1"},
@@ -1367,7 +1381,7 @@ def test_multipart_transforms_separately_selected_configured_command() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={
@@ -1392,7 +1406,7 @@ def test_multipart_image_only_uses_ocr_fallback_and_multimodal_content() -> None
     runtime.config.model_modalities = ("text", "image")
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={"prompt": "", "thread_id": "thread-1"},
@@ -1430,7 +1444,7 @@ def test_multipart_rejects_blank_prompt_without_attachments() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={"prompt": "  ", "thread_id": "thread-1"},
@@ -1449,7 +1463,7 @@ def test_multipart_rag_only_clones_then_ingests_and_cleans_up() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={
@@ -1498,7 +1512,7 @@ def test_multipart_rag_only_selected_command_uses_empty_arguments() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={
@@ -1541,7 +1555,7 @@ def test_multipart_accepts_standard_yaml_mime_type() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={"thread_id": "thread-1"},
@@ -1575,7 +1589,7 @@ def test_multipart_preparation_failures_emit_terminal_error(failure_point: str) 
     runtime = _FailingPreparationRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1", raise_server_exceptions=False) as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={
@@ -1585,11 +1599,7 @@ def test_multipart_preparation_failures_emit_terminal_error(failure_point: str) 
             files={"files": ("notes.txt", b"agents", "text/plain")},
         )
 
-    expected_error = (
-        "RuntimeError: RAG clone failed."
-        if failure_point == "clone"
-        else "RuntimeError: RAG ingestion failed."
-    )
+    expected_error = "Agent operation failed. Please retry."
     assert response.status_code == 200
     assert [json.loads(line) for line in response.iter_lines()] == [
         {
@@ -1609,7 +1619,7 @@ def test_multipart_rag_disabled_reports_attachment_error_without_agent() -> None
     runtime.config.rag = None
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={"prompt": "", "thread_id": "thread-1"},
@@ -1631,7 +1641,7 @@ def test_multipart_rejects_file_count_size_and_mime_extension_mismatches() -> No
     runtime.config.model_modalities = ("text", "image")
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         too_many = client.post(
             "/api/agent/stream/multipart",
             data={"prompt": "inspect", "thread_id": "thread-1"},
@@ -1669,7 +1679,7 @@ def test_multipart_rejects_images_for_text_only_model() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/agent/stream/multipart",
             data={"prompt": "inspect", "thread_id": "thread-1"},
@@ -1680,27 +1690,21 @@ def test_multipart_rejects_images_for_text_only_model() -> None:
     assert runtime.requests == []
 
 
-def test_reflection_save_validates_and_runs_hidden_reflection_thread() -> None:
-    """Verify confirmed proposals use the existing hidden save workflow."""
+def test_reflection_save_persists_without_model_and_consumes_token_once() -> None:
+    """Verify confirmed proposals persist before success without invoking a model."""
     agent = _FakeAgent([])
     runtime = _FakeRuntime(agent)
-    runtime.config.extensions.agent_reflection = ReflectionConfig(
-        enabled=True,
-        memory_file="/memories/AGENTS.md",
-        max_lesson_chars=700,
-    )
+    _enable_reflection_storage(runtime)
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         stream_response = client.post(
             "/api/agent/stream",
             json={"prompt": "That was wrong", "thread_id": "thread-1"},
         )
         proposal = next(
             line["proposal"]
-            for line in (
-                json.loads(line) for line in stream_response.iter_lines()
-            )
+            for line in (json.loads(line) for line in stream_response.iter_lines())
             if line["kind"] == "reflection_proposal"
         )
         assert proposal["confirmation_token"]
@@ -1724,39 +1728,10 @@ def test_reflection_save_validates_and_runs_hidden_reflection_thread() -> None:
         "memory_file": "/memories/AGENTS.md",
         "thread_id": "thread-1:reflection",
     }
-    assert runtime.requests == [
-        {
-            "args": ("high",),
-            "kwargs": {
-                "model_name": "other-model",
-                "reasoning_level_is_explicit": True,
-                "thread_id": "thread-1:reflection",
-                "async_subagent_url_override": None,
-                "mcp_session_id": None,
-            },
-        }
-    ]
-    assert agent.invoke_payload == {
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "A user confirmed this compact lesson should be saved to long-term "
-                    "agent memory.\n\nTarget memory file: /memories/AGENTS.md\n\n"
-                    "Update that file under a section named `Lessons learned from "
-                    "corrections`. If the section or file does not exist, create it. "
-                    "Add exactly one concise bullet unless an equivalent lesson already "
-                    "exists. Do not include this instruction text.\n\nLesson:\n"
-                    "- Correction: That was wrong. Next time, verify the corrected "
-                    "behavior before relying on the earlier assumption."
-                ),
-            }
-        ]
-    }
-    assert agent.invoke_config == {
-        "configurable": {"thread_id": "thread-1:reflection"},
-        "recursion_limit": 100,
-    }
+    assert runtime.requests == []
+    assert agent.invoke_payload is None
+    item = asyncio.run(runtime.store.aget(("api-reflections",), "/AGENTS.md"))
+    assert item.value["content"].count(proposal["lesson"]) == 1
 
 
 def test_reflection_save_rejects_proposal_not_issued_by_stream() -> None:
@@ -1769,7 +1744,7 @@ def test_reflection_save_rejects_proposal_not_issued_by_stream() -> None:
     )
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/api/reflections/save",
             json={
@@ -1788,49 +1763,55 @@ def test_reflection_save_rejects_proposal_not_issued_by_stream() -> None:
     assert runtime.requests == []
 
 
-def test_reflection_save_token_remains_retryable_after_agent_error() -> None:
-    """Verify a failed hidden save does not consume its issued proposal."""
+def test_reflection_tool_failure_is_not_success_and_token_can_retry() -> None:
+    """A model reporting a failed write must not count as confirmed persistence."""
 
-    class _FlakyReflectionAgent(_FakeAgent):
-        def __init__(self) -> None:
-            super().__init__([])
-            self.invoke_attempts = 0
-
+    class _ReportedFailureAgent(_FakeAgent):
         async def ainvoke(self, payload, *, config):
-            self.invoke_attempts += 1
-            if self.invoke_attempts == 1:
-                raise RuntimeError("temporary save failure")
-            return await super().ainvoke(payload, config=config)
+            return {
+                "messages": [
+                    {"type": "tool", "status": "error", "content": "write failed"}
+                ]
+            }
 
-    agent = _FlakyReflectionAgent()
-    runtime = _FakeRuntime(agent)
-    runtime.config.extensions.agent_reflection = ReflectionConfig(
-        enabled=True,
-        memory_file="/memories/AGENTS.md",
-        max_lesson_chars=700,
-    )
+    class _FlakyStore(core.InMemoryStore):
+        fail = True
+
+        async def aput(self, *args, **kwargs):
+            if self.fail:
+                raise OSError("temporary save failure")
+            return await super().aput(*args, **kwargs)
+
+    runtime = _FakeRuntime(_ReportedFailureAgent([]))
+    _enable_reflection_storage(runtime)
+    runtime.store = _FlakyStore()
     app = chainagents_api.create_app(runtime=runtime)
-
-    with TestClient(app, raise_server_exceptions=False) as client:
-        stream_response = client.post(
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1", raise_server_exceptions=False) as client:
+        response = client.post(
             "/api/agent/stream",
             json={"prompt": "That was wrong", "thread_id": "thread-1"},
         )
         proposal = next(
-            line["proposal"]
-            for line in (
-                json.loads(line) for line in stream_response.iter_lines()
-            )
-            if line["kind"] == "reflection_proposal"
+            json.loads(line)["proposal"]
+            for line in response.iter_lines()
+            if json.loads(line)["kind"] == "reflection_proposal"
         )
-        assert proposal["confirmation_token"]
+        runtime.requests.clear()
         payload = {"thread_id": "thread-1", "proposal": proposal}
         failed_response = client.post("/api/reflections/save", json=payload)
+        runtime.store.fail = False
         retry_response = client.post("/api/reflections/save", json=payload)
-
-    assert failed_response.status_code == 500
+        replay_response = client.post("/api/reflections/save", json=payload)
+    assert failed_response.status_code == 503
+    assert (
+        failed_response.json()["detail"]
+        == "Reflection could not be saved. Please retry."
+    )
     assert retry_response.status_code == 200
-    assert agent.invoke_attempts == 2
+    assert replay_response.status_code == 409
+    assert runtime.requests == []
+    item = asyncio.run(runtime.store.aget(("api-reflections",), "/AGENTS.md"))
+    assert item.value["content"].count(proposal["lesson"]) == 1
 
 
 def test_reflection_save_rejects_disabled_or_mismatched_proposals() -> None:
@@ -1853,7 +1834,7 @@ def test_reflection_save_rejects_disabled_or_mismatched_proposals() -> None:
         },
     }
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         disabled = client.post("/api/reflections/save", json=payload)
         runtime.config.extensions.agent_reflection.enabled = True
         mismatched = client.post("/api/reflections/save", json=payload)
@@ -1875,7 +1856,7 @@ def test_ui_directory_serves_static_app_after_api_routes(tmp_path: Path) -> None
     runtime = _FakeRuntime(_FakeAgent([]))
     app = chainagents_api.create_app(runtime=runtime, ui_dir=ui_directory)
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         index_response = client.get("/")
         asset_response = client.get("/app.js")
         api_response = client.get("/api/status")
@@ -1898,7 +1879,7 @@ def test_ui_directory_env_and_invalid_paths_fail_clearly(
     monkeypatch.setenv("CHAINAGENTS_UI_DIR", str(ui_directory))
 
     app = chainagents_api.create_app(runtime=_FakeRuntime(_FakeAgent([])))
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         response = client.get("/")
 
     assert response.status_code == 200
@@ -1916,3 +1897,62 @@ def test_api_parser_accepts_ui_directory() -> None:
     args = chainagents_api.build_parser().parse_args(["--ui-dir", "/tmp/sparxui"])
 
     assert args.ui_dir == "/tmp/sparxui"
+
+
+@pytest.mark.parametrize("after_write", [False, True])
+def test_reflection_confirmation_is_retryable_after_cancellation(after_write) -> None:
+    """Cancellation before or after a write restores the token and retries only once."""
+    import httpx
+
+    async def exercise():
+        reached_save = asyncio.Event()
+        block_save = asyncio.Event()
+
+        class _BlockingStore(core.InMemoryStore):
+            block = True
+
+            async def aput(self, *args, **kwargs):
+                if after_write:
+                    await super().aput(*args, **kwargs)
+                if self.block:
+                    reached_save.set()
+                    await block_save.wait()
+                if not after_write:
+                    await super().aput(*args, **kwargs)
+
+        runtime = _FakeRuntime(_FakeAgent([]))
+        _enable_reflection_storage(runtime)
+        runtime.store = _BlockingStore()
+        app = chainagents_api.create_app(runtime=runtime)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+            ) as client:
+                response = await client.post(
+                    "/api/agent/stream",
+                    json={"prompt": "That was wrong", "thread_id": "thread-1"},
+                )
+                proposal = next(
+                    json.loads(line)["proposal"]
+                    for line in response.iter_lines()
+                    if json.loads(line)["kind"] == "reflection_proposal"
+                )
+                runtime.requests.clear()
+                payload = {"thread_id": "thread-1", "proposal": proposal}
+                task = asyncio.create_task(
+                    client.post("/api/reflections/save", json=payload)
+                )
+                await asyncio.wait_for(reached_save.wait(), timeout=2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                runtime.store.block = False
+                retry = await client.post("/api/reflections/save", json=payload)
+                replay = await client.post("/api/reflections/save", json=payload)
+                assert retry.status_code == 200
+                assert replay.status_code == 409
+                assert runtime.requests == []
+                item = await runtime.store.aget(("api-reflections",), "/AGENTS.md")
+                assert item.value["content"].count(proposal["lesson"]) == 1
+
+    asyncio.run(exercise())

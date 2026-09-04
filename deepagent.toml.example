@@ -55,16 +55,6 @@ enabled = false
 tool_name_prefix = true
 stateful = true
 
-[mcp.servers.repo]
-transport = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "."]
-cwd = "."
-
-[mcp.servers.docs]
-transport = "http"
-url = "http://localhost:8000/mcp"
-
 [agent]
 state = "stateful"
 # DeepAgents 0.7 adds recursive delete and command execution tools. ChainAgents
@@ -83,7 +73,7 @@ memory_files = ["/memories/AGENTS.md"]
 # Relative skill source paths are resolved from this file and mapped to /workspace/...
 # This directory should contain one or more skill folders, each with its own SKILL.md.
 skills = ["skills"]
-mcp_servers = ["repo"]
+mcp_servers = []
 # Optional instruction appended to the main agent system prompt.
 # Use either custom_instruction or custom_instruction_file, not both.
 # custom_instruction = "Always ask clarifying questions before editing files."
@@ -118,17 +108,15 @@ generative_ui_enabled = true
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },
-  { name = "ask-researcher", description = "Delegate to repo-researcher subagent.", target = "subagent", value = "repo-researcher", template = "{input}" },
-  { name = "repo-readme", description = "Call MCP filesystem read_file on README.md.", target = "mcp_tool", value = "repo_read_file", mcp_server = "repo", template = "{\"path\": \"README.md\"}" },
 ]
 # Starter prompts shown by Chainlit before a message is sent.
 starters = [
-  { label = "Explain this repo", message = "Explain the architecture of this repository and identify the most important files.", command = "ask-researcher", icon = "book-open" },
+  { label = "Explain this repo", message = "Explain the architecture of this repository and identify the most important files.", icon = "book-open" },
   { label = "Review current changes", message = "Review the current working tree changes for bugs, regressions, and missing tests." },
 ]
 
 [rag]
-enabled = true
+enabled = false
 persist_directory = ".rag"
 include_globs = ["README.md", "chainlit.md", "prompts/**/*.md", "skills/**/*.md"]
 exclude_globs = ["AGENTS.md", "AGENT.md"]
@@ -154,38 +142,5 @@ provider = "auto"
 # Ollama or OpenAI-compatible embedding backend with model and base_url.
 # Cortex normalizes outbound tool-call IDs only for its own Chat Completions requests.
 
-[[subagents]]
-name = "repo-researcher"
-description = "Researches the codebase and produces concise implementation guidance."
-system_prompt_file = "prompts/repo-researcher.md"
-skills = ["skills/research"]
-mcp_servers = ["repo", "docs"]
-nested_subagents = ["reviewer"]
-# model = "claude-reviewer"
-
-[[subagents.subagents]]
-name = "repo-planner"
-description = "Turns repository findings into an implementation plan."
-system_prompt = "Use repository context to produce a concise implementation plan."
-skills = ["skills/research"]
-mcp_servers = ["repo"]
-
-[[subagents]]
-name = "reviewer"
-description = "Reviews proposed changes for bugs, regressions, and missing tests."
-system_prompt = """
-You are a strict code reviewer.
-Focus on correctness, regressions, and missing tests.
-Keep findings concise and actionable.
-"""
-skills = ["skills/reviewer"]
-mcp_servers = ["repo"]
-
-[[async_subagents]]
-name = "remote-researcher"
-description = "Runs longer research jobs in the background on an Agent Protocol server."
-graph_id = "researcher"
-# Omit url for ASGI transport in a co-deployed LangGraph setup.
-# Set url for HTTP transport to a remote Agent Protocol server.
-# url = "https://researcher-deployment.langsmith.dev"
-# headers = { Authorization = "Bearer ${RESEARCHER_TOKEN}" }
+# Optional MCP servers and subagents are documented in README.md. Add their
+# tables only after configuring the required commands, skills, and endpoints.

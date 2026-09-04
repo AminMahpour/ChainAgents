@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -168,7 +167,7 @@ def test_api_stream_emits_reflection_proposal_event() -> None:
 
     from fastapi.testclient import TestClient
 
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
         with client.stream(
             "POST",
             "/api/agent/stream",

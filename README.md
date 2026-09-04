@@ -33,7 +33,7 @@ Highlights
 - Chainlit image uploads sent to vision-capable models as photo attachments for OCR or image analysis
 - Chainlit OCR/image uploads accept PNG, JPEG, WEBP, and GIF files
 - config-driven synchronous and async DeepAgents subagents
-- DeepAgents `==0.7.10` with explicit todo planning and safe filesystem defaults
+- DeepAgents `==0.7.11` with explicit todo planning and safe filesystem defaults
 - per-response download buttons for Markdown and PDF exports
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
@@ -164,7 +164,7 @@ uv sync
 ollama pull gpt-oss:20b
 ```
 
-The dependency manifests require DeepAgents `==0.7.10`; `uv sync`
+The dependency manifests require DeepAgents `==0.7.11`; `uv sync`
 installs the matching locked release.
 
 PDF downloads are rendered with WeasyPrint. `uv sync` installs the Python package,
@@ -188,24 +188,24 @@ If you enable workspace-docs RAG with Ollama embeddings, also pull an embedding 
 ollama pull nomic-embed-text
 ```
 
-This repo now includes a live [deepagent.toml](deepagent.toml) with:
+This repo includes a portable [deepagent.toml](deepagent.toml) with:
 
-- model defaults for provider, base URL, model name, and reasoning effort
+- Ollama at `http://127.0.0.1:11434` with `gpt-oss:20b`
 - a higher LangGraph recursion limit for longer tool-heavy Deep Agent runs
 - recursive file deletion disabled unless `[agent].delete_tool_enabled = true`
 - command execution disabled unless `[agent].execute_tool_enabled = true`
-- a real `repo` MCP server pinned to `npx @modelcontextprotocol/server-filesystem@2025.8.21`
-- a `repo-researcher` subagent using [prompts/repo-researcher.md](prompts/repo-researcher.md)
-- the repo-local `skills/` source for both the main agent and the subagent
+- RAG, reflection, Langfuse, MCP servers, and subagents disabled until configured
+- the repo-local `skills/` source for the main agent
 
-If the MCP package is not already cached on your machine, `npx` may download it on first use.
+See [deepagent.toml.example](deepagent.toml.example) and the sections below for
+provider and optional integration examples.
 
 ## Run
 
 Start the Chainlit app:
 
 ```bash
-chainlit run main.py -w
+uv run chainlit run main.py -w
 ```
 
 Start the FastAPI server:
@@ -214,8 +214,28 @@ Start the FastAPI server:
 uv run chainagents-api --host 127.0.0.1 --port 8000
 ```
 
+## Development validation
+
+Install the locked development environment, then run the same gates used by CI:
+
+```bash
+uv sync --locked
+uv run ruff check chainagents *.py scripts/*.py
+uv run mypy
+uv run pytest
+bash scripts/verify-installed-wheel.sh
+```
+
+The wheel check builds the real distribution, installs its locked runtime
+dependencies in a fresh virtual environment, and runs import, CLI, API, and
+configuration smoke checks from a temporary user working directory.
+
 The API uses the same `deepagent.toml` and environment settings as the Chainlit
-and CLI entrypoints. Useful endpoints include:
+and CLI entrypoints. It serves one trusted owner: tokenless access requires a
+loopback peer and safe local Host/Origin, while remote binds require
+`CHAINAGENTS_API_TOKEN` and bearer Authorization headers. See
+[API access, browser deployment, and request limits](docs/API_SECURITY.md).
+Useful endpoints include:
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -268,8 +288,8 @@ uv run chainagents --status --no-rag
 uv run chainagents --configure
 uv run chainagents --tui --reasoning high
 uv run chainagents --list-commands
-uv run chainagents --command ask-researcher --prompt "Find the config entrypoints"
-uv run chainagents --stdin --model gemma4:26b --reasoning high < prompt.txt
+uv run chainagents --command summarize --prompt "Summarize the config entrypoints"
+uv run chainagents --stdin --model gpt-oss:20b --reasoning high < prompt.txt
 uv run chainagents --rebuild-rag
 uv run chainagents --upload-rag notes.md --prompt "Use my uploaded notes"
 uv run chainagents --photo scene.jpg --prompt "Describe this photo"
@@ -1019,9 +1039,10 @@ Current scope of this config support:
   configured backend must also implement sandbox execution
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
-- if you need custom Python tools, extend [chainagents/runtime/core.py](chainagents/runtime/core.py)
+- if you need custom Python tools, define them alongside the generated UI tool in [chainagents/runtime/commands.py](chainagents/runtime/commands.py), then register them in [graph.py](chainagents/runtime/graph.py) for static graphs and [lifecycle.py](chainagents/runtime/lifecycle.py) for live runtime agents
 
-See [deepagent.toml.example](deepagent.toml.example) for a complete example.
+See [deepagent.toml.example](deepagent.toml.example) for a portable baseline and
+the sections above for optional MCP and subagent examples.
 
 ## Workspace Contract
 
@@ -1038,6 +1059,32 @@ See [deepagent.toml.example](deepagent.toml.example) for a complete example.
 - When `[agent].state = "stateless"`, thread IDs still identify requests and MCP/RAG scopes, but the agent graph does not checkpoint conversation state, receive a LangGraph store, or expose `/memories/`.
 - MCP stateful sessions are process-local. They survive tool calls in the same thread, but not an app restart.
 - On startup, the UI shows how many skill sources, MCP servers, custom subagents, and async subagents were loaded from `deepagent.toml`.
+
+
+## Runtime module structure
+
+The public runtime API is `chainagents.runtime`. `runtime/core.py` explicitly
+re-exports the same objects for compatibility, and `deepagent_runtime` remains an
+alias of that facade.
+
+| Modules in `chainagents/runtime/` | Responsibility |
+| --- | --- |
+| `constants.py`, `types.py` | Shared defaults, workspace root, and configuration records |
+| `model_config.py` | Provider settings, endpoint normalization, and model profiles |
+| `extension_config.py`, `config.py` | Extension parsing and TOML/environment configuration |
+| `providers.py`, `models.py` | Provider adapters and configured model construction |
+| `backends.py` | Workspace paths and filesystem/storage backend routing |
+| `middleware.py` | Tool resilience and summarization middleware |
+| `commands.py` | Generated UI tools and skill command discovery |
+| `graph.py` | Tool schemas, nested subagents, and static graph assembly |
+| `tracing.py` | Langfuse callbacks and LangGraph run configuration |
+| `lifecycle.py`, `reflection.py` | Agent/MCP/persistence lifecycle and correction reflection |
+
+Implementation modules import their lower-level owners directly; they never import
+`core.py` or the package facade. Cross-module function calls resolve through the
+owning module so tests can patch that owner (for example,
+`chainagents.runtime.models.build_model`). Facade globals are not patch seams.
+Warning filters are installed by the runtime package before SDK imports.
 
 ## License
 

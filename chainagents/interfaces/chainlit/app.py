@@ -22,7 +22,6 @@ from chainlit.types import ThreadDict
 
 from chainagents.commands.native import (
     ParsedNativeCommand,
-    build_skill_command_prompt,
     dumps_tool_result,
     parse_native_command,
     resolve_native_command,
@@ -57,7 +56,7 @@ from chainagents.runtime.reflection import (
     ReflectionCollector,
     ReflectionProposal,
     format_reflection_proposal,
-    reflection_save_prompt,
+    reflection_save_prompt as reflection_save_prompt,
 )
 from chainagents.rag.runtime import UploadedRagFile
 from chainagents.exports.response import (
@@ -368,13 +367,13 @@ def rag_actions() -> list[cl.Action]:
     return [build_rag_action(), build_upload_rag_action()]
 
 
-def reflection_actions() -> list[cl.Action]:
+def reflection_actions(*, retry: bool = False) -> list[cl.Action]:
     """Return Chainlit actions for reflection confirmation."""
     return [
         cl.Action(
             name=REFLECTION_SAVE_ACTION,
-            payload={"value": "save"},
-            label="Save lesson",
+            payload={"value": "retry" if retry else "save"},
+            label="Retry" if retry else "Save lesson",
             tooltip="Ask the agent to save this lesson into long-term memory.",
             icon="save",
         ),
@@ -399,27 +398,34 @@ async def ask_to_save_reflection_lesson(
     mcp_session_id: str | None,
 ) -> None:
     """Ask the Chainlit user whether to save a reflection lesson."""
-    response = await cl.AskActionMessage(
-        content=format_reflection_proposal(proposal),
-        actions=reflection_actions(),
-        author="System",
-        timeout=90,
-        raise_on_timeout=False,
-    ).send()
-    if not response:
-        return
-    payload = response.get("payload") if isinstance(response, dict) else None
-    if not isinstance(payload, dict) or payload.get("value") != "save":
-        return
-    await save_reflection_lesson(
-        runtime=runtime,
-        settings=settings,
-        proposal=proposal,
-        reasoning_level=reasoning_level,
-        model_name=model_name,
-        async_url_override=async_url_override,
-        mcp_session_id=mcp_session_id,
-    )
+    retry = False
+    while True:
+        response = await cl.AskActionMessage(
+            content=format_reflection_proposal(proposal),
+            actions=reflection_actions(retry=retry),
+            author="System",
+            timeout=90,
+            raise_on_timeout=False,
+        ).send()
+        if not response:
+            return
+        payload = response.get("payload") if isinstance(response, dict) else None
+        expected_action = "retry" if retry else "save"
+        if not isinstance(payload, dict) or payload.get("value") != expected_action:
+            return
+        if await save_reflection_lesson(
+            runtime=runtime,
+            settings=settings,
+            proposal=proposal,
+            reasoning_level=reasoning_level,
+            model_name=model_name,
+            async_url_override=async_url_override,
+            mcp_session_id=mcp_session_id,
+        ):
+            return
+        # Chainlit consumes each prompt's actions. Keep this proposal and wait
+        # for a fresh user selection before attempting storage again.
+        retry = True
 
 
 async def save_reflection_lesson(
@@ -431,33 +437,21 @@ async def save_reflection_lesson(
     model_name: str,
     async_url_override: str | None,
     mcp_session_id: str | None,
-) -> None:
-    """Ask the configured agent to save a confirmed reflection lesson."""
-    reflection_thread_id = f"{settings.thread_id}:reflection"
-    agent = await runtime.get_agent(
-        reasoning_level,
-        model_name=model_name,
-        thread_id=reflection_thread_id,
-        async_subagent_url_override=async_url_override,
-        mcp_session_id=mcp_session_id,
-    )
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": reflection_save_prompt(proposal),
-            }
-        ]
-    }
-    config = build_langgraph_run_config(
-        runtime.config,
-        thread_id=reflection_thread_id,
-    )
-    await agent.ainvoke(payload, config=config)
+) -> bool:
+    """Return success only after verified persistence, allowing an explicit retry."""
+    try:
+        await runtime.save_reflection(proposal)
+    except Exception:
+        await cl.Message(
+            content="Reflection could not be saved. Please retry.",
+            author="System",
+        ).send()
+        return False
     await cl.Message(
         content=f"Saved lesson to `{proposal.memory_file}`.",
         author="System",
     ).send()
+    return True
 
 
 def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
@@ -1784,3 +1778,16 @@ async def on_chat_end() -> None:
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()
+
+    runtime = AgentRuntime.current()
+    if runtime is not None:
+        raw_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
+        thread_id = (
+            str(raw_settings.get("thread_id") or "").strip()
+            if isinstance(raw_settings, dict)
+            else ""
+        ) or current_chainlit_thread_id()
+        await runtime.close_conversation(
+            thread_id=thread_id or None,
+            mcp_session_id=current_mcp_session_id() or None,
+        )
