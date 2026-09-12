@@ -29,7 +29,7 @@ cd ChainAgents
 uv sync
 ```
 
-This installs the locked DeepAgents 0.7 release. ChainAgents explicitly keeps
+This installs the locked DeepAgents 0.7.11 release. ChainAgents explicitly keeps
 its todo-planning middleware, so multi-step work can still use `write_todos`
 and appear as a task list in Chainlit.
 
@@ -38,7 +38,6 @@ and appear as a task list in Chainlit.
 **Option A: Ollama (local, free)**
 
 ```bash
-ollama install   # if not already installed
 ollama pull gpt-oss:20b
 ```
 
@@ -70,7 +69,7 @@ export SNOWFLAKE_PAT="your-snowflake-pat"
 ### 3. Run the app
 
 ```bash
-chainlit run main.py -w
+uv run chainlit run main.py -w
 ```
 
 Open your browser at `http://localhost:8000`. You should see a "Workspace agent ready" message.
@@ -210,9 +209,6 @@ uv run chainagents --configure
 
 # List available commands
 uv run chainagents --list-commands
-
-# Delegate to a subagent
-uv run chainagents --command ask-researcher --prompt "Research this topic"
 ```
 
 Run `uv run chainagents --help` for all options.

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
+
+from markdown_it import MarkdownIt
 
 from chainagents.events.stream import AgentStreamEvent
 
@@ -236,6 +239,65 @@ def format_reflection_proposal(proposal: ReflectionProposal) -> str:
         f"Proposed lesson for `{proposal.memory_file}`:\n\n"
         f"{proposal.lesson}"
     )
+
+
+def canonical_reflection_lesson(lesson: str) -> str:
+    """Normalize a proposal to one line with exactly one Markdown bullet."""
+    text = lesson.strip()
+    while re.match(r"^[-*+](?:\s|$)", text):
+        text = text[1:].lstrip()
+    text = " ".join(text.split())
+    if not text:
+        raise ValueError("Reflection lesson must not be empty.")
+    return f"- {text}"
+
+
+def append_reflection_lesson(content: str, lesson: str) -> str:
+    """Insert a unique bullet in the correction section, preserving other sections."""
+    bullet = canonical_reflection_lesson(lesson)
+    lines = content.splitlines(keepends=True)
+    tokens = MarkdownIt().parse(content)
+    section_start = None
+    section_end = len(lines)
+    section_level = 0
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or token.map is None:
+            continue
+        level = int(token.tag[1:])
+        if section_start is not None and level <= section_level:
+            section_end = token.map[0]
+            break
+        if tokens[index + 1].content.strip() == "Lessons learned from corrections":
+            section_start = token.map[1]
+            section_level = level
+    if section_start is None:
+        separator = "" if not content else ("\n" if content.endswith("\n") else "\n\n")
+        return (
+            content
+            + separator
+            + "## Lessons learned from corrections\n\n"
+            + bullet
+            + "\n"
+        )
+
+    for token in tokens:
+        if token.type != "list_item_open" or token.map is None:
+            continue
+        start, end = token.map
+        if section_start <= start < section_end:
+            existing = "".join(lines[start:end]).strip()
+            try:
+                existing_bullet = canonical_reflection_lesson(existing)
+            except ValueError:
+                # Preserve empty Markdown list items without treating them as lessons.
+                continue
+            if existing_bullet == bullet:
+                return content
+    before = "".join(lines[:section_end])
+    after = "".join(lines[section_end:])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    return before + bullet + "\n" + ("\n" if after else "") + after
 
 
 def reflection_save_prompt(proposal: ReflectionProposal) -> str:

@@ -19,12 +19,18 @@ dependencies = [
     "langgraph-checkpoint-postgres>=1.0.0",
     "markdown-it-py>=4.0.0",
     "psycopg[binary,pool]>=3.2.0",
-    "pytest>=8.3.0",
     "python-multipart>=0.0.32",
     "rich>=15.0.0",
     "textual>=6.1.0",
     "uvicorn>=0.44.0",
     "weasyprint>=69.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy==2.3.1",
+    "pytest>=8.3.0",
+    "ruff==0.16.6",
 ]
 
 [project.scripts]
@@ -59,3 +65,23 @@ include = ["chainagents*"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# These modules install warning filters before importing warning-producing libraries.
+"chainagents/interfaces/chainlit/app.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+follow_imports = "silent"
+check_untyped_defs = true
+files = [
+    "chainagents/exports/generated_files.py",
+    "chainagents/interfaces/api/app.py",
+    "chainagents/interfaces/api/security.py",
+    "chainagents/interfaces/uploads.py",
+    "chainagents/runtime/reflection.py",
+]

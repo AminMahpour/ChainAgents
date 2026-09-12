@@ -10,9 +10,10 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+from deepagents.backends import CompositeBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import TodoListMiddleware
-from langchain.agents.middleware.types import ToolCallRequest
+from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -22,6 +23,16 @@ from langgraph.store.memory import InMemoryStore
 import pytest
 
 import deepagent_runtime
+import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.commands as runtime_commands
+import chainagents.runtime.config as runtime_config
+import chainagents.runtime.constants as runtime_constants
+import chainagents.runtime.graph as runtime_graph
+import chainagents.runtime.lifecycle as runtime_lifecycle
+import chainagents.runtime.middleware as runtime_middleware
+import chainagents.runtime.models as runtime_models
+import chainagents.runtime.providers as runtime_providers
+import chainagents.runtime.tracing as runtime_tracing
 from deepagent_runtime import (
     AgentRuntime,
     ChainlitCommandConfig,
@@ -712,7 +723,7 @@ def test_snowflake_cortex_filters_tools_to_openai_compatible_schemas(monkeypatch
     object_schema_tool = SimpleNamespace(name="object-schema")
     unsupported_tool = SimpleNamespace(name="unsupported")
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_graph,
         "tool_supports_openai_compatible_schema",
         lambda tool: tool is object_schema_tool,
     )
@@ -751,7 +762,7 @@ def test_snowflake_cortex_payload_does_not_mutate_the_parent_payload(monkeypatch
         ],
     }
     monkeypatch.setattr(
-        deepagent_runtime.OpenAICompatibleChatOpenAI,
+        runtime_providers.OpenAICompatibleChatOpenAI,
         "_get_request_payload",
         lambda self, input_, *, stop=None, **kwargs: parent_payload,
     )
@@ -2026,7 +2037,7 @@ def test_build_langgraph_run_config_attaches_langfuse_callback_handler(
             created_handlers.append(self)
 
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_tracing,
         "_import_langfuse_callback_handler",
         lambda: FakeLangfuseCallbackHandler,
     )
@@ -2058,7 +2069,7 @@ def test_build_langgraph_run_config_omits_callbacks_when_langfuse_is_disabled(
         monkeypatch: The monkeypatch value.
     """
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_tracing,
         "_import_langfuse_callback_handler",
         lambda: pytest.fail("disabled Langfuse should not import the callback"),
         raising=False,
@@ -3000,7 +3011,7 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
         tmp_path: Path to the tmp.
         monkeypatch: The monkeypatch value.
     """
-    monkeypatch.setattr(deepagent_runtime, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
 
     backend = deepagent_runtime.build_deepagent_backend()
     artifacts_root = deepagent_artifacts_root()
@@ -3030,7 +3041,7 @@ def test_build_deepagent_backend_routes_generated_outputs_separately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify downloadable generated outputs use a separate filesystem route."""
-    monkeypatch.setattr(deepagent_runtime, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
 
     backend = deepagent_runtime.build_deepagent_backend()
     outputs_root = generated_outputs_root()
@@ -3201,7 +3212,7 @@ def test_agent_runtime_initialize_runs_rag_startup_check(
                 persist_directory=self.config.persist_directory,
             )
 
-    monkeypatch.setattr(deepagent_runtime, "WorkspaceDocsRAG", DummyRAG)
+    monkeypatch.setattr(runtime_lifecycle, "WorkspaceDocsRAG", DummyRAG)
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     asyncio.run(runtime._initialize())
@@ -3231,12 +3242,12 @@ def test_agent_runtime_initialize_skips_postgres_state_handles_when_stateless(
         raise AssertionError(f"Unexpected Postgres state init for {database_url}")
 
     monkeypatch.setattr(
-        deepagent_runtime.AsyncPostgresStore,
+        runtime_lifecycle.AsyncPostgresStore,
         "from_conn_string",
         fail_from_conn_string,
     )
     monkeypatch.setattr(
-        deepagent_runtime.AsyncPostgresSaver,
+        runtime_lifecycle.AsyncPostgresSaver,
         "from_conn_string",
         fail_from_conn_string,
     )
@@ -3323,7 +3334,7 @@ def test_get_agent_includes_rag_tool_when_ready(
             """
             return {"query": query, "results": []}
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     runtime._store = InMemoryStore()
@@ -3363,7 +3374,7 @@ def test_get_agent_passes_deepagents_backend_instance(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(make_runtime_config(tmp_path), project_root=tmp_path)
     runtime._store = InMemoryStore()
@@ -3372,7 +3383,7 @@ def test_get_agent_passes_deepagents_backend_instance(
     asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
 
     backend = captured["kwargs"]["backend"]
-    assert isinstance(backend, deepagent_runtime.CompositeBackend)
+    assert isinstance(backend, CompositeBackend)
     assert not callable(backend)
     assert backend.routes["/workspace/"].cwd == tmp_path
 
@@ -3447,7 +3458,7 @@ def test_get_agent_passes_agent_memory_files_when_stateful(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     extensions = ExtensionsConfig(
         config_path=None,
@@ -3481,7 +3492,7 @@ def test_get_agent_omits_memory_when_stateful_memory_files_empty(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     extensions = ExtensionsConfig(
         config_path=None,
@@ -3513,7 +3524,7 @@ def test_get_agent_omits_store_and_checkpointer_when_stateless(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     config = make_runtime_config(tmp_path)
     config = dataclasses.replace(
@@ -3543,7 +3554,7 @@ def test_get_agent_disables_memories_backend_and_prompt_when_stateless(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     config = make_runtime_config(tmp_path)
     config = dataclasses.replace(
@@ -3591,7 +3602,7 @@ def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(
         make_runtime_config(
@@ -3648,7 +3659,7 @@ def test_get_agent_with_summarization_subagent_does_not_duplicate_middleware(
         monkeypatch: The monkeypatch value.
     """
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_models,
         "build_model",
         lambda *_args, **_kwargs: FakeListChatModel(responses=["ok"]),
     )
@@ -3691,7 +3702,7 @@ def test_get_agent_applies_configured_deepagents_summarization_thresholds(
     """
     created_summarizers: list[dict[str, object]] = []
 
-    class CapturingSummarizationMiddleware(deepagent_runtime.AgentMiddleware):
+    class CapturingSummarizationMiddleware(AgentMiddleware):
         """Capture summarization construction arguments."""
 
         @property
@@ -3716,7 +3727,7 @@ def test_get_agent_applies_configured_deepagents_summarization_thresholds(
         CapturingSummarizationMiddleware,
     )
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_models,
         "build_model",
         lambda *_args, **_kwargs: FakeListChatModel(responses=["ok"]),
     )
@@ -3767,8 +3778,8 @@ def test_get_agent_builds_compiled_subagents_for_nested_sync_subagents(
         """Return a visible model marker for graph-construction assertions."""
         return f"model:{model_name or config.model_name}:{reasoning_level}"
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", fake_build_model)
 
     runtime = AgentRuntime(
         make_runtime_config(
@@ -3881,7 +3892,7 @@ def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(
         RuntimeConfig(
@@ -3977,7 +3988,7 @@ def test_get_agent_resanitizes_inherited_tools_for_profile_subagent(
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(
         RuntimeConfig(
@@ -4060,9 +4071,9 @@ def test_get_agent_preserves_raw_inherited_tools_for_profile_subagent(
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_graph,
         "tool_supports_openai_compatible_schema",
         lambda tool: False,
     )
@@ -4151,7 +4162,7 @@ def test_get_agent_does_not_inherit_tools_when_configured_tools_are_filtered(
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(
         RuntimeConfig(
@@ -4235,8 +4246,8 @@ def test_get_agent_inherits_selected_profile_for_model_less_compiled_subagent(
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", fake_build_model)
 
     runtime = AgentRuntime(
         RuntimeConfig(
@@ -4311,8 +4322,8 @@ def test_get_agent_uses_selected_profile_reasoning_effort(
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", fake_build_model)
 
     runtime = AgentRuntime(
         RuntimeConfig(
@@ -4382,8 +4393,8 @@ model = "fast"
 
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
     monkeypatch.setenv("DEEPAGENT_MODEL_REASONING", "high")
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", fake_build_model)
 
     config = deepagent_runtime.RuntimeConfig.from_env()
     runtime = AgentRuntime(config, project_root=tmp_path)
@@ -4413,8 +4424,8 @@ def test_get_agent_explicit_default_reasoning_overrides_profile_default(
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", fake_build_model)
 
     runtime = AgentRuntime(
         RuntimeConfig(
@@ -4473,8 +4484,8 @@ def test_get_agent_cache_distinguishes_reasoning_explicitness_for_subagents(
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", fake_build_model)
 
     runtime = AgentRuntime(
         RuntimeConfig(
@@ -4574,14 +4585,14 @@ def test_create_configured_graph_uses_agent_profile_reasoning_effort(
         return f"model:{selected_name}:{reasoning_level}"
 
     monkeypatch.setattr(
-        deepagent_runtime.RuntimeConfig,
+        runtime_config.RuntimeConfig,
         "from_env",
         staticmethod(lambda: config),
     )
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
-    monkeypatch.setattr(deepagent_runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", fake_build_model)
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_backends,
         "build_deepagent_backend",
         lambda **kwargs: SimpleNamespace(),
     )
@@ -4604,9 +4615,9 @@ def test_get_agent_preserves_inherited_tools_for_compiled_nested_subagents(
         created_graphs.append(graph)
         return graph
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_models,
         "build_model",
         lambda config, reasoning_level, *, model_name=None: (
             f"model:{model_name or config.model_name}:{reasoning_level}"
@@ -4666,9 +4677,9 @@ def test_build_graph_subagent_specs_preserves_static_inherited_tools_for_compile
         created_graphs.append(graph)
         return graph
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
     monkeypatch.setattr(
-        deepagent_runtime,
+        runtime_models,
         "build_model",
         lambda config, reasoning_level, *, model_name=None: (
             f"model:{model_name or config.model_name}:{reasoning_level}"
@@ -4827,7 +4838,7 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     runtime._store = InMemoryStore()
@@ -4854,7 +4865,7 @@ def test_get_agent_includes_render_chainlit_ui_tool_by_default(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     runtime._store = InMemoryStore()
@@ -4889,7 +4900,7 @@ def test_get_agent_omits_render_chainlit_ui_tool_when_disabled(
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(deepagent_runtime, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
 
     runtime = AgentRuntime(
         make_runtime_config(
@@ -4918,7 +4929,7 @@ def test_render_chainlit_ui_tool_pushes_generated_panel(monkeypatch) -> None:
         pushed.append({"name": name, "props": props, **kwargs})
         return {"type": "ui", "id": kwargs.get("id") or "panel-1", "name": name}
 
-    monkeypatch.setattr(deepagent_runtime, "push_ui_message", fake_push_ui_message)
+    monkeypatch.setattr(runtime_commands, "push_ui_message", fake_push_ui_message)
 
     tool = deepagent_runtime.create_render_chainlit_ui_tool()
     result = tool.invoke(
@@ -4977,7 +4988,7 @@ def test_render_chainlit_ui_tool_promotes_action_items_without_duplicate_list(
         pushed.append({"name": name, "props": props, **kwargs})
         return {"type": "ui", "id": kwargs.get("id") or "panel-1", "name": name}
 
-    monkeypatch.setattr(deepagent_runtime, "push_ui_message", fake_push_ui_message)
+    monkeypatch.setattr(runtime_commands, "push_ui_message", fake_push_ui_message)
 
     tool = deepagent_runtime.create_render_chainlit_ui_tool()
     tool.invoke(
@@ -5091,7 +5102,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         load_calls.append((session, str(server_name)))
         return [SimpleNamespace(name=f"{server_name}_tool", session=session)]
 
-    monkeypatch.setattr(deepagent_runtime, "load_mcp_tools", fake_load_mcp_tools)
+    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", fake_load_mcp_tools)
 
     runtime = AgentRuntime(
         make_runtime_config(
@@ -5103,6 +5114,10 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         )
     )
     runtime._mcp_client = FakeMCPClient()
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+    monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent_with_configured_summarization", lambda *args, **kwargs: object())
 
     async def exercise_runtime():
         """Exercise runtime agent loading for a Chainlit session.
@@ -5125,24 +5140,28 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
             thread_id="thread-1",
             mcp_session_id="session-2",
         )
-        runtime._agents[("medium", "thread-1", None, "session-1")] = object()
-        runtime._agents[("medium", "thread-1", None, "session-2")] = object()
+        first = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-1")
+        other = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-2")
         await runtime.close_mcp_session("session-1")
         assert len(closed_sessions) == 1
         assert ("session-1", "repo") not in runtime._mcp_sessions
         assert ("session-1", ("repo",)) not in runtime._mcp_tools_cache
-        assert ("medium", "thread-1", None, "session-1") not in runtime._agents
-        assert ("medium", "thread-1", None, "session-2") in runtime._agents
+        assert first not in runtime._agents.values()
+        assert other in runtime._agents.values()
+        reopened = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-1")
+        assert reopened is not first
+        assert await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-2") is other
         await runtime.close_mcp_session("session-2")
+        await runtime.close_mcp_session("session-1")
         return session_1_tools_first, session_1_tools_second, session_2_tools
 
     session_1_tools_first, session_1_tools_second, session_2_tools = asyncio.run(
         exercise_runtime()
     )
 
-    assert len(created_sessions) == 2
-    assert len(load_calls) == 2
-    assert len(closed_sessions) == 2
+    assert len(created_sessions) == 3
+    assert len(load_calls) == 3
+    assert len(closed_sessions) == 3
     assert session_1_tools_first[0].session is session_1_tools_second[0].session
     assert session_1_tools_first[0].session is not session_2_tools[0].session
     assert closed_sessions[0] is session_1_tools_first[0].session
@@ -5151,6 +5170,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
 
 def test_rebuild_rag_index_clears_cached_agents(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """Verify that rebuild RAG index clears cached agents.
 
@@ -5182,9 +5202,17 @@ def test_rebuild_rag_index_clears_cached_agents(
 
     runtime = AgentRuntime(make_runtime_config(tmp_path))
     runtime._rag_service = RebuildableRAG()
-    runtime._agents[("medium", "thread-1", None)] = object()
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+    monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent_with_configured_summarization", lambda *args, **kwargs: object())
 
-    status = asyncio.run(runtime.rebuild_rag_index())
+    async def exercise():
+        await runtime.get_agent("medium", thread_id="thread-1")
+        assert runtime._agents
+        return await runtime.rebuild_rag_index()
+
+    status = asyncio.run(exercise())
 
     assert status.ready is True
     assert runtime._agents == {}

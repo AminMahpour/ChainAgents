@@ -39,6 +39,12 @@ jobs:
       - name: Byte-compile application modules
         run: uv run python -m compileall chainagents main.py langgraph_app.py deepagent_runtime.py chainlit_bridge.py rag_runtime.py
 
+      - name: Lint Python sources
+        run: uv run ruff check chainagents *.py scripts/*.py
+
+      - name: Type-check maintained modules
+        run: uv run mypy
+
       - name: Run tests
         run: uv run pytest
 
@@ -57,3 +63,6 @@ jobs:
               }
           )
           PY
+
+      - name: Verify installed wheel
+        run: bash scripts/verify-installed-wheel.sh
