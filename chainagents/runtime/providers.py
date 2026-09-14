@@ -101,7 +101,7 @@ class OpenAICompatibleChatOpenAI(ChatOpenAI):
 
 
 class SnowflakeCortexChatOpenAI(OpenAICompatibleChatOpenAI):
-    """Adapt Snowflake Cortex Chat Completions tool-call IDs."""
+    """Adapt Snowflake Cortex Chat Completions tool calls and result turns."""
 
     def _get_request_payload(
         self,
@@ -110,7 +110,7 @@ class SnowflakeCortexChatOpenAI(OpenAICompatibleChatOpenAI):
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> dict:
-        """Return a copied Chat Completions payload with canonical tool-call IDs."""
+        """Return a copied payload with canonical IDs and Cortex-safe tool turns."""
         payload = copy.deepcopy(
             super()._get_request_payload(input_, stop=stop, **kwargs)
         )
@@ -121,10 +121,16 @@ class SnowflakeCortexChatOpenAI(OpenAICompatibleChatOpenAI):
         pending_ids: set[str] = set()
         pending_canonical_ids: set[str] = set()
         canonical_ids: dict[str, str] = {}
+        pending_assistant: dict[str, Any] | None = None
+        pending_call_order: list[str] = []
+        pending_calls: dict[str, dict[str, Any]] = {}
+        pending_results: dict[str, dict[str, Any]] = {}
+        rewritten_messages: list[Any] = []
         for message in messages:
             if not isinstance(message, dict):
                 if pending_ids:
                     raise ValueError("incomplete tool-call batch before a new non-tool message")
+                rewritten_messages.append(message)
                 continue
             role = message.get("role")
             tool_calls = message.get("tool_calls")
@@ -152,6 +158,12 @@ class SnowflakeCortexChatOpenAI(OpenAICompatibleChatOpenAI):
                     pending_canonical_ids.add(canonical_id)
                     canonical_ids[raw_id] = canonical_id
                     tool_call["id"] = canonical_id
+                    pending_call_order.append(raw_id)
+                    pending_calls[raw_id] = tool_call
+                if len(tool_calls) == 1:
+                    rewritten_messages.append(message)
+                else:
+                    pending_assistant = message
                 continue
 
             if role == "tool":
@@ -162,16 +174,35 @@ class SnowflakeCortexChatOpenAI(OpenAICompatibleChatOpenAI):
                     raise ValueError("unmatched tool response ID")
                 message["tool_call_id"] = canonical_ids[raw_id]
                 pending_ids.remove(raw_id)
+                if pending_assistant is None:
+                    rewritten_messages.append(message)
+                else:
+                    pending_results[raw_id] = message
                 if not pending_ids:
+                    if pending_assistant is not None:
+                        for index, call_id in enumerate(pending_call_order):
+                            replayed_assistant = copy.deepcopy(pending_assistant)
+                            replayed_assistant["tool_calls"] = [pending_calls[call_id]]
+                            if index:
+                                replayed_assistant["content"] = None
+                            rewritten_messages.extend(
+                                [replayed_assistant, pending_results[call_id]]
+                            )
                     pending_canonical_ids.clear()
                     canonical_ids.clear()
+                    pending_assistant = None
+                    pending_call_order.clear()
+                    pending_calls.clear()
+                    pending_results.clear()
                 continue
 
             if pending_ids:
                 raise ValueError("incomplete tool-call batch before a new non-tool message")
+            rewritten_messages.append(message)
 
         if pending_ids:
             raise ValueError("incomplete tool-call batch at payload end")
+        payload["messages"] = rewritten_messages
         return payload
 
 

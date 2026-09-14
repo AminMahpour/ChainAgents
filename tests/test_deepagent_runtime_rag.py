@@ -743,6 +743,12 @@ def test_snowflake_cortex_payload_normalizes_a_single_tool_call_without_mutating
 
     payload = _cortex_model()._get_request_payload(messages)
 
+    assert [message["role"] for message in payload["messages"]] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert len(payload["messages"][1]["tool_calls"]) == 1
     assert payload["messages"][1]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
     assert payload["messages"][2]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
     assert messages[1].tool_calls[0]["id"] == "raw-call-1"
@@ -776,22 +782,75 @@ def test_snowflake_cortex_payload_does_not_mutate_the_parent_payload(monkeypatch
     assert parent_payload["messages"][1]["tool_call_id"] == "raw-call-1"
 
 
-def test_snowflake_cortex_payload_supports_parallel_calls_and_reversed_results() -> None:
-    """Verify each parallel result is matched by ID rather than positional order."""
-    payload = _cortex_model()._get_request_payload(
-        _cortex_messages(
-            tool_call_ids=["raw-call-1", "raw-call-2"],
-            tool_result_ids=["raw-call-2", "raw-call-1"],
-        )
+def test_snowflake_cortex_payload_replays_parallel_calls_as_sequential_turns() -> None:
+    """Verify parallel results are paired by ID in tool-call issuance order."""
+    messages = _cortex_messages(
+        tool_call_ids=["raw-call-1", "raw-call-2"],
+        tool_result_ids=["raw-call-2", "raw-call-1"],
     )
+    messages[1].content = "I will check both tools."
 
-    assert [call["id"] for call in payload["messages"][1]["tool_calls"]] == [
-        "call_0d10c795ab49e92cef4fbfa5",
-        "call_f495221433c3def0d8718adc",
+    payload = _cortex_model()._get_request_payload(messages)
+
+    assert payload["messages"] == [
+        {"role": "user", "content": "Use the supplied tools."},
+        {
+            "role": "assistant",
+            "content": "I will check both tools.",
+            "tool_calls": [
+                {
+                    "id": "call_0d10c795ab49e92cef4fbfa5",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_0",
+                        "arguments": '{"index": 0}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "result-1",
+            "tool_call_id": "call_0d10c795ab49e92cef4fbfa5",
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_f495221433c3def0d8718adc",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_1",
+                        "arguments": '{"index": 1}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "result-0",
+            "tool_call_id": "call_f495221433c3def0d8718adc",
+        },
     ]
-    assert [message["tool_call_id"] for message in payload["messages"][2:]] == [
-        "call_f495221433c3def0d8718adc",
-        "call_0d10c795ab49e92cef4fbfa5",
+
+
+def test_snowflake_cortex_payload_keeps_parallel_assistant_text_only_once() -> None:
+    """Verify replayed Cortex assistant turns do not repeat model text."""
+    messages = _cortex_messages(
+        tool_call_ids=["raw-call-1", "raw-call-2"],
+        tool_result_ids=["raw-call-1", "raw-call-2"],
+    )
+    messages[1].content = "I will check both tools."
+
+    payload = _cortex_model()._get_request_payload(messages)
+
+    assistant_messages = [
+        message for message in payload["messages"] if message["role"] == "assistant"
+    ]
+    assert [message["content"] for message in assistant_messages] == [
+        "I will check both tools.",
+        None,
     ]
 
 
@@ -810,7 +869,10 @@ def test_snowflake_cortex_payload_keeps_already_canonical_ids() -> None:
 def test_snowflake_cortex_payload_allows_raw_ids_to_be_reused_after_a_completed_batch() -> None:
     """Verify a completed batch does not reserve raw IDs for later assistant turns."""
     messages = [
-        *_cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=["raw-call-1"]),
+        *_cortex_messages(
+            tool_call_ids=["raw-call-1", "raw-call-2"],
+            tool_result_ids=["raw-call-2", "raw-call-1"],
+        ),
         AIMessage(
             content="",
             tool_calls=[
@@ -822,8 +884,8 @@ def test_snowflake_cortex_payload_allows_raw_ids_to_be_reused_after_a_completed_
 
     payload = _cortex_model()._get_request_payload(messages)
 
-    assert payload["messages"][3]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
-    assert payload["messages"][4]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert payload["messages"][5]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert payload["messages"][6]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
 
 
 @pytest.mark.parametrize(
@@ -889,11 +951,20 @@ def test_openai_compatible_payload_leaves_raw_tool_ids_unchanged() -> None:
     )
 
     payload = model._get_request_payload(
-        _cortex_messages(tool_call_ids=["raw-call-1"], tool_result_ids=["raw-call-1"])
+        _cortex_messages(
+            tool_call_ids=["raw-call-1", "raw-call-2"],
+            tool_result_ids=["raw-call-2", "raw-call-1"],
+        )
     )
 
-    assert payload["messages"][1]["tool_calls"][0]["id"] == "raw-call-1"
-    assert payload["messages"][2]["tool_call_id"] == "raw-call-1"
+    assert [call["id"] for call in payload["messages"][1]["tool_calls"]] == [
+        "raw-call-1",
+        "raw-call-2",
+    ]
+    assert [message["tool_call_id"] for message in payload["messages"][2:]] == [
+        "raw-call-2",
+        "raw-call-1",
+    ]
 
 
 def write_skill(
