@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.middleware as runtime_middleware
@@ -34,6 +36,42 @@ from chainagents.runtime.constants import (
 from chainagents.runtime.types import ModelDefaults, SubagentConfig
 
 logger = logging.getLogger("chainagents.runtime.core")
+
+_STATIC_BACKGROUND_TASK_MANAGERS: set[
+    runtime_background_tasks.BackgroundTaskManager
+] = set()
+
+
+def static_background_task_managers() -> tuple[
+    runtime_background_tasks.BackgroundTaskManager, ...
+]:
+    """Return task managers owned by exported configured graphs."""
+    return tuple(_STATIC_BACKGROUND_TASK_MANAGERS)
+
+
+async def close_static_background_tasks() -> None:
+    """Close every task manager owned by an exported configured graph."""
+    managers = tuple(_STATIC_BACKGROUND_TASK_MANAGERS)
+    _STATIC_BACKGROUND_TASK_MANAGERS.clear()
+    if managers:
+        await asyncio.gather(*(manager.close() for manager in managers))
+
+
+def _get_static_background_task_manager(
+    config: RuntimeConfig,
+) -> runtime_background_tasks.BackgroundTaskManager:
+    """Return the process-wide manager shared by exported graphs."""
+    background_config = config.extensions.background_subagents
+    if _STATIC_BACKGROUND_TASK_MANAGERS:
+        manager = next(iter(_STATIC_BACKGROUND_TASK_MANAGERS))
+        if manager.config != background_config:
+            raise RuntimeError(
+                "Exported graphs must use one background_subagents configuration."
+            )
+        return manager
+    manager = runtime_background_tasks.BackgroundTaskManager(background_config)
+    _STATIC_BACKGROUND_TASK_MANAGERS.add(manager)
+    return manager
 
 
 def load_agents_md_instruction(project_root: Path | None = None) -> str | None:
@@ -279,6 +317,8 @@ def build_static_sync_subagent_spec(
     inherited_model: ModelDefaults,
     project_root: Path | None,
     reasoning_level_is_explicit: bool = False,
+    background_manager: runtime_background_tasks.BackgroundTaskManager | None = None,
+    agent_path: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Build a sync subagent spec for configured graph creation."""
     effective_model = runtime_models.resolve_runtime_model_profile(
@@ -305,7 +345,8 @@ def build_static_sync_subagent_spec(
         source=subagent.name,
         project_root=project_root,
     )
-    if not has_nested_child_subagents(subagent):
+    background_enabled = background_manager is not None
+    if not has_nested_child_subagents(subagent) and not background_enabled:
         subagent_model = (
             runtime_models.build_model_for_profile(
                 config,
@@ -335,18 +376,30 @@ def build_static_sync_subagent_spec(
             inherited_tools=effective_tools,
             reasoning_level=effective_reasoning_level,
             reasoning_level_is_explicit=reasoning_level_is_explicit,
+            background_manager=background_manager,
+            agent_path=(*agent_path, child.name),
             inherited_model=effective_model,
             project_root=project_root,
         )
         for child in nested_child_subagents(subagent, registry)
     ]
+    background_tools = (
+        runtime_background_tasks.create_background_task_tools(
+            manager=background_manager,
+            subagents={spec["name"]: spec["runnable"] for spec in child_specs},
+            agent_path=agent_path,
+            recursion_limit=config.recursion_limit,
+        )
+        if background_manager is not None
+        else []
+    )
     runnable_kwargs: dict[str, Any] = {
         "model": runtime_models.build_model_for_profile(
             config,
             effective_reasoning_level,
             effective_model,
         ),
-        "tools": effective_tools or None,
+        "tools": [*effective_tools, *background_tools] or None,
         "system_prompt": subagent.system_prompt,
         "middleware": middleware,
         "backend": backend,
@@ -371,6 +424,7 @@ def build_graph_subagent_specs(
     backend: Any | None = None,
     project_root: Path | None = None,
     inherited_tools: list[Any] | None = None,
+    background_manager: runtime_background_tasks.BackgroundTaskManager | None = None,
 ) -> list[Any]:
     """Build graph subagent specs.
 
@@ -407,6 +461,8 @@ def build_graph_subagent_specs(
             reasoning_level_is_explicit=config.model_reasoning_override,
             inherited_model=inherited_model,
             project_root=project_root,
+            background_manager=background_manager,
+            agent_path=(subagent.name,),
         )
         for subagent in config.extensions.subagents
     ]
@@ -467,6 +523,9 @@ def create_configured_graph(
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
     main_model_profile = runtime_models.resolve_runtime_model_profile(config)
     main_tools = sanitize_tools_for_model(main_model_profile.provider, tools)
+    background_manager = None
+    if config.extensions.background_subagents.enabled:
+        background_manager = _get_static_background_task_manager(config)
     main_reasoning_level = reasoning_level_for_profile(
         main_model_profile,
         config.default_reasoning,
@@ -478,6 +537,20 @@ def create_configured_graph(
         backend=backend,
         project_root=runtime_constants.PROJECT_ROOT,
         inherited_tools=main_tools,
+        background_manager=background_manager,
+    )
+    local_subagent_specs = [
+        spec for spec in subagent_specs if "runnable" in spec
+    ]
+    background_tools = (
+        runtime_background_tasks.create_background_task_tools(
+            manager=background_manager,
+            subagents={spec["name"]: spec["runnable"] for spec in local_subagent_specs},
+            agent_path=(),
+            recursion_limit=config.recursion_limit,
+        )
+        if background_manager is not None
+        else []
     )
     agent_kwargs: dict[str, Any] = {
         "model": runtime_models.build_model_for_profile(
@@ -485,7 +558,7 @@ def create_configured_graph(
             main_reasoning_level,
             main_model_profile,
         ),
-        "tools": main_tools or None,
+        "tools": [*main_tools, *background_tools] or None,
         "system_prompt": compose_rag_system_prompt(
             compose_agent_system_prompt(
                 system_prompt_for_agent_state(system_prompt, config.agent_state),

@@ -30,6 +30,7 @@ from chainagents.runtime.reflection import (
     ReflectionProposal,
     format_reflection_proposal,
 )
+from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
 from chainagents.commands.native import (
     dumps_tool_result,
     parse_native_command,
@@ -1962,27 +1963,55 @@ async def interactive_repl(
     Returns:
         The interactive REPL result.
     """
+    thread_id = str(args.thread_id or DEFAULT_CLI_THREAD_ID).strip() or DEFAULT_CLI_THREAD_ID
+    queue = runtime.background_tasks.subscribe(thread_id)
+
+    async def print_completions() -> None:
+        while True:
+            snapshot = await queue.get()
+            print(format_background_task_notice(snapshot), file=stderr)
+
+    notice_task = asyncio.create_task(print_completions())
     print("ChainAgents CLI. Press Ctrl-D to exit.", file=stderr)
-    while True:
-        try:
-            prompt = input("chainagents> ")
-        except EOFError:
-            print("", file=stderr)
-            return 0
-        except KeyboardInterrupt:
-            print("", file=stderr)
-            return 130
-        if not prompt.strip():
-            continue
-        code = await run_agent_prompt(
-            runtime,
-            args,
-            prompt=prompt,
-            stdout=stdout,
-            stderr=stderr,
-        )
-        if code not in (0,):
-            return code
+    try:
+        while True:
+            try:
+                prompt = await asyncio.to_thread(input, "chainagents> ")
+            except EOFError:
+                print("", file=stderr)
+                return 0
+            except KeyboardInterrupt:
+                print("", file=stderr)
+                return 130
+            if not prompt.strip():
+                continue
+            code = await run_agent_prompt(
+                runtime,
+                args,
+                prompt=prompt,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            if code not in (0,):
+                return code
+    finally:
+        runtime.background_tasks.unsubscribe(thread_id, queue)
+        notice_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await notice_task
+
+
+def format_background_task_notice(snapshot: BackgroundTaskSnapshot) -> str:
+    """Format one terminal local task result for terminal interfaces."""
+    message = (
+        f"Background subagent {snapshot.agent_name} finished with status "
+        f"{snapshot.status}.\nTask ID: {snapshot.task_id}"
+    )
+    if snapshot.result:
+        return f"{message}\n{snapshot.result}"
+    if snapshot.error:
+        return f"{message}\nError: {snapshot.error}"
+    return message
 
 
 async def run_cli(
@@ -2111,12 +2140,20 @@ async def run_cli(
             stderr=stderr,
             emit_json=not args.json_output,
         )
+        background_snapshots = []
+        if isinstance(prompt_result, dict) or int(prompt_result) == 0:
+            background_snapshots = await runtime.background_tasks.wait_session(thread_id)
         if args.json_output:
             if isinstance(prompt_result, dict):
                 json_actions.update(prompt_result)
+                json_actions["background_tasks"] = [
+                    snapshot.to_payload() for snapshot in background_snapshots
+                ]
                 print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
                 return 0
             return int(prompt_result)
+        for snapshot in background_snapshots:
+            print(format_background_task_notice(snapshot), file=stderr)
         return int(prompt_result)
 
     if args.status or args.list_commands or args.rebuild_rag or args.upload_rag:

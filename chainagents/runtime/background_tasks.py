@@ -1,0 +1,608 @@
+"""Process-local background execution for configured synchronous subagents."""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import dataclasses
+import json
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Literal
+
+from langchain.tools import ToolRuntime, tool
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.runtime import Runtime
+
+from chainagents.runtime.types import BackgroundSubagentConfig
+
+
+BackgroundTaskStatus = Literal[
+    "pending",
+    "running",
+    "success",
+    "error",
+    "cancelled",
+]
+TERMINAL_BACKGROUND_TASK_STATUSES = frozenset({"success", "error", "cancelled"})
+_LANGGRAPH_CHECKPOINTER_KEY = "__pregel_checkpointer"
+_LANGGRAPH_RUNTIME_KEY = "__pregel_runtime"
+
+_CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "chainagents_background_task_id",
+    default=None,
+)
+
+
+def current_background_task_id() -> str | None:
+    """Return the task ID of the currently executing background subagent."""
+    return _CURRENT_BACKGROUND_TASK_ID.get()
+
+
+@dataclass(frozen=True)
+class BackgroundTaskSnapshot:
+    """Immutable public view of one local background task."""
+
+    task_id: str
+    session_id: str
+    agent_name: str
+    description: str
+    agent_path: tuple[str, ...]
+    parent_task_id: str | None
+    status: BackgroundTaskStatus
+    result: str | None
+    error: str | None
+    created_at: float
+    completed_at: float | None
+
+    def to_payload(self) -> dict[str, object]:
+        """Return a JSON-compatible representation."""
+        return {
+            "task_id": self.task_id,
+            "session_id": self.session_id,
+            "agent_name": self.agent_name,
+            "description": self.description,
+            "agent_path": list(self.agent_path),
+            "parent_task_id": self.parent_task_id,
+            "status": self.status,
+            "result": self.result,
+            "error": self.error,
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+        }
+
+
+@dataclass
+class _BackgroundTaskRecord:
+    task_id: str
+    session_id: str
+    agent_name: str
+    description: str
+    agent_path: tuple[str, ...]
+    parent_task_id: str | None
+    status: BackgroundTaskStatus
+    created_at: float
+    result: str | None = None
+    error: str | None = None
+    completed_at: float | None = None
+    execution: asyncio.Task[None] | None = None
+    completion: asyncio.Event | None = None
+
+    def snapshot(self) -> BackgroundTaskSnapshot:
+        return BackgroundTaskSnapshot(
+            task_id=self.task_id,
+            session_id=self.session_id,
+            agent_name=self.agent_name,
+            description=self.description,
+            agent_path=self.agent_path,
+            parent_task_id=self.parent_task_id,
+            status=self.status,
+            result=self.result,
+            error=self.error,
+            created_at=self.created_at,
+            completed_at=self.completed_at,
+        )
+
+
+BackgroundRunner = Callable[[str], Awaitable[str]]
+
+
+def _session_id_from_runtime(runtime: ToolRuntime) -> str:
+    configurable = runtime.config.get("configurable", {})
+    session_id = str(configurable.get("thread_id") or "").strip()
+    if not session_id:
+        raise ValueError(
+            "Local background tasks require an explicit conversation identity."
+        )
+    return session_id
+
+
+def _result_text(result: object) -> str:
+    if not isinstance(result, dict):
+        raise ValueError("Background subagent returned an unsupported result.")
+    structured = result.get("structured_response")
+    if structured is not None:
+        if hasattr(structured, "model_dump_json"):
+            return str(structured.model_dump_json())
+        if dataclasses.is_dataclass(structured) and not isinstance(structured, type):
+            return json.dumps(dataclasses.asdict(structured))
+        return json.dumps(structured)
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("Background subagent result does not contain messages.")
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and message.text:
+            text = message.text.rstrip()
+            if text:
+                return text
+    return ""
+
+
+def create_background_task_tools(
+    *,
+    manager: "BackgroundTaskManager",
+    subagents: dict[str, object],
+    agent_path: tuple[str, ...],
+    recursion_limit: int,
+) -> list[object]:
+    """Create task tools scoped to the direct children of one agent."""
+    allowed_names = tuple(sorted(subagents))
+    allowed_text = ", ".join(allowed_names) or "none"
+
+    @tool("spawn_background_task")
+    async def spawn_background_task(
+        description: str,
+        subagent_type: str,
+        runtime: ToolRuntime,
+    ) -> dict[str, object]:
+        """Launch an allowed local subagent and return its task ID immediately."""
+        session_id = _session_id_from_runtime(runtime)
+        child = subagents.get(subagent_type)
+        if child is None:
+            raise ValueError(
+                f"Allowed subagents for background work: {allowed_text}."
+            )
+        parent_configurable = runtime.config.get("configurable", {})
+        shared_checkpointer = parent_configurable.get(_LANGGRAPH_CHECKPOINTER_KEY)
+        shared_store = runtime.store
+
+        async def run_child(task_id: str) -> str:
+            state = {"messages": [HumanMessage(content=description)]}
+            configurable: dict[str, object] = {
+                "thread_id": f"{session_id}:background:{task_id}",
+                "ls_agent_type": "background_subagent",
+            }
+            if shared_checkpointer is not None:
+                configurable[_LANGGRAPH_CHECKPOINTER_KEY] = shared_checkpointer
+            if shared_store is not None:
+                configurable[_LANGGRAPH_RUNTIME_KEY] = Runtime(store=shared_store)
+            config = {
+                "configurable": configurable,
+                "recursion_limit": recursion_limit,
+            }
+            result = await child.ainvoke(state, config)  # type: ignore[attr-defined]
+            return _result_text(result)
+
+        snapshot = await manager.spawn(
+            session_id=session_id,
+            agent_name=subagent_type,
+            description=description,
+            agent_path=(*agent_path, subagent_type),
+            parent_task_id=current_background_task_id(),
+            runner=run_child,
+        )
+        return snapshot.to_payload()
+
+    @tool("list_background_tasks")
+    async def list_background_tasks(runtime: ToolRuntime) -> list[dict[str, object]]:
+        """List local background tasks visible to the current agent."""
+        session_id = _session_id_from_runtime(runtime)
+        snapshots = await manager.list(
+            session_id,
+            scope_path=agent_path,
+            ancestor_task_id=current_background_task_id(),
+        )
+        return [snapshot.to_payload() for snapshot in snapshots]
+
+    @tool("get_background_task")
+    async def get_background_task(
+        task_id: str,
+        wait_seconds: float = 0,
+        runtime: ToolRuntime = None,  # type: ignore[assignment]
+    ) -> dict[str, object]:
+        """Get a visible background task, optionally waiting up to 60 seconds."""
+        session_id = _session_id_from_runtime(runtime)
+        snapshot = await manager.get(
+            session_id,
+            task_id,
+            scope_path=agent_path,
+            ancestor_task_id=current_background_task_id(),
+            wait_seconds=wait_seconds,
+        )
+        return snapshot.to_payload()
+
+    @tool("cancel_background_task")
+    async def cancel_background_task(
+        task_id: str,
+        runtime: ToolRuntime,
+    ) -> dict[str, object]:
+        """Cancel a visible background task and all of its descendants."""
+        session_id = _session_id_from_runtime(runtime)
+        snapshot = await manager.cancel(
+            session_id,
+            task_id,
+            scope_path=agent_path,
+            ancestor_task_id=current_background_task_id(),
+        )
+        return snapshot.to_payload()
+
+    return [
+        spawn_background_task,
+        list_background_tasks,
+        get_background_task,
+        cancel_background_task,
+    ]
+
+
+class BackgroundTaskManager:
+    """Own process-local background subagent jobs for all conversations."""
+
+    def __init__(self, config: BackgroundSubagentConfig) -> None:
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._records: dict[str, _BackgroundTaskRecord] = {}
+        self._session_task_ids: dict[str, list[str]] = {}
+        self._subscribers: dict[
+            str, set[asyncio.Queue[BackgroundTaskSnapshot]]
+        ] = {}
+        self._closing_sessions: set[str] = set()
+        self._closed = False
+
+    async def spawn(
+        self,
+        *,
+        session_id: str,
+        agent_name: str,
+        description: str,
+        agent_path: tuple[str, ...],
+        runner: BackgroundRunner,
+        parent_task_id: str | None = None,
+    ) -> BackgroundTaskSnapshot:
+        """Start a job immediately and return before the runner finishes."""
+        normalized_session = session_id.strip()
+        if not normalized_session:
+            raise ValueError("Background tasks require a non-empty session ID.")
+        if not self.config.enabled:
+            raise RuntimeError("Local background subagents are disabled.")
+
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("The background task manager is closed.")
+            if normalized_session in self._closing_sessions:
+                raise RuntimeError("The background task session is closing.")
+            session_ids = self._session_task_ids.setdefault(normalized_session, [])
+            running_session = sum(
+                self._records[task_id].status not in TERMINAL_BACKGROUND_TASK_STATUSES
+                for task_id in session_ids
+            )
+            if running_session >= self.config.max_running_per_session:
+                raise RuntimeError(
+                    "Background running limit reached for this session "
+                    f"({self.config.max_running_per_session})."
+                )
+            running_total = sum(
+                record.status not in TERMINAL_BACKGROUND_TASK_STATUSES
+                for record in self._records.values()
+            )
+            if running_total >= self.config.max_running_total:
+                raise RuntimeError(
+                    "Background running limit reached for this process "
+                    f"({self.config.max_running_total})."
+                )
+            if len(session_ids) >= self.config.max_tasks_per_session:
+                raise RuntimeError(
+                    "Background retained task limit reached for this session "
+                    f"({self.config.max_tasks_per_session})."
+                )
+            if parent_task_id is not None:
+                parent = self._records.get(parent_task_id)
+                if parent is None or parent.session_id != normalized_session:
+                    raise ValueError("Background parent task does not exist in this session.")
+
+            task_id = f"bg-{uuid.uuid4().hex[:12]}"
+            record = _BackgroundTaskRecord(
+                task_id=task_id,
+                session_id=normalized_session,
+                agent_name=agent_name,
+                description=description,
+                agent_path=agent_path,
+                parent_task_id=parent_task_id,
+                status="pending",
+                created_at=time.time(),
+                completion=asyncio.Event(),
+            )
+            self._records[task_id] = record
+            session_ids.append(task_id)
+            context = contextvars.Context()
+            record.execution = asyncio.create_task(
+                self._execute(record, runner),
+                name=f"chainagents-{task_id}",
+                context=context,
+            )
+            return record.snapshot()
+
+    async def _execute(
+        self,
+        record: _BackgroundTaskRecord,
+        runner: BackgroundRunner,
+    ) -> None:
+        token = _CURRENT_BACKGROUND_TASK_ID.set(record.task_id)
+        try:
+            async with self._lock:
+                if record.status == "pending":
+                    record.status = "running"
+                elif record.status in TERMINAL_BACKGROUND_TASK_STATUSES:
+                    return
+            result = await runner(record.task_id)
+        except asyncio.CancelledError:
+            await self._finish(record, status="cancelled")
+            await self._cancel_descendants(record.session_id, record.task_id)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            detail = " ".join(str(exc).split()).strip()
+            error = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+            await self._finish(record, status="error", error=error)
+            await self._cancel_descendants(record.session_id, record.task_id)
+        else:
+            await self._finish(record, status="success", result=str(result))
+        finally:
+            _CURRENT_BACKGROUND_TASK_ID.reset(token)
+
+    async def _finish(
+        self,
+        record: _BackgroundTaskRecord,
+        *,
+        status: BackgroundTaskStatus,
+        result: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        async with self._lock:
+            if record.status in TERMINAL_BACKGROUND_TASK_STATUSES:
+                return
+            record.status = status
+            record.result = result
+            record.error = error
+            record.completed_at = time.time()
+            if record.completion is not None:
+                record.completion.set()
+            snapshot = record.snapshot()
+            subscribers = tuple(self._subscribers.get(record.session_id, ()))
+        for queue in subscribers:
+            queue.put_nowait(snapshot)
+
+    def _is_visible(
+        self,
+        record: _BackgroundTaskRecord,
+        scope_path: tuple[str, ...],
+        ancestor_task_id: str | None,
+    ) -> bool:
+        if scope_path and record.agent_path[: len(scope_path)] != scope_path:
+            return False
+        if ancestor_task_id is None:
+            return True
+        parent_task_id = record.parent_task_id
+        visited: set[str] = set()
+        while parent_task_id is not None and parent_task_id not in visited:
+            if parent_task_id == ancestor_task_id:
+                return True
+            visited.add(parent_task_id)
+            parent = self._records.get(parent_task_id)
+            parent_task_id = parent.parent_task_id if parent is not None else None
+        return False
+
+    async def list(
+        self,
+        session_id: str,
+        *,
+        scope_path: tuple[str, ...] = (),
+        ancestor_task_id: str | None = None,
+    ) -> list[BackgroundTaskSnapshot]:
+        """List retained tasks visible to an agent scope."""
+        async with self._lock:
+            return [
+                record.snapshot()
+                for task_id in self._session_task_ids.get(session_id, ())
+                for record in [self._records[task_id]]
+                if self._is_visible(record, scope_path, ancestor_task_id)
+            ]
+
+    async def get(
+        self,
+        session_id: str,
+        task_id: str,
+        *,
+        scope_path: tuple[str, ...] = (),
+        ancestor_task_id: str | None = None,
+        wait_seconds: float = 0,
+    ) -> BackgroundTaskSnapshot:
+        """Return a visible task, optionally waiting for terminal state."""
+        if wait_seconds < 0 or wait_seconds > 60:
+            raise ValueError("wait_seconds must be between 0 and 60.")
+        async with self._lock:
+            record = self._visible_record(
+                session_id,
+                task_id,
+                scope_path,
+                ancestor_task_id,
+            )
+            completion = record.completion
+            snapshot = record.snapshot()
+        if (
+            wait_seconds
+            and snapshot.status not in TERMINAL_BACKGROUND_TASK_STATUSES
+            and completion is not None
+        ):
+            try:
+                await asyncio.wait_for(completion.wait(), timeout=wait_seconds)
+            except TimeoutError:
+                pass
+            async with self._lock:
+                record = self._visible_record(
+                    session_id,
+                    task_id,
+                    scope_path,
+                    ancestor_task_id,
+                )
+                snapshot = record.snapshot()
+        return snapshot
+
+    def _visible_record(
+        self,
+        session_id: str,
+        task_id: str,
+        scope_path: tuple[str, ...],
+        ancestor_task_id: str | None,
+    ) -> _BackgroundTaskRecord:
+        record = self._records.get(task_id)
+        if (
+            record is None
+            or record.session_id != session_id
+            or not self._is_visible(record, scope_path, ancestor_task_id)
+        ):
+            raise KeyError(f"Background task '{task_id}' is not visible in this session.")
+        return record
+
+    async def cancel(
+        self,
+        session_id: str,
+        task_id: str,
+        *,
+        scope_path: tuple[str, ...] = (),
+        ancestor_task_id: str | None = None,
+    ) -> BackgroundTaskSnapshot:
+        """Cancel a visible task and all of its descendants."""
+        async with self._lock:
+            record = self._visible_record(
+                session_id,
+                task_id,
+                scope_path,
+                ancestor_task_id,
+            )
+            execution = record.execution
+        if execution is not None and not execution.done():
+            await self._finish(record, status="cancelled")
+            execution.cancel()
+        await self._cancel_descendants(session_id, task_id)
+        if execution is not None:
+            await asyncio.gather(execution, return_exceptions=True)
+        return await self.get(
+            session_id,
+            task_id,
+            scope_path=scope_path,
+            ancestor_task_id=ancestor_task_id,
+        )
+
+    async def _cancel_descendants(self, session_id: str, parent_task_id: str) -> None:
+        async with self._lock:
+            descendants: list[_BackgroundTaskRecord] = []
+            descendant_ids: set[str] = set()
+            parent_ids = {parent_task_id}
+            while parent_ids:
+                children = [
+                    record
+                    for record in self._records.values()
+                    if record.session_id == session_id
+                    and record.parent_task_id in parent_ids
+                    and record.task_id not in descendant_ids
+                ]
+                descendants.extend(children)
+                descendant_ids.update(record.task_id for record in children)
+                parent_ids = {record.task_id for record in children}
+            executions = [
+                record.execution
+                for record in descendants
+                if record.execution is not None and not record.execution.done()
+            ]
+        for execution in executions:
+            record = next(
+                item for item in descendants if item.execution is execution
+            )
+            await self._finish(record, status="cancelled")
+            execution.cancel()
+        if executions:
+            await asyncio.gather(*executions, return_exceptions=True)
+
+    async def wait_session(self, session_id: str) -> list[BackgroundTaskSnapshot]:
+        """Wait until every task currently or subsequently running in a session ends."""
+        while True:
+            async with self._lock:
+                executions = [
+                    record.execution
+                    for task_id in self._session_task_ids.get(session_id, ())
+                    for record in [self._records[task_id]]
+                    if record.execution is not None and not record.execution.done()
+                ]
+            if not executions:
+                return await self.list(session_id)
+            await asyncio.gather(*executions, return_exceptions=True)
+
+    async def close_session(self, session_id: str) -> None:
+        """Cancel, await, and forget all work owned by one conversation."""
+        async with self._lock:
+            self._closing_sessions.add(session_id)
+            task_ids = list(self._session_task_ids.get(session_id, ()))
+            executions = [
+                self._records[task_id].execution
+                for task_id in task_ids
+                if self._records[task_id].execution is not None
+                and not self._records[task_id].execution.done()
+            ]
+        for execution in executions:
+            record = next(
+                self._records[task_id]
+                for task_id in task_ids
+                if self._records[task_id].execution is execution
+            )
+            await self._finish(record, status="cancelled")
+            execution.cancel()
+        if executions:
+            await asyncio.gather(*executions, return_exceptions=True)
+        async with self._lock:
+            for task_id in task_ids:
+                self._records.pop(task_id, None)
+            self._session_task_ids.pop(session_id, None)
+            self._closing_sessions.discard(session_id)
+
+    def subscribe(self, session_id: str) -> asyncio.Queue[BackgroundTaskSnapshot]:
+        """Subscribe to terminal task snapshots for one conversation."""
+        queue: asyncio.Queue[BackgroundTaskSnapshot] = asyncio.Queue()
+        self._subscribers.setdefault(session_id, set()).add(queue)
+        return queue
+
+    def unsubscribe(
+        self,
+        session_id: str,
+        queue: asyncio.Queue[BackgroundTaskSnapshot],
+    ) -> None:
+        """Remove a previously registered completion subscriber."""
+        subscribers = self._subscribers.get(session_id)
+        if subscribers is None:
+            return
+        subscribers.discard(queue)
+        if not subscribers:
+            self._subscribers.pop(session_id, None)
+
+    async def close(self) -> None:
+        """Cancel all work and prevent future spawns."""
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            session_ids = list(self._session_task_ids)
+        await asyncio.gather(
+            *(self.close_session(session_id) for session_id in session_ids),
+            return_exceptions=False,
+        )
+        self._subscribers.clear()

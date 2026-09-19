@@ -75,6 +75,14 @@ summarization_middleware_enabled = true
 summarization_trigger_tokens = 150000
 summarization_keep_tokens = 10000
 
+[agent.background_subagents]
+# Local background execution is process-local and opt-in. Configured synchronous
+# subagents gain spawn/list/get/cancel tools when enabled.
+enabled = false
+max_running_per_session = 4
+max_running_total = 16
+max_tasks_per_session = 100
+
 [agent.reflection]
 enabled = false
 memory_file = "/memories/AGENTS.md"

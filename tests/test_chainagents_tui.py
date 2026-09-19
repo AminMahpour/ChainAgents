@@ -13,6 +13,8 @@ from textual.containers import VerticalScroll
 from textual.widgets import Markdown, RichLog
 
 import chainagents_cli
+from chainagents.runtime.background_tasks import BackgroundTaskManager
+from chainagents.runtime.types import BackgroundSubagentConfig
 from chainagents_tui import (
     DEFAULT_TUI_THREAD_ID,
     ChainAgentsTuiApp,
@@ -264,6 +266,52 @@ async def test_tui_mounts_expected_panes_and_prompt() -> None:
         assert app.query_one("#reasoning", RichLog)
         assert app.query_one("#tools", RichLog)
         assert app.query_one("#prompt", PromptTextArea)
+
+
+@pytest.mark.anyio
+async def test_tui_posts_local_background_completion_and_unsubscribes() -> None:
+    """Terminal task results should arrive while the TUI remains interactive."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
+    runtime.background_tasks = manager
+    runtime.config.extensions = SimpleNamespace(
+        background_subagents=manager.config,
+    )
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        async def runner(task_id):
+            return "background result"
+
+        spawned = await manager.spawn(
+            session_id=DEFAULT_TUI_THREAD_ID,
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await manager.get(DEFAULT_TUI_THREAD_ID, spawned.task_id, wait_seconds=1)
+        await pilot.pause()
+
+        assert any(spawned.task_id in entry for entry in app.tool_entries)
+        assert any("background result" in entry for entry in app.tool_entries)
+
+    entry_count = len(app.tool_entries)
+
+    async def later_runner(task_id):
+        return "later result"
+
+    later = await manager.spawn(
+        session_id=DEFAULT_TUI_THREAD_ID,
+        agent_name="researcher",
+        description="later",
+        agent_path=("researcher",),
+        runner=later_runner,
+    )
+    await manager.get(DEFAULT_TUI_THREAD_ID, later.task_id, wait_seconds=1)
+    await asyncio.sleep(0)
+    assert len(app.tool_entries) == entry_count
+    await manager.close()
 
 
 @pytest.mark.anyio

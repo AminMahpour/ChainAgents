@@ -35,6 +35,7 @@ import chainagents.runtime.providers as runtime_providers
 import chainagents.runtime.tracing as runtime_tracing
 from deepagent_runtime import (
     AgentRuntime,
+    BackgroundSubagentConfig,
     ChainlitCommandConfig,
     ExtensionsConfig,
     RuntimeConfig,
@@ -3588,11 +3589,11 @@ def test_get_agent_omits_store_and_checkpointer_when_stateless(
     monkeypatch,
 ) -> None:
     """Verify stateless agents do not receive LangGraph state handles."""
-    captured: dict[str, object] = {}
+    captured: list[dict[str, object]] = []
 
     def fake_create_deep_agent(*, tools=None, **kwargs):
         """Capture Deep Agent factory arguments for tests."""
-        captured["kwargs"] = kwargs
+        captured.append(kwargs)
         return object()
 
     monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
@@ -3601,7 +3602,18 @@ def test_get_agent_omits_store_and_checkpointer_when_stateless(
     config = dataclasses.replace(
         config,
         agent_state="stateless",
-        extensions=dataclasses.replace(config.extensions, agent_state="stateless"),
+        extensions=dataclasses.replace(
+            config.extensions,
+            agent_state="stateless",
+            background_subagents=BackgroundSubagentConfig(enabled=True),
+            subagents=(
+                SubagentConfig(
+                    name="researcher",
+                    description="Researches.",
+                    system_prompt="Research.",
+                ),
+            ),
+        ),
     )
     runtime = AgentRuntime(config, project_root=tmp_path)
     runtime._store = InMemoryStore()
@@ -3609,8 +3621,9 @@ def test_get_agent_omits_store_and_checkpointer_when_stateless(
 
     asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
 
-    assert "store" not in captured["kwargs"]
-    assert "checkpointer" not in captured["kwargs"]
+    assert len(captured) == 2
+    assert all("store" not in kwargs for kwargs in captured)
+    assert all("checkpointer" not in kwargs for kwargs in captured)
 
 
 def test_get_agent_disables_memories_backend_and_prompt_when_stateless(
@@ -3934,6 +3947,125 @@ def test_get_agent_builds_compiled_subagents_for_nested_sync_subagents(
     assert ("manager-mcp",) in mcp_tool_calls
     assert ("private-mcp",) in mcp_tool_calls
     assert ("reviewer-mcp",) in mcp_tool_calls
+
+
+def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Removing per-agent compilation would leak a parent's child registry."""
+    created_graphs: list[SimpleNamespace] = []
+
+    def fake_create_deep_agent(**kwargs):
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        runtime_models,
+        "build_model",
+        lambda config, reasoning_level, *, model_name=None: object(),
+    )
+    background = BackgroundSubagentConfig(enabled=True)
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                background_subagents=background,
+                subagents=(
+                    SubagentConfig(
+                        name="manager",
+                        description="Coordinates work.",
+                        system_prompt="Manage.",
+                        subagents=(
+                            SubagentConfig(
+                                name="reviewer",
+                                description="Reviews work.",
+                                system_prompt="Review.",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+
+    asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
+
+    assert len(created_graphs) == 3
+    reviewer_graph, manager_graph, main_graph = created_graphs
+    assert main_graph.kwargs["subagents"][0]["runnable"] is manager_graph
+    assert manager_graph.kwargs["subagents"][0]["runnable"] is reviewer_graph
+    assert all(graph.kwargs["store"] is runtime.store for graph in created_graphs)
+    assert all(
+        graph.kwargs["checkpointer"] is runtime.checkpointer
+        for graph in created_graphs
+    )
+    background_names = {
+        "spawn_background_task",
+        "list_background_tasks",
+        "get_background_task",
+        "cancel_background_task",
+    }
+    assert background_names <= {tool.name for tool in main_graph.kwargs["tools"]}
+    assert background_names <= {tool.name for tool in manager_graph.kwargs["tools"]}
+    assert background_names <= {tool.name for tool in reviewer_graph.kwargs["tools"]}
+
+
+def test_create_configured_graph_builds_local_background_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Static Agent Server graphs must expose the same local task tools."""
+    created_graphs: list[SimpleNamespace] = []
+
+    def fake_create_deep_agent(**kwargs):
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(
+            config_path=None,
+            background_subagents=BackgroundSubagentConfig(enabled=True),
+            subagents=(
+                SubagentConfig(
+                    name="researcher",
+                    description="Researches.",
+                    system_prompt="Research.",
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config))
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        runtime_backends,
+        "build_deepagent_backend",
+        lambda **kwargs: SimpleNamespace(),
+    )
+
+    graph = deepagent_runtime.create_configured_graph(include_async_subagents=False)
+
+    assert graph is created_graphs[-1]
+    assert len(created_graphs) == 2
+    child_graph, main_graph = created_graphs
+    assert main_graph.kwargs["subagents"][0]["runnable"] is child_graph
+    assert "spawn_background_task" in {
+        tool.name for tool in main_graph.kwargs["tools"]
+    }
+
+    deepagent_runtime.create_configured_graph(include_async_subagents=False)
+    assert len(runtime_graph.static_background_task_managers()) == 1
+
+    asyncio.run(runtime_graph.close_static_background_tasks())
 
 
 def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
@@ -5544,6 +5676,60 @@ summarization_keep_tokens = 2400
     assert extensions.summarization_middleware_enabled is True
     assert extensions.summarization_trigger_tokens == 6000
     assert extensions.summarization_keep_tokens == 2400
+
+
+def test_load_extensions_config_parses_background_subagent_limits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify local background execution requires an explicit, bounded opt-in."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[agent.background_subagents]
+enabled = true
+max_running_per_session = 3
+max_running_total = 7
+max_tasks_per_session = 21
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    background = deepagent_runtime.load_extensions_config().background_subagents
+
+    assert background.enabled is True
+    assert background.max_running_per_session == 3
+    assert background.max_running_total == 7
+    assert background.max_tasks_per_session == 21
+    assert deepagent_runtime.load_extensions_config().enabled is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("enabled", '"yes"'),
+        ("max_running_per_session", "0"),
+        ("max_running_total", "-1"),
+        ("max_tasks_per_session", '"many"'),
+    ],
+)
+def test_load_extensions_config_rejects_invalid_background_subagent_values(
+    tmp_path: Path,
+    monkeypatch,
+    field: str,
+    value: str,
+) -> None:
+    """Verify ambiguous or non-positive local background limits are rejected."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        f"[agent.background_subagents]\n{field} = {value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match=field):
+        deepagent_runtime.load_extensions_config()
 
 
 def test_load_extensions_config_defaults_high_risk_tools_to_disabled(

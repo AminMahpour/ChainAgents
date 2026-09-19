@@ -91,6 +91,16 @@ class SubagentConfig:
 
 
 @dataclass(frozen=True)
+class BackgroundSubagentConfig:
+    """Configure process-local background execution for synchronous subagents."""
+
+    enabled: bool = False
+    max_running_per_session: int = 4
+    max_running_total: int = 16
+    max_tasks_per_session: int = 100
+
+
+@dataclass(frozen=True)
 class AsyncSubagentConfig:
     """Describe an async subagent that runs through the Agent Protocol.
 
@@ -283,6 +293,7 @@ class ExtensionsConfig:
     agent_mcp_servers: tuple[str, ...] = ()
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
+    background_subagents: BackgroundSubagentConfig = BackgroundSubagentConfig()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
     chainlit_model_mode_enabled: bool = True
@@ -311,6 +322,7 @@ class ExtensionsConfig:
             or self.agent_mcp_servers
             or self.subagents
             or self.async_subagents
+            or self.background_subagents.enabled
             or self.chainlit_commands
             or self.chainlit_starters
         )

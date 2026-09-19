@@ -27,7 +27,11 @@ from chainagents.commands.native import (
     resolve_native_command,
     resolve_runtime_command,
 )
-from chainagents.interfaces.chainlit.async_tasks import AsyncTaskNotifier, async_subagent_url_override
+from chainagents.interfaces.chainlit.async_tasks import (
+    AsyncTaskNotifier,
+    LocalBackgroundTaskNotifier,
+    async_subagent_url_override,
+)
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
 from chainagents.interfaces.uploads import (
@@ -70,6 +74,7 @@ from chainagents.exports.response import (
 SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
+SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY = "local_background_task_notifier"
 SESSION_MCP_SESSION_ID_KEY = "mcp_session_id"
 SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
 REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
@@ -1247,6 +1252,25 @@ def get_async_task_notifier(
     return notifier
 
 
+def start_local_background_notifier(
+    *,
+    runtime: AgentRuntime,
+    session_id: str,
+) -> None:
+    """Start one local background completion subscriber for this chat."""
+    existing = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+    if isinstance(existing, LocalBackgroundTaskNotifier):
+        existing.cancel()
+    if not runtime.config.extensions.background_subagents.enabled:
+        return
+    notifier = LocalBackgroundTaskNotifier(
+        manager=runtime.background_tasks,
+        session_id=session_id,
+    )
+    notifier.start()
+    cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, notifier)
+
+
 @cl.on_chat_start
 async def on_chat_start() -> None:
     """Initialize Chainlit session state when a chat starts."""
@@ -1272,6 +1296,7 @@ async def on_chat_start() -> None:
     )
     await run_task_list.show_ready()
     store_settings(settings)
+    start_local_background_notifier(runtime=runtime, session_id=settings.thread_id)
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1376,6 +1401,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         show_reasoning_stream_default=extensions.chainlit_reasoning_steps_enabled,
         show_tool_calls_default=extensions.chainlit_tool_steps_enabled,
     )
+    start_local_background_notifier(runtime=runtime, session_id=settings.thread_id)
     run_task_list = await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
@@ -1778,6 +1804,9 @@ async def on_chat_end() -> None:
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()
+    local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+    if isinstance(local_notifier, LocalBackgroundTaskNotifier):
+        local_notifier.cancel()
 
     runtime = AgentRuntime.current()
     if runtime is not None:

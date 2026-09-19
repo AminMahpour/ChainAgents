@@ -11,6 +11,8 @@ import deepagent_runtime as core
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.lifecycle as runtime_lifecycle
 import chainagents.runtime.middleware as runtime_middleware
+from chainagents.runtime.background_tasks import BackgroundTaskManager
+from chainagents.runtime.types import BackgroundSubagentConfig
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
 from test_deepagent_runtime_rag import make_runtime_config, make_extensions_config
@@ -64,6 +66,86 @@ def test_conversation_close_evicts_graph_with_no_mcp_client(runtime, stateful):
         assert await runtime.get_agent('medium', thread_id='other', mcp_session_id='other-session') is other
         assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session') is not first
         await runtime.close()
+    asyncio.run(exercise())
+
+
+def test_conversation_close_cancels_background_tasks_before_mcp(runtime, monkeypatch):
+    """Conversation resources must remain alive until background jobs stop."""
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        queue = runtime.background_tasks.subscribe("thread")
+
+        async def runner(task_id):
+            await asyncio.Event().wait()
+            return task_id
+
+        spawned = await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="work",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        events = []
+
+        async def close_mcp_session(session_id):
+            events.append((session_id, not queue.empty()))
+
+        monkeypatch.setattr(runtime, "close_mcp_session", close_mcp_session)
+        await runtime.close_conversation(thread_id="thread", mcp_session_id="mcp")
+
+        terminal = queue.get_nowait()
+        assert terminal.task_id == spawned.task_id
+        assert terminal.status == "cancelled"
+        assert events == [("mcp", True)]
+        assert await runtime.background_tasks.list("thread") == []
+        await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_close_cancels_background_tasks(tmp_path):
+    """Runtime shutdown must not leave local subagent asyncio tasks alive."""
+    config = replace(
+        make_runtime_config(tmp_path),
+        rag=None,
+        rag_requested=False,
+        extensions=replace(
+            make_runtime_config(tmp_path).extensions,
+            background_subagents=BackgroundSubagentConfig(enabled=True),
+        ),
+    )
+    instance = core.AgentRuntime(config, project_root=tmp_path)
+
+    async def exercise():
+        queue = instance.background_tasks.subscribe("thread")
+
+        teardown_events = []
+
+        async def close_persistence_resource():
+            teardown_events.append(("persistence", not queue.empty()))
+
+        instance._exit_stack.push_async_callback(close_persistence_resource)
+
+        async def runner(task_id):
+            await asyncio.Event().wait()
+            return task_id
+
+        await instance.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="work",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        await instance.close()
+
+        assert queue.get_nowait().status == "cancelled"
+        assert teardown_events == [("persistence", True)]
+
     asyncio.run(exercise())
 
 

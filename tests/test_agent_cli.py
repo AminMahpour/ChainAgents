@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import json
 import re
+import threading
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,11 @@ import pytest
 
 import chainagents_cli
 from deepagent_runtime import RuntimeConfig
+from chainagents.runtime.background_tasks import (
+    BackgroundTaskManager,
+    BackgroundTaskSnapshot,
+)
+from chainagents.runtime.types import BackgroundSubagentConfig
 from rag_runtime import RagStatus, RagUploadResult
 
 
@@ -1173,6 +1180,113 @@ class _FakePromptRuntime:
             The fake prompt agent.
         """
         return self.agent
+
+
+@pytest.mark.anyio
+async def test_one_shot_json_waits_for_background_tasks(monkeypatch) -> None:
+    """One-shot JSON must contain terminal local background task results."""
+    args = chainagents_cli.parse_args(
+        ["--prompt", "hello", "--json", "--thread-id", "thread-1"]
+    )
+    snapshot = BackgroundTaskSnapshot(
+        task_id="bg-123",
+        session_id="thread-1",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        parent_task_id=None,
+        status="success",
+        result="done",
+        error=None,
+        created_at=1.0,
+        completed_at=2.0,
+    )
+
+    class Tasks:
+        async def wait_session(self, session_id):
+            assert session_id == "thread-1"
+            return [snapshot]
+
+    runtime = SimpleNamespace(background_tasks=Tasks())
+
+    async def run_agent_prompt(*args, **kwargs):
+        return {
+            "prompt": {
+                "response": "main response",
+                "thread_id": "thread-1",
+                "model": "fake-model",
+                "reasoning": "medium",
+            }
+        }
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", run_agent_prompt)
+    stdout = io.StringIO()
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=runtime,
+        stdout=stdout,
+        stderr=io.StringIO(),
+        stdin=io.StringIO(""),
+    )
+
+    assert code == 0
+    assert json.loads(stdout.getvalue())["background_tasks"] == [snapshot.to_payload()]
+
+
+@pytest.mark.anyio
+async def test_interactive_cli_keeps_loop_live_and_prints_task_completion(
+    monkeypatch,
+) -> None:
+    """Blocking terminal input must not starve local task completion notices."""
+    manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
+    runtime = SimpleNamespace(
+        background_tasks=manager,
+        config=SimpleNamespace(
+            extensions=SimpleNamespace(background_subagents=manager.config)
+        ),
+    )
+    args = chainagents_cli.parse_args(["--thread-id", "thread-1"])
+    input_started = threading.Event()
+    release_input = threading.Event()
+
+    def blocking_input(prompt):
+        input_started.set()
+        release_input.wait(timeout=2)
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", blocking_input)
+    stderr = io.StringIO()
+    repl = asyncio.create_task(
+        chainagents_cli.interactive_repl(
+            runtime,
+            args,
+            stdout=io.StringIO(),
+            stderr=stderr,
+        )
+    )
+    await asyncio.to_thread(input_started.wait, 1)
+
+    async def runner(task_id):
+        return "background result"
+
+    spawned = await manager.spawn(
+        session_id="thread-1",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        runner=runner,
+    )
+    await manager.get("thread-1", spawned.task_id, wait_seconds=1)
+    for _ in range(10):
+        if "background result" in stderr.getvalue():
+            break
+        await asyncio.sleep(0)
+    release_input.set()
+
+    assert await repl == 0
+    assert f"Task ID: {spawned.task_id}" in stderr.getvalue()
+    assert "background result" in stderr.getvalue()
+    await manager.close()
 
 
 @pytest.mark.anyio

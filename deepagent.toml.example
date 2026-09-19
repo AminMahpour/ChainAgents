@@ -84,6 +84,14 @@ mcp_servers = []
 summarization_trigger_tokens = 6000
 summarization_keep_tokens = 2400
 
+[agent.background_subagents]
+# Opt in to process-local background execution for configured sync subagents.
+# Tasks do not survive restarts and are cancelled when their conversation closes.
+enabled = false
+max_running_per_session = 4
+max_running_total = 16
+max_tasks_per_session = 100
+
 [agent.reflection]
 # Set true to propose compact lessons after corrections or unrecovered tool failures.
 # Chainlit asks before saving; CLI, TUI, and API only surface proposals.
@@ -144,3 +152,16 @@ provider = "auto"
 
 # Optional MCP servers and subagents are documented in README.md. Add their
 # tables only after configuring the required commands, skills, and endpoints.
+# When background_subagents is enabled, a configured parent can launch only its
+# direct children. This commented example gives the main agent a manager and the
+# manager a private planner that it can launch in the background:
+#
+# [[subagents]]
+# name = "research-manager"
+# description = "Coordinates repository research."
+# system_prompt = "Delegate focused research and synthesize the results."
+#
+# [[subagents.subagents]]
+# name = "repo-planner"
+# description = "Produces implementation plans from repository findings."
+# system_prompt = "Return a concise implementation plan."
