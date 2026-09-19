@@ -389,6 +389,7 @@ def build_static_sync_subagent_spec(
             subagents={spec["name"]: spec["runnable"] for spec in child_specs},
             agent_path=agent_path,
             recursion_limit=config.recursion_limit,
+            existing_tools=effective_tools,
         )
         if background_manager is not None
         else []
@@ -548,6 +549,7 @@ def create_configured_graph(
             subagents={spec["name"]: spec["runnable"] for spec in local_subagent_specs},
             agent_path=(),
             recursion_limit=config.recursion_limit,
+            existing_tools=main_tools,
         )
         if background_manager is not None
         else []

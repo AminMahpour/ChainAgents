@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -542,6 +543,50 @@ def test_close_session_awaits_cleanup_started_by_concurrent_cancel() -> None:
     asyncio.run(exercise())
 
 
+def test_concurrent_close_session_calls_are_idempotent() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        cleanup_calls = 0
+
+        async def runner(task_id: str) -> str:
+            await asyncio.Event().wait()
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            cleanup_started.set()
+            await allow_cleanup.wait()
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="running task",
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+
+        first_close = asyncio.create_task(manager.close_session("session-a"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        second_close = asyncio.create_task(manager.close_session("session-a"))
+        await asyncio.sleep(0)
+
+        allow_cleanup.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_close, second_close),
+            timeout=1,
+        )
+
+        assert cleanup_calls == 1
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_cancel_cascades_through_prestart_descendant_tree() -> None:
     """Cancelling before child coroutines start must still reach grandchildren."""
     async def exercise() -> None:
@@ -670,6 +715,22 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
         await manager.close()
 
     asyncio.run(exercise())
+
+
+def test_background_tools_reject_reserved_name_collisions() -> None:
+    manager = make_manager()
+
+    with pytest.raises(
+        ValueError,
+        match="reserved background task tool name.*spawn_background_task",
+    ):
+        create_background_task_tools(
+            manager=manager,
+            subagents={},
+            agent_path=(),
+            recursion_limit=20,
+            existing_tools=[SimpleNamespace(name="spawn_background_task")],
+        )
 
 
 def test_nested_background_tool_uses_the_original_conversation_session() -> None:

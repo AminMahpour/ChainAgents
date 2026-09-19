@@ -4017,6 +4017,43 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
     assert background_names <= {tool.name for tool in reviewer_graph.kwargs["tools"]}
 
 
+def test_get_agent_rejects_configured_background_tool_name_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Configured tools cannot shadow the local background task controls."""
+    runtime = AgentRuntime(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None,
+                background_subagents=BackgroundSubagentConfig(enabled=True),
+            ),
+        ),
+        project_root=tmp_path,
+    )
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+    monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
+
+    async def fake_build_main_tools(**kwargs):
+        return [SimpleNamespace(name="spawn_background_task")]
+
+    monkeypatch.setattr(runtime, "_build_main_tools", fake_build_main_tools)
+
+    async def exercise() -> None:
+        try:
+            with pytest.raises(
+                ValueError,
+                match="reserved background task tool name.*spawn_background_task",
+            ):
+                await runtime.get_agent("medium", thread_id="thread-1")
+        finally:
+            await runtime.close()
+
+    asyncio.run(exercise())
+
+
 def test_create_configured_graph_builds_local_background_subagents(
     tmp_path: Path,
     monkeypatch,

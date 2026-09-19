@@ -16,8 +16,10 @@ from chainagents.runtime.graph import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Cancel exported-graph background jobs before Agent Server shutdown."""
-    yield
-    await close_static_background_tasks()
+    try:
+        yield
+    finally:
+        await close_static_background_tasks()
 
 
 app = FastAPI(lifespan=lifespan)

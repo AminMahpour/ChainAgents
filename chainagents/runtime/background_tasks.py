@@ -8,7 +8,8 @@ import dataclasses
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal
 
@@ -27,6 +28,14 @@ BackgroundTaskStatus = Literal[
     "cancelled",
 ]
 TERMINAL_BACKGROUND_TASK_STATUSES = frozenset({"success", "error", "cancelled"})
+BACKGROUND_TASK_TOOL_NAMES = frozenset(
+    {
+        "spawn_background_task",
+        "list_background_tasks",
+        "get_background_task",
+        "cancel_background_task",
+    }
+)
 _LANGGRAPH_CHECKPOINTER_KEY = "__pregel_checkpointer"
 _LANGGRAPH_RUNTIME_KEY = "__pregel_runtime"
 
@@ -159,8 +168,28 @@ def create_background_task_tools(
     subagents: dict[str, object],
     agent_path: tuple[str, ...],
     recursion_limit: int,
+    existing_tools: Iterable[object] = (),
 ) -> list[object]:
     """Create task tools scoped to the direct children of one agent."""
+    collisions = sorted(
+        {
+            name
+            for tool in existing_tools
+            if (
+                name := str(
+                    getattr(tool, "name", None)
+                    or getattr(tool, "__name__", "")
+                ).strip()
+            )
+            in BACKGROUND_TASK_TOOL_NAMES
+        }
+    )
+    if collisions:
+        names = ", ".join(collisions)
+        raise ValueError(
+            "Configured tools use reserved background task tool names: "
+            f"{names}. Rename or prefix the configured tools."
+        )
     allowed_names = tuple(sorted(subagents))
     allowed_text = ", ".join(allowed_names) or "none"
 
@@ -283,6 +312,8 @@ class BackgroundTaskManager:
             str, set[asyncio.Queue[BackgroundTaskSnapshot]]
         ] = {}
         self._closing_sessions: set[str] = set()
+        self._session_close_locks: dict[str, asyncio.Lock] = {}
+        self._session_close_users: dict[str, int] = {}
         self._closed = False
 
     async def spawn(
@@ -620,33 +651,67 @@ class BackgroundTaskManager:
                 return await self.list(session_id)
             await asyncio.gather(*executions, return_exceptions=True)
 
-    async def close_session(self, session_id: str) -> None:
-        """Cancel, await, and forget all work owned by one conversation."""
+    async def _close_session_tasks(self, session_id: str) -> None:
+        """Cancel, await, and forget task records for a serialized session."""
         async with self._lock:
-            self._closing_sessions.add(session_id)
-            task_ids = list(self._session_task_ids.get(session_id, ()))
+            records = [
+                self._records[task_id]
+                for task_id in self._session_task_ids.get(session_id, ())
+                if task_id in self._records
+            ]
             executions = [
-                self._records[task_id].execution
-                for task_id in task_ids
-                if self._records[task_id].execution is not None
-                and not self._records[task_id].execution.done()
+                record.execution
+                for record in records
+                if record.execution is not None and not record.execution.done()
             ]
         for execution in executions:
             execution.cancel()
         if executions:
             await asyncio.gather(*executions, return_exceptions=True)
-        for task_id in task_ids:
-            record = self._records[task_id]
+        for record in records:
             if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
                 cleanup_error = await self._cleanup_record(record)
                 await self._finish(record, status="cancelled", error=cleanup_error)
             else:
                 await self._cleanup_record(record)
         async with self._lock:
-            for task_id in task_ids:
-                self._records.pop(task_id, None)
+            for record in records:
+                self._records.pop(record.task_id, None)
             self._session_task_ids.pop(session_id, None)
-            self._closing_sessions.discard(session_id)
+
+    @asynccontextmanager
+    async def closing_session(self, session_id: str) -> AsyncIterator[None]:
+        """Close tasks and reject new work until dependent resources are released."""
+        normalized_session = session_id.strip()
+        if not normalized_session:
+            raise ValueError("Background tasks require a non-empty session ID.")
+        async with self._lock:
+            close_lock = self._session_close_locks.setdefault(
+                normalized_session,
+                asyncio.Lock(),
+            )
+            self._session_close_users[normalized_session] = (
+                self._session_close_users.get(normalized_session, 0) + 1
+            )
+            self._closing_sessions.add(normalized_session)
+        try:
+            async with close_lock:
+                await self._close_session_tasks(normalized_session)
+                yield
+        finally:
+            async with self._lock:
+                users = self._session_close_users[normalized_session] - 1
+                if users:
+                    self._session_close_users[normalized_session] = users
+                else:
+                    self._session_close_users.pop(normalized_session, None)
+                    self._session_close_locks.pop(normalized_session, None)
+                    self._closing_sessions.discard(normalized_session)
+
+    async def close_session(self, session_id: str) -> None:
+        """Cancel, await, and forget all work owned by one conversation."""
+        async with self.closing_session(session_id):
+            pass
 
     def subscribe(self, session_id: str) -> asyncio.Queue[BackgroundTaskSnapshot]:
         """Subscribe to terminal task snapshots for one conversation."""

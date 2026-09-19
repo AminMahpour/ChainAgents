@@ -519,6 +519,7 @@ class AgentRuntime:
                 subagents={spec["name"]: spec["runnable"] for spec in child_specs},
                 agent_path=agent_path,
                 recursion_limit=self.config.recursion_limit,
+                existing_tools=effective_tools,
             )
             if background_enabled
             else []
@@ -656,6 +657,7 @@ class AgentRuntime:
                         },
                         agent_path=(),
                         recursion_limit=self.config.recursion_limit,
+                        existing_tools=main_tools,
                     )
                     if self.config.extensions.background_subagents.enabled
                     else []
@@ -1096,14 +1098,15 @@ class AgentRuntime:
     ) -> None:
         """Release conversation graphs and any stateful MCP transport resources."""
         if thread_id:
-            await self.background_tasks.close_session(thread_id)
-        await self.close_mcp_session(mcp_session_id or thread_id)
-        if thread_id:
-            async with self._agent_lock:
-                self._agents = {
-                    key: agent for key, agent in self._agents.items()
-                    if key.thread_id != thread_id or key.mcp_scope is not None
-                }
+            async with self.background_tasks.closing_session(thread_id):
+                await self.close_mcp_session(mcp_session_id or thread_id)
+                async with self._agent_lock:
+                    self._agents = {
+                        key: agent for key, agent in self._agents.items()
+                        if key.thread_id != thread_id or key.mcp_scope is not None
+                    }
+            return
+        await self.close_mcp_session(mcp_session_id)
 
     @staticmethod
     async def _close_mcp_owners(owners: list[_MCPSessionOwner]) -> None:

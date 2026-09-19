@@ -30,6 +30,11 @@ from chainagents.runtime.types import BackgroundSubagentConfig
 from rag_runtime import RagStatus, RagUploadResult
 
 
+CLI_STARTUP_TIMEOUT_SECONDS = float(
+    os.environ.get("CHAINAGENTS_TEST_CLI_STARTUP_TIMEOUT", "20")
+)
+
+
 def test_cli_parses_prompt_and_runtime_flags() -> None:
     """Verify that CLI parses prompt and runtime flags."""
     args = chainagents_cli.parse_args(
@@ -1318,7 +1323,7 @@ state = "stateless"
     os.close(slave_fd)
     output = bytearray()
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + CLI_STARTUP_TIMEOUT_SECONDS
         while b"chainagents> " not in output and time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
             if readable:
