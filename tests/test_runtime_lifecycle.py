@@ -11,8 +11,12 @@ import deepagent_runtime as core
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.lifecycle as runtime_lifecycle
 import chainagents.runtime.middleware as runtime_middleware
-from chainagents.runtime.background_tasks import BackgroundTaskManager
+from chainagents.runtime.background_tasks import (
+    BackgroundTaskManager,
+    create_background_task_tools,
+)
 from chainagents.runtime.types import BackgroundSubagentConfig
+from langchain.tools import ToolRuntime
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
 from test_deepagent_runtime_rag import make_runtime_config, make_extensions_config
@@ -207,6 +211,45 @@ def test_cancelled_conversation_close_finishes_resource_teardown(
                 wait_seconds=1,
             )
         ).status == "success"
+        await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_conversation_close_invalidates_existing_background_tools(runtime):
+    """A foreground run from before close cannot spawn after teardown."""
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        generation = runtime.background_tasks.session_generation("thread")
+        tools = create_background_task_tools(
+            manager=runtime.background_tasks,
+            subagents={"worker": object()},
+            agent_path=(),
+            recursion_limit=20,
+            session_generation=generation,
+        )
+        spawn_tool = next(
+            tool for tool in tools if tool.name == "spawn_background_task"
+        )
+        tool_runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "thread"}},
+            stream_writer=lambda _: None,
+            tool_call_id="stale-spawn",
+            store=None,
+        )
+
+        await runtime.close_conversation(
+            thread_id="thread",
+            mcp_session_id="thread",
+        )
+
+        with pytest.raises(RuntimeError, match="session was closed"):
+            await spawn_tool.coroutine("late work", "worker", tool_runtime)
         await runtime.background_tasks.close()
 
     asyncio.run(exercise())

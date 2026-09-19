@@ -540,6 +540,11 @@ class AgentRuntime:
                 },
                 agent_path=agent_path,
                 recursion_limit=self.config.recursion_limit,
+                session_generation=(
+                    self.background_tasks.session_generation(thread_id)
+                    if thread_id
+                    else None
+                ),
                 existing_tools=effective_tools,
             )
             if caller_background_enabled
@@ -689,6 +694,11 @@ class AgentRuntime:
                         subagents=background_subagents,
                         agent_path=(),
                         recursion_limit=self.config.recursion_limit,
+                        session_generation=(
+                            self.background_tasks.session_generation(thread_id)
+                            if thread_id
+                            else None
+                        ),
                         existing_tools=main_tools,
                     )
                     if (

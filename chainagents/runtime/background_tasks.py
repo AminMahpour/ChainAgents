@@ -244,6 +244,7 @@ def create_background_task_tools(
     subagents: dict[str, object],
     agent_path: tuple[str, ...],
     recursion_limit: int,
+    session_generation: int | None = None,
     existing_tools: Iterable[object] = (),
 ) -> list[object]:
     """Create task tools scoped to the direct children of one agent."""
@@ -321,6 +322,7 @@ def create_background_task_tools(
             agent_path=(*agent_path, subagent_type),
             owner_path=current_background_invocation_path(),
             parent_task_id=current_background_task_id(),
+            expected_session_generation=session_generation,
             runner=run_child,
             cleanup=cleanup_child if callable(delete_checkpoint_thread) else None,
         )
@@ -394,8 +396,13 @@ class BackgroundTaskManager:
         self._closing_sessions: set[str] = set()
         self._session_close_locks: dict[str, asyncio.Lock] = {}
         self._session_close_users: dict[str, int] = {}
+        self._session_generations: dict[str, int] = {}
         self._close_task: asyncio.Task[None] | None = None
         self._closed = False
+
+    def session_generation(self, session_id: str) -> int:
+        """Return the current lifecycle generation for one session."""
+        return self._session_generations.get(session_id.strip(), 0)
 
     async def spawn(
         self,
@@ -407,6 +414,7 @@ class BackgroundTaskManager:
         owner_path: tuple[str, ...] = (),
         runner: BackgroundRunner,
         parent_task_id: str | None = None,
+        expected_session_generation: int | None = None,
         cleanup: BackgroundCleanup | None = None,
     ) -> BackgroundTaskSnapshot:
         """Start a job immediately and return before the runner finishes."""
@@ -421,6 +429,14 @@ class BackgroundTaskManager:
                 raise RuntimeError("The background task manager is closed.")
             if normalized_session in self._closing_sessions:
                 raise RuntimeError("The background task session is closing.")
+            if (
+                expected_session_generation is not None
+                and self._session_generations.get(normalized_session, 0)
+                != expected_session_generation
+            ):
+                raise RuntimeError(
+                    "The background task session was closed; start a new foreground run."
+                )
             session_ids = self._session_task_ids.setdefault(normalized_session, [])
             running_session = sum(
                 self._records[task_id].status not in TERMINAL_BACKGROUND_TASK_STATUSES
@@ -506,7 +522,14 @@ class BackgroundTaskManager:
             await self._finish(record, status="error", error=error)
         else:
             cleanup_error = await self._cleanup_record(record)
-            if cleanup_error:
+            if record.cancelling:
+                await self._cancel_descendants(record.session_id, record.task_id)
+                await self._finish(
+                    record,
+                    status="cancelled",
+                    error=cleanup_error,
+                )
+            elif cleanup_error:
                 await self._cancel_descendants(record.session_id, record.task_id)
                 await self._finish(record, status="error", error=cleanup_error)
             else:
@@ -788,6 +811,9 @@ class BackgroundTaskManager:
                 for record in records
                 if record.execution is not None and not record.execution.done()
             ]
+            for record in records:
+                if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
+                    record.cancelling = True
         for execution in executions:
             execution.cancel()
         if executions:
@@ -816,6 +842,9 @@ class BackgroundTaskManager:
             )
             self._session_close_users[normalized_session] = (
                 self._session_close_users.get(normalized_session, 0) + 1
+            )
+            self._session_generations[normalized_session] = (
+                self._session_generations.get(normalized_session, 0) + 1
             )
             self._closing_sessions.add(normalized_session)
         try:

@@ -360,8 +360,9 @@ def test_cancelling_parent_rejects_late_descendant_spawn() -> None:
         )
         await asyncio.wait_for(runner_started.wait(), timeout=1)
 
-        await manager.cancel("session-a", parent.task_id)
+        terminal = await manager.cancel("session-a", parent.task_id)
 
+        assert terminal.status == "cancelled"
         assert isinstance(spawn_error, RuntimeError)
         assert "parent task is cancelling" in str(spawn_error)
         assert [task.task_id for task in await manager.list("session-a")] == [
