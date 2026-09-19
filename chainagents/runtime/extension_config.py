@@ -431,6 +431,12 @@ def parse_sync_subagent_config(
                 f"Defined servers: {sorted(mcp_servers)}"
             )
 
+    background = raw_subagent.get("background", False)
+    if not isinstance(background, bool):
+        raise ValueError(
+            f"subagent '{name}' background config must be a boolean."
+        )
+
     nested_subagent_names = normalize_required_string_list(
         raw_subagent.get("nested_subagents", []),
         field_name=f"subagent '{name}' nested_subagents",
@@ -464,6 +470,7 @@ def parse_sync_subagent_config(
         skills=subagent_skill_paths,
         mcp_servers=raw_subagent_mcp_servers,
         model=model,
+        background=background,
         nested_subagent_names=nested_subagent_names,
         subagents=tuple(nested_subagents),
     )

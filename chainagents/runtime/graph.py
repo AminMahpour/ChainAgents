@@ -345,8 +345,17 @@ def build_static_sync_subagent_spec(
         source=subagent.name,
         project_root=project_root,
     )
-    background_enabled = background_manager is not None
-    if not has_nested_child_subagents(subagent) and not background_enabled:
+    child_subagents = nested_child_subagents(subagent, registry)
+    target_background_enabled = (
+        background_manager is not None and subagent.background
+    )
+    background_child_names = {
+        child.name for child in child_subagents if child.background
+    }
+    caller_background_enabled = (
+        background_manager is not None and bool(background_child_names)
+    )
+    if not child_subagents and not target_background_enabled:
         subagent_model = (
             runtime_models.build_model_for_profile(
                 config,
@@ -381,19 +390,23 @@ def build_static_sync_subagent_spec(
             inherited_model=effective_model,
             project_root=project_root,
         )
-        for child in nested_child_subagents(subagent, registry)
+        for child in child_subagents
     ]
     if not child_specs:
         middleware.append(runtime_middleware.DisableSubagentDelegationMiddleware())
     background_tools = (
         runtime_background_tasks.create_background_task_tools(
             manager=background_manager,
-            subagents={spec["name"]: spec["runnable"] for spec in child_specs},
+            subagents={
+                spec["name"]: spec["runnable"]
+                for spec in child_specs
+                if spec["name"] in background_child_names
+            },
             agent_path=agent_path,
             recursion_limit=config.recursion_limit,
             existing_tools=effective_tools,
         )
-        if background_manager is not None
+        if caller_background_enabled
         else []
     )
     runnable_kwargs: dict[str, Any] = {
@@ -418,7 +431,7 @@ def build_static_sync_subagent_spec(
         "description": subagent.description,
         "runnable": (
             runtime_background_tasks.scope_background_task_invocation(runnable)
-            if background_manager is not None
+            if caller_background_enabled
             else runnable
         ),
     }
@@ -549,15 +562,25 @@ def create_configured_graph(
     local_subagent_specs = [
         spec for spec in subagent_specs if "runnable" in spec
     ]
+    background_subagent_names = {
+        subagent.name
+        for subagent in config.extensions.subagents
+        if subagent.background
+    }
+    background_subagents = {
+        spec["name"]: spec["runnable"]
+        for spec in local_subagent_specs
+        if spec["name"] in background_subagent_names
+    }
     background_tools = (
         runtime_background_tasks.create_background_task_tools(
             manager=background_manager,
-            subagents={spec["name"]: spec["runnable"] for spec in local_subagent_specs},
+            subagents=background_subagents,
             agent_path=(),
             recursion_limit=config.recursion_limit,
             existing_tools=main_tools,
         )
-        if background_manager is not None
+        if background_manager is not None and background_subagents
         else []
     )
     agent_kwargs: dict[str, Any] = {

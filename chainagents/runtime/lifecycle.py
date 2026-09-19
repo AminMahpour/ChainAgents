@@ -473,8 +473,21 @@ class AgentRuntime:
             source=subagent.name,
             project_root=self.project_root,
         )
-        background_enabled = self.config.extensions.background_subagents.enabled
-        if not runtime_graph.has_nested_child_subagents(subagent) and not background_enabled:
+        global_background_enabled = (
+            self.config.extensions.background_subagents.enabled
+        )
+        child_subagents = runtime_graph.nested_child_subagents(
+            subagent,
+            registry,
+        )
+        target_background_enabled = global_background_enabled and subagent.background
+        background_child_names = {
+            child.name for child in child_subagents if child.background
+        }
+        caller_background_enabled = (
+            global_background_enabled and bool(background_child_names)
+        )
+        if not child_subagents and not target_background_enabled:
             subagent_tools = own_tools
             if (
                 not subagent_tools
@@ -511,7 +524,7 @@ class AgentRuntime:
                 mcp_session_id=mcp_session_id,
                 agent_path=(*agent_path, child.name),
             )
-            for child in runtime_graph.nested_child_subagents(subagent, registry)
+            for child in child_subagents
         ]
         if not child_specs:
             middleware.append(
@@ -520,12 +533,16 @@ class AgentRuntime:
         background_tools = (
             runtime_background_tasks.create_background_task_tools(
                 manager=self.background_tasks,
-                subagents={spec["name"]: spec["runnable"] for spec in child_specs},
+                subagents={
+                    spec["name"]: spec["runnable"]
+                    for spec in child_specs
+                    if spec["name"] in background_child_names
+                },
                 agent_path=agent_path,
                 recursion_limit=self.config.recursion_limit,
                 existing_tools=effective_tools,
             )
-            if background_enabled
+            if caller_background_enabled
             else []
         )
         runnable_kwargs: dict[str, Any] = {
@@ -552,7 +569,7 @@ class AgentRuntime:
             "description": subagent.description,
             "runnable": (
                 runtime_background_tasks.scope_background_task_invocation(runnable)
-                if background_enabled
+                if caller_background_enabled
                 else runnable
             ),
         }
@@ -656,18 +673,28 @@ class AgentRuntime:
                     )
                     for subagent in self.config.extensions.async_subagents
                 )
+                background_subagent_names = {
+                    subagent.name
+                    for subagent in self.config.extensions.subagents
+                    if subagent.background
+                }
+                background_subagents = {
+                    spec["name"]: spec["runnable"]
+                    for spec in local_subagent_specs
+                    if spec["name"] in background_subagent_names
+                }
                 background_tools = (
                     runtime_background_tasks.create_background_task_tools(
                         manager=self.background_tasks,
-                        subagents={
-                            spec["name"]: spec["runnable"]
-                            for spec in local_subagent_specs
-                        },
+                        subagents=background_subagents,
                         agent_path=(),
                         recursion_limit=self.config.recursion_limit,
                         existing_tools=main_tools,
                     )
-                    if self.config.extensions.background_subagents.enabled
+                    if (
+                        self.config.extensions.background_subagents.enabled
+                        and background_subagents
+                    )
                     else []
                 )
                 agent_kwargs: dict[str, Any] = {

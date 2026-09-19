@@ -42,6 +42,7 @@ class SubagentConfig:
         skills: The skills value.
         mcp_servers: The MCP servers value.
         model: Model name or model object used by the runtime.
+        background: Whether this subagent may be launched as a background task.
         nested_subagent_names: Top-level sync subagent names exposed to this subagent.
         subagents: Inline private sync subagents exposed to this subagent.
     """
@@ -52,6 +53,7 @@ class SubagentConfig:
     skills: tuple[str, ...] = ()
     mcp_servers: tuple[str, ...] = ()
     model: str | None = None
+    background: bool = False
     nested_subagent_names: tuple[str, ...] = ()
     subagents: tuple["SubagentConfig", ...] = ()
 

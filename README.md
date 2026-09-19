@@ -732,6 +732,7 @@ Supported subagent fields:
 - `skills`: optional list of skill source paths for that subagent
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional profile name or raw model name. Profile names can switch provider settings and tool-schema handling for that sync subagent. Raw model names inherit the parent/default provider settings.
+- `background`: optional boolean, defaulting to `false`. When global local background execution is enabled, `true` allows the subagent's direct parent to launch it with `spawn_background_task`. Foreground `task` delegation is unaffected.
 - `nested_subagents`: optional list of top-level sync subagent names exposed as children of this subagent
 - `[[subagents.subagents]]`: optional inline private sync child subagents under a parent subagent
 
@@ -807,7 +808,7 @@ parents. A parent can expose several shared children, for example
 
 Inline children accept the same fields as other synchronous subagents:
 `name`, `description`, `system_prompt` or `system_prompt_file`, `skills`,
-`mcp_servers`, `model`, and their own nested children. A referenced child uses
+`mcp_servers`, `model`, `background`, and their own nested children. A referenced child uses
 the configuration from its top-level `[[subagents]]` entry wherever it is
 reused. When `model` is omitted, the child continues with its parent/default
 model configuration.
@@ -839,7 +840,7 @@ Main `[agent]` additions:
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
-- `[agent.background_subagents]`: opt-in process-local background execution for configured synchronous subagents. `enabled` defaults to `false`; the three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
+- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
@@ -863,6 +864,27 @@ max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100
 ```
+
+Then opt in each synchronous subagent that its direct parent may launch in the
+background:
+
+```toml
+[[subagents]]
+name = "research-manager"
+description = "Coordinates repository research and planning."
+system_prompt = "Delegate focused work and synthesize the results."
+background = true
+
+[[subagents.subagents]]
+name = "repo-planner"
+description = "Turns repository findings into an implementation plan."
+system_prompt = "Produce a concise, actionable implementation plan."
+background = true
+```
+
+An unmarked subagent remains available through the blocking `task` tool but is
+rejected by `spawn_background_task`. Marking a parent does not implicitly mark
+its children; each background launch target opts in independently.
 
 The agent receives four tools:
 

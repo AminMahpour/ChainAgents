@@ -14,6 +14,7 @@ from deepagents.backends import CompositeBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
+from langchain.tools import ToolRuntime
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -3625,6 +3626,7 @@ def test_get_agent_omits_store_and_checkpointer_when_stateless(
                     name="researcher",
                     description="Researches.",
                     system_prompt="Research.",
+                    background=True,
                 ),
             ),
         ),
@@ -3993,11 +3995,13 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
                         name="manager",
                         description="Coordinates work.",
                         system_prompt="Manage.",
+                        background=True,
                         subagents=(
                             SubagentConfig(
                                 name="reviewer",
                                 description="Reviews work.",
                                 system_prompt="Review.",
+                                background=True,
                             ),
                         ),
                     ),
@@ -4014,7 +4018,7 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
     assert len(created_graphs) == 3
     reviewer_graph, manager_graph, main_graph = created_graphs
     assert main_graph.kwargs["subagents"][0]["runnable"].runnable is manager_graph
-    assert manager_graph.kwargs["subagents"][0]["runnable"].runnable is reviewer_graph
+    assert manager_graph.kwargs["subagents"][0]["runnable"] is reviewer_graph
     assert all(graph.kwargs["store"] is runtime.store for graph in created_graphs)
     assert all(
         graph.kwargs["checkpointer"] is runtime.checkpointer
@@ -4028,7 +4032,9 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
     }
     assert background_names <= {tool.name for tool in main_graph.kwargs["tools"]}
     assert background_names <= {tool.name for tool in manager_graph.kwargs["tools"]}
-    assert background_names <= {tool.name for tool in reviewer_graph.kwargs["tools"]}
+    assert background_names.isdisjoint(
+        {tool.name for tool in reviewer_graph.kwargs["tools"] or []}
+    )
     assert reviewer_graph.kwargs["subagents"] == []
     assert any(
         isinstance(
@@ -4050,6 +4056,14 @@ def test_get_agent_rejects_configured_background_tool_name_collision(
             extensions=ExtensionsConfig(
                 config_path=None,
                 background_subagents=BackgroundSubagentConfig(enabled=True),
+                subagents=(
+                    SubagentConfig(
+                        name="worker",
+                        description="Works.",
+                        system_prompt="Work.",
+                        background=True,
+                    ),
+                ),
             ),
         ),
         project_root=tmp_path,
@@ -4057,6 +4071,11 @@ def test_get_agent_rejects_configured_background_tool_name_collision(
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
     monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        runtime_middleware,
+        "create_deep_agent",
+        lambda **kwargs: SimpleNamespace(kwargs=kwargs),
+    )
 
     async def fake_build_main_tools(**kwargs):
         return [SimpleNamespace(name="spawn_background_task")]
@@ -4098,6 +4117,12 @@ def test_create_configured_graph_builds_local_background_subagents(
                     name="researcher",
                     description="Researches.",
                     system_prompt="Research.",
+                    background=True,
+                ),
+                SubagentConfig(
+                    name="foreground-only",
+                    description="Runs only in the foreground.",
+                    system_prompt="Work in the foreground.",
                 ),
             ),
         ),
@@ -4116,7 +4141,8 @@ def test_create_configured_graph_builds_local_background_subagents(
     assert graph is created_graphs[-1]
     assert len(created_graphs) == 2
     child_graph, main_graph = created_graphs
-    assert main_graph.kwargs["subagents"][0]["runnable"].runnable is child_graph
+    assert main_graph.kwargs["subagents"][0]["runnable"] is child_graph
+    assert "runnable" not in main_graph.kwargs["subagents"][1]
     assert child_graph.kwargs["subagents"] == []
     assert any(
         isinstance(
@@ -4128,6 +4154,27 @@ def test_create_configured_graph_builds_local_background_subagents(
     assert "spawn_background_task" in {
         tool.name for tool in main_graph.kwargs["tools"]
     }
+
+    spawn_tool = next(
+        tool
+        for tool in main_graph.kwargs["tools"]
+        if tool.name == "spawn_background_task"
+    )
+    runtime = ToolRuntime(
+        state={},
+        context=None,
+        config={"configurable": {"thread_id": "thread-1"}},
+        stream_writer=lambda _: None,
+        tool_call_id="spawn-call",
+        store=None,
+    )
+    with pytest.raises(
+        ValueError,
+        match="Allowed subagents for background work: researcher",
+    ):
+        asyncio.run(
+            spawn_tool.coroutine("work", "foreground-only", runtime)
+        )
 
     deepagent_runtime.create_configured_graph(include_async_subagents=False)
     assert len(runtime_graph.static_background_task_managers()) == 1
@@ -6093,11 +6140,13 @@ args = ["server"]
 name = "manager"
 description = "Coordinates specialist agents."
 system_prompt = "Manage the work."
+background = true
 
 [[subagents.subagents]]
 name = "private-reviewer"
 description = "Reviews manager output."
 system_prompt = "Review the work."
+background = true
 skills = ["/workspace/private-reviewer"]
 mcp_servers = ["repo"]
 model = "gpt-oss:120b"
@@ -6115,14 +6164,39 @@ system_prompt = "Review top-level work."
 
     manager = extensions.subagents[0]
     assert manager.name == "manager"
+    assert manager.background is True
     assert manager.nested_subagent_names == ()
     assert len(manager.subagents) == 1
     private_reviewer = manager.subagents[0]
     assert private_reviewer.name == "private-reviewer"
+    assert private_reviewer.background is True
     assert private_reviewer.skills == ("/workspace/private-reviewer/",)
     assert private_reviewer.mcp_servers == ("repo",)
     assert private_reviewer.model == "gpt-oss:120b"
     assert extensions.subagents[1].name == "public-reviewer"
+    assert extensions.subagents[1].background is False
+
+
+def test_load_extensions_config_rejects_non_boolean_subagent_background(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Per-subagent background eligibility must be an explicit boolean."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[[subagents]]
+name = "researcher"
+description = "Researches."
+system_prompt = "Research."
+background = "yes"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="subagent 'researcher'.*background"):
+        deepagent_runtime.load_extensions_config()
 
 
 def test_load_extensions_config_parses_nested_subagent_references(
