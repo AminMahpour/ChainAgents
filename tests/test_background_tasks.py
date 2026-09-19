@@ -450,6 +450,98 @@ def test_close_session_cancels_tasks_and_publishes_one_terminal_event() -> None:
     asyncio.run(exercise())
 
 
+def test_close_session_awaits_checkpoint_cleanup_when_task_is_cancelled() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        cleanup_calls = 0
+        cleanup_completions = 0
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            nonlocal cleanup_calls, cleanup_completions
+            cleanup_calls += 1
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            cleanup_completions += 1
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="finishing task",
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        close_task = asyncio.create_task(manager.close_session("session-a"))
+        await asyncio.sleep(0)
+        allow_cleanup.set()
+        await asyncio.wait_for(close_task, timeout=1)
+
+        assert cleanup_calls == 1
+        assert cleanup_completions == 1
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_close_session_awaits_cleanup_started_by_concurrent_cancel() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        cleanup_calls = 0
+        cleanup_completions = 0
+
+        async def runner(task_id: str) -> str:
+            await asyncio.Event().wait()
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            nonlocal cleanup_calls, cleanup_completions
+            cleanup_calls += 1
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            cleanup_completions += 1
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="running task",
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        cancel_task = asyncio.create_task(
+            manager.cancel("session-a", spawned.task_id)
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        close_task = asyncio.create_task(manager.close_session("session-a"))
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        allow_cleanup.set()
+        cancelled, _ = await asyncio.wait_for(
+            asyncio.gather(cancel_task, close_task),
+            timeout=1,
+        )
+
+        assert cancelled.status == "cancelled"
+        assert cleanup_calls == 1
+        assert cleanup_completions == 1
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_cancel_cascades_through_prestart_descendant_tree() -> None:
     """Cancelling before child coroutines start must still reach grandchildren."""
     async def exercise() -> None:

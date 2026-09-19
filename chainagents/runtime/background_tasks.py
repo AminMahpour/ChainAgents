@@ -90,6 +90,7 @@ class _BackgroundTaskRecord:
     execution: asyncio.Task[None] | None = None
     completion: asyncio.Event | None = None
     cleanup: BackgroundCleanup | None = None
+    cleanup_task: asyncio.Task[None] | None = None
 
     def snapshot(self) -> BackgroundTaskSnapshot:
         return BackgroundTaskSnapshot(
@@ -388,20 +389,37 @@ class BackgroundTaskManager:
     async def _cleanup_record(self, record: _BackgroundTaskRecord) -> str | None:
         async with self._lock:
             cleanup = record.cleanup
-            record.cleanup = None
+            cleanup_task = record.cleanup_task
+            if cleanup is not None and cleanup_task is None:
+                cleanup_task = asyncio.create_task(
+                    cleanup(record.task_id),
+                    name=f"chainagents-cleanup-{record.task_id}",
+                )
+                record.cleanup_task = cleanup_task
         if cleanup is None:
             return None
+        assert cleanup_task is not None
         try:
-            await cleanup(record.task_id)
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            if cleanup_task.cancelled():
+                async with self._lock:
+                    if record.cleanup_task is cleanup_task:
+                        record.cleanup_task = None
+            raise
         except Exception as exc:  # noqa: BLE001
             async with self._lock:
-                if record.cleanup is None:
-                    record.cleanup = cleanup
+                if record.cleanup_task is cleanup_task:
+                    record.cleanup_task = None
             detail = " ".join(str(exc).split()).strip()
             summary = (
                 f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
             )
             return f"Background checkpoint cleanup failed: {summary}"
+        async with self._lock:
+            if record.cleanup_task is cleanup_task:
+                record.cleanup_task = None
+                record.cleanup = None
         return None
 
     async def _finish(
@@ -543,12 +561,8 @@ class BackgroundTaskManager:
         if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
             cleanup_error = await self._cleanup_record(record)
             await self._finish(record, status="cancelled", error=cleanup_error)
-        return await self.get(
-            session_id,
-            task_id,
-            scope_path=scope_path,
-            ancestor_task_id=ancestor_task_id,
-        )
+        async with self._lock:
+            return record.snapshot()
 
     async def _cancel_descendants(self, session_id: str, parent_task_id: str) -> None:
         async with self._lock:
