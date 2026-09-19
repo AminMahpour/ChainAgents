@@ -160,8 +160,10 @@ provider = "auto"
 # name = "research-manager"
 # description = "Coordinates repository research."
 # system_prompt = "Delegate focused research and synthesize the results."
+# background = true
 #
 # [[subagents.subagents]]
 # name = "repo-planner"
 # description = "Produces implementation plans from repository findings."
 # system_prompt = "Return a concise implementation plan."
+# background = true
