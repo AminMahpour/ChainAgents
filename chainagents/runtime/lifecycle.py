@@ -513,6 +513,10 @@ class AgentRuntime:
             )
             for child in runtime_graph.nested_child_subagents(subagent, registry)
         ]
+        if not child_specs:
+            middleware.append(
+                runtime_middleware.DisableSubagentDelegationMiddleware()
+            )
         background_tools = (
             runtime_background_tasks.create_background_task_tools(
                 manager=self.background_tasks,
@@ -534,7 +538,7 @@ class AgentRuntime:
             "middleware": middleware,
             "backend": backend,
             "skills": list(subagent.skills) or None,
-            "subagents": child_specs or None,
+            "subagents": child_specs,
         }
         if self.config.agent_state == "stateful":
             runnable_kwargs["store"] = self.store

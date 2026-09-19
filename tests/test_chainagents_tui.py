@@ -315,6 +315,41 @@ async def test_tui_posts_local_background_completion_and_unsubscribes() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_normalizes_thread_id_for_runs_and_background_notices() -> None:
+    """Whitespace around a TUI thread ID cannot split task ownership."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
+    runtime.background_tasks = manager
+    runtime.config.extensions = SimpleNamespace(
+        background_subagents=manager.config,
+    )
+    app = ChainAgentsTuiApp(
+        runtime=runtime,
+        args=_args(thread_id="  session-a  "),
+    )
+
+    async with app.run_test() as pilot:
+        assert app.thread_id == "session-a"
+
+        async def runner(task_id):
+            return "normalized result"
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await manager.get("session-a", spawned.task_id, wait_seconds=1)
+        await pilot.pause()
+
+        assert any("normalized result" in entry for entry in app.tool_entries)
+
+    await manager.close()
+
+
+@pytest.mark.anyio
 async def test_tui_submits_prompt_and_streams_response() -> None:
     agent = _FakeAgent([
         _raw_event(((), "messages", (_Token("Hello from agent"), {}))),

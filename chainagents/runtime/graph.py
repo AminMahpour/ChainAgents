@@ -383,6 +383,8 @@ def build_static_sync_subagent_spec(
         )
         for child in nested_child_subagents(subagent, registry)
     ]
+    if not child_specs:
+        middleware.append(runtime_middleware.DisableSubagentDelegationMiddleware())
     background_tools = (
         runtime_background_tasks.create_background_task_tools(
             manager=background_manager,
@@ -405,7 +407,7 @@ def build_static_sync_subagent_spec(
         "middleware": middleware,
         "backend": backend,
         "skills": list(subagent.skills) or None,
-        "subagents": child_specs or None,
+        "subagents": child_specs,
     }
     runnable = runtime_middleware.create_deep_agent_with_configured_summarization(
         config,

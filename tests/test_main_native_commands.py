@@ -646,6 +646,67 @@ def test_chainlit_prompt_text_preserves_text_without_images() -> None:
 
 
 @pytest.mark.anyio
+async def test_settings_update_resubscribes_background_notifier_for_new_thread(
+    monkeypatch,
+) -> None:
+    """Changing the Chainlit thread must move local completion notices."""
+    settings = AppSettings(
+        model_name="gpt-oss:20b",
+        reasoning_level="medium",
+        thread_id="thread-new",
+        show_reasoning_stream=False,
+        show_tool_calls=True,
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            model_name="gpt-oss:20b",
+            model_choices=("gpt-oss:20b",),
+            extensions=SimpleNamespace(
+                background_subagents=SimpleNamespace(enabled=True),
+                chainlit_reasoning_steps_enabled=False,
+                chainlit_tool_steps_enabled=True,
+                chainlit_model_mode_enabled=False,
+                chainlit_reasoning_mode_enabled=False,
+            ),
+        ),
+    )
+    notifier = main.LocalBackgroundTaskNotifier(
+        manager=SimpleNamespace(),
+        session_id="thread-old",
+    )
+    session_data = {
+        main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY: notifier,
+        main.SESSION_SETTINGS_KEY: {"thread_id": "thread-old"},
+    }
+    user_session = SimpleNamespace(
+        get=session_data.get,
+        set=session_data.__setitem__,
+    )
+    restarted: list[str] = []
+
+    async def get_runtime():
+        return runtime
+
+    async def publish_modes(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "coerce_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(main.cl, "user_session", user_session)
+    monkeypatch.setattr(main, "publish_modes", publish_modes)
+    monkeypatch.setattr(
+        main,
+        "start_local_background_notifier",
+        lambda *, runtime, session_id: restarted.append(session_id),
+    )
+
+    await main.on_settings_update({"thread_id": "thread-new"})
+
+    assert restarted == ["thread-new"]
+    assert session_data[main.SESSION_SETTINGS_KEY]["thread_id"] == "thread-new"
+
+
+@pytest.mark.anyio
 async def test_publish_modes_ignores_missing_modes_column_error(monkeypatch) -> None:
     """Verify that publish modes ignores missing modes column error.
 

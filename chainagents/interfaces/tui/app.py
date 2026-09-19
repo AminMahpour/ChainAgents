@@ -185,7 +185,10 @@ class ChainAgentsTuiApp(App[int]):
         super().__init__()
         self.runtime = runtime
         self.args = args
-        self.thread_id = str(getattr(args, "thread_id", "") or DEFAULT_TUI_THREAD_ID)
+        self.thread_id = (
+            str(getattr(args, "thread_id", "") or "").strip()
+            or DEFAULT_TUI_THREAD_ID
+        )
         self.reasoning_level: ReasoningLevel = normalize_reasoning_level(
             getattr(args, "reasoning", None),
             default=runtime.config.default_reasoning,

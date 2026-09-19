@@ -3518,6 +3518,20 @@ def test_deepagents_middleware_restores_todos_and_controls_high_risk_tools(
     assert "todos" in graph.channels
 
 
+def test_leaf_subagent_middleware_removes_implicit_task_tool(tmp_path: Path) -> None:
+    """Compiled leaves must not expose DeepAgents' default delegate."""
+    config = make_runtime_config(tmp_path)
+    graph = runtime_middleware.create_deep_agent_with_configured_summarization(
+        config,
+        model=FakeListChatModel(responses=["ok"]),
+        middleware=[runtime_middleware.DisableSubagentDelegationMiddleware()],
+        subagents=[],
+    )
+
+    tool_names = set(graph.nodes["tools"].bound.tools_by_name)
+    assert "task" not in tool_names
+
+
 def test_get_agent_passes_agent_memory_files_when_stateful(
     tmp_path: Path,
     monkeypatch,
@@ -4015,6 +4029,14 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
     assert background_names <= {tool.name for tool in main_graph.kwargs["tools"]}
     assert background_names <= {tool.name for tool in manager_graph.kwargs["tools"]}
     assert background_names <= {tool.name for tool in reviewer_graph.kwargs["tools"]}
+    assert reviewer_graph.kwargs["subagents"] == []
+    assert any(
+        isinstance(
+            item,
+            runtime_middleware.DisableSubagentDelegationMiddleware,
+        )
+        for item in reviewer_graph.kwargs["middleware"]
+    )
 
 
 def test_get_agent_rejects_configured_background_tool_name_collision(
@@ -4095,6 +4117,14 @@ def test_create_configured_graph_builds_local_background_subagents(
     assert len(created_graphs) == 2
     child_graph, main_graph = created_graphs
     assert main_graph.kwargs["subagents"][0]["runnable"] is child_graph
+    assert child_graph.kwargs["subagents"] == []
+    assert any(
+        isinstance(
+            item,
+            runtime_middleware.DisableSubagentDelegationMiddleware,
+        )
+        for item in child_graph.kwargs["middleware"]
+    )
     assert "spawn_background_task" in {
         tool.name for tool in main_graph.kwargs["tools"]
     }
