@@ -17,12 +17,43 @@ from chainagents.runtime.constants import (
 )
 from chainagents.runtime.reflection import normalize_reflection_config
 from chainagents.runtime.types import (
+    BackgroundSubagentConfig,
     AsyncSubagentConfig,
     ChainlitCommandConfig,
     ChainlitStarterConfig,
     ExtensionsConfig,
     SubagentConfig,
 )
+
+
+def normalize_background_subagent_config(value: Any) -> BackgroundSubagentConfig:
+    """Validate the opt-in process-local background subagent settings."""
+    if value is None:
+        return BackgroundSubagentConfig()
+    if not isinstance(value, dict):
+        raise ValueError(
+            "The top-level 'agent.background_subagents' config must be a table/object."
+        )
+    enabled = value.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "The top-level 'agent.background_subagents.enabled' config must be a boolean."
+        )
+    limits: dict[str, int] = {}
+    defaults = BackgroundSubagentConfig()
+    for field_name in (
+        "max_running_per_session",
+        "max_running_total",
+        "max_tasks_per_session",
+    ):
+        raw = value.get(field_name, getattr(defaults, field_name))
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+            raise ValueError(
+                "The top-level "
+                f"'agent.background_subagents.{field_name}' config must be a positive integer."
+            )
+        limits[field_name] = raw
+    return BackgroundSubagentConfig(enabled=enabled, **limits)
 
 
 def normalize_agent_state(value: Any | None) -> AgentStateMode:
@@ -400,6 +431,12 @@ def parse_sync_subagent_config(
                 f"Defined servers: {sorted(mcp_servers)}"
             )
 
+    background = raw_subagent.get("background", False)
+    if not isinstance(background, bool):
+        raise ValueError(
+            f"subagent '{name}' background config must be a boolean."
+        )
+
     nested_subagent_names = normalize_required_string_list(
         raw_subagent.get("nested_subagents", []),
         field_name=f"subagent '{name}' nested_subagents",
@@ -433,6 +470,7 @@ def parse_sync_subagent_config(
         skills=subagent_skill_paths,
         mcp_servers=raw_subagent_mcp_servers,
         model=model,
+        background=background,
         nested_subagent_names=nested_subagent_names,
         subagents=tuple(nested_subagents),
     )
@@ -594,6 +632,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         raise ValueError(
             "The top-level 'agent.execute_tool_enabled' config must be a boolean."
         )
+    background_subagents = normalize_background_subagent_config(
+        agent_section.get("background_subagents")
+    )
     agent_reflection = normalize_reflection_config(
         agent_section.get("reflection"),
         agent_state=agent_state,
@@ -834,6 +875,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         agent_mcp_servers=raw_agent_mcp_servers,
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
+        background_subagents=background_subagents,
         chainlit_commands=tuple(chainlit_commands),
         chainlit_starters=tuple(chainlit_starters),
         chainlit_model_mode_enabled=raw_model_mode_enabled,

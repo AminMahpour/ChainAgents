@@ -507,6 +507,73 @@ def create_app(
             ),
         )
 
+    @app.get("/api/background-tasks")
+    async def list_background_tasks(
+        request: Request,
+        thread_id: str,
+    ) -> list[dict[str, object]]:
+        """List retained local background tasks for one conversation."""
+        session_id = _required_text(thread_id, "thread_id")
+        active_runtime = _runtime_from_request(request)
+        snapshots = await active_runtime.background_tasks.list(session_id)
+        return [snapshot.to_payload() for snapshot in snapshots]
+
+    @app.delete("/api/background-tasks")
+    async def close_background_task_session(
+        request: Request,
+        thread_id: str,
+    ) -> dict[str, object]:
+        """Close a conversation and cancel its unfinished local background work."""
+        session_id = _required_text(thread_id, "thread_id")
+        active_runtime = _runtime_from_request(request)
+        await active_runtime.close_conversation(
+            thread_id=session_id,
+            mcp_session_id=session_id,
+        )
+        return {"closed": True, "thread_id": session_id}
+
+    @app.get("/api/background-tasks/{task_id}")
+    async def get_background_task(
+        task_id: str,
+        request: Request,
+        thread_id: str,
+        wait_seconds: float = 0,
+    ) -> dict[str, object]:
+        """Get one retained local background task by ID."""
+        session_id = _required_text(thread_id, "thread_id")
+        normalized_task_id = _required_text(task_id, "task_id")
+        active_runtime = _runtime_from_request(request)
+        try:
+            snapshot = await active_runtime.background_tasks.get(
+                session_id,
+                normalized_task_id,
+                wait_seconds=wait_seconds,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return snapshot.to_payload()
+
+    @app.delete("/api/background-tasks/{task_id}")
+    async def cancel_background_task(
+        task_id: str,
+        request: Request,
+        thread_id: str,
+    ) -> dict[str, object]:
+        """Cancel one local background task and its descendants."""
+        session_id = _required_text(thread_id, "thread_id")
+        normalized_task_id = _required_text(task_id, "task_id")
+        active_runtime = _runtime_from_request(request)
+        try:
+            snapshot = await active_runtime.background_tasks.cancel(
+                session_id,
+                normalized_task_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return snapshot.to_payload()
+
     @app.get("/api/generated-files/{relative_path:path}")
     async def download_generated_file(
         relative_path: str,

@@ -42,6 +42,7 @@ class SubagentConfig:
         skills: The skills value.
         mcp_servers: The MCP servers value.
         model: Model name or model object used by the runtime.
+        background: Whether this subagent may be launched as a background task.
         nested_subagent_names: Top-level sync subagent names exposed to this subagent.
         subagents: Inline private sync subagents exposed to this subagent.
     """
@@ -52,6 +53,7 @@ class SubagentConfig:
     skills: tuple[str, ...] = ()
     mcp_servers: tuple[str, ...] = ()
     model: str | None = None
+    background: bool = False
     nested_subagent_names: tuple[str, ...] = ()
     subagents: tuple["SubagentConfig", ...] = ()
 
@@ -88,6 +90,16 @@ class SubagentConfig:
         elif self.model:
             spec["model"] = self.model
         return spec
+
+
+@dataclass(frozen=True)
+class BackgroundSubagentConfig:
+    """Configure process-local background execution for synchronous subagents."""
+
+    enabled: bool = False
+    max_running_per_session: int = 4
+    max_running_total: int = 16
+    max_tasks_per_session: int = 100
 
 
 @dataclass(frozen=True)
@@ -283,6 +295,7 @@ class ExtensionsConfig:
     agent_mcp_servers: tuple[str, ...] = ()
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
+    background_subagents: BackgroundSubagentConfig = BackgroundSubagentConfig()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
     chainlit_model_mode_enabled: bool = True
@@ -311,6 +324,7 @@ class ExtensionsConfig:
             or self.agent_mcp_servers
             or self.subagents
             or self.async_subagents
+            or self.background_subagents.enabled
             or self.chainlit_commands
             or self.chainlit_starters
         )

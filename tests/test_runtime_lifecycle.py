@@ -11,6 +11,12 @@ import deepagent_runtime as core
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.lifecycle as runtime_lifecycle
 import chainagents.runtime.middleware as runtime_middleware
+from chainagents.runtime.background_tasks import (
+    BackgroundTaskManager,
+    create_background_task_tools,
+)
+from chainagents.runtime.types import BackgroundSubagentConfig
+from langchain.tools import ToolRuntime
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
 from test_deepagent_runtime_rag import make_runtime_config, make_extensions_config
@@ -64,6 +70,260 @@ def test_conversation_close_evicts_graph_with_no_mcp_client(runtime, stateful):
         assert await runtime.get_agent('medium', thread_id='other', mcp_session_id='other-session') is other
         assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session') is not first
         await runtime.close()
+    asyncio.run(exercise())
+
+
+def test_conversation_close_cancels_background_tasks_before_mcp(runtime, monkeypatch):
+    """Conversation resources must remain alive until background jobs stop."""
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        queue = runtime.background_tasks.subscribe("thread")
+
+        async def runner(task_id):
+            await asyncio.Event().wait()
+            return task_id
+
+        spawned = await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="work",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        events = []
+
+        async def close_mcp_session(session_id):
+            events.append((session_id, not queue.empty()))
+
+        monkeypatch.setattr(runtime, "close_mcp_session", close_mcp_session)
+        await runtime.close_conversation(thread_id="thread", mcp_session_id="mcp")
+
+        terminal = queue.get_nowait()
+        assert terminal.task_id == spawned.task_id
+        assert terminal.status == "cancelled"
+        assert events == [("mcp", True)]
+        assert await runtime.background_tasks.list("thread") == []
+        await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_conversation_close_rejects_spawns_until_resource_teardown_finishes(
+    runtime,
+    monkeypatch,
+):
+    """A closing conversation cannot launch jobs while MCP resources close."""
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        mcp_close_started = asyncio.Event()
+        allow_mcp_close = asyncio.Event()
+
+        async def close_mcp_session(session_id):
+            assert session_id == "mcp"
+            mcp_close_started.set()
+            await allow_mcp_close.wait()
+
+        async def runner(task_id):
+            return task_id
+
+        monkeypatch.setattr(runtime, "close_mcp_session", close_mcp_session)
+        close_task = asyncio.create_task(
+            runtime.close_conversation(thread_id="thread", mcp_session_id="mcp")
+        )
+        await asyncio.wait_for(mcp_close_started.wait(), timeout=1)
+
+        with pytest.raises(RuntimeError, match="session is closing"):
+            await runtime.background_tasks.spawn(
+                session_id="thread",
+                agent_name="worker",
+                description="late work",
+                agent_path=("worker",),
+                runner=runner,
+            )
+
+        allow_mcp_close.set()
+        await asyncio.wait_for(close_task, timeout=1)
+        await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_conversation_close_finishes_resource_teardown(
+    runtime,
+    monkeypatch,
+):
+    """Caller cancellation must not reopen a partially closed conversation."""
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        mcp_close_started = asyncio.Event()
+        allow_mcp_close = asyncio.Event()
+
+        async def close_mcp_session(session_id):
+            assert session_id == "mcp"
+            mcp_close_started.set()
+            await allow_mcp_close.wait()
+
+        async def runner(task_id):
+            return task_id
+
+        monkeypatch.setattr(runtime, "close_mcp_session", close_mcp_session)
+        close_task = asyncio.create_task(
+            runtime.close_conversation(thread_id="thread", mcp_session_id="mcp")
+        )
+        await asyncio.wait_for(mcp_close_started.wait(), timeout=1)
+        close_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not close_task.done()
+        with pytest.raises(RuntimeError, match="session is closing"):
+            await runtime.background_tasks.spawn(
+                session_id="thread",
+                agent_name="worker",
+                description="late work",
+                agent_path=("worker",),
+                runner=runner,
+            )
+
+        allow_mcp_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=1)
+
+        reopened = await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="new work",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        assert (
+            await runtime.background_tasks.get(
+                "thread",
+                reopened.task_id,
+                wait_seconds=1,
+            )
+        ).status == "success"
+        await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_conversation_close_invalidates_existing_background_tools(runtime):
+    """A foreground run from before close cannot access a reopened session."""
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        generation = runtime.background_tasks.session_generation("thread")
+        tools = create_background_task_tools(
+            manager=runtime.background_tasks,
+            subagents={"worker": object()},
+            agent_path=(),
+            recursion_limit=20,
+            session_generation=generation,
+        )
+        spawn_tool = next(
+            tool for tool in tools if tool.name == "spawn_background_task"
+        )
+        list_tool = next(
+            tool for tool in tools if tool.name == "list_background_tasks"
+        )
+        get_tool = next(
+            tool for tool in tools if tool.name == "get_background_task"
+        )
+        cancel_tool = next(
+            tool for tool in tools if tool.name == "cancel_background_task"
+        )
+        tool_runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "thread"}},
+            stream_writer=lambda _: None,
+            tool_call_id="stale-spawn",
+            store=None,
+        )
+
+        await runtime.close_conversation(
+            thread_id="thread",
+            mcp_session_id="thread",
+        )
+
+        with pytest.raises(RuntimeError, match="session was closed"):
+            await spawn_tool.coroutine("late work", "worker", tool_runtime)
+
+        reopened = await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="new work",
+            agent_path=("worker",),
+            runner=lambda task_id: asyncio.sleep(0, result=task_id),
+        )
+        for call in (
+            lambda: list_tool.coroutine(tool_runtime),
+            lambda: get_tool.coroutine(reopened.task_id, 0, tool_runtime),
+            lambda: cancel_tool.coroutine(reopened.task_id, tool_runtime),
+        ):
+            with pytest.raises(RuntimeError, match="session was closed"):
+                await call()
+        await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_close_cancels_background_tasks(tmp_path):
+    """Runtime shutdown must not leave local subagent asyncio tasks alive."""
+    config = replace(
+        make_runtime_config(tmp_path),
+        rag=None,
+        rag_requested=False,
+        extensions=replace(
+            make_runtime_config(tmp_path).extensions,
+            background_subagents=BackgroundSubagentConfig(enabled=True),
+        ),
+    )
+    instance = core.AgentRuntime(config, project_root=tmp_path)
+
+    async def exercise():
+        queue = instance.background_tasks.subscribe("thread")
+        cleaned = []
+
+        teardown_events = []
+
+        async def close_persistence_resource():
+            teardown_events.append(("persistence", not queue.empty()))
+
+        instance._exit_stack.push_async_callback(close_persistence_resource)
+
+        async def runner(task_id):
+            await asyncio.Event().wait()
+            return task_id
+
+        async def cleanup(task_id):
+            cleaned.append(task_id)
+
+        await instance.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="work",
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        await instance.close()
+
+        assert queue.get_nowait().status == "cancelled"
+        assert len(cleaned) == 1
+        assert teardown_events == [("persistence", True)]
+
     asyncio.run(exercise())
 
 
@@ -201,13 +461,14 @@ def test_mcp_session_startup_unwinds_owner_and_allows_retry(runtime, monkeypatch
     asyncio.run(exercise())
 
 
-def test_conversation_close_retains_other_session_on_same_thread(runtime):
+def test_conversation_close_rebuilds_other_session_on_same_thread(runtime):
     runtime.config = replace(runtime.config, extensions=replace(runtime.config.extensions, mcp_stateful=True))
     async def exercise():
         first = await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session')
         other = await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session')
         await runtime.close_conversation(thread_id='thread', mcp_session_id='session')
         assert first not in runtime._agents.values()
-        assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session') is other
+        assert other not in runtime._agents.values()
+        assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session') is not other
         await runtime.close()
     asyncio.run(exercise())

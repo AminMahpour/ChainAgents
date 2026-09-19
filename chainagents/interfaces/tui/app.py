@@ -35,6 +35,7 @@ from chainagents.runtime import (
     build_langgraph_run_config,
     normalize_reasoning_level,
 )
+from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
 
 
 DEFAULT_TUI_THREAD_ID = "tui"
@@ -92,6 +93,14 @@ class PromptTextArea(TextArea):
         """Insert a newline at the cursor, replacing any selection."""
         start, end = self.selection
         self.replace("\n", start, end, maintain_selection_offset=False)
+
+
+class BackgroundTaskCompleted(Message):
+    """Deliver a terminal background task through Textual's message queue."""
+
+    def __init__(self, snapshot: BackgroundTaskSnapshot) -> None:
+        super().__init__()
+        self.snapshot = snapshot
 
 
 class ChainAgentsTuiApp(App[int]):
@@ -176,7 +185,10 @@ class ChainAgentsTuiApp(App[int]):
         super().__init__()
         self.runtime = runtime
         self.args = args
-        self.thread_id = str(getattr(args, "thread_id", "") or DEFAULT_TUI_THREAD_ID)
+        self.thread_id = (
+            str(getattr(args, "thread_id", "") or "").strip()
+            or DEFAULT_TUI_THREAD_ID
+        )
         self.reasoning_level: ReasoningLevel = normalize_reasoning_level(
             getattr(args, "reasoning", None),
             default=runtime.config.default_reasoning,
@@ -194,6 +206,8 @@ class ChainAgentsTuiApp(App[int]):
         self.command_help_text = ""
         self.command_help_visible = False
         self.visible_command_names: list[str] = []
+        self.background_task_queue: asyncio.Queue[BackgroundTaskSnapshot] | None = None
+        self.background_notice_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         """Compose the TUI layout."""
@@ -215,6 +229,55 @@ class ChainAgentsTuiApp(App[int]):
             f"Ready. thread={self.thread_id} model={self.model_name} "
             f"reasoning={self.reasoning_level}"
         )
+        background_config = getattr(
+            getattr(self.runtime.config, "extensions", None),
+            "background_subagents",
+            None,
+        )
+        if getattr(background_config, "enabled", False):
+            self.background_task_queue = self.runtime.background_tasks.subscribe(
+                self.thread_id
+            )
+            self.background_notice_task = asyncio.create_task(
+                self._watch_background_tasks()
+            )
+
+    async def _watch_background_tasks(self) -> None:
+        """Append terminal local task results to the tools pane."""
+        if self.background_task_queue is None:
+            return
+        while True:
+            snapshot = await self.background_task_queue.get()
+            self.post_message(BackgroundTaskCompleted(snapshot))
+
+    @on(BackgroundTaskCompleted)
+    def show_background_task_completion(self, event: BackgroundTaskCompleted) -> None:
+        """Render one terminal task notice delivered by the application."""
+        self._append_tool_entry(self._format_background_task(event.snapshot))
+
+    def on_unmount(self) -> None:
+        """Stop local background notifications when the Textual app exits."""
+        if self.background_task_queue is not None:
+            self.runtime.background_tasks.unsubscribe(
+                self.thread_id,
+                self.background_task_queue,
+            )
+            self.background_task_queue = None
+        if self.background_notice_task is not None:
+            self.background_notice_task.cancel()
+            self.background_notice_task = None
+
+    @staticmethod
+    def _format_background_task(snapshot: BackgroundTaskSnapshot) -> str:
+        message = (
+            f"background subagent {snapshot.agent_name} finished with status "
+            f"{snapshot.status}; Task ID: {snapshot.task_id}"
+        )
+        if snapshot.result:
+            return f"{message}; {snapshot.result}"
+        if snapshot.error:
+            return f"{message}; error: {snapshot.error}"
+        return message
 
     def on_key(self, event: events.Key) -> None:
         """Handle prompt-level slash command completion keys."""

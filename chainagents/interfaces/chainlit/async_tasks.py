@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Any
 
@@ -10,11 +11,71 @@ import chainlit as cl
 from langgraph_sdk import get_client
 
 from chainagents.runtime import AsyncSubagentConfig
+from chainagents.runtime.background_tasks import (
+    BackgroundTaskManager,
+    BackgroundTaskSnapshot,
+)
 
 
 DEFAULT_POLL_SECONDS = 5.0
 DEFAULT_AGENT_PROTOCOL_URL = "http://127.0.0.1:2024"
 TERMINAL_STATUSES = {"success", "error", "cancelled", "interrupted", "timeout"}
+logger = logging.getLogger("chainagents.interfaces.chainlit.async_tasks")
+
+
+def format_local_task_result(snapshot: BackgroundTaskSnapshot) -> str:
+    """Format one terminal process-local task snapshot for Chainlit."""
+    content = (
+        f"Local background subagent `{snapshot.agent_name}` finished with status "
+        f"`{snapshot.status}`.\n\nTask ID: `{snapshot.task_id}`"
+    )
+    if snapshot.result:
+        return f"{content}\n\n{snapshot.result}"
+    if snapshot.error:
+        return f"{content}\n\nError: {snapshot.error}"
+    return content
+
+
+class LocalBackgroundTaskNotifier:
+    """Deliver one Chainlit message for each local task terminal transition."""
+
+    def __init__(self, *, manager: BackgroundTaskManager, session_id: str) -> None:
+        self.manager = manager
+        self.session_id = session_id
+        self.queue: asyncio.Queue[BackgroundTaskSnapshot] | None = None
+        self.task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        """Subscribe and start consuming completion events."""
+        if self.task is not None and not self.task.done():
+            return
+        self.queue = self.manager.subscribe(self.session_id)
+        self.task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        if self.queue is None:
+            return
+        while True:
+            snapshot = await self.queue.get()
+            try:
+                await cl.Message(
+                    content=format_local_task_result(snapshot),
+                    author="Background subagent",
+                ).send()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to send local background task notice for %s.",
+                    snapshot.task_id,
+                )
+
+    def cancel(self) -> None:
+        """Stop notifications without changing the underlying jobs."""
+        if self.queue is not None:
+            self.manager.unsubscribe(self.session_id, self.queue)
+            self.queue = None
+        if self.task is not None:
+            self.task.cancel()
+            self.task = None
 
 
 def async_subagent_url_override() -> str | None:

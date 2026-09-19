@@ -18,6 +18,7 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.graph as runtime_graph
@@ -111,6 +112,10 @@ class AgentRuntime:
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
         self._exit_stack.push_async_callback(self.close_all_mcp_sessions)
+        self.background_tasks = runtime_background_tasks.BackgroundTaskManager(
+            config.extensions.background_subagents
+        )
+        self._exit_stack.push_async_callback(self.background_tasks.close)
         self._chainlit_commands, self._chainlit_command_notes = runtime_commands.build_chainlit_command_catalog(
             config.extensions,
             project_root=self.project_root,
@@ -408,6 +413,7 @@ class AgentRuntime:
                 sanitized_inherited_tools=sanitized_inherited_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
+                agent_path=(subagent.name,),
             )
             for subagent in self.config.extensions.subagents
         ]
@@ -425,6 +431,7 @@ class AgentRuntime:
         sanitized_inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
+        agent_path: tuple[str, ...],
     ) -> dict[str, Any]:
         """Build one sync subagent spec, compiling it when it has children."""
         effective_model = runtime_models.resolve_runtime_model_profile(
@@ -466,7 +473,21 @@ class AgentRuntime:
             source=subagent.name,
             project_root=self.project_root,
         )
-        if not runtime_graph.has_nested_child_subagents(subagent):
+        global_background_enabled = (
+            self.config.extensions.background_subagents.enabled
+        )
+        child_subagents = runtime_graph.nested_child_subagents(
+            subagent,
+            registry,
+        )
+        target_background_enabled = global_background_enabled and subagent.background
+        background_child_names = {
+            child.name for child in child_subagents if child.background
+        }
+        caller_background_enabled = (
+            global_background_enabled and bool(background_child_names)
+        )
+        if not child_subagents and not target_background_enabled:
             subagent_tools = own_tools
             if (
                 not subagent_tools
@@ -501,20 +522,45 @@ class AgentRuntime:
                 sanitized_inherited_tools=effective_tools,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
+                agent_path=(*agent_path, child.name),
             )
-            for child in runtime_graph.nested_child_subagents(subagent, registry)
+            for child in child_subagents
         ]
+        if not child_specs:
+            middleware.append(
+                runtime_middleware.DisableSubagentDelegationMiddleware()
+            )
+        background_tools = (
+            runtime_background_tasks.create_background_task_tools(
+                manager=self.background_tasks,
+                subagents={
+                    spec["name"]: spec["runnable"]
+                    for spec in child_specs
+                    if spec["name"] in background_child_names
+                },
+                agent_path=agent_path,
+                recursion_limit=self.config.recursion_limit,
+                session_generation=(
+                    self.background_tasks.session_generation(thread_id)
+                    if thread_id
+                    else None
+                ),
+                existing_tools=effective_tools,
+            )
+            if caller_background_enabled
+            else []
+        )
         runnable_kwargs: dict[str, Any] = {
             "model": self._build_model(
                 effective_reasoning_level,
                 model_profile=effective_model,
             ),
-            "tools": effective_tools or None,
+            "tools": [*effective_tools, *background_tools] or None,
             "system_prompt": subagent.system_prompt,
             "middleware": middleware,
             "backend": backend,
             "skills": list(subagent.skills) or None,
-            "subagents": child_specs or None,
+            "subagents": child_specs,
         }
         if self.config.agent_state == "stateful":
             runnable_kwargs["store"] = self.store
@@ -526,7 +572,11 @@ class AgentRuntime:
         return {
             "name": subagent.name,
             "description": subagent.description,
-            "runnable": runnable,
+            "runnable": (
+                runtime_background_tasks.scope_background_task_invocation(runnable)
+                if caller_background_enabled
+                else runnable
+            ),
         }
 
     async def get_agent(
@@ -621,15 +671,45 @@ class AgentRuntime:
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
+                local_subagent_specs = list(subagent_specs)
                 subagent_specs.extend(
                     subagent.to_deepagents_spec(
                         url_override=async_subagent_url_override,
                     )
                     for subagent in self.config.extensions.async_subagents
                 )
+                background_subagent_names = {
+                    subagent.name
+                    for subagent in self.config.extensions.subagents
+                    if subagent.background
+                }
+                background_subagents = {
+                    spec["name"]: spec["runnable"]
+                    for spec in local_subagent_specs
+                    if spec["name"] in background_subagent_names
+                }
+                background_tools = (
+                    runtime_background_tasks.create_background_task_tools(
+                        manager=self.background_tasks,
+                        subagents=background_subagents,
+                        agent_path=(),
+                        recursion_limit=self.config.recursion_limit,
+                        session_generation=(
+                            self.background_tasks.session_generation(thread_id)
+                            if thread_id
+                            else None
+                        ),
+                        existing_tools=main_tools,
+                    )
+                    if (
+                        self.config.extensions.background_subagents.enabled
+                        and background_subagents
+                    )
+                    else []
+                )
                 agent_kwargs: dict[str, Any] = {
                     "model": model,
-                    "tools": main_tools or None,
+                    "tools": [*main_tools, *background_tools] or None,
                     "system_prompt": compose_rag_system_prompt(
                         runtime_graph.compose_agent_system_prompt(
                             runtime_graph.system_prompt_for_agent_state(
@@ -1062,13 +1142,29 @@ class AgentRuntime:
         self, *, thread_id: str | None, mcp_session_id: str | None = None
     ) -> None:
         """Release conversation graphs and any stateful MCP transport resources."""
-        await self.close_mcp_session(mcp_session_id or thread_id)
+        close_task = asyncio.create_task(
+            self._close_conversation(
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+            ),
+            name=f"chainagents-close-conversation-{thread_id or mcp_session_id}",
+        )
+        await runtime_background_tasks.await_preserving_cancellation(close_task)
+
+    async def _close_conversation(
+        self, *, thread_id: str | None, mcp_session_id: str | None = None
+    ) -> None:
+        """Complete conversation teardown independently of its caller."""
         if thread_id:
-            async with self._agent_lock:
-                self._agents = {
-                    key: agent for key, agent in self._agents.items()
-                    if key.thread_id != thread_id or key.mcp_scope is not None
-                }
+            async with self.background_tasks.closing_session(thread_id):
+                await self.close_mcp_session(mcp_session_id or thread_id)
+                async with self._agent_lock:
+                    self._agents = {
+                        key: agent for key, agent in self._agents.items()
+                        if key.thread_id != thread_id
+                    }
+            return
+        await self.close_mcp_session(mcp_session_id)
 
     @staticmethod
     async def _close_mcp_owners(owners: list[_MCPSessionOwner]) -> None:
@@ -1095,11 +1191,14 @@ class AgentRuntime:
     async def close(self) -> None:
         """Close the agent runtime."""
         try:
-            await self._exit_stack.aclose()
+            await self.background_tasks.close()
         finally:
-            self._checkpointer = None
-            self._store = None
-            self._mcp_client = None
+            try:
+                await self._exit_stack.aclose()
+            finally:
+                self._checkpointer = None
+                self._store = None
+                self._mcp_client = None
 
     def _build_backend(self, runtime):
         """Build the Deep Agent backend for the current runtime settings.

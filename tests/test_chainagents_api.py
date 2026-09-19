@@ -17,6 +17,7 @@ import pytest
 import chainagents_api
 from chainagents.runtime import core
 from chainagents.runtime.reflection import ReflectionConfig
+from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
 from rag_runtime import RagUploadResult
 
 
@@ -201,6 +202,76 @@ def test_health_reports_ok() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_background_task_routes_are_conversation_scoped() -> None:
+    """API clients can poll, cancel, and close one logical task session."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    snapshot = BackgroundTaskSnapshot(
+        task_id="bg-123",
+        session_id="thread-1",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        parent_task_id=None,
+        status="success",
+        result="finished",
+        error=None,
+        created_at=1.0,
+        completed_at=2.0,
+    )
+    calls: list[tuple[Any, ...]] = []
+
+    class BackgroundTasks:
+        async def list(self, session_id):
+            calls.append(("list", session_id))
+            return [snapshot]
+
+        async def get(self, session_id, task_id, *, wait_seconds=0):
+            calls.append(("get", session_id, task_id, wait_seconds))
+            return snapshot
+
+        async def cancel(self, session_id, task_id):
+            calls.append(("cancel", session_id, task_id))
+            return snapshot
+
+    runtime.background_tasks = BackgroundTasks()
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        calls.append(("close", thread_id, mcp_session_id))
+
+    runtime.close_conversation = close_conversation
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+        base_url="http://127.0.0.1",
+    ) as client:
+        listed = client.get("/api/background-tasks", params={"thread_id": "thread-1"})
+        fetched = client.get(
+            "/api/background-tasks/bg-123",
+            params={"thread_id": "thread-1", "wait_seconds": 4},
+        )
+        cancelled = client.delete(
+            "/api/background-tasks/bg-123",
+            params={"thread_id": "thread-1"},
+        )
+        closed = client.delete(
+            "/api/background-tasks",
+            params={"thread_id": "thread-1"},
+        )
+
+    assert listed.json() == [snapshot.to_payload()]
+    assert fetched.json() == snapshot.to_payload()
+    assert cancelled.json() == snapshot.to_payload()
+    assert closed.json() == {"closed": True, "thread_id": "thread-1"}
+    assert calls == [
+        ("list", "thread-1"),
+        ("get", "thread-1", "bg-123", 4.0),
+        ("cancel", "thread-1", "bg-123"),
+        ("close", "thread-1", "thread-1"),
+    ]
 
 
 def test_status_reports_runtime_configuration() -> None:

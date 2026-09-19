@@ -34,6 +34,18 @@ logger = logging.getLogger("chainagents.runtime.core")
 _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
 
 
+class DisableSubagentDelegationMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Replace DeepAgents' implicit subagent middleware with an empty slot.
+
+    DeepAgents adds a general-purpose delegate when a compiled agent has no
+    configured synchronous children. Its supported middleware merge replaces
+    entries by name, so this no-op slot preserves a true leaf agent without
+    changing harness profiles shared by parent agents using the same model.
+    """
+
+    name = "SubAgentMiddleware"
+
+
 def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
     """Summarize tool exception.
 

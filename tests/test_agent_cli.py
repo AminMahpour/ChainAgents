@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import json
+import os
+import pty
 import re
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +23,17 @@ import pytest
 
 import chainagents_cli
 from deepagent_runtime import RuntimeConfig
+from chainagents.runtime.background_tasks import (
+    BackgroundTaskManager,
+    BackgroundTaskSnapshot,
+)
+from chainagents.runtime.types import BackgroundSubagentConfig
 from rag_runtime import RagStatus, RagUploadResult
+
+
+CLI_STARTUP_TIMEOUT_SECONDS = float(
+    os.environ.get("CHAINAGENTS_TEST_CLI_STARTUP_TIMEOUT", "20")
+)
 
 
 def test_cli_parses_prompt_and_runtime_flags() -> None:
@@ -1173,6 +1192,190 @@ class _FakePromptRuntime:
             The fake prompt agent.
         """
         return self.agent
+
+
+@pytest.mark.anyio
+async def test_one_shot_json_waits_for_background_tasks(monkeypatch) -> None:
+    """One-shot JSON must contain terminal local background task results."""
+    args = chainagents_cli.parse_args(
+        ["--prompt", "hello", "--json", "--thread-id", "thread-1"]
+    )
+    snapshot = BackgroundTaskSnapshot(
+        task_id="bg-123",
+        session_id="thread-1",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        parent_task_id=None,
+        status="success",
+        result="done",
+        error=None,
+        created_at=1.0,
+        completed_at=2.0,
+    )
+
+    class Tasks:
+        async def wait_session(self, session_id):
+            assert session_id == "thread-1"
+            return [snapshot]
+
+    runtime = SimpleNamespace(background_tasks=Tasks())
+
+    async def run_agent_prompt(*args, **kwargs):
+        return {
+            "prompt": {
+                "response": "main response",
+                "thread_id": "thread-1",
+                "model": "fake-model",
+                "reasoning": "medium",
+            }
+        }
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", run_agent_prompt)
+    stdout = io.StringIO()
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=runtime,
+        stdout=stdout,
+        stderr=io.StringIO(),
+        stdin=io.StringIO(""),
+    )
+
+    assert code == 0
+    assert json.loads(stdout.getvalue())["background_tasks"] == [snapshot.to_payload()]
+
+
+@pytest.mark.anyio
+async def test_interactive_cli_keeps_loop_live_and_prints_task_completion() -> None:
+    """Blocking terminal input must not starve local task completion notices."""
+    manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
+    runtime = SimpleNamespace(
+        background_tasks=manager,
+        config=SimpleNamespace(
+            extensions=SimpleNamespace(background_subagents=manager.config)
+        ),
+    )
+    args = chainagents_cli.parse_args(["--thread-id", "thread-1"])
+    read_fd, write_fd = os.pipe()
+    stdin = os.fdopen(read_fd)
+    stderr = io.StringIO()
+    repl = asyncio.create_task(
+        chainagents_cli.interactive_repl(
+            runtime,
+            args,
+            stdout=io.StringIO(),
+            stderr=stderr,
+            stdin=stdin,
+        )
+    )
+    await asyncio.sleep(0)
+
+    async def runner(task_id):
+        return "background result"
+
+    spawned = await manager.spawn(
+        session_id="thread-1",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        runner=runner,
+    )
+    await manager.get("thread-1", spawned.task_id, wait_seconds=1)
+    for _ in range(10):
+        if "background result" in stderr.getvalue():
+            break
+        await asyncio.sleep(0)
+    os.close(write_fd)
+
+    assert await repl == 0
+    assert f"Task ID: {spawned.task_id}" in stderr.getvalue()
+    assert "background result" in stderr.getvalue()
+    stdin.close()
+    await manager.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file descriptor readers require POSIX")
+@pytest.mark.anyio
+async def test_terminal_line_partial_pipe_input_does_not_block_event_loop() -> None:
+    """Partial pipe input must not run blocking readline on the event loop."""
+    read_fd, write_fd = os.pipe()
+    stdin = os.fdopen(read_fd)
+
+    def write_line_slowly() -> None:
+        os.write(write_fd, b"partial")
+        time.sleep(0.2)
+        os.write(write_fd, b" line\n")
+        os.close(write_fd)
+
+    writer = threading.Thread(target=write_line_slowly)
+    writer.start()
+    started_at = time.monotonic()
+    line_task = asyncio.create_task(
+        chainagents_cli._read_terminal_line(
+            stdin=stdin,
+            stdout=io.StringIO(),
+            prompt="chainagents> ",
+        )
+    )
+    await asyncio.sleep(0.02)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.1
+    assert await line_task == "partial line"
+    writer.join(timeout=1)
+    stdin.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY signals require POSIX")
+def test_interactive_cli_sigint_exits_promptly(tmp_path: Path) -> None:
+    """Idle asynchronous input must not strand a blocking executor thread."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+name = "fake-model"
+
+[agent]
+state = "stateless"
+""".strip(),
+        encoding="utf-8",
+    )
+    master_fd, slave_fd = pty.openpty()
+    environment = os.environ.copy()
+    environment["DEEPAGENT_CONFIG"] = str(config_path)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "chainagents.interfaces.cli.app"],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = bytearray()
+    try:
+        deadline = time.monotonic() + CLI_STARTUP_TIMEOUT_SECONDS
+        while b"chainagents> " not in output and time.monotonic() < deadline:
+            readable, _, _ = select.select([master_fd], [], [], 0.1)
+            if readable:
+                output.extend(os.read(master_fd, 4096))
+        assert b"chainagents> " in output
+
+        process.send_signal(signal.SIGINT)
+        try:
+            return_code = process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+            pytest.fail("interactive CLI did not exit within three seconds of SIGINT")
+        assert return_code == 130
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+        os.close(master_fd)
 
 
 @pytest.mark.anyio

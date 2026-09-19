@@ -732,6 +732,7 @@ Supported subagent fields:
 - `skills`: optional list of skill source paths for that subagent
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional profile name or raw model name. Profile names can switch provider settings and tool-schema handling for that sync subagent. Raw model names inherit the parent/default provider settings.
+- `background`: optional boolean, defaulting to `false`. When global local background execution is enabled, `true` allows the subagent's direct parent to launch it with `spawn_background_task`. Foreground `task` delegation is unaffected.
 - `nested_subagents`: optional list of top-level sync subagent names exposed as children of this subagent
 - `[[subagents.subagents]]`: optional inline private sync child subagents under a parent subagent
 
@@ -807,7 +808,7 @@ parents. A parent can expose several shared children, for example
 
 Inline children accept the same fields as other synchronous subagents:
 `name`, `description`, `system_prompt` or `system_prompt_file`, `skills`,
-`mcp_servers`, `model`, and their own nested children. A referenced child uses
+`mcp_servers`, `model`, `background`, and their own nested children. A referenced child uses
 the configuration from its top-level `[[subagents]]` entry wherever it is
 reused. When `model` is omitted, the child continues with its parent/default
 model configuration.
@@ -839,6 +840,7 @@ Main `[agent]` additions:
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
+- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
@@ -849,6 +851,89 @@ Main `[agent]` additions:
 - `summarization_trigger_tokens`: optional positive integer token threshold for DeepAgents' built-in summarization middleware.
 - `summarization_keep_tokens`: optional positive integer token budget to keep after DeepAgents summarizes conversation history.
 - Legacy `summarization_middleware_enabled` entries are still parsed for compatibility, but ChainAgents no longer injects a second summarization middleware.
+
+### Local Background Subagents
+
+Local background execution lets the main agent or a nested synchronous agent
+start one of its configured children and continue immediately. Enable it with:
+
+```toml
+[agent.background_subagents]
+enabled = true
+max_running_per_session = 4
+max_running_total = 16
+max_tasks_per_session = 100
+```
+
+Then opt in each synchronous subagent that its direct parent may launch in the
+background:
+
+```toml
+[[subagents]]
+name = "research-manager"
+description = "Coordinates repository research and planning."
+system_prompt = "Delegate focused work and synthesize the results."
+background = true
+
+[[subagents.subagents]]
+name = "repo-planner"
+description = "Turns repository findings into an implementation plan."
+system_prompt = "Produce a concise, actionable implementation plan."
+background = true
+```
+
+An unmarked subagent remains available through the blocking `task` tool but is
+rejected by `spawn_background_task`. Marking a parent does not implicitly mark
+its children; each background launch target opts in independently.
+
+The agent receives four tools:
+
+- `spawn_background_task(description, subagent_type)` starts an allowed direct
+  child and returns a task ID immediately
+- `list_background_tasks()` lists tasks visible to the calling agent
+- `get_background_task(task_id, wait_seconds=0)` returns current state or waits
+  up to 60 seconds
+- `cancel_background_task(task_id)` cancels the task and all descendants
+
+For example, with the `research-manager` and private `repo-planner` nesting
+shown above, the main agent can call:
+
+```text
+spawn_background_task("Investigate the failing API tests", "research-manager")
+```
+
+The running `research-manager` can independently launch its private child with
+`spawn_background_task("Identify the smallest fix", "repo-planner")`. Either
+agent can continue its current response, call `list_background_tasks()` later,
+retrieve a terminal result with `get_background_task("bg-...")`, or stop its
+visible subtree with `cancel_background_task("bg-...")`.
+
+The main agent can inspect the whole conversation task tree. Nested agents can
+inspect only their own task subtree and can spawn only their configured direct
+children. Background runs receive an isolated user message and checkpoint
+thread while retaining their configured model, skills, MCP tools, workspace,
+and shared memory access. Their state and streamed tokens are not merged into
+the parent response.
+
+Chainlit and the interactive CLI/TUI post one notice when a task finishes. A
+one-shot CLI invocation prints the main response first, then waits for its
+remaining background work; JSON output includes a `background_tasks` array.
+The HTTP API exposes conversation-scoped list, get, cancel, and close operations
+under `/api/background-tasks`.
+
+```bash
+curl "http://127.0.0.1:8000/api/background-tasks?thread_id=$THREAD_ID"
+curl "http://127.0.0.1:8000/api/background-tasks/bg-123?thread_id=$THREAD_ID&wait_seconds=10"
+curl -X DELETE "http://127.0.0.1:8000/api/background-tasks/bg-123?thread_id=$THREAD_ID"
+curl -X DELETE "http://127.0.0.1:8000/api/background-tasks?thread_id=$THREAD_ID"
+```
+
+Tasks are retained until the conversation closes and are cancelled before its
+MCP resources are released. They are stored only in the current process and do
+not survive restarts. Agent Server deployments therefore require session
+affinity when multiple workers are used. The custom Agent Server app exposes
+`DELETE /background-tasks/sessions/{thread_id}` for explicit cleanup and closes
+all remaining managers during server shutdown.
 
 ## Chainlit Native Commands
 
