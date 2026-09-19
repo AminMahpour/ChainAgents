@@ -672,6 +672,127 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
     asyncio.run(exercise())
 
 
+def test_nested_background_tool_uses_the_original_conversation_session() -> None:
+    class LeafRunnable:
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            return {"messages": [AIMessage(content="nested result")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        nested_tools = create_background_task_tools(
+            manager=manager,
+            subagents={"worker": LeafRunnable()},
+            agent_path=("manager",),
+            recursion_limit=20,
+        )
+        nested_spawn = next(
+            tool for tool in nested_tools if tool.name == "spawn_background_task"
+        )
+
+        class ParentRunnable:
+            async def ainvoke(
+                self,
+                state: dict[str, object],
+                config: dict[str, object],
+            ) -> dict[str, object]:
+                runtime = ToolRuntime(
+                    state=state,
+                    context=None,
+                    config=config,
+                    stream_writer=lambda _: None,
+                    tool_call_id="nested-call",
+                    store=None,
+                )
+                spawned = await nested_spawn.coroutine(
+                    "nested work",
+                    "worker",
+                    runtime,
+                )
+                return {
+                    "messages": [
+                        AIMessage(content=f"parent spawned {spawned['task_id']}")
+                    ]
+                }
+
+        main_tools = create_background_task_tools(
+            manager=manager,
+            subagents={"manager": ParentRunnable()},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        main_spawn = next(
+            tool for tool in main_tools if tool.name == "spawn_background_task"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="main-call",
+            store=None,
+        )
+
+        parent = await main_spawn.coroutine("parent work", "manager", runtime)
+        completed = await manager.wait_session("session-a")
+
+        assert len(completed) == 2
+        parent_snapshot = next(task for task in completed if task.task_id == parent["task_id"])
+        child_snapshot = next(task for task in completed if task.parent_task_id == parent["task_id"])
+        assert parent_snapshot.status == "success"
+        assert child_snapshot.status == "success"
+        assert child_snapshot.session_id == "session-a"
+        assert child_snapshot.agent_path == ("manager", "worker")
+        assert child_snapshot.result == "nested result"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_top_level_config_cannot_override_the_conversation_session() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        await manager.spawn(
+            session_id="session-b",
+            agent_name="worker",
+            description="private work",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        list_tool = next(tool for tool in tools if tool.name == "list_background_tasks")
+        injected_runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={
+                "configurable": {
+                    "thread_id": "session-a",
+                    "__chainagents_background_session_id": "session-b",
+                }
+            },
+            stream_writer=lambda _: None,
+            tool_call_id="injected-call",
+            store=None,
+        )
+
+        assert await list_tool.coroutine(injected_runtime) == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_real_graph_parent_continues_while_background_child_runs() -> None:
     """Exercise the real DeepAgents graph without streaming child messages."""
 

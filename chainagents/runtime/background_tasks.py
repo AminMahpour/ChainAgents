@@ -34,6 +34,12 @@ _CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = contextvars.Co
     "chainagents_background_task_id",
     default=None,
 )
+_CURRENT_BACKGROUND_SESSION_ID: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar(
+        "chainagents_background_session_id",
+        default=None,
+    )
+)
 
 
 def current_background_task_id() -> str | None:
@@ -114,7 +120,11 @@ BackgroundCleanup = Callable[[str], Awaitable[None]]
 
 def _session_id_from_runtime(runtime: ToolRuntime) -> str:
     configurable = runtime.config.get("configurable", {})
-    session_id = str(configurable.get("thread_id") or "").strip()
+    session_id = str(
+        _CURRENT_BACKGROUND_SESSION_ID.get()
+        or configurable.get("thread_id")
+        or ""
+    ).strip()
     if not session_id:
         raise ValueError(
             "Local background tasks require an explicit conversation identity."
@@ -355,7 +365,8 @@ class BackgroundTaskManager:
         record: _BackgroundTaskRecord,
         runner: BackgroundRunner,
     ) -> None:
-        token = _CURRENT_BACKGROUND_TASK_ID.set(record.task_id)
+        task_token = _CURRENT_BACKGROUND_TASK_ID.set(record.task_id)
+        session_token = _CURRENT_BACKGROUND_SESSION_ID.set(record.session_id)
         try:
             async with self._lock:
                 if record.status == "pending":
@@ -384,7 +395,8 @@ class BackgroundTaskManager:
             else:
                 await self._finish(record, status="success", result=str(result))
         finally:
-            _CURRENT_BACKGROUND_TASK_ID.reset(token)
+            _CURRENT_BACKGROUND_SESSION_ID.reset(session_token)
+            _CURRENT_BACKGROUND_TASK_ID.reset(task_token)
 
     async def _cleanup_record(self, record: _BackgroundTaskRecord) -> str | None:
         async with self._lock:
