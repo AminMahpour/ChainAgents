@@ -89,6 +89,7 @@ class _BackgroundTaskRecord:
     completed_at: float | None = None
     execution: asyncio.Task[None] | None = None
     completion: asyncio.Event | None = None
+    cleanup: BackgroundCleanup | None = None
 
     def snapshot(self) -> BackgroundTaskSnapshot:
         return BackgroundTaskSnapshot(
@@ -107,6 +108,7 @@ class _BackgroundTaskRecord:
 
 
 BackgroundRunner = Callable[[str], Awaitable[str]]
+BackgroundCleanup = Callable[[str], Awaitable[None]]
 
 
 def _session_id_from_runtime(runtime: ToolRuntime) -> str:
@@ -167,11 +169,17 @@ def create_background_task_tools(
         parent_configurable = runtime.config.get("configurable", {})
         shared_checkpointer = parent_configurable.get(_LANGGRAPH_CHECKPOINTER_KEY)
         shared_store = runtime.store
+        delete_checkpoint_thread = getattr(
+            shared_checkpointer,
+            "adelete_thread",
+            None,
+        )
 
         async def run_child(task_id: str) -> str:
             state = {"messages": [HumanMessage(content=description)]}
             configurable: dict[str, object] = {
                 "thread_id": f"{session_id}:background:{task_id}",
+                "checkpoint_ns": "",
                 "ls_agent_type": "background_subagent",
             }
             if shared_checkpointer is not None:
@@ -185,6 +193,11 @@ def create_background_task_tools(
             result = await child.ainvoke(state, config)  # type: ignore[attr-defined]
             return _result_text(result)
 
+        async def cleanup_child(task_id: str) -> None:
+            await delete_checkpoint_thread(
+                f"{session_id}:background:{task_id}"
+            )
+
         snapshot = await manager.spawn(
             session_id=session_id,
             agent_name=subagent_type,
@@ -192,6 +205,7 @@ def create_background_task_tools(
             agent_path=(*agent_path, subagent_type),
             parent_task_id=current_background_task_id(),
             runner=run_child,
+            cleanup=cleanup_child if callable(delete_checkpoint_thread) else None,
         )
         return snapshot.to_payload()
 
@@ -269,6 +283,7 @@ class BackgroundTaskManager:
         agent_path: tuple[str, ...],
         runner: BackgroundRunner,
         parent_task_id: str | None = None,
+        cleanup: BackgroundCleanup | None = None,
     ) -> BackgroundTaskSnapshot:
         """Start a job immediately and return before the runner finishes."""
         normalized_session = session_id.strip()
@@ -322,6 +337,7 @@ class BackgroundTaskManager:
                 status="pending",
                 created_at=time.time(),
                 completion=asyncio.Event(),
+                cleanup=cleanup,
             )
             self._records[task_id] = record
             session_ids.append(task_id)
@@ -347,18 +363,46 @@ class BackgroundTaskManager:
                     return
             result = await runner(record.task_id)
         except asyncio.CancelledError:
-            await self._finish(record, status="cancelled")
+            cleanup_error = await self._cleanup_record(record)
             await self._cancel_descendants(record.session_id, record.task_id)
+            await self._finish(record, status="cancelled", error=cleanup_error)
             raise
         except Exception as exc:  # noqa: BLE001
             detail = " ".join(str(exc).split()).strip()
             error = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
-            await self._finish(record, status="error", error=error)
+            cleanup_error = await self._cleanup_record(record)
+            if cleanup_error:
+                error = f"{error}; {cleanup_error}"
             await self._cancel_descendants(record.session_id, record.task_id)
+            await self._finish(record, status="error", error=error)
         else:
-            await self._finish(record, status="success", result=str(result))
+            cleanup_error = await self._cleanup_record(record)
+            if cleanup_error:
+                await self._cancel_descendants(record.session_id, record.task_id)
+                await self._finish(record, status="error", error=cleanup_error)
+            else:
+                await self._finish(record, status="success", result=str(result))
         finally:
             _CURRENT_BACKGROUND_TASK_ID.reset(token)
+
+    async def _cleanup_record(self, record: _BackgroundTaskRecord) -> str | None:
+        async with self._lock:
+            cleanup = record.cleanup
+            record.cleanup = None
+        if cleanup is None:
+            return None
+        try:
+            await cleanup(record.task_id)
+        except Exception as exc:  # noqa: BLE001
+            async with self._lock:
+                if record.cleanup is None:
+                    record.cleanup = cleanup
+            detail = " ".join(str(exc).split()).strip()
+            summary = (
+                f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+            )
+            return f"Background checkpoint cleanup failed: {summary}"
+        return None
 
     async def _finish(
         self,
@@ -492,11 +536,13 @@ class BackgroundTaskManager:
             )
             execution = record.execution
         if execution is not None and not execution.done():
-            await self._finish(record, status="cancelled")
             execution.cancel()
         await self._cancel_descendants(session_id, task_id)
         if execution is not None:
             await asyncio.gather(execution, return_exceptions=True)
+        if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
+            cleanup_error = await self._cleanup_record(record)
+            await self._finish(record, status="cancelled", error=cleanup_error)
         return await self.get(
             session_id,
             task_id,
@@ -526,13 +572,13 @@ class BackgroundTaskManager:
                 if record.execution is not None and not record.execution.done()
             ]
         for execution in executions:
-            record = next(
-                item for item in descendants if item.execution is execution
-            )
-            await self._finish(record, status="cancelled")
             execution.cancel()
         if executions:
             await asyncio.gather(*executions, return_exceptions=True)
+        for record in descendants:
+            if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
+                cleanup_error = await self._cleanup_record(record)
+                await self._finish(record, status="cancelled", error=cleanup_error)
 
     async def wait_session(self, session_id: str) -> list[BackgroundTaskSnapshot]:
         """Wait until every task currently or subsequently running in a session ends."""
@@ -560,15 +606,16 @@ class BackgroundTaskManager:
                 and not self._records[task_id].execution.done()
             ]
         for execution in executions:
-            record = next(
-                self._records[task_id]
-                for task_id in task_ids
-                if self._records[task_id].execution is execution
-            )
-            await self._finish(record, status="cancelled")
             execution.cancel()
         if executions:
             await asyncio.gather(*executions, return_exceptions=True)
+        for task_id in task_ids:
+            record = self._records[task_id]
+            if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
+                cleanup_error = await self._cleanup_record(record)
+                await self._finish(record, status="cancelled", error=cleanup_error)
+            else:
+                await self._cleanup_record(record)
         async with self._lock:
             for task_id in task_ids:
                 self._records.pop(task_id, None)

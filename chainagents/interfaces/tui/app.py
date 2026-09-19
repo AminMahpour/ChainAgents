@@ -95,6 +95,14 @@ class PromptTextArea(TextArea):
         self.replace("\n", start, end, maintain_selection_offset=False)
 
 
+class BackgroundTaskCompleted(Message):
+    """Deliver a terminal background task through Textual's message queue."""
+
+    def __init__(self, snapshot: BackgroundTaskSnapshot) -> None:
+        super().__init__()
+        self.snapshot = snapshot
+
+
 class ChainAgentsTuiApp(App[int]):
     """Interactive Textual app for the configured ChainAgents runtime."""
 
@@ -237,7 +245,12 @@ class ChainAgentsTuiApp(App[int]):
             return
         while True:
             snapshot = await self.background_task_queue.get()
-            self._append_tool_entry(self._format_background_task(snapshot))
+            self.post_message(BackgroundTaskCompleted(snapshot))
+
+    @on(BackgroundTaskCompleted)
+    def show_background_task_completion(self, event: BackgroundTaskCompleted) -> None:
+        """Render one terminal task notice delivered by the application."""
+        self._append_tool_entry(self._format_background_task(event.snapshot))
 
     def on_unmount(self) -> None:
         """Stop local background notifications when the Textual app exits."""

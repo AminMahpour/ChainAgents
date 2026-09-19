@@ -261,6 +261,50 @@ def test_global_limit_wait_timeout_and_repeated_cancel_are_stable() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+def test_terminal_tasks_release_their_checkpoint_resource(outcome: str) -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        release = asyncio.Event()
+        cleaned: list[str] = []
+
+        async def runner(task_id: str) -> str:
+            if outcome == "error":
+                raise ValueError("failed")
+            if outcome == "cancel":
+                await release.wait()
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleaned.append(task_id)
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description=outcome,
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        if outcome == "cancel":
+            terminal = await manager.cancel("session-a", spawned.task_id)
+        else:
+            terminal = await manager.get(
+                "session-a", spawned.task_id, wait_seconds=1
+            )
+
+        expected_status = {
+            "success": "success",
+            "error": "error",
+            "cancel": "cancelled",
+        }[outcome]
+        assert terminal.status == expected_status
+        assert cleaned == [spawned.task_id]
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_spawn_racing_with_shutdown_never_leaves_live_work() -> None:
     async def exercise() -> None:
         manager = make_manager()
@@ -375,10 +419,14 @@ def test_close_session_cancels_tasks_and_publishes_one_terminal_event() -> None:
     async def exercise() -> None:
         manager = make_manager()
         queue = manager.subscribe("session-a")
+        cleaned: list[str] = []
 
         async def runner(task_id: str) -> str:
             await asyncio.Event().wait()
             return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleaned.append(task_id)
 
         spawned = await manager.spawn(
             session_id="session-a",
@@ -386,6 +434,7 @@ def test_close_session_cancels_tasks_and_publishes_one_terminal_event() -> None:
             description="long task",
             agent_path=("worker",),
             runner=runner,
+            cleanup=cleanup,
         )
         await manager.close_session("session-a")
 
@@ -393,6 +442,7 @@ def test_close_session_cancels_tasks_and_publishes_one_terminal_event() -> None:
         assert event.task_id == spawned.task_id
         assert event.status == "cancelled"
         assert queue.empty()
+        assert cleaned == [spawned.task_id]
         assert await manager.list("session-a") == []
         manager.unsubscribe("session-a", queue)
         await manager.close()
@@ -523,7 +573,7 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
         assert child_runtime.store is store
         assert child_runtime is not runtime
         assert "checkpoint_id" not in configurable
-        assert "checkpoint_ns" not in configurable
+        assert configurable["checkpoint_ns"] == ""
         assert "callbacks" not in child_config
         await manager.close()
 
@@ -535,6 +585,7 @@ def test_real_graph_parent_continues_while_background_child_runs() -> None:
 
     async def exercise() -> None:
         manager = make_manager()
+        checkpointer = MemorySaver()
         child_started = asyncio.Event()
         child_release = asyncio.Event()
 
@@ -563,6 +614,7 @@ def test_real_graph_parent_continues_while_background_child_runs() -> None:
                 ]
             ),
             tools=[wait_for_release],
+            checkpointer=True,
         )
         background_tools = create_background_task_tools(
             manager=manager,
@@ -591,6 +643,7 @@ def test_real_graph_parent_continues_while_background_child_runs() -> None:
                 ]
             ),
             tools=background_tools,
+            checkpointer=checkpointer,
         )
 
         result = await parent.ainvoke(
@@ -607,11 +660,22 @@ def test_real_graph_parent_continues_while_background_child_runs() -> None:
         tasks = await manager.list("session-a")
         assert len(tasks) == 1
         assert tasks[0].status == "running"
+        child_checkpoint_config = {
+            "configurable": {
+                "thread_id": f"session-a:background:{tasks[0].task_id}"
+            }
+        }
+        for _ in range(20):
+            if await checkpointer.aget_tuple(child_checkpoint_config) is not None:
+                break
+            await asyncio.sleep(0)
+        assert await checkpointer.aget_tuple(child_checkpoint_config) is not None
 
         child_release.set()
         completed = await manager.wait_session("session-a")
         assert completed[0].status == "success"
         assert completed[0].result == "private child result"
+        assert await checkpointer.aget_tuple(child_checkpoint_config) is None
         await manager.close()
 
     asyncio.run(exercise())

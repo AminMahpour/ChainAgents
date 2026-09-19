@@ -6,8 +6,14 @@ import base64
 import asyncio
 import io
 import json
+import os
+import pty
 import re
-import threading
+import select
+import signal
+import subprocess
+import sys
+import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -1234,9 +1240,7 @@ async def test_one_shot_json_waits_for_background_tasks(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
-async def test_interactive_cli_keeps_loop_live_and_prints_task_completion(
-    monkeypatch,
-) -> None:
+async def test_interactive_cli_keeps_loop_live_and_prints_task_completion() -> None:
     """Blocking terminal input must not starve local task completion notices."""
     manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
     runtime = SimpleNamespace(
@@ -1246,15 +1250,8 @@ async def test_interactive_cli_keeps_loop_live_and_prints_task_completion(
         ),
     )
     args = chainagents_cli.parse_args(["--thread-id", "thread-1"])
-    input_started = threading.Event()
-    release_input = threading.Event()
-
-    def blocking_input(prompt):
-        input_started.set()
-        release_input.wait(timeout=2)
-        raise EOFError
-
-    monkeypatch.setattr("builtins.input", blocking_input)
+    read_fd, write_fd = os.pipe()
+    stdin = os.fdopen(read_fd)
     stderr = io.StringIO()
     repl = asyncio.create_task(
         chainagents_cli.interactive_repl(
@@ -1262,9 +1259,10 @@ async def test_interactive_cli_keeps_loop_live_and_prints_task_completion(
             args,
             stdout=io.StringIO(),
             stderr=stderr,
+            stdin=stdin,
         )
     )
-    await asyncio.to_thread(input_started.wait, 1)
+    await asyncio.sleep(0)
 
     async def runner(task_id):
         return "background result"
@@ -1281,12 +1279,65 @@ async def test_interactive_cli_keeps_loop_live_and_prints_task_completion(
         if "background result" in stderr.getvalue():
             break
         await asyncio.sleep(0)
-    release_input.set()
+    os.close(write_fd)
 
     assert await repl == 0
     assert f"Task ID: {spawned.task_id}" in stderr.getvalue()
     assert "background result" in stderr.getvalue()
+    stdin.close()
     await manager.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY signals require POSIX")
+def test_interactive_cli_sigint_exits_promptly(tmp_path: Path) -> None:
+    """Idle asynchronous input must not strand a blocking executor thread."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "ollama"
+name = "fake-model"
+
+[agent]
+state = "stateless"
+""".strip(),
+        encoding="utf-8",
+    )
+    master_fd, slave_fd = pty.openpty()
+    environment = os.environ.copy()
+    environment["DEEPAGENT_CONFIG"] = str(config_path)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "chainagents.interfaces.cli.app"],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = bytearray()
+    try:
+        deadline = time.monotonic() + 5
+        while b"chainagents> " not in output and time.monotonic() < deadline:
+            readable, _, _ = select.select([master_fd], [], [], 0.1)
+            if readable:
+                output.extend(os.read(master_fd, 4096))
+        assert b"chainagents> " in output
+
+        process.send_signal(signal.SIGINT)
+        try:
+            return_code = process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+            pytest.fail("interactive CLI did not exit within three seconds of SIGINT")
+        assert return_code == 130
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+        os.close(master_fd)
 
 
 @pytest.mark.anyio

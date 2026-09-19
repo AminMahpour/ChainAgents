@@ -122,6 +122,7 @@ def test_runtime_close_cancels_background_tasks(tmp_path):
 
     async def exercise():
         queue = instance.background_tasks.subscribe("thread")
+        cleaned = []
 
         teardown_events = []
 
@@ -134,16 +135,21 @@ def test_runtime_close_cancels_background_tasks(tmp_path):
             await asyncio.Event().wait()
             return task_id
 
+        async def cleanup(task_id):
+            cleaned.append(task_id)
+
         await instance.background_tasks.spawn(
             session_id="thread",
             agent_name="worker",
             description="work",
             agent_path=("worker",),
             runner=runner,
+            cleanup=cleanup,
         )
         await instance.close()
 
         assert queue.get_nowait().status == "cancelled"
+        assert len(cleaned) == 1
         assert teardown_events == [("persistence", True)]
 
     asyncio.run(exercise())

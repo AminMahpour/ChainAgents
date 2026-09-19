@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import sys
+import threading
 import tomllib
 import traceback
 from contextlib import suppress
@@ -1945,12 +1946,76 @@ async def run_agent_prompt(
     return 0
 
 
+async def _read_terminal_line(
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+    prompt: str,
+) -> str:
+    """Read one line without blocking the event loop or its default executor."""
+    stdout.write(prompt)
+    stdout.flush()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    reader_fd: int | None = None
+
+    def deliver_result(line: str) -> None:
+        if not future.done():
+            future.set_result(line)
+
+    def deliver_error(exc: BaseException) -> None:
+        if not future.done():
+            future.set_exception(exc)
+
+    def read_ready() -> None:
+        try:
+            line = stdin.readline()
+        except BaseException as exc:  # pragma: no cover - device-specific failures
+            deliver_error(exc)
+        else:
+            if reader_fd is not None:
+                loop.remove_reader(reader_fd)
+            deliver_result(line)
+
+    try:
+        reader_fd = stdin.fileno()
+        loop.add_reader(reader_fd, read_ready)
+    except (AttributeError, NotImplementedError, OSError, ValueError):
+        reader_fd = None
+
+        def read_in_daemon_thread() -> None:
+            try:
+                line = stdin.readline()
+            except BaseException as exc:  # pragma: no cover - device-specific failures
+                try:
+                    loop.call_soon_threadsafe(deliver_error, exc)
+                except RuntimeError:
+                    return
+            else:
+                try:
+                    loop.call_soon_threadsafe(deliver_result, line)
+                except RuntimeError:
+                    return
+
+        threading.Thread(target=read_in_daemon_thread, daemon=True).start()
+
+    try:
+        line = await future
+    finally:
+        if reader_fd is not None:
+            loop.remove_reader(reader_fd)
+    if line == "":
+        raise EOFError
+    return line.rstrip("\r\n")
+
+
 async def interactive_repl(
     runtime: AgentRuntime,
     args: argparse.Namespace,
     *,
     stdout: TextIO,
     stderr: TextIO,
+    stdin: TextIO,
 ) -> int:
     """Run the interactive CLI prompt loop.
 
@@ -1959,6 +2024,7 @@ async def interactive_repl(
         args: Parsed command-line arguments.
         stdout: The stdout value.
         stderr: The stderr value.
+        stdin: The stdin value.
 
     Returns:
         The interactive REPL result.
@@ -1976,7 +2042,11 @@ async def interactive_repl(
     try:
         while True:
             try:
-                prompt = await asyncio.to_thread(input, "chainagents> ")
+                prompt = await _read_terminal_line(
+                    stdin=stdin,
+                    stdout=stdout,
+                    prompt="chainagents> ",
+                )
             except EOFError:
                 print("", file=stderr)
                 return 0
@@ -2166,6 +2236,7 @@ async def run_cli(
         args,
         stdout=stdout,
         stderr=stderr,
+        stdin=stdin,
     )
 
 
@@ -2215,7 +2286,10 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         The main result.
     """
-    return asyncio.run(async_main(argv))
+    try:
+        return asyncio.run(async_main(argv))
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":
