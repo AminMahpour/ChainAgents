@@ -321,6 +321,58 @@ def test_cancelled_task_cancel_finishes_finalization_before_returning() -> None:
     asyncio.run(exercise())
 
 
+def test_cancelling_parent_rejects_late_descendant_spawn() -> None:
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=3, max_running_total=3)
+        runner_started = asyncio.Event()
+        child_release = asyncio.Event()
+        spawn_error: BaseException | None = None
+
+        async def child_runner(task_id: str) -> str:
+            await child_release.wait()
+            return task_id
+
+        async def parent_runner(task_id: str) -> str:
+            nonlocal spawn_error
+            runner_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                try:
+                    await manager.spawn(
+                        session_id="session-a",
+                        agent_name="child",
+                        description="late child",
+                        agent_path=("parent", "child"),
+                        parent_task_id=task_id,
+                        runner=child_runner,
+                    )
+                except BaseException as exc:
+                    spawn_error = exc
+                return "cancel handled"
+
+        parent = await manager.spawn(
+            session_id="session-a",
+            agent_name="parent",
+            description="parent",
+            agent_path=("parent",),
+            runner=parent_runner,
+        )
+        await asyncio.wait_for(runner_started.wait(), timeout=1)
+
+        await manager.cancel("session-a", parent.task_id)
+
+        assert isinstance(spawn_error, RuntimeError)
+        assert "parent task is cancelling" in str(spawn_error)
+        assert [task.task_id for task in await manager.list("session-a")] == [
+            parent.task_id
+        ]
+        child_release.set()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
 def test_terminal_tasks_release_their_checkpoint_resource(outcome: str) -> None:
     async def exercise() -> None:
@@ -1355,6 +1407,64 @@ def test_chainlit_local_notifier_sends_one_terminal_result(monkeypatch) -> None:
                 f"`success`.\n\nTask ID: `{spawned.task_id}`\n\nfinished result",
             )
         ]
+        notifier.cancel()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_continues_after_send_failure(monkeypatch) -> None:
+    """One transport failure must not disable later completion notices."""
+    async def exercise() -> None:
+        manager = make_manager()
+        attempts = 0
+        delivered = asyncio.Event()
+
+        class Message:
+            def __init__(self, *, content: str, author: str) -> None:
+                self.content = content
+                self.author = author
+
+            async def send(self) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("temporary transport failure")
+                delivered.set()
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Message",
+            Message,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        first = await manager.spawn(
+            session_id="session-a",
+            agent_name="first",
+            description="first",
+            agent_path=("first",),
+            runner=runner,
+        )
+        await manager.get("session-a", first.task_id, wait_seconds=1)
+        second = await manager.spawn(
+            session_id="session-a",
+            agent_name="second",
+            description="second",
+            agent_path=("second",),
+            runner=runner,
+        )
+        await manager.get("session-a", second.task_id, wait_seconds=1)
+        await asyncio.wait_for(delivered.wait(), timeout=1)
+
+        assert attempts == 2
+        assert notifier.task is not None and not notifier.task.done()
         notifier.cancel()
         await manager.close()
 

@@ -13,6 +13,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -1291,6 +1292,38 @@ async def test_interactive_cli_keeps_loop_live_and_prints_task_completion() -> N
     assert "background result" in stderr.getvalue()
     stdin.close()
     await manager.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file descriptor readers require POSIX")
+@pytest.mark.anyio
+async def test_terminal_line_partial_pipe_input_does_not_block_event_loop() -> None:
+    """Partial pipe input must not run blocking readline on the event loop."""
+    read_fd, write_fd = os.pipe()
+    stdin = os.fdopen(read_fd)
+
+    def write_line_slowly() -> None:
+        os.write(write_fd, b"partial")
+        time.sleep(0.2)
+        os.write(write_fd, b" line\n")
+        os.close(write_fd)
+
+    writer = threading.Thread(target=write_line_slowly)
+    writer.start()
+    started_at = time.monotonic()
+    line_task = asyncio.create_task(
+        chainagents_cli._read_terminal_line(
+            stdin=stdin,
+            stdout=io.StringIO(),
+            prompt="chainagents> ",
+        )
+    )
+    await asyncio.sleep(0.02)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.1
+    assert await line_task == "partial line"
+    writer.join(timeout=1)
+    stdin.close()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY signals require POSIX")

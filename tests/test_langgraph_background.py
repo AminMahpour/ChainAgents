@@ -24,8 +24,20 @@ def test_langgraph_http_app_closes_sessions_and_managers() -> None:
         response = client.delete("/background-tasks/sessions/thread-1")
         assert response.status_code == 200
         assert response.json() == {"closed": True, "thread_id": "thread-1"}
+        nested_response = client.delete(
+            "/background-tasks/sessions/team/research"
+        )
+        assert nested_response.status_code == 200
+        assert nested_response.json() == {
+            "closed": True,
+            "thread_id": "team/research",
+        }
 
-    assert calls == [("session", "thread-1"), ("manager", None)]
+    assert calls == [
+        ("session", "thread-1"),
+        ("session", "team/research"),
+        ("manager", None),
+    ]
     assert runtime_graph.static_background_task_managers() == ()
 
 

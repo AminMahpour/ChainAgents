@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Any
 
@@ -19,6 +20,7 @@ from chainagents.runtime.background_tasks import (
 DEFAULT_POLL_SECONDS = 5.0
 DEFAULT_AGENT_PROTOCOL_URL = "http://127.0.0.1:2024"
 TERMINAL_STATUSES = {"success", "error", "cancelled", "interrupted", "timeout"}
+logger = logging.getLogger("chainagents.interfaces.chainlit.async_tasks")
 
 
 def format_local_task_result(snapshot: BackgroundTaskSnapshot) -> str:
@@ -55,10 +57,16 @@ class LocalBackgroundTaskNotifier:
             return
         while True:
             snapshot = await self.queue.get()
-            await cl.Message(
-                content=format_local_task_result(snapshot),
-                author="Background subagent",
-            ).send()
+            try:
+                await cl.Message(
+                    content=format_local_task_result(snapshot),
+                    author="Background subagent",
+                ).send()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to send local background task notice for %s.",
+                    snapshot.task_id,
+                )
 
     def cancel(self) -> None:
         """Stop notifications without changing the underlying jobs."""

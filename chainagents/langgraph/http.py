@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-@app.delete("/background-tasks/sessions/{thread_id}")
+@app.delete("/background-tasks/sessions/{thread_id:path}")
 async def close_background_session(thread_id: str) -> dict[str, object]:
     """Cancel and forget one session across exported graph managers."""
     session_id = thread_id.strip()

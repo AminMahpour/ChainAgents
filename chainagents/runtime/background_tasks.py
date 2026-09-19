@@ -181,6 +181,7 @@ class _BackgroundTaskRecord:
     cleanup: BackgroundCleanup | None = None
     cleanup_task: asyncio.Task[None] | None = None
     cancel_task: asyncio.Task[BackgroundTaskSnapshot] | None = None
+    cancelling: bool = False
 
     def snapshot(self) -> BackgroundTaskSnapshot:
         return BackgroundTaskSnapshot(
@@ -448,6 +449,8 @@ class BackgroundTaskManager:
                 parent = self._records.get(parent_task_id)
                 if parent is None or parent.session_id != normalized_session:
                     raise ValueError("Background parent task does not exist in this session.")
+                if parent.cancelling:
+                    raise RuntimeError("Background parent task is cancelling.")
 
             task_id = f"bg-{uuid.uuid4().hex[:12]}"
             record = _BackgroundTaskRecord(
@@ -699,6 +702,7 @@ class BackgroundTaskManager:
                 owner_path,
                 ancestor_task_id,
             )
+            record.cancelling = True
             if record.cancel_task is None:
                 record.cancel_task = asyncio.create_task(
                     self._cancel_record(record),
@@ -746,6 +750,8 @@ class BackgroundTaskManager:
                 for record in descendants
                 if record.execution is not None and not record.execution.done()
             ]
+            for record in descendants:
+                record.cancelling = True
         for execution in executions:
             execution.cancel()
         if executions:

@@ -1957,7 +1957,6 @@ async def _read_terminal_line(
     stdout.flush()
     loop = asyncio.get_running_loop()
     future: asyncio.Future[str] = loop.create_future()
-    reader_fd: int | None = None
 
     def deliver_result(line: str) -> None:
         if not future.done():
@@ -1967,43 +1966,23 @@ async def _read_terminal_line(
         if not future.done():
             future.set_exception(exc)
 
-    def read_ready() -> None:
+    def read_in_daemon_thread() -> None:
         try:
             line = stdin.readline()
         except BaseException as exc:  # pragma: no cover - device-specific failures
-            deliver_error(exc)
-        else:
-            if reader_fd is not None:
-                loop.remove_reader(reader_fd)
-            deliver_result(line)
-
-    try:
-        reader_fd = stdin.fileno()
-        loop.add_reader(reader_fd, read_ready)
-    except (AttributeError, NotImplementedError, OSError, ValueError):
-        reader_fd = None
-
-        def read_in_daemon_thread() -> None:
             try:
-                line = stdin.readline()
-            except BaseException as exc:  # pragma: no cover - device-specific failures
-                try:
-                    loop.call_soon_threadsafe(deliver_error, exc)
-                except RuntimeError:
-                    return
-            else:
-                try:
-                    loop.call_soon_threadsafe(deliver_result, line)
-                except RuntimeError:
-                    return
+                loop.call_soon_threadsafe(deliver_error, exc)
+            except RuntimeError:
+                return
+        else:
+            try:
+                loop.call_soon_threadsafe(deliver_result, line)
+            except RuntimeError:
+                return
 
-        threading.Thread(target=read_in_daemon_thread, daemon=True).start()
+    threading.Thread(target=read_in_daemon_thread, daemon=True).start()
 
-    try:
-        line = await future
-    finally:
-        if reader_fd is not None:
-            loop.remove_reader(reader_fd)
+    line = await future
     if line == "":
         raise EOFError
     return line.rstrip("\r\n")
