@@ -150,6 +150,68 @@ def test_conversation_close_rejects_spawns_until_resource_teardown_finishes(
     asyncio.run(exercise())
 
 
+def test_cancelled_conversation_close_finishes_resource_teardown(
+    runtime,
+    monkeypatch,
+):
+    """Caller cancellation must not reopen a partially closed conversation."""
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        mcp_close_started = asyncio.Event()
+        allow_mcp_close = asyncio.Event()
+
+        async def close_mcp_session(session_id):
+            assert session_id == "mcp"
+            mcp_close_started.set()
+            await allow_mcp_close.wait()
+
+        async def runner(task_id):
+            return task_id
+
+        monkeypatch.setattr(runtime, "close_mcp_session", close_mcp_session)
+        close_task = asyncio.create_task(
+            runtime.close_conversation(thread_id="thread", mcp_session_id="mcp")
+        )
+        await asyncio.wait_for(mcp_close_started.wait(), timeout=1)
+        close_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not close_task.done()
+        with pytest.raises(RuntimeError, match="session is closing"):
+            await runtime.background_tasks.spawn(
+                session_id="thread",
+                agent_name="worker",
+                description="late work",
+                agent_path=("worker",),
+                runner=runner,
+            )
+
+        allow_mcp_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=1)
+
+        reopened = await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="new work",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        assert (
+            await runtime.background_tasks.get(
+                "thread",
+                reopened.task_id,
+                wait_seconds=1,
+            )
+        ).status == "success"
+        await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
 def test_runtime_close_cancels_background_tasks(tmp_path):
     """Runtime shutdown must not leave local subagent asyncio tasks alive."""
     config = replace(

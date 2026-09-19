@@ -263,6 +263,64 @@ def test_global_limit_wait_timeout_and_repeated_cancel_are_stable() -> None:
     asyncio.run(exercise())
 
 
+def test_cancelled_task_cancel_finishes_finalization_before_returning() -> None:
+    async def exercise() -> None:
+        manager = make_manager(
+            max_running_per_session=1,
+            max_running_total=1,
+        )
+        runner_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        async def runner(task_id: str) -> str:
+            runner_started.set()
+            await asyncio.Event().wait()
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="running task",
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        await asyncio.wait_for(runner_started.wait(), timeout=1)
+
+        cancel_task = asyncio.create_task(
+            manager.cancel("session-a", spawned.task_id)
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        cancel_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not cancel_task.done()
+        allow_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(cancel_task, timeout=1)
+
+        terminal = await manager.get("session-a", spawned.task_id)
+        assert terminal.status == "cancelled"
+        replacement = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="replacement task",
+            agent_path=("worker",),
+            runner=lambda task_id: asyncio.sleep(0, result=task_id),
+        )
+        assert (
+            await manager.get("session-a", replacement.task_id, wait_seconds=1)
+        ).status == "success"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
 def test_terminal_tasks_release_their_checkpoint_resource(outcome: str) -> None:
     async def exercise() -> None:

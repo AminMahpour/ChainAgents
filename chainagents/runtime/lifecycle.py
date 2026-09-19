@@ -1105,6 +1105,19 @@ class AgentRuntime:
         self, *, thread_id: str | None, mcp_session_id: str | None = None
     ) -> None:
         """Release conversation graphs and any stateful MCP transport resources."""
+        close_task = asyncio.create_task(
+            self._close_conversation(
+                thread_id=thread_id,
+                mcp_session_id=mcp_session_id,
+            ),
+            name=f"chainagents-close-conversation-{thread_id or mcp_session_id}",
+        )
+        await runtime_background_tasks.await_preserving_cancellation(close_task)
+
+    async def _close_conversation(
+        self, *, thread_id: str | None, mcp_session_id: str | None = None
+    ) -> None:
+        """Complete conversation teardown independently of its caller."""
         if thread_id:
             async with self.background_tasks.closing_session(thread_id):
                 await self.close_mcp_session(mcp_session_id or thread_id)

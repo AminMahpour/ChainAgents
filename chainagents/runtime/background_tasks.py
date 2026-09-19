@@ -11,7 +11,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
@@ -39,6 +39,7 @@ BACKGROUND_TASK_TOOL_NAMES = frozenset(
 )
 _LANGGRAPH_CHECKPOINTER_KEY = "__pregel_checkpointer"
 _LANGGRAPH_RUNTIME_KEY = "__pregel_runtime"
+_T = TypeVar("_T")
 
 _CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "chainagents_background_task_id",
@@ -66,6 +67,22 @@ def current_background_task_id() -> str | None:
 def current_background_invocation_path() -> tuple[str, ...]:
     """Return the ownership path of the current configured-agent invocation."""
     return _CURRENT_BACKGROUND_INVOCATION_PATH.get()
+
+
+async def await_preserving_cancellation(task: asyncio.Task[_T]) -> _T:
+    """Delay caller cancellation until a lifecycle task has finished."""
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            cancellation = exc
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 class _BackgroundInvocationScopedRunnable(Runnable[Any, Any]):
@@ -163,6 +180,7 @@ class _BackgroundTaskRecord:
     completion: asyncio.Event | None = None
     cleanup: BackgroundCleanup | None = None
     cleanup_task: asyncio.Task[None] | None = None
+    cancel_task: asyncio.Task[BackgroundTaskSnapshot] | None = None
 
     def snapshot(self) -> BackgroundTaskSnapshot:
         return BackgroundTaskSnapshot(
@@ -681,10 +699,24 @@ class BackgroundTaskManager:
                 owner_path,
                 ancestor_task_id,
             )
+            if record.cancel_task is None:
+                record.cancel_task = asyncio.create_task(
+                    self._cancel_record(record),
+                    name=f"chainagents-cancel-{record.task_id}",
+                )
+            cancel_task = record.cancel_task
+        return await await_preserving_cancellation(cancel_task)
+
+    async def _cancel_record(
+        self,
+        record: _BackgroundTaskRecord,
+    ) -> BackgroundTaskSnapshot:
+        """Cancel and finalize a record independently of its caller."""
+        async with self._lock:
             execution = record.execution
         if execution is not None and not execution.done():
             execution.cancel()
-        await self._cancel_descendants(session_id, task_id)
+        await self._cancel_descendants(record.session_id, record.task_id)
         if execution is not None:
             await asyncio.gather(execution, return_exceptions=True)
         if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
@@ -800,29 +832,12 @@ class BackgroundTaskManager:
             self._close_session(session_id),
             name=f"chainagents-close-background-session-{session_id}",
         )
-        await self._await_preserving_cancellation(close_task)
+        await await_preserving_cancellation(close_task)
 
     async def _close_session(self, session_id: str) -> None:
         """Run a complete session close in its own cancellation scope."""
         async with self.closing_session(session_id):
             pass
-
-    async def _await_preserving_cancellation(
-        self,
-        task: asyncio.Task[None],
-    ) -> None:
-        """Delay caller cancellation until a lifecycle task has finished."""
-        cancellation: asyncio.CancelledError | None = None
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                if task.cancelled():
-                    raise
-                cancellation = exc
-        task.result()
-        if cancellation is not None:
-            raise cancellation
 
     def subscribe(self, session_id: str) -> asyncio.Queue[BackgroundTaskSnapshot]:
         """Subscribe to terminal task snapshots for one conversation."""
@@ -854,7 +869,7 @@ class BackgroundTaskManager:
                     name="chainagents-close-background-tasks",
                 )
             close_task = self._close_task
-        await self._await_preserving_cancellation(close_task)
+        await await_preserving_cancellation(close_task)
 
     async def _close_all_sessions(self, session_ids: list[str]) -> None:
         """Close the manager's sessions and release completion subscribers."""
