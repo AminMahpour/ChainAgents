@@ -670,6 +670,13 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
             ),
         ),
     )
+    lifecycle_events: list[str] = []
+
+    class _BackgroundTasks:
+        async def close_session(self, session_id: str) -> None:
+            lifecycle_events.append(f"close:{session_id}")
+
+    runtime.background_tasks = _BackgroundTasks()
     notifier = main.LocalBackgroundTaskNotifier(
         manager=SimpleNamespace(),
         session_id="thread-old",
@@ -682,8 +689,6 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
         get=session_data.get,
         set=session_data.__setitem__,
     )
-    restarted: list[str] = []
-
     async def get_runtime():
         return runtime
 
@@ -697,12 +702,14 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
     monkeypatch.setattr(
         main,
         "start_local_background_notifier",
-        lambda *, runtime, session_id: restarted.append(session_id),
+        lambda *, runtime, session_id: lifecycle_events.append(
+            f"start:{session_id}"
+        ),
     )
 
     await main.on_settings_update({"thread_id": "thread-new"})
 
-    assert restarted == ["thread-new"]
+    assert lifecycle_events == ["close:thread-old", "start:thread-new"]
     assert session_data[main.SESSION_SETTINGS_KEY]["thread_id"] == "thread-new"
 
 

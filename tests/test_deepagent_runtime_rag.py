@@ -4013,8 +4013,8 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
 
     assert len(created_graphs) == 3
     reviewer_graph, manager_graph, main_graph = created_graphs
-    assert main_graph.kwargs["subagents"][0]["runnable"] is manager_graph
-    assert manager_graph.kwargs["subagents"][0]["runnable"] is reviewer_graph
+    assert main_graph.kwargs["subagents"][0]["runnable"].runnable is manager_graph
+    assert manager_graph.kwargs["subagents"][0]["runnable"].runnable is reviewer_graph
     assert all(graph.kwargs["store"] is runtime.store for graph in created_graphs)
     assert all(
         graph.kwargs["checkpointer"] is runtime.checkpointer
@@ -4116,7 +4116,7 @@ def test_create_configured_graph_builds_local_background_subagents(
     assert graph is created_graphs[-1]
     assert len(created_graphs) == 2
     child_graph, main_graph = created_graphs
-    assert main_graph.kwargs["subagents"][0]["runnable"] is child_graph
+    assert main_graph.kwargs["subagents"][0]["runnable"].runnable is child_graph
     assert child_graph.kwargs["subagents"] == []
     assert any(
         isinstance(

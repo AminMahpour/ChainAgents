@@ -1462,8 +1462,13 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         ),
         show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
     )
-    store_settings(settings)
     local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+    if (
+        isinstance(local_notifier, LocalBackgroundTaskNotifier)
+        and local_notifier.session_id != settings.thread_id
+    ):
+        await runtime.background_tasks.close_session(local_notifier.session_id)
+    store_settings(settings)
     if (
         not isinstance(local_notifier, LocalBackgroundTaskNotifier)
         or local_notifier.session_id != settings.thread_id

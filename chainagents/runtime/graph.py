@@ -416,7 +416,11 @@ def build_static_sync_subagent_spec(
     return {
         "name": subagent.name,
         "description": subagent.description,
-        "runnable": runnable,
+        "runnable": (
+            runtime_background_tasks.scope_background_task_invocation(runnable)
+            if background_manager is not None
+            else runnable
+        ),
     }
 
 

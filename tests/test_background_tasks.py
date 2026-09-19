@@ -17,6 +17,7 @@ from langgraph.store.memory import InMemoryStore
 from chainagents.runtime.background_tasks import (
     BackgroundTaskManager,
     create_background_task_tools,
+    scope_background_task_invocation,
 )
 from chainagents.runtime.types import BackgroundSubagentConfig
 from chainagents.interfaces.chainlit.async_tasks import LocalBackgroundTaskNotifier
@@ -587,6 +588,114 @@ def test_concurrent_close_session_calls_are_idempotent() -> None:
     asyncio.run(exercise())
 
 
+def test_cancelled_close_session_finishes_cleanup_before_reopening() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        runner_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        async def runner(task_id: str) -> str:
+            runner_started.set()
+            await asyncio.Event().wait()
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="running task",
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        await asyncio.wait_for(runner_started.wait(), timeout=1)
+
+        close_task = asyncio.create_task(manager.close_session("session-a"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        close_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not close_task.done()
+        with pytest.raises(RuntimeError, match="session is closing"):
+            await manager.spawn(
+                session_id="session-a",
+                agent_name="worker",
+                description="late task",
+                agent_path=("worker",),
+                runner=runner,
+            )
+
+        allow_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=1)
+
+        assert await manager.list("session-a") == []
+        reopened = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="new task",
+            agent_path=("worker",),
+            runner=lambda task_id: asyncio.sleep(0, result=task_id),
+        )
+        assert (await manager.get("session-a", reopened.task_id, wait_seconds=1)).status == "success"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_manager_close_finishes_session_cleanup() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        runner_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        async def runner(task_id: str) -> str:
+            runner_started.set()
+            await asyncio.Event().wait()
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="running task",
+            agent_path=("worker",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        await asyncio.wait_for(runner_started.wait(), timeout=1)
+
+        close_task = asyncio.create_task(manager.close())
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        close_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not close_task.done()
+        allow_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=1)
+
+        assert await manager.list("session-a") == []
+        with pytest.raises(RuntimeError, match="manager is closed"):
+            await manager.spawn(
+                session_id="session-a",
+                agent_name="worker",
+                description="late task",
+                agent_path=("worker",),
+                runner=runner,
+            )
+
+    asyncio.run(exercise())
+
+
 def test_cancel_cascades_through_prestart_descendant_tree() -> None:
     """Cancelling before child coroutines start must still reach grandchildren."""
     async def exercise() -> None:
@@ -808,6 +917,97 @@ def test_nested_background_tool_uses_the_original_conversation_session() -> None
         assert child_snapshot.session_id == "session-a"
         assert child_snapshot.agent_path == ("manager", "worker")
         assert child_snapshot.result == "nested result"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_parallel_foreground_subagent_invocations_have_isolated_task_scopes() -> None:
+    class LeafRunnable:
+        def __init__(self, release: asyncio.Event) -> None:
+            self.release = release
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            await self.release.wait()
+            return {"messages": [AIMessage(content="done")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        release = asyncio.Event()
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"worker": LeafRunnable(release)},
+            agent_path=("manager",),
+            recursion_limit=20,
+        )
+        by_name = {tool.name: tool for tool in tools}
+        spawned_by_label: dict[str, str] = {}
+        both_spawned = asyncio.Event()
+
+        class ForegroundInvocation:
+            async def ainvoke(
+                self,
+                state: dict[str, object],
+                config: dict[str, object],
+            ) -> dict[str, object]:
+                label = str(state["label"])
+                runtime = ToolRuntime(
+                    state=state,
+                    context=None,
+                    config=config,
+                    stream_writer=lambda _: None,
+                    tool_call_id=f"spawn-{label}",
+                    store=None,
+                )
+                spawned = await by_name["spawn_background_task"].coroutine(
+                    f"work {label}",
+                    "worker",
+                    runtime,
+                )
+                spawned_by_label[label] = str(spawned["task_id"])
+                if len(spawned_by_label) == 2:
+                    both_spawned.set()
+                await both_spawned.wait()
+
+                visible = await by_name["list_background_tasks"].coroutine(runtime)
+                other_label = "b" if label == "a" else "a"
+                try:
+                    await by_name["get_background_task"].coroutine(
+                        spawned_by_label[other_label],
+                        0,
+                        runtime,
+                    )
+                except KeyError:
+                    cross_visible = False
+                else:
+                    cross_visible = True
+                return {
+                    "visible_ids": [str(task["task_id"]) for task in visible],
+                    "cross_visible": cross_visible,
+                }
+
+        runnable = scope_background_task_invocation(ForegroundInvocation())
+        config = {"configurable": {"thread_id": "session-a"}}
+        first, second = await asyncio.gather(
+            runnable.ainvoke({"label": "a"}, config),
+            runnable.ainvoke({"label": "b"}, config),
+        )
+
+        assert first == {
+            "visible_ids": [spawned_by_label["a"]],
+            "cross_visible": False,
+        }
+        assert second == {
+            "visible_ids": [spawned_by_label["b"]],
+            "cross_visible": False,
+        }
+
+        release.set()
+        await manager.wait_session("session-a")
         await manager.close()
 
     asyncio.run(exercise())

@@ -11,10 +11,11 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.runtime import Runtime
 
 from chainagents.runtime.types import BackgroundSubagentConfig
@@ -49,11 +50,66 @@ _CURRENT_BACKGROUND_SESSION_ID: contextvars.ContextVar[str | None] = (
         default=None,
     )
 )
+_CURRENT_BACKGROUND_INVOCATION_PATH: contextvars.ContextVar[tuple[str, ...]] = (
+    contextvars.ContextVar(
+        "chainagents_background_invocation_path",
+        default=(),
+    )
+)
 
 
 def current_background_task_id() -> str | None:
     """Return the task ID of the currently executing background subagent."""
     return _CURRENT_BACKGROUND_TASK_ID.get()
+
+
+def current_background_invocation_path() -> tuple[str, ...]:
+    """Return the ownership path of the current configured-agent invocation."""
+    return _CURRENT_BACKGROUND_INVOCATION_PATH.get()
+
+
+class _BackgroundInvocationScopedRunnable(Runnable[Any, Any]):
+    """Give each configured subagent invocation a distinct task-tree scope."""
+
+    def __init__(self, runnable: object) -> None:
+        self.runnable = runnable
+
+    def invoke(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        token = _CURRENT_BACKGROUND_INVOCATION_PATH.set(
+            (*current_background_invocation_path(), uuid.uuid4().hex)
+        )
+        try:
+            return self.runnable.invoke(input, config, **kwargs)  # type: ignore[attr-defined]
+        finally:
+            _CURRENT_BACKGROUND_INVOCATION_PATH.reset(token)
+
+    async def ainvoke(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        token = _CURRENT_BACKGROUND_INVOCATION_PATH.set(
+            (*current_background_invocation_path(), uuid.uuid4().hex)
+        )
+        try:
+            return await self.runnable.ainvoke(  # type: ignore[attr-defined]
+                input,
+                config,
+                **kwargs,
+            )
+        finally:
+            _CURRENT_BACKGROUND_INVOCATION_PATH.reset(token)
+
+
+def scope_background_task_invocation(runnable: object) -> Runnable[Any, Any]:
+    """Wrap a configured subagent with invocation-local task ownership."""
+    return _BackgroundInvocationScopedRunnable(runnable)
 
 
 @dataclass(frozen=True)
@@ -96,6 +152,7 @@ class _BackgroundTaskRecord:
     agent_name: str
     description: str
     agent_path: tuple[str, ...]
+    owner_path: tuple[str, ...]
     parent_task_id: str | None
     status: BackgroundTaskStatus
     created_at: float
@@ -243,6 +300,7 @@ def create_background_task_tools(
             agent_name=subagent_type,
             description=description,
             agent_path=(*agent_path, subagent_type),
+            owner_path=current_background_invocation_path(),
             parent_task_id=current_background_task_id(),
             runner=run_child,
             cleanup=cleanup_child if callable(delete_checkpoint_thread) else None,
@@ -256,6 +314,7 @@ def create_background_task_tools(
         snapshots = await manager.list(
             session_id,
             scope_path=agent_path,
+            owner_path=current_background_invocation_path(),
             ancestor_task_id=current_background_task_id(),
         )
         return [snapshot.to_payload() for snapshot in snapshots]
@@ -272,6 +331,7 @@ def create_background_task_tools(
             session_id,
             task_id,
             scope_path=agent_path,
+            owner_path=current_background_invocation_path(),
             ancestor_task_id=current_background_task_id(),
             wait_seconds=wait_seconds,
         )
@@ -288,6 +348,7 @@ def create_background_task_tools(
             session_id,
             task_id,
             scope_path=agent_path,
+            owner_path=current_background_invocation_path(),
             ancestor_task_id=current_background_task_id(),
         )
         return snapshot.to_payload()
@@ -314,6 +375,7 @@ class BackgroundTaskManager:
         self._closing_sessions: set[str] = set()
         self._session_close_locks: dict[str, asyncio.Lock] = {}
         self._session_close_users: dict[str, int] = {}
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
     async def spawn(
@@ -323,6 +385,7 @@ class BackgroundTaskManager:
         agent_name: str,
         description: str,
         agent_path: tuple[str, ...],
+        owner_path: tuple[str, ...] = (),
         runner: BackgroundRunner,
         parent_task_id: str | None = None,
         cleanup: BackgroundCleanup | None = None,
@@ -375,6 +438,7 @@ class BackgroundTaskManager:
                 agent_name=agent_name,
                 description=description,
                 agent_path=agent_path,
+                owner_path=owner_path,
                 parent_task_id=parent_task_id,
                 status="pending",
                 created_at=time.time(),
@@ -398,6 +462,7 @@ class BackgroundTaskManager:
     ) -> None:
         task_token = _CURRENT_BACKGROUND_TASK_ID.set(record.task_id)
         session_token = _CURRENT_BACKGROUND_SESSION_ID.set(record.session_id)
+        owner_token = _CURRENT_BACKGROUND_INVOCATION_PATH.set(record.owner_path)
         try:
             async with self._lock:
                 if record.status == "pending":
@@ -426,6 +491,7 @@ class BackgroundTaskManager:
             else:
                 await self._finish(record, status="success", result=str(result))
         finally:
+            _CURRENT_BACKGROUND_INVOCATION_PATH.reset(owner_token)
             _CURRENT_BACKGROUND_SESSION_ID.reset(session_token)
             _CURRENT_BACKGROUND_TASK_ID.reset(task_token)
 
@@ -491,9 +557,12 @@ class BackgroundTaskManager:
         self,
         record: _BackgroundTaskRecord,
         scope_path: tuple[str, ...],
+        owner_path: tuple[str, ...],
         ancestor_task_id: str | None,
     ) -> bool:
         if scope_path and record.agent_path[: len(scope_path)] != scope_path:
+            return False
+        if owner_path and record.owner_path[: len(owner_path)] != owner_path:
             return False
         if ancestor_task_id is None:
             return True
@@ -512,6 +581,7 @@ class BackgroundTaskManager:
         session_id: str,
         *,
         scope_path: tuple[str, ...] = (),
+        owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
     ) -> list[BackgroundTaskSnapshot]:
         """List retained tasks visible to an agent scope."""
@@ -520,7 +590,12 @@ class BackgroundTaskManager:
                 record.snapshot()
                 for task_id in self._session_task_ids.get(session_id, ())
                 for record in [self._records[task_id]]
-                if self._is_visible(record, scope_path, ancestor_task_id)
+                if self._is_visible(
+                    record,
+                    scope_path,
+                    owner_path,
+                    ancestor_task_id,
+                )
             ]
 
     async def get(
@@ -529,6 +604,7 @@ class BackgroundTaskManager:
         task_id: str,
         *,
         scope_path: tuple[str, ...] = (),
+        owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
         wait_seconds: float = 0,
     ) -> BackgroundTaskSnapshot:
@@ -540,6 +616,7 @@ class BackgroundTaskManager:
                 session_id,
                 task_id,
                 scope_path,
+                owner_path,
                 ancestor_task_id,
             )
             completion = record.completion
@@ -558,6 +635,7 @@ class BackgroundTaskManager:
                     session_id,
                     task_id,
                     scope_path,
+                    owner_path,
                     ancestor_task_id,
                 )
                 snapshot = record.snapshot()
@@ -568,13 +646,19 @@ class BackgroundTaskManager:
         session_id: str,
         task_id: str,
         scope_path: tuple[str, ...],
+        owner_path: tuple[str, ...],
         ancestor_task_id: str | None,
     ) -> _BackgroundTaskRecord:
         record = self._records.get(task_id)
         if (
             record is None
             or record.session_id != session_id
-            or not self._is_visible(record, scope_path, ancestor_task_id)
+            or not self._is_visible(
+                record,
+                scope_path,
+                owner_path,
+                ancestor_task_id,
+            )
         ):
             raise KeyError(f"Background task '{task_id}' is not visible in this session.")
         return record
@@ -585,6 +669,7 @@ class BackgroundTaskManager:
         task_id: str,
         *,
         scope_path: tuple[str, ...] = (),
+        owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
     ) -> BackgroundTaskSnapshot:
         """Cancel a visible task and all of its descendants."""
@@ -593,6 +678,7 @@ class BackgroundTaskManager:
                 session_id,
                 task_id,
                 scope_path,
+                owner_path,
                 ancestor_task_id,
             )
             execution = record.execution
@@ -710,8 +796,33 @@ class BackgroundTaskManager:
 
     async def close_session(self, session_id: str) -> None:
         """Cancel, await, and forget all work owned by one conversation."""
+        close_task = asyncio.create_task(
+            self._close_session(session_id),
+            name=f"chainagents-close-background-session-{session_id}",
+        )
+        await self._await_preserving_cancellation(close_task)
+
+    async def _close_session(self, session_id: str) -> None:
+        """Run a complete session close in its own cancellation scope."""
         async with self.closing_session(session_id):
             pass
+
+    async def _await_preserving_cancellation(
+        self,
+        task: asyncio.Task[None],
+    ) -> None:
+        """Delay caller cancellation until a lifecycle task has finished."""
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if task.cancelled():
+                    raise
+                cancellation = exc
+        task.result()
+        if cancellation is not None:
+            raise cancellation
 
     def subscribe(self, session_id: str) -> asyncio.Queue[BackgroundTaskSnapshot]:
         """Subscribe to terminal task snapshots for one conversation."""
@@ -735,10 +846,18 @@ class BackgroundTaskManager:
     async def close(self) -> None:
         """Cancel all work and prevent future spawns."""
         async with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            session_ids = list(self._session_task_ids)
+            if self._close_task is None:
+                self._closed = True
+                session_ids = list(self._session_task_ids)
+                self._close_task = asyncio.create_task(
+                    self._close_all_sessions(session_ids),
+                    name="chainagents-close-background-tasks",
+                )
+            close_task = self._close_task
+        await self._await_preserving_cancellation(close_task)
+
+    async def _close_all_sessions(self, session_ids: list[str]) -> None:
+        """Close the manager's sessions and release completion subscribers."""
         await asyncio.gather(
             *(self.close_session(session_id) for session_id in session_ids),
             return_exceptions=False,
