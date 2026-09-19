@@ -9,10 +9,17 @@ import json
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast, overload
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
@@ -265,6 +272,134 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                 yield chunk
         finally:
             self._reset_generation(token)
+
+    @overload
+    def astream_events(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        *,
+        version: Literal["v1", "v2"] = "v2",
+        include_names: Sequence[str] | None = None,
+        include_types: Sequence[str] | None = None,
+        include_tags: Sequence[str] | None = None,
+        exclude_names: Sequence[str] | None = None,
+        exclude_types: Sequence[str] | None = None,
+        exclude_tags: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]: ...
+
+    @overload
+    def astream_events(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        *,
+        version: Literal["v3"],
+        **kwargs: Any,
+    ) -> Awaitable[Any]: ...
+
+    def astream_events(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        *,
+        version: Literal["v1", "v2", "v3"] = "v2",
+        include_names: Sequence[str] | None = None,
+        include_types: Sequence[str] | None = None,
+        include_tags: Sequence[str] | None = None,
+        exclude_names: Sequence[str] | None = None,
+        exclude_types: Sequence[str] | None = None,
+        exclude_tags: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any] | Awaitable[Any]:
+        configurable = (config or {}).get("configurable", {})
+        session_id = str(configurable.get("thread_id") or "").strip()
+        generation = (
+            self.manager.session_generation(session_id)
+            if session_id
+            else None
+        )
+        if version == "v3":
+            result = self.runnable.astream_events(  # type: ignore[attr-defined]
+                input,
+                config,
+                version=version,
+                **kwargs,
+            )
+
+            async def await_events() -> Any:
+                token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation)
+                try:
+                    stream = await cast(Awaitable[Any], result)
+                    graph_iterator = getattr(stream, "_graph_aiter", None)
+                    if graph_iterator is not None:
+                        stream._graph_aiter = (  # noqa: SLF001
+                            _BackgroundSessionScopedAsyncIterator(
+                                graph_iterator,
+                                generation,
+                            )
+                        )
+                    return stream
+                finally:
+                    _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
+
+            return await_events()
+
+        result = self.runnable.astream_events(  # type: ignore[attr-defined]
+            input,
+            config,
+            version=version,
+            include_names=include_names,
+            include_types=include_types,
+            include_tags=include_tags,
+            exclude_names=exclude_names,
+            exclude_types=exclude_types,
+            exclude_tags=exclude_tags,
+            **kwargs,
+        )
+
+        async def iterate_events() -> AsyncIterator[Any]:
+            token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation)
+            try:
+                async for event in cast(AsyncIterator[Any], result):
+                    yield event
+            finally:
+                _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
+
+        return iterate_events()
+
+
+class _BackgroundSessionScopedAsyncIterator:
+    """Activate a session capability for each lazy v3 graph pull."""
+
+    def __init__(
+        self,
+        iterator: AsyncIterator[Any],
+        generation: BackgroundSessionGeneration | None,
+    ) -> None:
+        self.iterator = iterator
+        self.generation = generation
+
+    def __aiter__(self) -> "_BackgroundSessionScopedAsyncIterator":
+        return self
+
+    async def __anext__(self) -> Any:
+        token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(self.generation)
+        try:
+            return await self.iterator.__anext__()
+        finally:
+            _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
+
+    async def aclose(self) -> None:
+        close = getattr(self.iterator, "aclose", None)
+        if close is None:
+            return
+        token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(self.generation)
+        try:
+            await close()
+        finally:
+            _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
 
 def scope_background_session_invocation(
@@ -560,6 +695,10 @@ class BackgroundTaskManager:
         normalized_session = session_id.strip()
         if not normalized_session:
             raise ValueError("Background tasks require a non-empty session ID.")
+        if self._closed:
+            raise RuntimeError("The background task manager is closed.")
+        if normalized_session in self._closing_sessions:
+            raise RuntimeError("The background task session is closing.")
         generation = self._session_generations.get(normalized_session)
         if generation is None:
             generation = BackgroundSessionGeneration(normalized_session)

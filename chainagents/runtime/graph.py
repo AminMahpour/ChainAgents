@@ -270,6 +270,14 @@ def has_nested_child_subagents(subagent: SubagentConfig) -> bool:
     return bool(subagent.subagents or subagent.nested_subagent_names)
 
 
+def has_background_subagent(subagents: tuple[SubagentConfig, ...]) -> bool:
+    """Return whether a configured tree contains a background-capable agent."""
+    return any(
+        subagent.background or has_background_subagent(subagent.subagents)
+        for subagent in subagents
+    )
+
+
 def inherited_tools_for_model(
     *,
     inherited_tools: list[Any],
@@ -620,7 +628,10 @@ def create_configured_graph(
         config,
         **agent_kwargs,
     )
-    if background_manager is not None and background_subagents:
+    if (
+        background_manager is not None
+        and has_background_subagent(config.extensions.subagents)
+    ):
         return runtime_background_tasks.scope_background_session_invocation(
             graph,
             background_manager,

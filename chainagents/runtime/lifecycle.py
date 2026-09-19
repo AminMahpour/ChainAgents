@@ -1161,7 +1161,7 @@ class AgentRuntime:
                 async with self._agent_lock:
                     self._agents = {
                         key: agent for key, agent in self._agents.items()
-                        if key.thread_id != thread_id or key.mcp_scope is not None
+                        if key.thread_id != thread_id
                     }
             return
         await self.close_mcp_session(mcp_session_id)

@@ -461,13 +461,14 @@ def test_mcp_session_startup_unwinds_owner_and_allows_retry(runtime, monkeypatch
     asyncio.run(exercise())
 
 
-def test_conversation_close_retains_other_session_on_same_thread(runtime):
+def test_conversation_close_rebuilds_other_session_on_same_thread(runtime):
     runtime.config = replace(runtime.config, extensions=replace(runtime.config.extensions, mcp_stateful=True))
     async def exercise():
         first = await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session')
         other = await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session')
         await runtime.close_conversation(thread_id='thread', mcp_session_id='session')
         assert first not in runtime._agents.values()
-        assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session') is other
+        assert other not in runtime._agents.values()
+        assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session') is not other
         await runtime.close()
     asyncio.run(exercise())

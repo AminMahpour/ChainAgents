@@ -4182,6 +4182,63 @@ def test_create_configured_graph_builds_local_background_subagents(
     asyncio.run(runtime_graph.close_static_background_tasks())
 
 
+def test_create_configured_graph_scopes_nested_only_background_subagents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Nested-only background targets still require main-run invalidation."""
+    created_graphs: list[SimpleNamespace] = []
+
+    def fake_create_deep_agent(**kwargs):
+        graph = SimpleNamespace(kwargs=kwargs)
+        created_graphs.append(graph)
+        return graph
+
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(
+            config_path=None,
+            background_subagents=BackgroundSubagentConfig(enabled=True),
+            subagents=(
+                SubagentConfig(
+                    name="manager",
+                    description="Coordinates work.",
+                    system_prompt="Coordinate.",
+                    subagents=(
+                        SubagentConfig(
+                            name="researcher",
+                            description="Researches.",
+                            system_prompt="Research.",
+                            background=True,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config))
+    monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(runtime_models, "build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        runtime_backends,
+        "build_deepagent_backend",
+        lambda **kwargs: SimpleNamespace(),
+    )
+
+    graph = deepagent_runtime.create_configured_graph(
+        include_async_subagents=False
+    )
+
+    assert graph.runnable is created_graphs[-1]
+    assert len(created_graphs) == 3
+    manager_graph = created_graphs[1]
+    assert "spawn_background_task" in {
+        tool.name for tool in manager_graph.kwargs["tools"]
+    }
+
+    asyncio.run(runtime_graph.close_static_background_tasks())
+
+
 def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
     tmp_path: Path,
     monkeypatch,

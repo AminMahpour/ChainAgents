@@ -14,11 +14,13 @@ from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 from langgraph.store.memory import InMemoryStore
 
 from chainagents.runtime.background_tasks import (
     BackgroundTaskManager,
     create_background_task_tools,
+    current_background_session_generation,
     scope_background_session_invocation,
     scope_background_task_invocation,
 )
@@ -97,6 +99,83 @@ def test_session_generation_entries_are_reclaimed() -> None:
 
         await manager.close_session("unknown-session")
         assert tuple(manager._session_generations) == ()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_session_generation_rejects_runs_started_during_close() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+
+        async with manager.closing_session("session-a"):
+            with pytest.raises(RuntimeError, match="session is closing"):
+                manager.session_generation("session-a")
+
+        assert manager.session_generation("session-a").active
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_exported_graph_forwards_v3_events_with_session_generation() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        captured: list[object] = []
+        captured_kwargs: list[dict[str, object]] = []
+
+        class Invocation:
+            def astream_events(self, input, config=None, *, version="v2", **kwargs):
+                captured_kwargs.append(kwargs)
+
+                async def v3_result():
+                    captured.append(current_background_session_generation())
+                    return {"version": version}
+
+                return v3_result()
+
+        graph = scope_background_session_invocation(Invocation(), manager)
+        result = graph.astream_events(
+            {},
+            {"configurable": {"thread_id": "session-a"}},
+            version="v3",
+        )
+
+        assert await result == {"version": "v3"}
+        assert captured == [manager.session_generation("session-a")]
+        assert captured_kwargs == [{}]
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.filterwarnings("ignore:The v3 streaming protocol.*")
+def test_exported_compiled_graph_v3_pulls_keep_session_generation() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        captured: list[object] = []
+
+        async def inspect_generation(state):
+            captured.append(current_background_session_generation())
+            return state
+
+        builder = StateGraph(dict)
+        builder.add_node("inspect", inspect_generation)
+        builder.add_edge(START, "inspect")
+        builder.add_edge("inspect", END)
+        graph = scope_background_session_invocation(
+            builder.compile(),
+            manager,
+        )
+
+        run = await graph.astream_events(
+            {},
+            {"configurable": {"thread_id": "session-a"}},
+            version="v3",
+        )
+        await run.output()
+
+        assert captured == [manager.session_generation("session-a")]
         await manager.close()
 
     asyncio.run(exercise())
