@@ -8,7 +8,8 @@ import dataclasses
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
@@ -41,6 +42,16 @@ _LANGGRAPH_CHECKPOINTER_KEY = "__pregel_checkpointer"
 _LANGGRAPH_RUNTIME_KEY = "__pregel_runtime"
 _T = TypeVar("_T")
 
+
+class BackgroundSessionGeneration:
+    """Weakly tracked capability for one open background-task session."""
+
+    __slots__ = ("active", "session_id", "__weakref__")
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.active = True
+
 _CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "chainagents_background_task_id",
     default=None,
@@ -57,6 +68,12 @@ _CURRENT_BACKGROUND_INVOCATION_PATH: contextvars.ContextVar[tuple[str, ...]] = (
         default=(),
     )
 )
+_CURRENT_BACKGROUND_SESSION_GENERATION: contextvars.ContextVar[
+    BackgroundSessionGeneration | None
+] = contextvars.ContextVar(
+    "chainagents_background_session_generation",
+    default=None,
+)
 
 
 def current_background_task_id() -> str | None:
@@ -67,6 +84,11 @@ def current_background_task_id() -> str | None:
 def current_background_invocation_path() -> tuple[str, ...]:
     """Return the ownership path of the current configured-agent invocation."""
     return _CURRENT_BACKGROUND_INVOCATION_PATH.get()
+
+
+def current_background_session_generation() -> BackgroundSessionGeneration | None:
+    """Return the lifecycle capability attached to the current graph run."""
+    return _CURRENT_BACKGROUND_SESSION_GENERATION.get()
 
 
 async def await_preserving_cancellation(task: asyncio.Task[_T]) -> _T:
@@ -129,6 +151,130 @@ def scope_background_task_invocation(runnable: object) -> Runnable[Any, Any]:
     return _BackgroundInvocationScopedRunnable(runnable)
 
 
+class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
+    """Attach a session lifecycle capability to one exported graph run."""
+
+    def __init__(
+        self,
+        runnable: object,
+        manager: "BackgroundTaskManager",
+    ) -> None:
+        self.runnable = runnable
+        self.manager = manager
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.runnable, name)
+
+    @property
+    def InputType(self) -> Any:  # noqa: N802
+        return self.runnable.InputType  # type: ignore[attr-defined]
+
+    @property
+    def OutputType(self) -> Any:  # noqa: N802
+        return self.runnable.OutputType  # type: ignore[attr-defined]
+
+    @property
+    def config_specs(self) -> list[Any]:
+        return list(self.runnable.config_specs)  # type: ignore[attr-defined]
+
+    def get_input_schema(self, config: RunnableConfig | None = None) -> Any:
+        return self.runnable.get_input_schema(config)  # type: ignore[attr-defined]
+
+    def get_output_schema(self, config: RunnableConfig | None = None) -> Any:
+        return self.runnable.get_output_schema(config)  # type: ignore[attr-defined]
+
+    def get_graph(self, config: RunnableConfig | None = None) -> Any:
+        return self.runnable.get_graph(config)  # type: ignore[attr-defined]
+
+    def _set_generation(
+        self,
+        config: RunnableConfig | None,
+    ) -> contextvars.Token[BackgroundSessionGeneration | None] | None:
+        configurable = (config or {}).get("configurable", {})
+        session_id = str(configurable.get("thread_id") or "").strip()
+        if not session_id:
+            return None
+        return _CURRENT_BACKGROUND_SESSION_GENERATION.set(
+            self.manager.session_generation(session_id)
+        )
+
+    @staticmethod
+    def _reset_generation(
+        token: contextvars.Token[BackgroundSessionGeneration | None] | None,
+    ) -> None:
+        if token is not None:
+            _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
+
+    def invoke(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        token = self._set_generation(config)
+        try:
+            return self.runnable.invoke(input, config, **kwargs)  # type: ignore[attr-defined]
+        finally:
+            self._reset_generation(token)
+
+    async def ainvoke(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        token = self._set_generation(config)
+        try:
+            return await self.runnable.ainvoke(  # type: ignore[attr-defined]
+                input,
+                config,
+                **kwargs,
+            )
+        finally:
+            self._reset_generation(token)
+
+    def stream(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Iterator[Any]:
+        token = self._set_generation(config)
+        try:
+            yield from self.runnable.stream(  # type: ignore[attr-defined]
+                input,
+                config,
+                **kwargs,
+            )
+        finally:
+            self._reset_generation(token)
+
+    async def astream(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        token = self._set_generation(config)
+        try:
+            async for chunk in self.runnable.astream(  # type: ignore[attr-defined]
+                input,
+                config,
+                **kwargs,
+            ):
+                yield chunk
+        finally:
+            self._reset_generation(token)
+
+
+def scope_background_session_invocation(
+    runnable: object,
+    manager: "BackgroundTaskManager",
+) -> Runnable[Any, Any]:
+    """Wrap an exported graph with invocation-scoped session invalidation."""
+    return _BackgroundSessionScopedRunnable(runnable, manager)
+
+
 @dataclass(frozen=True)
 class BackgroundTaskSnapshot:
     """Immutable public view of one local background task."""
@@ -170,6 +316,7 @@ class _BackgroundTaskRecord:
     description: str
     agent_path: tuple[str, ...]
     owner_path: tuple[str, ...]
+    session_generation: BackgroundSessionGeneration | None
     parent_task_id: str | None
     status: BackgroundTaskStatus
     created_at: float
@@ -244,7 +391,7 @@ def create_background_task_tools(
     subagents: dict[str, object],
     agent_path: tuple[str, ...],
     recursion_limit: int,
-    session_generation: int | None = None,
+    session_generation: BackgroundSessionGeneration | None = None,
     existing_tools: Iterable[object] = (),
 ) -> list[object]:
     """Create task tools scoped to the direct children of one agent."""
@@ -269,6 +416,9 @@ def create_background_task_tools(
         )
     allowed_names = tuple(sorted(subagents))
     allowed_text = ", ".join(allowed_names) or "none"
+
+    def expected_generation() -> BackgroundSessionGeneration | None:
+        return session_generation or current_background_session_generation()
 
     @tool("spawn_background_task")
     async def spawn_background_task(
@@ -322,7 +472,7 @@ def create_background_task_tools(
             agent_path=(*agent_path, subagent_type),
             owner_path=current_background_invocation_path(),
             parent_task_id=current_background_task_id(),
-            expected_session_generation=session_generation,
+            expected_session_generation=expected_generation(),
             runner=run_child,
             cleanup=cleanup_child if callable(delete_checkpoint_thread) else None,
         )
@@ -337,6 +487,7 @@ def create_background_task_tools(
             scope_path=agent_path,
             owner_path=current_background_invocation_path(),
             ancestor_task_id=current_background_task_id(),
+            expected_session_generation=expected_generation(),
         )
         return [snapshot.to_payload() for snapshot in snapshots]
 
@@ -355,6 +506,7 @@ def create_background_task_tools(
             owner_path=current_background_invocation_path(),
             ancestor_task_id=current_background_task_id(),
             wait_seconds=wait_seconds,
+            expected_session_generation=expected_generation(),
         )
         return snapshot.to_payload()
 
@@ -371,6 +523,7 @@ def create_background_task_tools(
             scope_path=agent_path,
             owner_path=current_background_invocation_path(),
             ancestor_task_id=current_background_task_id(),
+            expected_session_generation=expected_generation(),
         )
         return snapshot.to_payload()
 
@@ -396,13 +549,38 @@ class BackgroundTaskManager:
         self._closing_sessions: set[str] = set()
         self._session_close_locks: dict[str, asyncio.Lock] = {}
         self._session_close_users: dict[str, int] = {}
-        self._session_generations: dict[str, int] = {}
+        self._session_generations: weakref.WeakValueDictionary[
+            str, BackgroundSessionGeneration
+        ] = weakref.WeakValueDictionary()
         self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
-    def session_generation(self, session_id: str) -> int:
+    def session_generation(self, session_id: str) -> BackgroundSessionGeneration:
         """Return the current lifecycle generation for one session."""
-        return self._session_generations.get(session_id.strip(), 0)
+        normalized_session = session_id.strip()
+        if not normalized_session:
+            raise ValueError("Background tasks require a non-empty session ID.")
+        generation = self._session_generations.get(normalized_session)
+        if generation is None:
+            generation = BackgroundSessionGeneration(normalized_session)
+            self._session_generations[normalized_session] = generation
+        return generation
+
+    def _validate_session_generation(
+        self,
+        session_id: str,
+        expected: BackgroundSessionGeneration | None,
+    ) -> None:
+        if expected is None:
+            return
+        if (
+            not expected.active
+            or expected.session_id != session_id
+            or self._session_generations.get(session_id) is not expected
+        ):
+            raise RuntimeError(
+                "The background task session was closed; start a new foreground run."
+            )
 
     async def spawn(
         self,
@@ -414,7 +592,7 @@ class BackgroundTaskManager:
         owner_path: tuple[str, ...] = (),
         runner: BackgroundRunner,
         parent_task_id: str | None = None,
-        expected_session_generation: int | None = None,
+        expected_session_generation: BackgroundSessionGeneration | None = None,
         cleanup: BackgroundCleanup | None = None,
     ) -> BackgroundTaskSnapshot:
         """Start a job immediately and return before the runner finishes."""
@@ -429,14 +607,10 @@ class BackgroundTaskManager:
                 raise RuntimeError("The background task manager is closed.")
             if normalized_session in self._closing_sessions:
                 raise RuntimeError("The background task session is closing.")
-            if (
-                expected_session_generation is not None
-                and self._session_generations.get(normalized_session, 0)
-                != expected_session_generation
-            ):
-                raise RuntimeError(
-                    "The background task session was closed; start a new foreground run."
-                )
+            self._validate_session_generation(
+                normalized_session,
+                expected_session_generation,
+            )
             session_ids = self._session_task_ids.setdefault(normalized_session, [])
             running_session = sum(
                 self._records[task_id].status not in TERMINAL_BACKGROUND_TASK_STATUSES
@@ -476,6 +650,7 @@ class BackgroundTaskManager:
                 description=description,
                 agent_path=agent_path,
                 owner_path=owner_path,
+                session_generation=expected_session_generation,
                 parent_task_id=parent_task_id,
                 status="pending",
                 created_at=time.time(),
@@ -500,6 +675,9 @@ class BackgroundTaskManager:
         task_token = _CURRENT_BACKGROUND_TASK_ID.set(record.task_id)
         session_token = _CURRENT_BACKGROUND_SESSION_ID.set(record.session_id)
         owner_token = _CURRENT_BACKGROUND_INVOCATION_PATH.set(record.owner_path)
+        generation_token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(
+            record.session_generation
+        )
         try:
             async with self._lock:
                 if record.status == "pending":
@@ -535,6 +713,7 @@ class BackgroundTaskManager:
             else:
                 await self._finish(record, status="success", result=str(result))
         finally:
+            _CURRENT_BACKGROUND_SESSION_GENERATION.reset(generation_token)
             _CURRENT_BACKGROUND_INVOCATION_PATH.reset(owner_token)
             _CURRENT_BACKGROUND_SESSION_ID.reset(session_token)
             _CURRENT_BACKGROUND_TASK_ID.reset(task_token)
@@ -627,9 +806,14 @@ class BackgroundTaskManager:
         scope_path: tuple[str, ...] = (),
         owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
+        expected_session_generation: BackgroundSessionGeneration | None = None,
     ) -> list[BackgroundTaskSnapshot]:
         """List retained tasks visible to an agent scope."""
         async with self._lock:
+            self._validate_session_generation(
+                session_id,
+                expected_session_generation,
+            )
             return [
                 record.snapshot()
                 for task_id in self._session_task_ids.get(session_id, ())
@@ -651,11 +835,16 @@ class BackgroundTaskManager:
         owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
         wait_seconds: float = 0,
+        expected_session_generation: BackgroundSessionGeneration | None = None,
     ) -> BackgroundTaskSnapshot:
         """Return a visible task, optionally waiting for terminal state."""
         if wait_seconds < 0 or wait_seconds > 60:
             raise ValueError("wait_seconds must be between 0 and 60.")
         async with self._lock:
+            self._validate_session_generation(
+                session_id,
+                expected_session_generation,
+            )
             record = self._visible_record(
                 session_id,
                 task_id,
@@ -675,6 +864,10 @@ class BackgroundTaskManager:
             except TimeoutError:
                 pass
             async with self._lock:
+                self._validate_session_generation(
+                    session_id,
+                    expected_session_generation,
+                )
                 record = self._visible_record(
                     session_id,
                     task_id,
@@ -715,9 +908,14 @@ class BackgroundTaskManager:
         scope_path: tuple[str, ...] = (),
         owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
+        expected_session_generation: BackgroundSessionGeneration | None = None,
     ) -> BackgroundTaskSnapshot:
         """Cancel a visible task and all of its descendants."""
         async with self._lock:
+            self._validate_session_generation(
+                session_id,
+                expected_session_generation,
+            )
             record = self._visible_record(
                 session_id,
                 task_id,
@@ -843,9 +1041,9 @@ class BackgroundTaskManager:
             self._session_close_users[normalized_session] = (
                 self._session_close_users.get(normalized_session, 0) + 1
             )
-            self._session_generations[normalized_session] = (
-                self._session_generations.get(normalized_session, 0) + 1
-            )
+            generation = self._session_generations.pop(normalized_session, None)
+            if generation is not None:
+                generation.active = False
             self._closing_sessions.add(normalized_session)
         try:
             async with close_lock:

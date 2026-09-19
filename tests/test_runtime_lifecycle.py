@@ -217,7 +217,7 @@ def test_cancelled_conversation_close_finishes_resource_teardown(
 
 
 def test_conversation_close_invalidates_existing_background_tools(runtime):
-    """A foreground run from before close cannot spawn after teardown."""
+    """A foreground run from before close cannot access a reopened session."""
     runtime.background_tasks = BackgroundTaskManager(
         BackgroundSubagentConfig(enabled=True)
     )
@@ -233,6 +233,15 @@ def test_conversation_close_invalidates_existing_background_tools(runtime):
         )
         spawn_tool = next(
             tool for tool in tools if tool.name == "spawn_background_task"
+        )
+        list_tool = next(
+            tool for tool in tools if tool.name == "list_background_tasks"
+        )
+        get_tool = next(
+            tool for tool in tools if tool.name == "get_background_task"
+        )
+        cancel_tool = next(
+            tool for tool in tools if tool.name == "cancel_background_task"
         )
         tool_runtime = ToolRuntime(
             state={},
@@ -250,6 +259,21 @@ def test_conversation_close_invalidates_existing_background_tools(runtime):
 
         with pytest.raises(RuntimeError, match="session was closed"):
             await spawn_tool.coroutine("late work", "worker", tool_runtime)
+
+        reopened = await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="new work",
+            agent_path=("worker",),
+            runner=lambda task_id: asyncio.sleep(0, result=task_id),
+        )
+        for call in (
+            lambda: list_tool.coroutine(tool_runtime),
+            lambda: get_tool.coroutine(reopened.task_id, 0, tool_runtime),
+            lambda: cancel_tool.coroutine(reopened.task_id, tool_runtime),
+        ):
+            with pytest.raises(RuntimeError, match="session was closed"):
+                await call()
         await runtime.background_tasks.close()
 
     asyncio.run(exercise())

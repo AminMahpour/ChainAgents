@@ -4138,7 +4138,7 @@ def test_create_configured_graph_builds_local_background_subagents(
 
     graph = deepagent_runtime.create_configured_graph(include_async_subagents=False)
 
-    assert graph is created_graphs[-1]
+    assert graph.runnable is created_graphs[-1]
     assert len(created_graphs) == 2
     child_graph, main_graph = created_graphs
     assert main_graph.kwargs["subagents"][0]["runnable"] is child_graph

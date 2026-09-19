@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +19,7 @@ from langgraph.store.memory import InMemoryStore
 from chainagents.runtime.background_tasks import (
     BackgroundTaskManager,
     create_background_task_tools,
+    scope_background_session_invocation,
     scope_background_task_invocation,
 )
 from chainagents.runtime.types import BackgroundSubagentConfig
@@ -75,6 +78,81 @@ def test_spawn_returns_before_runner_finishes_and_result_can_be_retrieved() -> N
         finished = await manager.get("session-a", spawned.task_id, wait_seconds=1)
         assert finished.status == "success"
         assert finished.result == f"result:{spawned.task_id}"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_session_generation_entries_are_reclaimed() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        generation = manager.session_generation("session-a")
+        generation_ref = weakref.ref(generation)
+
+        assert tuple(manager._session_generations) == ("session-a",)
+        del generation
+        gc.collect()
+        assert generation_ref() is None
+        assert tuple(manager._session_generations) == ()
+
+        await manager.close_session("unknown-session")
+        assert tuple(manager._session_generations) == ()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_exported_graph_invocation_is_invalidated_by_overlapping_close() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"worker": object()},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        spawn_tool = next(
+            tool for tool in tools if tool.name == "spawn_background_task"
+        )
+        tool_runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="exported-spawn",
+            store=None,
+        )
+
+        class Invocation:
+            async def astream(self, input, config=None, **kwargs):
+                started.set()
+                await release.wait()
+                yield await spawn_tool.coroutine(
+                    "late work",
+                    "worker",
+                    tool_runtime,
+                )
+
+        graph = scope_background_session_invocation(Invocation(), manager)
+
+        async def consume_stream():
+            return [
+                chunk
+                async for chunk in graph.astream(
+                    {},
+                    {"configurable": {"thread_id": "session-a"}},
+                )
+            ]
+
+        run = asyncio.create_task(consume_stream())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await manager.close_session("session-a")
+        release.set()
+
+        with pytest.raises(RuntimeError, match="session was closed"):
+            await run
         await manager.close()
 
     asyncio.run(exercise())

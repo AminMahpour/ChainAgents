@@ -672,17 +672,17 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
     )
     lifecycle_events: list[str] = []
 
-    class _BackgroundTasks:
-        async def close_session(self, session_id: str) -> None:
-            lifecycle_events.append(f"close:{session_id}")
+    async def close_conversation(*, thread_id, mcp_session_id) -> None:
+        lifecycle_events.append(f"close:{thread_id}:{mcp_session_id}")
 
-    runtime.background_tasks = _BackgroundTasks()
+    runtime.close_conversation = close_conversation
     notifier = main.LocalBackgroundTaskNotifier(
         manager=SimpleNamespace(),
         session_id="thread-old",
     )
     session_data = {
         main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY: notifier,
+        main.SESSION_MCP_SESSION_ID_KEY: "actual-session",
         main.SESSION_SETTINGS_KEY: {"thread_id": "thread-old"},
     }
     user_session = SimpleNamespace(
@@ -709,7 +709,10 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
 
     await main.on_settings_update({"thread_id": "thread-new"})
 
-    assert lifecycle_events == ["close:thread-old", "start:thread-new"]
+    assert lifecycle_events == [
+        "close:thread-old:actual-session",
+        "start:thread-new",
+    ]
     assert session_data[main.SESSION_SETTINGS_KEY]["thread_id"] == "thread-new"
 
 

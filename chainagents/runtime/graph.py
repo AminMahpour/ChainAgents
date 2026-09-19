@@ -616,4 +616,13 @@ def create_configured_graph(
     memory_files = stateful_agent_memory_files(config)
     if memory_files is not None:
         agent_kwargs["memory"] = memory_files
-    return runtime_middleware.create_deep_agent_with_configured_summarization(config, **agent_kwargs)
+    graph = runtime_middleware.create_deep_agent_with_configured_summarization(
+        config,
+        **agent_kwargs,
+    )
+    if background_manager is not None and background_subagents:
+        return runtime_background_tasks.scope_background_session_invocation(
+            graph,
+            background_manager,
+        )
+    return graph

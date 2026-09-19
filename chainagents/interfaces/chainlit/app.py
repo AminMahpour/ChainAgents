@@ -1467,7 +1467,10 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         isinstance(local_notifier, LocalBackgroundTaskNotifier)
         and local_notifier.session_id != settings.thread_id
     ):
-        await runtime.background_tasks.close_session(local_notifier.session_id)
+        await runtime.close_conversation(
+            thread_id=local_notifier.session_id,
+            mcp_session_id=current_mcp_session_id() or None,
+        )
     store_settings(settings)
     if (
         not isinstance(local_notifier, LocalBackgroundTaskNotifier)
