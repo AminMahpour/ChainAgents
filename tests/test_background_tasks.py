@@ -19,13 +19,16 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.store.memory import InMemoryStore
 
 from chainagents.runtime.background_tasks import (
+    BackgroundTaskActivity,
     BackgroundTaskManager,
     create_background_task_tools,
+    current_background_invocation_path,
     current_background_session_generation,
     current_background_task_id,
     scope_background_session_invocation,
     scope_background_task_invocation,
 )
+from chainagents.events.stream import AgentStreamEvent
 from chainagents.runtime.types import BackgroundSubagentConfig
 from chainagents.interfaces.chainlit.async_tasks import LocalBackgroundTaskNotifier
 
@@ -87,6 +90,57 @@ def test_spawn_returns_before_runner_finishes_and_result_can_be_retrieved() -> N
     asyncio.run(exercise())
 
 
+def test_background_activity_channel_orders_live_events_before_completion() -> None:
+    """One session queue must receive live activity before its terminal snapshot."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        queue = manager.subscribe_activity("session-a")
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="Checking the repository",
+                ),
+            )
+            return "finished result"
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        live = await asyncio.wait_for(queue.get(), timeout=1)
+        terminal = await asyncio.wait_for(queue.get(), timeout=1)
+
+        assert live == BackgroundTaskActivity(
+            task_id=spawned.task_id,
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            event=AgentStreamEvent(
+                kind="reasoning_delta",
+                source="researcher",
+                text="Checking the repository",
+            ),
+        )
+        assert terminal.event is None
+        assert terminal.snapshot is not None
+        assert terminal.snapshot.status == "success"
+        assert terminal.snapshot.result == "finished result"
+        assert queue.empty()
+
+        manager.unsubscribe_activity("session-a", queue)
+        assert "session-a" not in manager._activity_subscribers
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_session_generation_entries_are_reclaimed() -> None:
     async def exercise() -> None:
         manager = make_manager()
@@ -116,6 +170,50 @@ def test_session_generation_rejects_runs_started_during_close() -> None:
 
         assert manager.session_generation("session-a").active
         await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_background_invocation_scope_wraps_each_stream_pull() -> None:
+    """Streaming a scoped child must not fall back to one final ainvoke result."""
+    async def exercise() -> None:
+        captured_paths: list[tuple[str, ...]] = []
+        captured_kwargs: list[dict[str, object]] = []
+
+        class Invocation:
+            async def ainvoke(self, input, config=None, **kwargs):
+                return "fallback"
+
+            async def astream(self, input, config=None, **kwargs):
+                captured_kwargs.append(kwargs)
+                captured_paths.append(current_background_invocation_path())
+                yield "first"
+                await asyncio.sleep(0)
+                captured_paths.append(current_background_invocation_path())
+                yield "second"
+
+        runnable = scope_background_task_invocation(Invocation())
+        streamed = [
+            chunk
+            async for chunk in runnable.astream(
+                {},
+                {"configurable": {"thread_id": "session-a"}},
+                stream_mode=["values", "messages"],
+                subgraphs=True,
+            )
+        ]
+
+        assert streamed == ["first", "second"]
+        assert len(captured_paths) == 2
+        assert captured_paths[0] == captured_paths[1]
+        assert captured_paths[0]
+        assert current_background_invocation_path() == ()
+        assert captured_kwargs == [
+            {
+                "stream_mode": ["values", "messages"],
+                "subgraphs": True,
+            }
+        ]
 
     asyncio.run(exercise())
 
@@ -1092,6 +1190,108 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
         assert "checkpoint_id" not in configurable
         assert configurable["checkpoint_ns"] == ""
         assert "callbacks" not in child_config
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_background_tools_stream_child_activity_with_relabelled_sources() -> None:
+    """Opted-in children must publish root and nested activity before completion."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.calls: list[
+                tuple[dict[str, object], dict[str, object], dict[str, object]]
+            ] = []
+
+        async def ainvoke(self, state, config, **kwargs):
+            raise AssertionError("stream activity must not use ainvoke")
+
+        async def astream(self, state, config, **kwargs):
+            self.calls.append((state, config, kwargs))
+            root_token = SimpleNamespace(
+                type="AIMessageChunk",
+                additional_kwargs={"reasoning_content": "root thought"},
+                tool_call_chunks=[],
+                content="",
+            )
+            nested_token = SimpleNamespace(
+                type="AIMessageChunk",
+                additional_kwargs={"reasoning_content": "nested thought"},
+                tool_call_chunks=[],
+                content="",
+            )
+            yield ((), "messages", (root_token, {}))
+            yield (("worker:child-run",), "messages", (nested_token, {}))
+            yield (
+                (),
+                "values",
+                {
+                    "messages": [
+                        HumanMessage(content="investigate"),
+                        AIMessage(content="streamed result"),
+                    ]
+                },
+            )
+
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        child = ChildRunnable()
+        activity_queue = manager.subscribe_activity("session-a")
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": child},
+            agent_path=(),
+            recursion_limit=45,
+        )
+        spawn_tool = next(
+            tool for tool in tools if tool.name == "spawn_background_task"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="call-1",
+            store=None,
+        )
+
+        spawned = await spawn_tool.coroutine("investigate", "researcher", runtime)
+        activities = [
+            await asyncio.wait_for(activity_queue.get(), timeout=1)
+            for _ in range(3)
+        ]
+
+        assert [
+            activity.event.source
+            for activity in activities
+            if activity.event is not None
+        ] == ["researcher", "researcher / worker"]
+        assert [
+            activity.event.text
+            for activity in activities
+            if activity.event is not None
+        ] == ["root thought", "nested thought"]
+        assert activities[-1].snapshot is not None
+        assert activities[-1].snapshot.status == "success"
+        assert activities[-1].snapshot.result == "streamed result"
+        assert child.calls == [
+            (
+                {"messages": [HumanMessage(content="investigate")]},
+                {
+                    "configurable": {
+                        "thread_id": f"session-a:background:{spawned['task_id']}",
+                        "checkpoint_ns": "",
+                        "ls_agent_type": "background_subagent",
+                    },
+                    "recursion_limit": 45,
+                },
+                {
+                    "stream_mode": ["values", "messages", "updates"],
+                    "subgraphs": True,
+                },
+            )
+        ]
         await manager.close()
 
     asyncio.run(exercise())
@@ -2355,6 +2555,414 @@ def test_chainlit_local_notifier_sends_status_without_dumping_result(monkeypatch
             )
         ]
         notifier.cancel()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_streams_nested_activity_before_completion(
+    monkeypatch,
+) -> None:
+    """Enabled activity streaming should render one ordered nested task tree."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        timeline: list[tuple[str, str, str]] = []
+        steps: list[Step] = []
+        delivered = asyncio.Event()
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                self.tokens: list[str] = []
+                steps.append(self)
+
+            async def send(self) -> None:
+                timeline.append(("send", self.id, self.name))
+
+            async def update(self) -> None:
+                timeline.append(("update", self.id, str(self.output)))
+
+            async def stream_token(self, token: str) -> None:
+                self.tokens.append(token)
+                timeline.append(("token", self.id, token))
+
+        class Message:
+            def __init__(self, *, content: str, author: str) -> None:
+                self.content = content
+                self.author = author
+
+            async def send(self) -> None:
+                timeline.append(("message", self.author, self.content))
+                delivered.set()
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Message",
+            Message,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            for event in (
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="Inspecting ",
+                ),
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="the repository",
+                ),
+                AgentStreamEvent(
+                    kind="tool_call",
+                    source="researcher / worker",
+                    tool_call_id="researcher / worker:0",
+                    tool_name="read_file",
+                    tool_args='{"file_path":"skills/example/SKILL.md"}',
+                ),
+                AgentStreamEvent(
+                    kind="tool_result",
+                    source="researcher / worker",
+                    tool_call_id="call-real",
+                    tool_name="read_file",
+                    tool_result="skill contents",
+                    status="success",
+                ),
+            ):
+                await manager.publish_activity(task_id, event)
+            return "finished result"
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(delivered.wait(), timeout=2)
+
+        parent = next(step for step in steps if step.type == "run")
+        reasoning = next(step for step in steps if step.type == "llm")
+        tool = next(step for step in steps if step.type == "tool")
+        assert parent.name == "researcher (background)"
+        assert parent.parent_id is None
+        assert reasoning.name == "researcher reasoning"
+        assert reasoning.parent_id == parent.id
+        assert reasoning.tokens == ["Inspecting the repository"]
+        assert tool.name == "researcher / worker · read_file"
+        assert tool.parent_id == parent.id
+        assert tool.input == '{"file_path":"skills/example/SKILL.md"}'
+        assert tool.output == "skill contents"
+        assert parent.end is not None
+        assert reasoning.end is not None
+        assert tool.end is not None
+        assert timeline[-1] == (
+            "message",
+            "Background subagent",
+            "Local background subagent `researcher` finished with status "
+            f"`success`.\n\nTask ID: `{spawned.task_id}`",
+        )
+        assert sum(item[0] == "message" for item in timeline) == 1
+
+        notifier.cancel()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_closes_remaining_steps_after_update_failure(
+    monkeypatch,
+) -> None:
+    """One failed child update must not strand the rest of the activity tree."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        steps: list[Step] = []
+        delivered = asyncio.Event()
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                self.update_attempted = False
+                steps.append(self)
+
+            async def send(self) -> None:
+                return None
+
+            async def update(self) -> None:
+                self.update_attempted = True
+                if self.type == "llm":
+                    raise RuntimeError("reasoning update failed")
+
+            async def stream_token(self, token: str) -> None:
+                return None
+
+        class Message:
+            def __init__(self, *, content: str, author: str) -> None:
+                self.content = content
+                self.author = author
+
+            async def send(self) -> None:
+                delivered.set()
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Message",
+            Message,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="thinking",
+                ),
+            )
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="tool_call",
+                    source="researcher",
+                    tool_call_id="call-1",
+                    tool_name="search",
+                ),
+            )
+            return "finished"
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(delivered.wait(), timeout=2)
+
+        reasoning = next(step for step in steps if step.type == "llm")
+        tool = next(step for step in steps if step.type == "tool")
+        parent = next(step for step in steps if step.type == "run")
+        assert reasoning.update_attempted is True
+        assert tool.update_attempted is True
+        assert parent.update_attempted is True
+        assert tool.end is not None
+        assert parent.end is not None
+
+        notifier.cancel()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_async_close_ends_open_activity_steps(
+    monkeypatch,
+) -> None:
+    """Session teardown should close rendered steps before discarding state."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        steps: list[Step] = []
+        rendered = asyncio.Event()
+        release = asyncio.Event()
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                steps.append(self)
+
+            async def send(self) -> None:
+                if self.type == "llm":
+                    rendered.set()
+
+            async def update(self) -> None:
+                return None
+
+            async def stream_token(self, token: str) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="thinking",
+                ),
+            )
+            await release.wait()
+            return "finished"
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(rendered.wait(), timeout=2)
+
+        await notifier.aclose()
+
+        assert notifier.task is None
+        assert notifier.activity_queue is None
+        assert notifier.activity_states == {}
+        assert "session-a" not in manager._activity_subscribers
+        assert all(step.end is not None for step in steps)
+        assert next(step for step in steps if step.type == "run").output == "Stopped"
+
+        release.set()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_async_close_resumes_interrupted_terminal_close(
+    monkeypatch,
+) -> None:
+    """Cancelling the consumer mid-terminal-close must retain cleanup state."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        steps: list[Step] = []
+        terminal_close_started = asyncio.Event()
+        blocked_once = False
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                self.update_attempts = 0
+                steps.append(self)
+
+            async def send(self) -> None:
+                return None
+
+            async def update(self) -> None:
+                nonlocal blocked_once
+                self.update_attempts += 1
+                if self.type == "llm" and not blocked_once:
+                    blocked_once = True
+                    terminal_close_started.set()
+                    await asyncio.Event().wait()
+
+            async def stream_token(self, token: str) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="thinking",
+                ),
+            )
+            return "finished"
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(terminal_close_started.wait(), timeout=2)
+
+        await notifier.aclose()
+
+        reasoning = next(step for step in steps if step.type == "llm")
+        parent = next(step for step in steps if step.type == "run")
+        assert reasoning.update_attempts == 2
+        assert reasoning.end is not None
+        assert parent.update_attempts == 1
+        assert parent.end is not None
+        assert parent.output == "Stopped"
+        assert notifier.activity_states == {}
         await manager.close()
 
     asyncio.run(exercise())

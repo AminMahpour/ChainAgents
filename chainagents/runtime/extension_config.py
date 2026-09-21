@@ -39,6 +39,12 @@ def normalize_background_subagent_config(value: Any) -> BackgroundSubagentConfig
         raise ValueError(
             "The top-level 'agent.background_subagents.enabled' config must be a boolean."
         )
+    stream_activity = value.get("stream_activity", False)
+    if not isinstance(stream_activity, bool):
+        raise ValueError(
+            "The top-level 'agent.background_subagents.stream_activity' config "
+            "must be a boolean."
+        )
     limits: dict[str, int] = {}
     defaults = BackgroundSubagentConfig()
     for field_name in (
@@ -53,7 +59,11 @@ def normalize_background_subagent_config(value: Any) -> BackgroundSubagentConfig
                 f"'agent.background_subagents.{field_name}' config must be a positive integer."
             )
         limits[field_name] = raw
-    return BackgroundSubagentConfig(enabled=enabled, **limits)
+    return BackgroundSubagentConfig(
+        enabled=enabled,
+        stream_activity=stream_activity,
+        **limits,
+    )
 
 
 def normalize_agent_state(value: Any | None) -> AgentStateMode:

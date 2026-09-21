@@ -28,6 +28,11 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field
 
+from chainagents.events.stream import (
+    AgentStreamEvent,
+    AgentStreamEventAdapter,
+    langgraph_part_from_event_chunk,
+)
 from chainagents.runtime.types import BackgroundSubagentConfig
 
 
@@ -152,6 +157,25 @@ class _BackgroundInvocationScopedRunnable(Runnable[Any, Any]):
                 config,
                 **kwargs,
             )
+        finally:
+            _CURRENT_BACKGROUND_INVOCATION_PATH.reset(token)
+
+    async def astream(
+        self,
+        input: Any,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        token = _CURRENT_BACKGROUND_INVOCATION_PATH.set(
+            (*current_background_invocation_path(), uuid.uuid4().hex)
+        )
+        try:
+            async for chunk in self.runnable.astream(  # type: ignore[attr-defined]
+                input,
+                config,
+                **kwargs,
+            ):
+                yield chunk
         finally:
             _CURRENT_BACKGROUND_INVOCATION_PATH.reset(token)
 
@@ -446,6 +470,18 @@ class BackgroundTaskSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class BackgroundTaskActivity:
+    """One live event or terminal snapshot from a local background task."""
+
+    task_id: str
+    session_id: str
+    agent_name: str
+    description: str
+    event: AgentStreamEvent | None = None
+    snapshot: BackgroundTaskSnapshot | None = None
+
+
 class BackgroundSubagentBatchRequest(BaseModel):
     """One independently executable child request in a subagent batch."""
 
@@ -616,6 +652,32 @@ def create_background_task_tools(
                 "configurable": configurable,
                 "recursion_limit": recursion_limit,
             }
+            if manager.config.stream_activity:
+                adapter = AgentStreamEventAdapter(prompt=description)
+                final_values: object = None
+                async for chunk in child.astream(  # type: ignore[attr-defined]
+                    state,
+                    config,
+                    stream_mode=["values", "messages", "updates"],
+                    subgraphs=True,
+                ):
+                    part = langgraph_part_from_event_chunk(chunk)
+                    if part is None:
+                        continue
+                    namespace = tuple(part.get("ns", ()))
+                    if part.get("type") == "values" and not namespace:
+                        final_values = part.get("data")
+                    for event in adapter.events_from_part(part):
+                        source = (
+                            subagent_type
+                            if not namespace
+                            else f"{subagent_type} / {event.source}"
+                        )
+                        await manager.publish_activity(
+                            task_id,
+                            dataclasses.replace(event, source=source),
+                        )
+                return _result_text(final_values)
             result = await child.ainvoke(state, config)  # type: ignore[attr-defined]
             return _result_text(result)
 
@@ -804,6 +866,9 @@ class BackgroundTaskManager:
         self._session_task_ids: dict[str, list[str]] = {}
         self._subscribers: dict[
             str, set[asyncio.Queue[BackgroundTaskSnapshot]]
+        ] = {}
+        self._activity_subscribers: dict[
+            str, set[asyncio.Queue[BackgroundTaskActivity]]
         ] = {}
         self._closing_sessions: set[str] = set()
         self._session_close_locks: dict[str, asyncio.Lock] = {}
@@ -1073,8 +1138,43 @@ class BackgroundTaskManager:
                 record.completion.set()
             snapshot = record.snapshot()
             subscribers = tuple(self._subscribers.get(record.session_id, ()))
+            activity_subscribers = tuple(
+                self._activity_subscribers.get(record.session_id, ())
+            )
+        for completion_queue in subscribers:
+            completion_queue.put_nowait(snapshot)
+        terminal_activity = BackgroundTaskActivity(
+            task_id=record.task_id,
+            session_id=record.session_id,
+            agent_name=record.agent_name,
+            description=record.description,
+            snapshot=snapshot,
+        )
+        for activity_queue in activity_subscribers:
+            activity_queue.put_nowait(terminal_activity)
+
+    async def publish_activity(
+        self,
+        task_id: str,
+        event: AgentStreamEvent,
+    ) -> None:
+        """Publish one live event to activity subscribers for its task session."""
+        async with self._lock:
+            record = self._records.get(task_id)
+            if record is None:
+                return
+            subscribers = tuple(
+                self._activity_subscribers.get(record.session_id, ())
+            )
+            activity = BackgroundTaskActivity(
+                task_id=record.task_id,
+                session_id=record.session_id,
+                agent_name=record.agent_name,
+                description=record.description,
+                event=event,
+            )
         for queue in subscribers:
-            queue.put_nowait(snapshot)
+            queue.put_nowait(activity)
 
     def _is_visible(
         self,
@@ -1439,6 +1539,28 @@ class BackgroundTaskManager:
         if not subscribers:
             self._subscribers.pop(session_id, None)
 
+    def subscribe_activity(
+        self,
+        session_id: str,
+    ) -> asyncio.Queue[BackgroundTaskActivity]:
+        """Subscribe to ordered live and terminal task activity."""
+        queue: asyncio.Queue[BackgroundTaskActivity] = asyncio.Queue()
+        self._activity_subscribers.setdefault(session_id, set()).add(queue)
+        return queue
+
+    def unsubscribe_activity(
+        self,
+        session_id: str,
+        queue: asyncio.Queue[BackgroundTaskActivity],
+    ) -> None:
+        """Remove a previously registered task activity subscriber."""
+        subscribers = self._activity_subscribers.get(session_id)
+        if subscribers is None:
+            return
+        subscribers.discard(queue)
+        if not subscribers:
+            self._activity_subscribers.pop(session_id, None)
+
     async def close(self) -> None:
         """Cancel all work and prevent future spawns."""
         async with self._lock:
@@ -1462,3 +1584,4 @@ class BackgroundTaskManager:
             return_exceptions=False,
         )
         self._subscribers.clear()
+        self._activity_subscribers.clear()

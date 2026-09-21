@@ -6211,6 +6211,7 @@ def test_load_extensions_config_parses_background_subagent_limits(
         """
 [agent.background_subagents]
 enabled = true
+stream_activity = true
 max_running_per_session = 3
 max_running_total = 7
 max_tasks_per_session = 21
@@ -6222,6 +6223,7 @@ max_tasks_per_session = 21
     background = deepagent_runtime.load_extensions_config().background_subagents
 
     assert background.enabled is True
+    assert background.stream_activity is True
     assert background.max_running_per_session == 3
     assert background.max_running_total == 7
     assert background.max_tasks_per_session == 21
@@ -6232,6 +6234,7 @@ max_tasks_per_session = 21
     ("field", "value"),
     [
         ("enabled", '"yes"'),
+        ("stream_activity", '"yes"'),
         ("max_running_per_session", "0"),
         ("max_running_total", "-1"),
         ("max_tasks_per_session", '"many"'),

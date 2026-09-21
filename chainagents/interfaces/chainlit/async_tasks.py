@@ -5,19 +5,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 import chainlit as cl
+from chainlit.utils import utc_now
 from langgraph_sdk import get_client
 
+from chainagents.events.stream import AgentStreamEvent
 from chainagents.runtime import AsyncSubagentConfig
 from chainagents.runtime.background_tasks import (
+    BackgroundTaskActivity,
     BackgroundTaskManager,
     BackgroundTaskSnapshot,
 )
 
 
 DEFAULT_POLL_SECONDS = 5.0
+ACTIVITY_FLUSH_SECONDS = 0.05
 DEFAULT_AGENT_PROTOCOL_URL = "http://127.0.0.1:2024"
 TERMINAL_STATUSES = {"success", "error", "cancelled", "interrupted", "timeout"}
 logger = logging.getLogger("chainagents.interfaces.chainlit.async_tasks")
@@ -34,21 +39,46 @@ def format_local_task_result(snapshot: BackgroundTaskSnapshot) -> str:
     return content
 
 
+@dataclass
+class _LocalToolActivityState:
+    """Identity and Chainlit step for one streamed background tool call."""
+
+    call_id: str
+    source: str
+    name: str
+    step: cl.Step
+
+
+@dataclass
+class _LocalTaskActivityState:
+    """Chainlit steps owned by one process-local background task."""
+
+    parent: cl.Step
+    reasoning_steps: dict[str, cl.Step] = field(default_factory=dict)
+    tool_steps: dict[str, _LocalToolActivityState] = field(default_factory=dict)
+
+
 class LocalBackgroundTaskNotifier:
-    """Deliver one Chainlit message for each local task terminal transition."""
+    """Deliver local task activity and one terminal Chainlit message."""
 
     def __init__(self, *, manager: BackgroundTaskManager, session_id: str) -> None:
         self.manager = manager
         self.session_id = session_id
         self.queue: asyncio.Queue[BackgroundTaskSnapshot] | None = None
+        self.activity_queue: asyncio.Queue[BackgroundTaskActivity] | None = None
+        self.activity_states: dict[str, _LocalTaskActivityState] = {}
         self.task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         """Subscribe and start consuming completion events."""
         if self.task is not None and not self.task.done():
             return
-        self.queue = self.manager.subscribe(self.session_id)
-        self.task = asyncio.create_task(self._run())
+        if self.manager.config.stream_activity:
+            self.activity_queue = self.manager.subscribe_activity(self.session_id)
+            self.task = asyncio.create_task(self._run_activity())
+        else:
+            self.queue = self.manager.subscribe(self.session_id)
+            self.task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
         if self.queue is None:
@@ -66,14 +96,308 @@ class LocalBackgroundTaskNotifier:
                     snapshot.task_id,
                 )
 
-    def cancel(self) -> None:
-        """Stop notifications without changing the underlying jobs."""
+    async def _run_activity(self) -> None:
+        if self.activity_queue is None:
+            return
+        while True:
+            first = await self.activity_queue.get()
+            batch = [first]
+            if first.snapshot is None:
+                await asyncio.sleep(ACTIVITY_FLUSH_SECONDS)
+            while True:
+                try:
+                    batch.append(self.activity_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            await self._handle_activity_batch(batch)
+
+    async def _handle_activity_batch(
+        self,
+        batch: list[BackgroundTaskActivity],
+    ) -> None:
+        pending: BackgroundTaskActivity | None = None
+        pending_text = ""
+
+        async def flush_reasoning() -> None:
+            nonlocal pending, pending_text
+            if pending is None or pending.event is None:
+                return
+            try:
+                await self._handle_live_event(
+                    pending,
+                    AgentStreamEvent(
+                        kind="reasoning_delta",
+                        source=pending.event.source,
+                        text=pending_text,
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to render local background task activity for %s.",
+                    pending.task_id,
+                )
+            pending = None
+            pending_text = ""
+
+        for activity in batch:
+            event = activity.event
+            if event is not None and event.kind == "reasoning_delta":
+                if (
+                    pending is not None
+                    and pending.task_id == activity.task_id
+                    and pending.event is not None
+                    and pending.event.source == event.source
+                ):
+                    pending_text += event.text
+                    continue
+                await flush_reasoning()
+                pending = activity
+                pending_text = event.text
+                continue
+
+            await flush_reasoning()
+            try:
+                if event is not None:
+                    await self._handle_live_event(activity, event)
+                elif activity.snapshot is not None:
+                    await self._handle_terminal(activity)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to render local background task activity for %s.",
+                    activity.task_id,
+                )
+        await flush_reasoning()
+
+    async def _activity_state(
+        self,
+        activity: BackgroundTaskActivity,
+    ) -> _LocalTaskActivityState:
+        state = self.activity_states.get(activity.task_id)
+        if state is not None:
+            return state
+        parent = cl.Step(
+            name=f"{activity.agent_name} (background)",
+            type="run",
+            default_open=True,
+        )
+        parent.input = activity.description
+        parent.start = utc_now()
+        state = _LocalTaskActivityState(parent=parent)
+        self.activity_states[activity.task_id] = state
+        await parent.send()
+        return state
+
+    async def _handle_live_event(
+        self,
+        activity: BackgroundTaskActivity,
+        event: AgentStreamEvent,
+    ) -> None:
+        if event.kind == "reasoning_delta" and event.text:
+            state = await self._activity_state(activity)
+            step = state.reasoning_steps.get(event.source)
+            if step is None:
+                step = cl.Step(
+                    name=f"{event.source} reasoning",
+                    type="llm",
+                    parent_id=state.parent.id,
+                    default_open=True,
+                )
+                step.start = utc_now()
+                state.reasoning_steps[event.source] = step
+                await step.send()
+            await step.stream_token(event.text)
+            return
+
+        if event.kind == "tool_call":
+            state = await self._activity_state(activity)
+            if event.previous_tool_call_id and event.tool_call_id:
+                previous = state.tool_steps.pop(event.previous_tool_call_id, None)
+                if previous is not None:
+                    previous.call_id = event.tool_call_id
+                    state.tool_steps[event.tool_call_id] = previous
+            call_id = event.tool_call_id or event.source
+            tool_state = state.tool_steps.get(call_id)
+            if tool_state is None:
+                step = cl.Step(
+                    name=f"{event.source} · {event.tool_name or 'tool'}",
+                    type="tool",
+                    parent_id=state.parent.id,
+                    default_open=True,
+                    show_input="json",
+                    language="json",
+                )
+                step.start = utc_now()
+                step.output = "Running..."
+                tool_state = _LocalToolActivityState(
+                    call_id=call_id,
+                    source=event.source,
+                    name=event.tool_name or "tool",
+                    step=step,
+                )
+                state.tool_steps[call_id] = tool_state
+                await step.send()
+            step = tool_state.step
+            if event.tool_name:
+                tool_state.name = event.tool_name
+                step.name = f"{event.source} · {event.tool_name}"
+            if event.tool_args:
+                step.input = event.tool_args
+            await step.update()
+            return
+
+        if event.kind == "tool_result":
+            state = await self._activity_state(activity)
+            call_id = event.tool_call_id or event.source
+            tool_state = self._resolve_tool_state(state, event)
+            if tool_state is None:
+                step = cl.Step(
+                    name=f"{event.source} · {event.tool_name or 'tool'}",
+                    type="tool",
+                    parent_id=state.parent.id,
+                    default_open=True,
+                    show_input="json",
+                    language="json",
+                )
+                step.start = utc_now()
+                tool_state = _LocalToolActivityState(
+                    call_id=call_id,
+                    source=event.source,
+                    name=event.tool_name or "tool",
+                    step=step,
+                )
+                state.tool_steps[call_id] = tool_state
+                await step.send()
+            elif call_id and tool_state.call_id != call_id:
+                for existing_id, existing in tuple(state.tool_steps.items()):
+                    if existing is tool_state:
+                        state.tool_steps.pop(existing_id, None)
+                tool_state.call_id = call_id
+                state.tool_steps[call_id] = tool_state
+            step = tool_state.step
+            if event.tool_name:
+                tool_state.name = event.tool_name
+                step.name = f"{event.source} · {event.tool_name}"
+            step.output = event.tool_result
+            step.end = utc_now()
+            await step.update()
+
+    @staticmethod
+    def _resolve_tool_state(
+        state: _LocalTaskActivityState,
+        event: AgentStreamEvent,
+    ) -> _LocalToolActivityState | None:
+        if event.tool_call_id and event.tool_call_id in state.tool_steps:
+            return state.tool_steps[event.tool_call_id]
+        candidates = list({id(item): item for item in state.tool_steps.values()}.values())
+        source_name = [
+            item
+            for item in candidates
+            if item.source == event.source
+            and bool(event.tool_name)
+            and item.name == event.tool_name
+        ]
+        if len(source_name) == 1:
+            return source_name[0]
+        source = [item for item in candidates if item.source == event.source]
+        if len(source) == 1:
+            return source[0]
+        return None
+
+    async def _handle_terminal(self, activity: BackgroundTaskActivity) -> None:
+        snapshot = activity.snapshot
+        if snapshot is None:
+            return
+        try:
+            state = await self._activity_state(activity)
+            await self._close_activity_state(
+                activity.task_id,
+                state,
+                parent_output=f"Finished with status: {snapshot.status}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to close local background task steps for %s.",
+                activity.task_id,
+            )
+        self.activity_states.pop(activity.task_id, None)
+        await cl.Message(
+            content=format_local_task_result(snapshot),
+            author="Background subagent",
+        ).send()
+
+    async def _close_activity_state(
+        self,
+        task_id: str,
+        state: _LocalTaskActivityState,
+        *,
+        parent_output: str,
+    ) -> None:
+        for step in state.reasoning_steps.values():
+            if getattr(step, "end", None) is None:
+                step.end = utc_now()
+            try:
+                await step.update()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to close a reasoning step for %s.", task_id)
+        tool_states = {
+            id(item): item for item in state.tool_steps.values()
+        }.values()
+        for tool_state in tool_states:
+            step = tool_state.step
+            if getattr(step, "end", None) is None:
+                step.end = utc_now()
+            try:
+                await step.update()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to close a tool step for %s.", task_id)
+        state.parent.output = parent_output
+        state.parent.end = utc_now()
+        try:
+            await state.parent.update()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to close the background task parent step for %s.",
+                task_id,
+            )
+
+    def _unsubscribe(self) -> None:
         if self.queue is not None:
             self.manager.unsubscribe(self.session_id, self.queue)
             self.queue = None
+        if self.activity_queue is not None:
+            self.manager.unsubscribe_activity(self.session_id, self.activity_queue)
+            self.activity_queue = None
+
+    async def aclose(self) -> None:
+        """Stop notifications and best-effort close all rendered activity steps."""
+        self._unsubscribe()
+        consumer = self.task
+        self.task = None
+        if consumer is not None:
+            consumer.cancel()
+            try:
+                await consumer
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("Local background task notifier stopped unexpectedly.")
+        for task_id, state in tuple(self.activity_states.items()):
+            await self._close_activity_state(
+                task_id,
+                state,
+                parent_output="Stopped",
+            )
+        self.activity_states.clear()
+
+    def cancel(self) -> None:
+        """Stop notifications without changing the underlying jobs."""
+        self._unsubscribe()
         if self.task is not None:
             self.task.cancel()
             self.task = None
+        self.activity_states.clear()
 
 
 def async_subagent_url_override() -> str | None:

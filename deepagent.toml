@@ -84,6 +84,9 @@ summarization_keep_tokens = 10000
 # launch or waiting batch execution. Foreground delegation remains available
 # for every configured subagent.
 enabled = false
+# Set true to stream background reasoning and tool activity into nested Chainlit
+# steps. The CLI, TUI, and HTTP API remain completion-only.
+stream_activity = false
 max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100

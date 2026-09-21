@@ -97,6 +97,7 @@ class BackgroundSubagentConfig:
     """Configure process-local background execution for synchronous subagents."""
 
     enabled: bool = False
+    stream_activity: bool = False
     max_running_per_session: int = 4
     max_running_total: int = 16
     max_tasks_per_session: int = 100

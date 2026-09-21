@@ -843,7 +843,7 @@ Main `[agent]` additions:
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
-- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
+- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. `stream_activity = true` exposes live reasoning and tool activity as nested Chainlit steps while leaving other interfaces completion-only. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
@@ -863,6 +863,7 @@ start one of its configured children and continue immediately. Enable it with:
 ```toml
 [agent.background_subagents]
 enabled = true
+stream_activity = true
 max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100
@@ -946,9 +947,13 @@ the parent response. Concurrent children can therefore observe the same
 workspace and memory resources; prompts should assign non-overlapping writes or
 otherwise coordinate shared updates.
 
-Chainlit and the interactive CLI/TUI post one status-only notice when a task
-finishes; successful output remains available through `get_background_task`
-instead of being copied into the notice. A
+By default, Chainlit and the interactive CLI/TUI post one status-only notice
+when a task finishes; successful output remains available through
+`get_background_task` instead of being copied into the notice. With
+`stream_activity = true`, Chainlit additionally renders each background task as
+a parent step with nested reasoning and tool-call steps, then closes that tree
+before posting the same single terminal notice. The setting does not expose
+live background activity through the CLI, TUI, or HTTP API. A
 one-shot CLI invocation prints the main response first, then waits for its
 remaining background work. One-shot text output prints terminal results because
 the process is about to exit; JSON output includes a `background_tasks` array.

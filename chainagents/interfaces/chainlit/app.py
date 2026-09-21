@@ -1252,7 +1252,7 @@ def get_async_task_notifier(
     return notifier
 
 
-def start_local_background_notifier(
+async def start_local_background_notifier(
     *,
     runtime: AgentRuntime,
     session_id: str,
@@ -1260,7 +1260,7 @@ def start_local_background_notifier(
     """Start one local background completion subscriber for this chat."""
     existing = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
     if isinstance(existing, LocalBackgroundTaskNotifier):
-        existing.cancel()
+        await existing.aclose()
     if not runtime.config.extensions.background_subagents.enabled:
         return
     notifier = LocalBackgroundTaskNotifier(
@@ -1296,7 +1296,10 @@ async def on_chat_start() -> None:
     )
     await run_task_list.show_ready()
     store_settings(settings)
-    start_local_background_notifier(runtime=runtime, session_id=settings.thread_id)
+    await start_local_background_notifier(
+        runtime=runtime,
+        session_id=settings.thread_id,
+    )
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1401,7 +1404,10 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         show_reasoning_stream_default=extensions.chainlit_reasoning_steps_enabled,
         show_tool_calls_default=extensions.chainlit_tool_steps_enabled,
     )
-    start_local_background_notifier(runtime=runtime, session_id=settings.thread_id)
+    await start_local_background_notifier(
+        runtime=runtime,
+        session_id=settings.thread_id,
+    )
     run_task_list = await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
@@ -1467,6 +1473,7 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         isinstance(local_notifier, LocalBackgroundTaskNotifier)
         and local_notifier.session_id != settings.thread_id
     ):
+        await local_notifier.aclose()
         await runtime.close_conversation(
             thread_id=local_notifier.session_id,
             mcp_session_id=current_mcp_session_id() or None,
@@ -1476,7 +1483,7 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         not isinstance(local_notifier, LocalBackgroundTaskNotifier)
         or local_notifier.session_id != settings.thread_id
     ):
-        start_local_background_notifier(
+        await start_local_background_notifier(
             runtime=runtime,
             session_id=settings.thread_id,
         )
@@ -1823,7 +1830,7 @@ async def on_chat_end() -> None:
         notifier.cancel()
     local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
     if isinstance(local_notifier, LocalBackgroundTaskNotifier):
-        local_notifier.cancel()
+        await local_notifier.aclose()
 
     runtime = AgentRuntime.current()
     if runtime is not None:
