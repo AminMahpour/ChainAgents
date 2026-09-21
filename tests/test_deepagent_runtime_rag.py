@@ -4026,6 +4026,7 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
     )
     background_names = {
         "spawn_background_task",
+        "run_subagent_batch",
         "list_background_tasks",
         "get_background_task",
         "cancel_background_task",
@@ -4154,6 +4155,9 @@ def test_create_configured_graph_builds_local_background_subagents(
     assert "spawn_background_task" in {
         tool.name for tool in main_graph.kwargs["tools"]
     }
+    assert "run_subagent_batch" in {
+        tool.name for tool in main_graph.kwargs["tools"]
+    }
 
     spawn_tool = next(
         tool
@@ -4233,6 +4237,9 @@ def test_create_configured_graph_scopes_nested_only_background_subagents(
     assert len(created_graphs) == 3
     manager_graph = created_graphs[1]
     assert "spawn_background_task" in {
+        tool.name for tool in manager_graph.kwargs["tools"]
+    }
+    assert "run_subagent_batch" in {
         tool.name for tool in manager_graph.kwargs["tools"]
     }
 

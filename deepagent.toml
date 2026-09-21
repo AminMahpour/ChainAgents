@@ -78,7 +78,8 @@ summarization_keep_tokens = 10000
 [agent.background_subagents]
 # Local background execution is process-local and opt-in. Configured synchronous
 # subagents must also set `background = true` to be eligible for background
-# launch. Foreground delegation remains available for every configured subagent.
+# launch or waiting batch execution. Foreground delegation remains available
+# for every configured subagent.
 enabled = false
 max_running_per_session = 4
 max_running_total = 16

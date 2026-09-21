@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextvars
 import dataclasses
 import json
@@ -25,6 +26,7 @@ from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.runtime import Runtime
+from pydantic import BaseModel, Field
 
 from chainagents.runtime.types import BackgroundSubagentConfig
 
@@ -40,6 +42,7 @@ TERMINAL_BACKGROUND_TASK_STATUSES = frozenset({"success", "error", "cancelled"})
 BACKGROUND_TASK_TOOL_NAMES = frozenset(
     {
         "spawn_background_task",
+        "run_subagent_batch",
         "list_background_tasks",
         "get_background_task",
         "cancel_background_task",
@@ -443,6 +446,29 @@ class BackgroundTaskSnapshot:
         }
 
 
+class BackgroundSubagentBatchRequest(BaseModel):
+    """One independently executable child request in a subagent batch."""
+
+    description: str = Field(
+        description=(
+            "A complete task description for one subagent. Include all context "
+            "the isolated child needs."
+        )
+    )
+    subagent_type: str = Field(
+        description="The configured direct child subagent that should run the task."
+    )
+
+
+@dataclass(frozen=True)
+class _BackgroundTaskSubmission:
+    agent_name: str
+    description: str
+    agent_path: tuple[str, ...]
+    runner: BackgroundRunner
+    cleanup: BackgroundCleanup | None = None
+
+
 @dataclass
 class _BackgroundTaskRecord:
     task_id: str
@@ -555,14 +581,12 @@ def create_background_task_tools(
     def expected_generation() -> BackgroundSessionGeneration | None:
         return session_generation or current_background_session_generation()
 
-    @tool("spawn_background_task")
-    async def spawn_background_task(
+    def build_submission(
         description: str,
         subagent_type: str,
         runtime: ToolRuntime,
-    ) -> dict[str, object]:
-        """Launch an allowed local subagent and return its task ID immediately."""
-        session_id = _session_id_from_runtime(runtime)
+        session_id: str,
+    ) -> _BackgroundTaskSubmission:
         child = subagents.get(subagent_type)
         if child is None:
             raise ValueError(
@@ -595,23 +619,121 @@ def create_background_task_tools(
             result = await child.ainvoke(state, config)  # type: ignore[attr-defined]
             return _result_text(result)
 
-        async def cleanup_child(task_id: str) -> None:
-            await delete_checkpoint_thread(
-                f"{session_id}:background:{task_id}"
-            )
+        cleanup: BackgroundCleanup | None = None
+        if callable(delete_checkpoint_thread):
+            async def cleanup_child(task_id: str) -> None:
+                await delete_checkpoint_thread(
+                    f"{session_id}:background:{task_id}"
+                )
 
-        snapshot = await manager.spawn(
-            session_id=session_id,
+            cleanup = cleanup_child
+
+        return _BackgroundTaskSubmission(
             agent_name=subagent_type,
             description=description,
             agent_path=(*agent_path, subagent_type),
+            runner=run_child,
+            cleanup=cleanup,
+        )
+
+    @tool("spawn_background_task")
+    async def spawn_background_task(
+        description: str,
+        subagent_type: str,
+        runtime: ToolRuntime,
+    ) -> dict[str, object]:
+        """Launch an allowed local subagent and return its task ID immediately."""
+        session_id = _session_id_from_runtime(runtime)
+        submission = build_submission(
+            description,
+            subagent_type,
+            runtime,
+            session_id,
+        )
+
+        snapshot = await manager.spawn(
+            session_id=session_id,
+            agent_name=submission.agent_name,
+            description=submission.description,
+            agent_path=submission.agent_path,
             owner_path=current_background_invocation_path(),
             parent_task_id=current_background_task_id(),
             expected_session_generation=expected_generation(),
-            runner=run_child,
-            cleanup=cleanup_child if callable(delete_checkpoint_thread) else None,
+            runner=submission.runner,
+            cleanup=submission.cleanup,
         )
         return snapshot.to_payload()
+
+    @tool("run_subagent_batch")
+    async def run_subagent_batch(
+        tasks: list[BackgroundSubagentBatchRequest],
+        runtime: ToolRuntime,
+    ) -> dict[str, object]:
+        """Run independent child tasks concurrently and return all reports in order."""
+        if not tasks:
+            raise ValueError("A subagent batch requires at least one task.")
+        session_id = _session_id_from_runtime(runtime)
+        normalized = [
+            task
+            if isinstance(task, BackgroundSubagentBatchRequest)
+            else BackgroundSubagentBatchRequest.model_validate(task)
+            for task in tasks
+        ]
+        for task in normalized:
+            if not task.description.strip():
+                raise ValueError("Each subagent batch description must be non-empty.")
+        submissions = [
+            build_submission(
+                task.description,
+                task.subagent_type,
+                runtime,
+                session_id,
+            )
+            for task in normalized
+        ]
+        owner_path = current_background_invocation_path()
+        parent_task_id = current_background_task_id()
+        generation = expected_generation()
+        snapshots = await manager.spawn_batch(
+            session_id=session_id,
+            submissions=submissions,
+            owner_path=owner_path,
+            parent_task_id=parent_task_id,
+            expected_session_generation=generation,
+        )
+        task_ids = [snapshot.task_id for snapshot in snapshots]
+        try:
+            completed = await manager.wait_batch(
+                session_id,
+                task_ids,
+                scope_path=agent_path,
+                owner_path=owner_path,
+                ancestor_task_id=parent_task_id,
+                expected_session_generation=generation,
+            )
+        except asyncio.CancelledError:
+            async def cancel_batch() -> None:
+                await asyncio.gather(
+                    *(
+                        manager.cancel(
+                            session_id,
+                            task_id,
+                            scope_path=agent_path,
+                            owner_path=owner_path,
+                            ancestor_task_id=parent_task_id,
+                        )
+                        for task_id in task_ids
+                    ),
+                    return_exceptions=True,
+                )
+
+            cancellation = asyncio.create_task(
+                cancel_batch(),
+                name=f"chainagents-cancel-batch-{runtime.tool_call_id}",
+            )
+            await await_preserving_cancellation(cancellation)
+            raise
+        return {"results": [snapshot.to_payload() for snapshot in completed]}
 
     @tool("list_background_tasks")
     async def list_background_tasks(runtime: ToolRuntime) -> list[dict[str, object]]:
@@ -664,6 +786,7 @@ def create_background_task_tools(
 
     return [
         spawn_background_task,
+        run_subagent_batch,
         list_background_tasks,
         get_background_task,
         cancel_background_task,
@@ -735,11 +858,40 @@ class BackgroundTaskManager:
         cleanup: BackgroundCleanup | None = None,
     ) -> BackgroundTaskSnapshot:
         """Start a job immediately and return before the runner finishes."""
+        snapshots = await self.spawn_batch(
+            session_id=session_id,
+            submissions=[
+                _BackgroundTaskSubmission(
+                    agent_name=agent_name,
+                    description=description,
+                    agent_path=agent_path,
+                    runner=runner,
+                    cleanup=cleanup,
+                )
+            ],
+            owner_path=owner_path,
+            parent_task_id=parent_task_id,
+            expected_session_generation=expected_session_generation,
+        )
+        return snapshots[0]
+
+    async def spawn_batch(
+        self,
+        *,
+        session_id: str,
+        submissions: Sequence[_BackgroundTaskSubmission],
+        owner_path: tuple[str, ...] = (),
+        parent_task_id: str | None = None,
+        expected_session_generation: BackgroundSessionGeneration | None = None,
+    ) -> builtins.list[BackgroundTaskSnapshot]:
+        """Atomically admit and start an ordered batch of background jobs."""
         normalized_session = session_id.strip()
         if not normalized_session:
             raise ValueError("Background tasks require a non-empty session ID.")
         if not self.config.enabled:
             raise RuntimeError("Local background subagents are disabled.")
+        if not submissions:
+            raise ValueError("Background task batches require at least one submission.")
 
         async with self._lock:
             if self._closed:
@@ -750,12 +902,13 @@ class BackgroundTaskManager:
                 normalized_session,
                 expected_session_generation,
             )
-            session_ids = self._session_task_ids.setdefault(normalized_session, [])
+            session_ids = self._session_task_ids.get(normalized_session, [])
             running_session = sum(
                 self._records[task_id].status not in TERMINAL_BACKGROUND_TASK_STATUSES
                 for task_id in session_ids
             )
-            if running_session >= self.config.max_running_per_session:
+            batch_size = len(submissions)
+            if running_session + batch_size > self.config.max_running_per_session:
                 raise RuntimeError(
                     "Background running limit reached for this session "
                     f"({self.config.max_running_per_session})."
@@ -764,12 +917,12 @@ class BackgroundTaskManager:
                 record.status not in TERMINAL_BACKGROUND_TASK_STATUSES
                 for record in self._records.values()
             )
-            if running_total >= self.config.max_running_total:
+            if running_total + batch_size > self.config.max_running_total:
                 raise RuntimeError(
                     "Background running limit reached for this process "
                     f"({self.config.max_running_total})."
                 )
-            if len(session_ids) >= self.config.max_tasks_per_session:
+            if len(session_ids) + batch_size > self.config.max_tasks_per_session:
                 raise RuntimeError(
                     "Background retained task limit reached for this session "
                     f"({self.config.max_tasks_per_session})."
@@ -781,30 +934,34 @@ class BackgroundTaskManager:
                 if parent.cancelling:
                     raise RuntimeError("Background parent task is cancelling.")
 
-            task_id = f"bg-{uuid.uuid4().hex[:12]}"
-            record = _BackgroundTaskRecord(
-                task_id=task_id,
-                session_id=normalized_session,
-                agent_name=agent_name,
-                description=description,
-                agent_path=agent_path,
-                owner_path=owner_path,
-                session_generation=expected_session_generation,
-                parent_task_id=parent_task_id,
-                status="pending",
-                created_at=time.time(),
-                completion=asyncio.Event(),
-                cleanup=cleanup,
-            )
-            self._records[task_id] = record
-            session_ids.append(task_id)
-            context = contextvars.Context()
-            record.execution = asyncio.create_task(
-                self._execute(record, runner),
-                name=f"chainagents-{task_id}",
-                context=context,
-            )
-            return record.snapshot()
+            retained_ids = self._session_task_ids.setdefault(normalized_session, [])
+            records: list[_BackgroundTaskRecord] = []
+            for submission in submissions:
+                task_id = f"bg-{uuid.uuid4().hex[:12]}"
+                record = _BackgroundTaskRecord(
+                    task_id=task_id,
+                    session_id=normalized_session,
+                    agent_name=submission.agent_name,
+                    description=submission.description,
+                    agent_path=submission.agent_path,
+                    owner_path=owner_path,
+                    session_generation=expected_session_generation,
+                    parent_task_id=parent_task_id,
+                    status="pending",
+                    created_at=time.time(),
+                    completion=asyncio.Event(),
+                    cleanup=submission.cleanup,
+                )
+                self._records[task_id] = record
+                retained_ids.append(task_id)
+                records.append(record)
+            for record, submission in zip(records, submissions, strict=True):
+                record.execution = asyncio.create_task(
+                    self._execute(record, submission.runner),
+                    name=f"chainagents-{record.task_id}",
+                    context=contextvars.Context(),
+                )
+            return [record.snapshot() for record in records]
 
     async def _execute(
         self,
@@ -862,8 +1019,11 @@ class BackgroundTaskManager:
             cleanup = record.cleanup
             cleanup_task = record.cleanup_task
             if cleanup is not None and cleanup_task is None:
+                async def run_cleanup() -> None:
+                    await cleanup(record.task_id)
+
                 cleanup_task = asyncio.create_task(
-                    cleanup(record.task_id),
+                    run_cleanup(),
                     name=f"chainagents-cleanup-{record.task_id}",
                 )
                 record.cleanup_task = cleanup_task
@@ -946,7 +1106,7 @@ class BackgroundTaskManager:
         owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
         expected_session_generation: BackgroundSessionGeneration | None = None,
-    ) -> list[BackgroundTaskSnapshot]:
+    ) -> builtins.list[BackgroundTaskSnapshot]:
         """List retained tasks visible to an agent scope."""
         async with self._lock:
             self._validate_session_generation(
@@ -1016,6 +1176,44 @@ class BackgroundTaskManager:
                 )
                 snapshot = record.snapshot()
         return snapshot
+
+    async def wait_batch(
+        self,
+        session_id: str,
+        task_ids: Sequence[str],
+        *,
+        scope_path: tuple[str, ...] = (),
+        owner_path: tuple[str, ...] = (),
+        ancestor_task_id: str | None = None,
+        expected_session_generation: BackgroundSessionGeneration | None = None,
+    ) -> builtins.list[BackgroundTaskSnapshot]:
+        """Wait for an exact visible batch and return snapshots in input order."""
+        async with self._lock:
+            self._validate_session_generation(
+                session_id,
+                expected_session_generation,
+            )
+            records = [
+                self._visible_record(
+                    session_id,
+                    task_id,
+                    scope_path,
+                    owner_path,
+                    ancestor_task_id,
+                )
+                for task_id in task_ids
+            ]
+            executions = [
+                record.execution
+                for record in records
+                if record.execution is not None and not record.execution.done()
+            ]
+        if executions:
+            await asyncio.shield(
+                asyncio.gather(*executions, return_exceptions=True)
+            )
+        async with self._lock:
+            return [record.snapshot() for record in records]
 
     def _visible_record(
         self,
@@ -1121,7 +1319,10 @@ class BackgroundTaskManager:
                 cleanup_error = await self._cleanup_record(record)
                 await self._finish(record, status="cancelled", error=cleanup_error)
 
-    async def wait_session(self, session_id: str) -> list[BackgroundTaskSnapshot]:
+    async def wait_session(
+        self,
+        session_id: str,
+    ) -> builtins.list[BackgroundTaskSnapshot]:
         """Wait until every task currently or subsequently running in a session ends."""
         while True:
             async with self._lock:
@@ -1243,7 +1444,10 @@ class BackgroundTaskManager:
             close_task = self._close_task
         await await_preserving_cancellation(close_task)
 
-    async def _close_all_sessions(self, session_ids: list[str]) -> None:
+    async def _close_all_sessions(
+        self,
+        session_ids: builtins.list[str],
+    ) -> None:
         """Close the manager's sessions and release completion subscribers."""
         await asyncio.gather(
             *(self.close_session(session_id) for session_id in session_ids),

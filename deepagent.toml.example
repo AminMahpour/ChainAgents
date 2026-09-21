@@ -85,8 +85,9 @@ summarization_trigger_tokens = 6000
 summarization_keep_tokens = 2400
 
 [agent.background_subagents]
-# Opt in to process-local background execution for configured sync subagents.
-# Tasks do not survive restarts and are cancelled when their conversation closes.
+# Opt in to process-local background and waiting batch execution for configured
+# sync subagents. Tasks do not survive restarts and are cancelled when their
+# conversation closes.
 enabled = false
 max_running_per_session = 4
 max_running_total = 16

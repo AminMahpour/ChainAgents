@@ -13,6 +13,7 @@ from deepagents import create_deep_agent
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.store.memory import InMemoryStore
@@ -1039,6 +1040,7 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
         by_name = {tool.name: tool for tool in tools}
         assert set(by_name) == {
             "spawn_background_task",
+            "run_subagent_batch",
             "list_background_tasks",
             "get_background_task",
             "cancel_background_task",
@@ -1094,6 +1096,494 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
     asyncio.run(exercise())
 
 
+def test_run_subagent_batch_executes_repeated_targets_concurrently_in_input_order() -> None:
+    """A one-call fanout must overlap child runs and preserve request ordering."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+            self.configs: list[dict[str, object]] = []
+            self.both_started = asyncio.Event()
+            self.releases = {
+                "first": asyncio.Event(),
+                "second": asyncio.Event(),
+            }
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            self.started.append(description)
+            self.configs.append(config)
+            if len(self.started) == 2:
+                self.both_started.set()
+            await self.releases[description].wait()
+            return {"messages": [AIMessage(content=f"result:{description}")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": child},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        batch_tool = next(
+            tool for tool in tools if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "first", "subagent_type": "researcher"},
+                    {"description": "second", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.both_started.wait(), timeout=1)
+        child.releases["second"].set()
+        await asyncio.sleep(0)
+        assert not batch_call.done()
+        child.releases["first"].set()
+
+        result = await asyncio.wait_for(batch_call, timeout=1)
+
+        assert [item["description"] for item in result["results"]] == [
+            "first",
+            "second",
+        ]
+        assert [item["agent_name"] for item in result["results"]] == [
+            "researcher",
+            "researcher",
+        ]
+        assert [item["status"] for item in result["results"]] == [
+            "success",
+            "success",
+        ]
+        assert [item["result"] for item in result["results"]] == [
+            "result:first",
+            "result:second",
+        ]
+        thread_ids = [
+            str(config["configurable"]["thread_id"])
+            for config in child.configs
+        ]
+        assert len(set(thread_ids)) == 2
+        assert all(thread_id.startswith("session-a:background:bg-") for thread_id in thread_ids)
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_has_an_openai_compatible_nested_schema() -> None:
+    """Cortex-compatible tool conversion must retain both batch item fields."""
+    manager = make_manager()
+    batch_tool = next(
+        tool
+        for tool in create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": object()},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        if tool.name == "run_subagent_batch"
+    )
+
+    schema = convert_to_openai_tool(batch_tool)["function"]["parameters"]
+
+    assert schema["type"] == "object"
+    assert set(schema["properties"]) == {"tasks"}
+    assert schema["required"] == ["tasks"]
+    item_schema = schema["properties"]["tasks"]["items"]
+    assert item_schema["type"] == "object"
+    assert item_schema["required"] == ["description", "subagent_type"]
+
+
+def test_run_subagent_batch_rejects_the_whole_batch_when_capacity_is_insufficient() -> None:
+    """Batch admission must not launch a prefix that happens to fit."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started.set()
+            return {"messages": [AIMessage(content="unexpected")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=2, max_running_total=3)
+        blocker_release = asyncio.Event()
+
+        async def blocker(task_id: str) -> str:
+            await blocker_release.wait()
+            return task_id
+
+        existing = await manager.spawn(
+            session_id="session-a",
+            agent_name="existing",
+            description="existing",
+            agent_path=("existing",),
+            runner=blocker,
+        )
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        with pytest.raises(RuntimeError, match="running limit.*session"):
+            await batch_tool.coroutine(
+                [
+                    {"description": "one", "subagent_type": "researcher"},
+                    {"description": "two", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+
+        assert not child.started.is_set()
+        assert [task.task_id for task in await manager.list("session-a")] == [
+            existing.task_id
+        ]
+        blocker_release.set()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_validates_every_request_before_launching() -> None:
+    """Empty, blank, and unknown work must leave the session untouched."""
+
+    class ChildRunnable:
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            return {"messages": [AIMessage(content="unexpected")]}
+
+    async def exercise() -> None:
+        manager = make_manager()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": ChildRunnable()},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        with pytest.raises(ValueError, match="at least one"):
+            await batch_tool.coroutine([], runtime)
+        with pytest.raises(ValueError, match="description"):
+            await batch_tool.coroutine(
+                [{"description": "   ", "subagent_type": "researcher"}],
+                runtime,
+            )
+        with pytest.raises(ValueError, match="Allowed subagents"):
+            await batch_tool.coroutine(
+                [{"description": "work", "subagent_type": "unknown"}],
+                runtime,
+            )
+
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_keeps_sibling_results_when_one_child_fails() -> None:
+    """A failed child must become one result instead of failing the whole tool."""
+
+    class ChildRunnable:
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            if description == "fail":
+                raise RuntimeError("child failed")
+            return {"messages": [AIMessage(content="survived")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": ChildRunnable()},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        result = await batch_tool.coroutine(
+            [
+                {"description": "fail", "subagent_type": "researcher"},
+                {"description": "succeed", "subagent_type": "researcher"},
+            ],
+            runtime,
+        )
+
+        assert [item["status"] for item in result["results"]] == [
+            "error",
+            "success",
+        ]
+        assert result["results"][0]["error"] == "RuntimeError: child failed"
+        assert result["results"][1]["result"] == "survived"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelling_run_subagent_batch_cancels_every_unfinished_child() -> None:
+    """Cancelling a waiting batch call must not orphan its child tasks."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.both_started = asyncio.Event()
+            self.cancelled = 0
+            self.both_cancelled = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                if self.cancelled == 2:
+                    self.both_cancelled.set()
+                raise
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "one", "subagent_type": "researcher"},
+                    {"description": "two", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.both_started.wait(), timeout=1)
+
+        batch_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch_call
+
+        await asyncio.wait_for(child.both_cancelled.wait(), timeout=1)
+        assert [task.status for task in await manager.list("session-a")] == [
+            "cancelled",
+            "cancelled",
+        ]
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_returns_cancelled_results_when_session_closes() -> None:
+    """Session teardown must release a waiting batch call without orphaning work."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.both_started = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            await asyncio.Event().wait()
+            return {"messages": [AIMessage(content="unreachable")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "one", "subagent_type": "researcher"},
+                    {"description": "two", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.both_started.wait(), timeout=1)
+
+        await manager.close_session("session-a")
+        result = await asyncio.wait_for(batch_call, timeout=1)
+
+        assert [item["status"] for item in result["results"]] == [
+            "cancelled",
+            "cancelled",
+        ]
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_concurrent_subagent_batches_share_atomic_capacity_limits() -> None:
+    """Two simultaneous batches cannot both pass a shared capacity boundary."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.first_batch_started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.first_batch_started.set()
+            await self.release.wait()
+            return {"messages": [AIMessage(content="done")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=3, max_running_total=3)
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        requests = [
+            {"description": "one", "subagent_type": "researcher"},
+            {"description": "two", "subagent_type": "researcher"},
+        ]
+        first = asyncio.create_task(batch_tool.coroutine(requests, runtime))
+        await asyncio.wait_for(child.first_batch_started.wait(), timeout=1)
+
+        with pytest.raises(RuntimeError, match="running limit.*session"):
+            await batch_tool.coroutine(requests, runtime)
+
+        assert len(await manager.list("session-a")) == 2
+        child.release.set()
+        await asyncio.wait_for(first, timeout=1)
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_background_tools_reject_reserved_name_collisions() -> None:
     manager = make_manager()
 
@@ -1107,6 +1597,18 @@ def test_background_tools_reject_reserved_name_collisions() -> None:
             agent_path=(),
             recursion_limit=20,
             existing_tools=[SimpleNamespace(name="spawn_background_task")],
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="reserved background task tool name.*run_subagent_batch",
+    ):
+        create_background_task_tools(
+            manager=manager,
+            subagents={},
+            agent_path=(),
+            recursion_limit=20,
+            existing_tools=[SimpleNamespace(name="run_subagent_batch")],
         )
 
 
@@ -1418,6 +1920,86 @@ def test_real_graph_parent_continues_while_background_child_runs() -> None:
         assert completed[0].status == "success"
         assert completed[0].result == "private child result"
         assert await checkpointer.aget_tuple(child_checkpoint_config) is None
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_real_graph_runs_a_subagent_batch_from_one_supervisor_tool_call() -> None:
+    """A single model tool call must fan out into separate concurrent child runs."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.both_started = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            return {"messages": [AIMessage(content=f"report:{description}")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": child},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        parent = create_deep_agent(
+            model=_ToolCallingFakeModel(
+                responses=[
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "run_subagent_batch",
+                                "args": {
+                                    "tasks": [
+                                        {
+                                            "description": "alpha",
+                                            "subagent_type": "researcher",
+                                        },
+                                        {
+                                            "description": "beta",
+                                            "subagent_type": "researcher",
+                                        },
+                                    ]
+                                },
+                                "id": "batch-call",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="synthesized result"),
+                ]
+            ),
+            tools=tools,
+        )
+
+        result = await parent.ainvoke(
+            {"messages": [HumanMessage(content="research both topics")]},
+            {"configurable": {"thread_id": "session-a"}},
+        )
+
+        assert result["messages"][-1].text == "synthesized result"
+        completed = await manager.list("session-a")
+        assert [task.description for task in completed] == ["alpha", "beta"]
+        assert [task.result for task in completed] == [
+            "report:alpha",
+            "report:beta",
+        ]
+        assert len({task.task_id for task in completed}) == 2
         await manager.close()
 
     asyncio.run(exercise())

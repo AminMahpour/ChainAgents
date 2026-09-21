@@ -732,7 +732,7 @@ Supported subagent fields:
 - `skills`: optional list of skill source paths for that subagent
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional profile name or raw model name. Profile names can switch provider settings and tool-schema handling for that sync subagent. Raw model names inherit the parent/default provider settings.
-- `background`: optional boolean, defaulting to `false`. When global local background execution is enabled, `true` allows the subagent's direct parent to launch it with `spawn_background_task`. Foreground `task` delegation is unaffected.
+- `background`: optional boolean, defaulting to `false`. When global local background execution is enabled, `true` allows the subagent's direct parent to launch it with `spawn_background_task` or include it in `run_subagent_batch`. Foreground `task` delegation is unaffected.
 - `nested_subagents`: optional list of top-level sync subagent names exposed as children of this subagent
 - `[[subagents.subagents]]`: optional inline private sync child subagents under a parent subagent
 
@@ -883,13 +883,16 @@ background = true
 ```
 
 An unmarked subagent remains available through the blocking `task` tool but is
-rejected by `spawn_background_task`. Marking a parent does not implicitly mark
-its children; each background launch target opts in independently.
+rejected by `spawn_background_task` and `run_subagent_batch`. Marking a parent
+does not implicitly mark its children; each background launch target opts in
+independently.
 
-The agent receives four tools:
+The agent receives five tools:
 
 - `spawn_background_task(description, subagent_type)` starts an allowed direct
   child and returns a task ID immediately
+- `run_subagent_batch(tasks)` starts every independent task concurrently, waits
+  for all of them, and returns their terminal reports in input order
 - `list_background_tasks()` lists tasks visible to the calling agent
 - `get_background_task(task_id, wait_seconds=0)` returns current state or waits
   up to 60 seconds
@@ -902,6 +905,29 @@ shown above, the main agent can call:
 spawn_background_task("Investigate the failing API tests", "research-manager")
 ```
 
+When several tasks are independent, one tool call can fan out to separate
+subagent conversations:
+
+```text
+run_subagent_batch(tasks=[
+  {"subagent_type": "research-manager", "description": "Trace the API failures."},
+  {"subagent_type": "research-manager", "description": "Check the related tests."}
+])
+```
+
+The call waits for every child and returns one `results` array. Entries stay in
+request order even when children finish in another order. Each entry includes
+the normal task ID, status, result, and error fields. A failed child does not
+discard successful sibling reports. The manager validates capacity for the
+whole batch before launch, so a batch that exceeds a configured limit starts no
+children. Cancelling the waiting call cancels its unfinished children and their
+descendants.
+
+Batch delegation is provider-independent. It is useful when a supervisor model,
+including a Snowflake Cortex model, can emit only one tool call per assistant
+turn: that single call starts separate child graph runs, and each child uses its
+own model request stream.
+
 The running `research-manager` can independently launch its private child with
 `spawn_background_task("Identify the smallest fix", "repo-planner")`. Either
 agent can continue its current response, call `list_background_tasks()` later,
@@ -913,7 +939,9 @@ inspect only their own task subtree and can spawn only their configured direct
 children. Background runs receive an isolated user message and checkpoint
 thread while retaining their configured model, skills, MCP tools, workspace,
 and shared memory access. Their state and streamed tokens are not merged into
-the parent response.
+the parent response. Concurrent children can therefore observe the same
+workspace and memory resources; prompts should assign non-overlapping writes or
+otherwise coordinate shared updates.
 
 Chainlit and the interactive CLI/TUI post one notice when a task finishes. A
 one-shot CLI invocation prints the main response first, then waits for its
