@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from collections.abc import AsyncIterator, Iterator
 from functools import cached_property
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessageChunk
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
+from langchain_core.messages import AIMessageChunk, BaseMessage, ToolCallChunk
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 
 from chainagents.runtime.constants import (
@@ -62,8 +68,135 @@ def _openai_compatible_reasoning_delta(chunk: dict[str, Any]) -> Any:
     return None
 
 
+class _ToolCallChunkIndexRepair:
+    """Repair a provider stream that reuses one index for distinct tool calls."""
+
+    def __init__(self) -> None:
+        self._call_indexes: dict[str, int] = {}
+        self._index_owners: dict[int, str] = {}
+        self._provider_index_calls: dict[int, list[str]] = {}
+        self._active_index: int | None = None
+        self._repairing = False
+
+    def repair(self, chunk: ChatGenerationChunk) -> ChatGenerationChunk:
+        """Return a chunk with unambiguous tool-call indexes when needed."""
+        message = chunk.message
+        if not isinstance(message, AIMessageChunk) or not message.tool_call_chunks:
+            return chunk
+
+        repaired_chunks: list[ToolCallChunk] = []
+        changed = False
+        for tool_call_chunk in message.tool_call_chunks:
+            repaired = tool_call_chunk.copy()
+            call_id = repaired.get("id")
+            provider_index = repaired.get("index")
+            if isinstance(call_id, str) and call_id:
+                repaired_index = self._call_indexes.get(call_id)
+                if repaired_index is None and isinstance(provider_index, int):
+                    provider_calls = self._provider_index_calls.setdefault(
+                        provider_index,
+                        [],
+                    )
+                    owner = self._index_owners.get(provider_index)
+                    if provider_calls or (owner is not None and owner != call_id):
+                        self._repairing = True
+                        repaired_index = self._next_index()
+                    else:
+                        repaired_index = provider_index
+                    provider_calls.append(call_id)
+                    self._call_indexes[call_id] = repaired_index
+                    self._index_owners[repaired_index] = call_id
+                if repaired_index is not None:
+                    self._active_index = repaired_index
+                    if provider_index != repaired_index:
+                        repaired["index"] = repaired_index
+                        changed = True
+            elif self._repairing and self._active_index is not None:
+                repaired_index = self._active_index
+                if isinstance(provider_index, int):
+                    provider_calls = self._provider_index_calls.get(
+                        provider_index,
+                        [],
+                    )
+                    if len(provider_calls) == 1:
+                        repaired_index = self._call_indexes[provider_calls[0]]
+                if provider_index != repaired_index:
+                    repaired["index"] = repaired_index
+                    changed = True
+            repaired_chunks.append(repaired)
+
+        if not changed:
+            return chunk
+        repaired_message = message.model_copy(deep=True)
+        repaired_message.tool_call_chunks = repaired_chunks
+        return chunk.model_copy(update={"message": repaired_message})
+
+    def _next_index(self) -> int:
+        """Return the first non-negative index not already owned by a call."""
+        candidate = 0
+        while candidate in self._index_owners:
+            candidate += 1
+        return candidate
+
+
 class OpenAICompatibleChatOpenAI(ChatOpenAI):
     """Adapt OpenAI-compatible chat chunks while preserving reasoning deltas."""
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        *,
+        stream_usage: bool | None = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Stream chunks with request-local repair for reused tool-call indexes."""
+        repair = _ToolCallChunkIndexRepair()
+        for chunk in super()._stream(
+            messages,
+            stop=stop,
+            run_manager=None,
+            stream_usage=stream_usage,
+            **kwargs,
+        ):
+            repaired = repair.repair(chunk)
+            if run_manager is not None:
+                logprobs = (repaired.generation_info or {}).get("logprobs")
+                run_manager.on_llm_new_token(
+                    repaired.text,
+                    chunk=repaired,
+                    logprobs=logprobs,
+                )
+            yield repaired
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        *,
+        stream_usage: bool | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """Asynchronously stream chunks with request-local index repair."""
+        repair = _ToolCallChunkIndexRepair()
+        async for chunk in super()._astream(
+            messages,
+            stop=stop,
+            run_manager=None,
+            stream_usage=stream_usage,
+            **kwargs,
+        ):
+            repaired = repair.repair(chunk)
+            if run_manager is not None:
+                logprobs = (repaired.generation_info or {}).get("logprobs")
+                await run_manager.on_llm_new_token(
+                    repaired.text,
+                    chunk=repaired,
+                    logprobs=logprobs,
+                )
+            yield repaired
 
     def _convert_chunk_to_generation_chunk(
         self,

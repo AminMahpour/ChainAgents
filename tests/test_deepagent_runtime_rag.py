@@ -18,6 +18,7 @@ from langchain.tools import ToolRuntime
 from langchain_anthropic.chat_models import convert_to_anthropic_tool
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -215,6 +216,299 @@ def test_openai_compatible_model_preserves_vllm_reasoning_delta() -> None:
     assert generation_chunk.message.additional_kwargs["reasoning_content"] == (
         "thinking through the answer"
     )
+
+
+def _streamed_tool_call_chunk(
+    *,
+    call_id: str | None,
+    index: int,
+    name: str | None = None,
+    args: str = "",
+) -> ChatGenerationChunk:
+    """Build one literal OpenAI-compatible streamed tool-call fragment."""
+    return ChatGenerationChunk(
+        message=AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {
+                    "name": name,
+                    "args": args,
+                    "id": call_id,
+                    "index": index,
+                    "type": "tool_call_chunk",
+                }
+            ],
+        )
+    )
+
+
+def _merge_generation_chunks(
+    chunks: list[ChatGenerationChunk],
+) -> ChatGenerationChunk:
+    """Merge streamed chunks exactly as LangChain does for a completed response."""
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged += chunk
+    return merged
+
+
+def _malformed_cortex_tool_call_chunks() -> list[ChatGenerationChunk]:
+    """Return two calls whose provider indexes both incorrectly start at zero."""
+    return [
+        _streamed_tool_call_chunk(call_id="call-first", index=0, name="read_file"),
+        _streamed_tool_call_chunk(
+            call_id=None,
+            index=0,
+            args='{"file_path":"first.md"}',
+        ),
+        _streamed_tool_call_chunk(call_id="call-second", index=0, name="read_file"),
+        _streamed_tool_call_chunk(
+            call_id=None,
+            index=0,
+            args='{"file_path":"second.md"}',
+        ),
+    ]
+
+
+def _mixed_tool_call_index_chunks() -> list[ChatGenerationChunk]:
+    """Return one reused index followed by two uniquely indexed calls."""
+    return [
+        _streamed_tool_call_chunk(call_id="call-a", index=0, name="read_file"),
+        _streamed_tool_call_chunk(call_id=None, index=0, args='{"path":"a"}'),
+        _streamed_tool_call_chunk(call_id="call-b", index=0, name="read_file"),
+        _streamed_tool_call_chunk(call_id=None, index=0, args='{"path":"b"}'),
+        _streamed_tool_call_chunk(call_id="call-c", index=2, name="read_file"),
+        _streamed_tool_call_chunk(call_id="call-d", index=3, name="read_file"),
+        _streamed_tool_call_chunk(call_id=None, index=2, args='{"path":"c"}'),
+        _streamed_tool_call_chunk(call_id=None, index=3, args='{"path":"d"}'),
+    ]
+
+
+def test_openai_compatible_stream_repairs_reused_tool_call_indexes(monkeypatch) -> None:
+    """Distinct call IDs sharing an index must retain their own argument deltas."""
+    source_chunks = _malformed_cortex_tool_call_chunks()
+
+    def fake_stream(self, *args, **kwargs):
+        yield from source_chunks
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_stream", fake_stream)
+
+    streamed = list(_cortex_model()._stream([]))
+    merged = _merge_generation_chunks(streamed)
+
+    assert merged.message.tool_calls == [
+        {
+            "name": "read_file",
+            "args": {"file_path": "first.md"},
+            "id": "call-first",
+            "type": "tool_call",
+        },
+        {
+            "name": "read_file",
+            "args": {"file_path": "second.md"},
+            "id": "call-second",
+            "type": "tool_call",
+        },
+    ]
+    assert merged.message.invalid_tool_calls == []
+
+
+def test_openai_compatible_stream_preserves_unique_indexes_after_a_reuse(
+    monkeypatch,
+) -> None:
+    """Repair mode must still honor continuations with uniquely owned indexes."""
+    source_chunks = _mixed_tool_call_index_chunks()
+
+    def fake_stream(self, *args, **kwargs):
+        yield from source_chunks
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_stream", fake_stream)
+
+    merged = _merge_generation_chunks(list(_cortex_model()._stream([])))
+
+    assert [call["args"] for call in merged.message.tool_calls] == [
+        {"path": "a"},
+        {"path": "b"},
+        {"path": "c"},
+        {"path": "d"},
+    ]
+    assert merged.message.invalid_tool_calls == []
+
+
+def test_openai_compatible_astream_repairs_reused_tool_call_indexes(
+    monkeypatch,
+) -> None:
+    """The async model stream must apply the same per-call index repair."""
+    source_chunks = _malformed_cortex_tool_call_chunks()
+
+    async def fake_astream(self, *args, **kwargs):
+        for chunk in source_chunks:
+            yield chunk
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_astream", fake_astream)
+
+    async def exercise() -> ChatGenerationChunk:
+        streamed = [chunk async for chunk in _cortex_model()._astream([])]
+        return _merge_generation_chunks(streamed)
+
+    merged = asyncio.run(exercise())
+
+    assert [call["args"] for call in merged.message.tool_calls] == [
+        {"file_path": "first.md"},
+        {"file_path": "second.md"},
+    ]
+    assert merged.message.invalid_tool_calls == []
+
+
+def test_openai_compatible_astream_preserves_unique_indexes_after_a_reuse(
+    monkeypatch,
+) -> None:
+    """Async repair must preserve uniquely attributable continuation chunks."""
+    source_chunks = _mixed_tool_call_index_chunks()
+
+    async def fake_astream(self, *args, **kwargs):
+        for chunk in source_chunks:
+            yield chunk
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_astream", fake_astream)
+
+    async def exercise() -> ChatGenerationChunk:
+        streamed = [chunk async for chunk in _cortex_model()._astream([])]
+        return _merge_generation_chunks(streamed)
+
+    merged = asyncio.run(exercise())
+
+    assert [call["args"] for call in merged.message.tool_calls] == [
+        {"path": "a"},
+        {"path": "b"},
+        {"path": "c"},
+        {"path": "d"},
+    ]
+    assert merged.message.invalid_tool_calls == []
+
+
+def test_openai_compatible_stream_leaves_compliant_tool_call_indexes_unchanged(
+    monkeypatch,
+) -> None:
+    """Unique provider indexes must pass through the repair path untouched."""
+    source_chunks = [
+        _streamed_tool_call_chunk(call_id="call-first", index=0, name="read_file"),
+        _streamed_tool_call_chunk(call_id=None, index=0, args='{"path":"one"}'),
+        _streamed_tool_call_chunk(call_id="call-second", index=1, name="read_file"),
+        _streamed_tool_call_chunk(call_id=None, index=1, args='{"path":"two"}'),
+    ]
+
+    def fake_stream(self, *args, **kwargs):
+        yield from source_chunks
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_stream", fake_stream)
+
+    streamed = list(_cortex_model()._stream([]))
+
+    assert [
+        chunk.message.tool_call_chunks[0]["index"] for chunk in streamed
+    ] == [0, 0, 1, 1]
+
+
+def test_openai_compatible_tool_call_index_repair_is_local_to_each_stream(
+    monkeypatch,
+) -> None:
+    """Call IDs and repaired indexes from one request must not leak into the next."""
+    first_stream = _malformed_cortex_tool_call_chunks()
+    second_stream = [
+        _streamed_tool_call_chunk(call_id="call-alpha", index=0, name="read_file"),
+        _streamed_tool_call_chunk(call_id=None, index=0, args='{"path":"a"}'),
+        _streamed_tool_call_chunk(call_id="call-beta", index=1, name="read_file"),
+        _streamed_tool_call_chunk(call_id=None, index=1, args='{"path":"b"}'),
+    ]
+    streams = iter((first_stream, second_stream))
+
+    def fake_stream(self, *args, **kwargs):
+        yield from next(streams)
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_stream", fake_stream)
+    model = _cortex_model()
+
+    list(model._stream([]))
+    streamed = list(model._stream([]))
+
+    assert [
+        chunk.message.tool_call_chunks[0]["index"] for chunk in streamed
+    ] == [0, 0, 1, 1]
+
+
+def test_openai_compatible_stream_callbacks_receive_repaired_chunks(monkeypatch) -> None:
+    """Streaming callbacks must observe repaired indexes before emitting events."""
+    source_chunks = _malformed_cortex_tool_call_chunks()
+
+    class RecordingRunManager:
+        def __init__(self) -> None:
+            self.chunks: list[ChatGenerationChunk] = []
+
+        def on_llm_new_token(self, token, *, chunk, logprobs) -> None:
+            self.chunks.append(chunk)
+
+    def fake_stream(self, *args, **kwargs):
+        run_manager = kwargs.get("run_manager")
+        for chunk in source_chunks:
+            if run_manager is not None:
+                run_manager.on_llm_new_token(
+                    chunk.text,
+                    chunk=chunk,
+                    logprobs=None,
+                )
+            yield chunk
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_stream", fake_stream)
+    run_manager = RecordingRunManager()
+
+    list(_cortex_model()._stream([], run_manager=run_manager))
+    merged = _merge_generation_chunks(run_manager.chunks)
+
+    assert [call["args"] for call in merged.message.tool_calls] == [
+        {"file_path": "first.md"},
+        {"file_path": "second.md"},
+    ]
+
+
+def test_openai_compatible_astream_callbacks_receive_repaired_chunks(
+    monkeypatch,
+) -> None:
+    """Async callbacks must receive repaired chunks before emitting events."""
+    source_chunks = _malformed_cortex_tool_call_chunks()
+
+    class RecordingRunManager:
+        def __init__(self) -> None:
+            self.chunks: list[ChatGenerationChunk] = []
+
+        async def on_llm_new_token(self, token, *, chunk, logprobs) -> None:
+            self.chunks.append(chunk)
+
+    async def fake_astream(self, *args, **kwargs):
+        run_manager = kwargs.get("run_manager")
+        for chunk in source_chunks:
+            if run_manager is not None:
+                await run_manager.on_llm_new_token(
+                    chunk.text,
+                    chunk=chunk,
+                    logprobs=None,
+                )
+            yield chunk
+
+    monkeypatch.setattr(runtime_providers.ChatOpenAI, "_astream", fake_astream)
+
+    async def exercise() -> list[ChatGenerationChunk]:
+        run_manager = RecordingRunManager()
+        async for _ in _cortex_model()._astream([], run_manager=run_manager):
+            pass
+        return run_manager.chunks
+
+    merged = _merge_generation_chunks(asyncio.run(exercise()))
+
+    assert [call["args"] for call in merged.message.tool_calls] == [
+        {"file_path": "first.md"},
+        {"file_path": "second.md"},
+    ]
 
 
 def _cortex_messages(*, tool_call_ids: list[str], tool_result_ids: list[str]) -> list[Any]:
