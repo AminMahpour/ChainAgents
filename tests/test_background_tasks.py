@@ -22,6 +22,7 @@ from chainagents.runtime.background_tasks import (
     BackgroundTaskManager,
     create_background_task_tools,
     current_background_session_generation,
+    current_background_task_id,
     scope_background_session_invocation,
     scope_background_task_invocation,
 )
@@ -1457,6 +1458,114 @@ def test_cancelling_run_subagent_batch_cancels_every_unfinished_child() -> None:
             "cancelled",
         ]
         await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelling_batch_preserves_descendants_of_completed_children() -> None:
+    """Cancelling a batch wait must not cancel work owned by a finished child."""
+
+    class ChildRunnable:
+        def __init__(self, manager: BackgroundTaskManager) -> None:
+            self.manager = manager
+            self.finished_task_id: str | None = None
+            self.descendant_task_id: str | None = None
+            self.descendant_started = asyncio.Event()
+            self.descendant_cancelled = asyncio.Event()
+            self.unfinished_started = asyncio.Event()
+            self.unfinished_cancelled = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            if description == "finished":
+                self.finished_task_id = current_background_task_id()
+                assert self.finished_task_id is not None
+
+                async def run_descendant(task_id: str) -> str:
+                    self.descendant_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.descendant_cancelled.set()
+                        raise
+
+                descendant = await self.manager.spawn(
+                    session_id="session-a",
+                    agent_name="descendant",
+                    description="surviving descendant",
+                    agent_path=("researcher", "descendant"),
+                    parent_task_id=self.finished_task_id,
+                    runner=run_descendant,
+                )
+                self.descendant_task_id = descendant.task_id
+                return {"messages": [AIMessage(content="done")]}
+
+            self.unfinished_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.unfinished_cancelled.set()
+                raise
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=5, max_running_total=5)
+        child = ChildRunnable(manager)
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "finished", "subagent_type": "researcher"},
+                    {"description": "unfinished", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.descendant_started.wait(), timeout=1)
+        await asyncio.wait_for(child.unfinished_started.wait(), timeout=1)
+        assert child.finished_task_id is not None
+        finished = await manager.get(
+            "session-a",
+            child.finished_task_id,
+            wait_seconds=1,
+        )
+        assert finished.status == "success"
+
+        batch_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch_call
+
+        await asyncio.wait_for(child.unfinished_cancelled.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not child.descendant_cancelled.is_set()
+        assert child.descendant_task_id is not None
+        descendant = await manager.get("session-a", child.descendant_task_id)
+        assert descendant.status == "running"
+
+        await manager.close()
+        assert child.descendant_cancelled.is_set()
 
     asyncio.run(exercise())
 

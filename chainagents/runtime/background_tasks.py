@@ -721,6 +721,7 @@ def create_background_task_tools(
                             scope_path=agent_path,
                             owner_path=owner_path,
                             ancestor_task_id=parent_task_id,
+                            only_if_unfinished=True,
                         )
                         for task_id in task_ids
                     ),
@@ -1247,6 +1248,7 @@ class BackgroundTaskManager:
         owner_path: tuple[str, ...] = (),
         ancestor_task_id: str | None = None,
         expected_session_generation: BackgroundSessionGeneration | None = None,
+        only_if_unfinished: bool = False,
     ) -> BackgroundTaskSnapshot:
         """Cancel a visible task and all of its descendants."""
         async with self._lock:
@@ -1261,6 +1263,11 @@ class BackgroundTaskManager:
                 owner_path,
                 ancestor_task_id,
             )
+            if (
+                only_if_unfinished
+                and record.status in TERMINAL_BACKGROUND_TASK_STATUSES
+            ):
+                return record.snapshot()
             record.cancelling = True
             if record.cancel_task is None:
                 record.cancel_task = asyncio.create_task(
