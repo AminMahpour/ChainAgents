@@ -2200,8 +2200,8 @@ def test_foreground_cancellation_does_not_cancel_spawned_background_work() -> No
     asyncio.run(exercise())
 
 
-def test_chainlit_local_notifier_sends_one_terminal_result(monkeypatch) -> None:
-    """A completed task should notify the chat without starting another agent turn."""
+def test_chainlit_local_notifier_sends_status_without_dumping_result(monkeypatch) -> None:
+    """A completion notice should keep successful output available only on demand."""
     async def exercise() -> None:
         manager = make_manager()
         sent: list[tuple[str, str]] = []
@@ -2242,7 +2242,7 @@ def test_chainlit_local_notifier_sends_one_terminal_result(monkeypatch) -> None:
             (
                 "Background subagent",
                 "Local background subagent `researcher` finished with status "
-                f"`success`.\n\nTask ID: `{spawned.task_id}`\n\nfinished result",
+                f"`success`.\n\nTask ID: `{spawned.task_id}`",
             )
         ]
         notifier.cancel()

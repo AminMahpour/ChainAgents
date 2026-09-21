@@ -1282,14 +1282,15 @@ async def test_interactive_cli_keeps_loop_live_and_prints_task_completion() -> N
     )
     await manager.get("thread-1", spawned.task_id, wait_seconds=1)
     for _ in range(10):
-        if "background result" in stderr.getvalue():
+        if spawned.task_id in stderr.getvalue():
             break
         await asyncio.sleep(0)
     os.close(write_fd)
 
     assert await repl == 0
     assert f"Task ID: {spawned.task_id}" in stderr.getvalue()
-    assert "background result" in stderr.getvalue()
+    assert "finished with status success" in stderr.getvalue()
+    assert "background result" not in stderr.getvalue()
     stdin.close()
     await manager.close()
 

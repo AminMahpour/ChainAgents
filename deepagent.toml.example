@@ -2,6 +2,8 @@
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
+# Optional positive output-token limit for each response.
+# max_tokens = 4096
 name = "gpt-oss:20b"
 models = ["gpt-oss:20b", "gemma4:27b"]
 reasoning_effort = "medium"
@@ -21,6 +23,7 @@ disable_streaming_for_tool_calls = false
 # base_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1"
 # endpoint_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"
 # name = "claude-sonnet-4-5"
+# max_tokens = 4096
 # api_key = ""  # required unless SNOWFLAKE_PAT or DEEPAGENT_MODEL_API_KEY is set
 # Credential order: CLI --api-key, SNOWFLAKE_PAT, DEEPAGENT_MODEL_API_KEY, then api_key.
 #

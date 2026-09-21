@@ -130,6 +130,7 @@ class RuntimeConfig:
         model_base_url: URL for the model base.
         model_api_key: The model API key value.
         model_temperature: The model temperature value.
+        model_max_tokens: Maximum output tokens for one model response.
         default_reasoning: The default reasoning value.
         persistence_mode: The persistence mode value.
         agent_state: Whether the DeepAgents graph is stateful or stateless.
@@ -171,6 +172,7 @@ class RuntimeConfig:
     default_reasoning: ReasoningLevel
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
+    model_max_tokens: int | None = None
     langfuse: LangfuseConfig = LangfuseConfig()
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     model_repeat_penalty: float | None = None
@@ -610,6 +612,7 @@ class RuntimeConfig:
             reasoning_effort=default_reasoning,
             thinking=model_defaults.thinking,
             temperature=model_temperature,
+            max_tokens=model_defaults.max_tokens,
             repeat_penalty=model_repeat_penalty,
             disable_streaming=model_disable_streaming,
             modalities=model_defaults.modalities,
@@ -715,6 +718,7 @@ class RuntimeConfig:
             model_base_url=model_base_url,
             model_api_key=model_api_key,
             model_temperature=model_temperature,
+            model_max_tokens=model_defaults.max_tokens,
             model_repeat_penalty=model_repeat_penalty,
             default_reasoning=default_reasoning,
             persistence_mode="postgres" if database_url else "memory",

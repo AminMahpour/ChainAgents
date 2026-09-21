@@ -61,6 +61,9 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
         temperature=runtime_model_config.normalize_model_temperature(
             getattr(config, "model_temperature", DEFAULT_TEMPERATURE)
         ),
+        max_tokens=runtime_model_config.normalize_model_max_tokens(
+            getattr(config, "model_max_tokens", None)
+        ),
         repeat_penalty=runtime_model_config.normalize_repeat_penalty(
             getattr(config, "model_repeat_penalty", None)
         ),
@@ -218,6 +221,8 @@ def build_model(
         }
         if resolved_profile.repeat_penalty is not None:
             kwargs["repeat_penalty"] = resolved_profile.repeat_penalty
+        if resolved_profile.max_tokens is not None:
+            kwargs["num_predict"] = resolved_profile.max_tokens
         return ChatOllama(**kwargs)
 
     api_key = model_api_key_for_profile(config, resolved_profile)
@@ -239,6 +244,8 @@ def build_model(
             resolved_profile.thinking,
         ):
             kwargs["thinking"] = {"type": "adaptive"}
+        if resolved_profile.max_tokens is not None:
+            kwargs["max_tokens"] = resolved_profile.max_tokens
         kwargs["api_key"] = api_key
         default_query = runtime_model_config.model_endpoint_query_to_dict(resolved_profile.endpoint_query)
         if default_query:
@@ -260,6 +267,8 @@ def build_model(
             "disable_streaming": resolved_profile.disable_streaming,
             "extra_body": {"reasoning": {"effort": reasoning_level}},
         }
+        if resolved_profile.max_tokens is not None:
+            kwargs["max_completion_tokens"] = resolved_profile.max_tokens
         default_query = runtime_model_config.model_endpoint_query_to_dict(resolved_profile.endpoint_query)
         if default_query:
             kwargs["default_query"] = default_query
@@ -272,6 +281,8 @@ def build_model(
         "temperature": resolved_profile.temperature,
         "disable_streaming": resolved_profile.disable_streaming,
     }
+    if resolved_profile.max_tokens is not None:
+        kwargs["max_completion_tokens"] = resolved_profile.max_tokens
     default_query = runtime_model_config.model_endpoint_query_to_dict(resolved_profile.endpoint_query)
     if default_query:
         kwargs["default_query"] = default_query

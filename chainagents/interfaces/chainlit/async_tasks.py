@@ -29,8 +29,6 @@ def format_local_task_result(snapshot: BackgroundTaskSnapshot) -> str:
         f"Local background subagent `{snapshot.agent_name}` finished with status "
         f"`{snapshot.status}`.\n\nTask ID: `{snapshot.task_id}`"
     )
-    if snapshot.result:
-        return f"{content}\n\n{snapshot.result}"
     if snapshot.error:
         return f"{content}\n\nError: {snapshot.error}"
     return content

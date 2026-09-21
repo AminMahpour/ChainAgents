@@ -273,8 +273,6 @@ class ChainAgentsTuiApp(App[int]):
             f"background subagent {snapshot.agent_name} finished with status "
             f"{snapshot.status}; Task ID: {snapshot.task_id}"
         )
-        if snapshot.result:
-            return f"{message}; {snapshot.result}"
         if snapshot.error:
             return f"{message}; error: {snapshot.error}"
         return message

@@ -2056,8 +2056,6 @@ def format_background_task_notice(snapshot: BackgroundTaskSnapshot) -> str:
         f"Background subagent {snapshot.agent_name} finished with status "
         f"{snapshot.status}.\nTask ID: {snapshot.task_id}"
     )
-    if snapshot.result:
-        return f"{message}\n{snapshot.result}"
     if snapshot.error:
         return f"{message}\nError: {snapshot.error}"
     return message

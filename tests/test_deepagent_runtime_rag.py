@@ -285,6 +285,57 @@ api_key = "toml-pat"
     assert model.openai_api_key.get_secret_value() == "toml-pat"
 
 
+def test_runtime_config_forwards_snowflake_cortex_max_tokens_to_request_payload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A configured Cortex output limit must reach the outbound API payload."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "claude-sonnet-4-5"
+api_key = "toml-pat"
+max_tokens = 321
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+    payload = model._get_request_payload([HumanMessage(content="hello")])
+
+    assert payload["max_completion_tokens"] == 321
+
+
+@pytest.mark.parametrize("max_tokens", ["0", "-1", "1.5", '"many"', "true"])
+def test_runtime_config_rejects_invalid_model_max_tokens(
+    tmp_path: Path,
+    monkeypatch,
+    max_tokens: str,
+) -> None:
+    """Invalid output limits must fail closed instead of being silently ignored."""
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        f"""
+[model]
+provider = "snowflake_cortex"
+base_url = "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+name = "claude-sonnet-4-5"
+api_key = "toml-pat"
+max_tokens = {max_tokens}
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match="max_tokens.*positive integer"):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
 def test_runtime_config_normalizes_snowflake_cortex_full_endpoint_url(
     tmp_path: Path,
     monkeypatch,

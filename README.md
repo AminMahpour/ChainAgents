@@ -352,6 +352,7 @@ You can keep the model defaults in `deepagent.toml`:
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
+max_tokens = 4096
 repeat_penalty = 1.1
 name = "gpt-oss:20b"
 models = ["gpt-oss:20b", "gemma4:27b"]
@@ -397,6 +398,7 @@ Use either the Chat Completions base URL or the complete Chat Completions endpoi
 provider = "snowflake_cortex"
 base_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1"
 name = "claude-sonnet-4-5"
+max_tokens = 4096
 # api_key = ""  # optional only when SNOWFLAKE_PAT or DEEPAGENT_MODEL_API_KEY is set
 ```
 
@@ -474,7 +476,8 @@ Notes:
 
 - `provider` selects `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic`.
 - `provider = "claude"` is accepted as an alias for `provider = "anthropic"`.
-- Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
+- Preferred shared fields are `base_url`, `name`, `temperature`, `max_tokens`, and `reasoning_effort`.
+- `max_tokens` is an optional positive output-token limit. It maps to `max_completion_tokens` for Snowflake Cortex and OpenAI-compatible providers, `max_tokens` for Anthropic, and `num_predict` for Ollama.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
@@ -943,7 +946,9 @@ the parent response. Concurrent children can therefore observe the same
 workspace and memory resources; prompts should assign non-overlapping writes or
 otherwise coordinate shared updates.
 
-Chainlit and the interactive CLI/TUI post one notice when a task finishes. A
+Chainlit and the interactive CLI/TUI post one status-only notice when a task
+finishes; successful output remains available through `get_background_task`
+instead of being copied into the notice. A
 one-shot CLI invocation prints the main response first, then waits for its
 remaining background work; JSON output includes a `background_tasks` array.
 The HTTP API exposes conversation-scoped list, get, cancel, and close operations
