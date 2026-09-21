@@ -1246,6 +1246,52 @@ async def test_one_shot_json_waits_for_background_tasks(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
+async def test_one_shot_text_keeps_terminal_background_result(monkeypatch) -> None:
+    """A process that exits after waiting must print the otherwise-lost result."""
+    args = chainagents_cli.parse_args(
+        ["--prompt", "hello", "--thread-id", "thread-1"]
+    )
+    snapshot = BackgroundTaskSnapshot(
+        task_id="bg-123",
+        session_id="thread-1",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        parent_task_id=None,
+        status="success",
+        result="background result",
+        error=None,
+        created_at=1.0,
+        completed_at=2.0,
+    )
+
+    class Tasks:
+        async def wait_session(self, session_id):
+            assert session_id == "thread-1"
+            return [snapshot]
+
+    runtime = SimpleNamespace(background_tasks=Tasks())
+
+    async def run_agent_prompt(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", run_agent_prompt)
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=runtime,
+        stdout=io.StringIO(),
+        stderr=stderr,
+        stdin=io.StringIO(""),
+    )
+
+    assert code == 0
+    assert "Task ID: bg-123" in stderr.getvalue()
+    assert "background result" in stderr.getvalue()
+
+
+@pytest.mark.anyio
 async def test_interactive_cli_keeps_loop_live_and_prints_task_completion() -> None:
     """Blocking terminal input must not starve local task completion notices."""
     manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))

@@ -950,7 +950,8 @@ Chainlit and the interactive CLI/TUI post one status-only notice when a task
 finishes; successful output remains available through `get_background_task`
 instead of being copied into the notice. A
 one-shot CLI invocation prints the main response first, then waits for its
-remaining background work; JSON output includes a `background_tasks` array.
+remaining background work. One-shot text output prints terminal results because
+the process is about to exit; JSON output includes a `background_tasks` array.
 The HTTP API exposes conversation-scoped list, get, cancel, and close operations
 under `/api/background-tasks`.
 
