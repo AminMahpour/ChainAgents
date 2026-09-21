@@ -1525,6 +1525,104 @@ def test_run_subagent_batch_returns_cancelled_results_when_session_closes() -> N
     asyncio.run(exercise())
 
 
+def test_wait_batch_waits_for_cancellation_cleanup_to_finalize_records() -> None:
+    """A cancelled execution is not terminal until its cleanup has finished."""
+
+    async def exercise() -> None:
+        manager = make_manager()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="work",
+            agent_path=("researcher",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        execution = manager._records[spawned.task_id].execution
+        assert execution is not None
+        waiter = asyncio.create_task(
+            manager.wait_batch("session-a", [spawned.task_id])
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        cancellation = asyncio.create_task(
+            manager.cancel("session-a", spawned.task_id)
+        )
+
+        await asyncio.gather(execution, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not cancellation.done()
+        assert not waiter.done()
+
+        release_cleanup.set()
+        cancelled = await asyncio.wait_for(cancellation, timeout=1)
+        completed = await asyncio.wait_for(waiter, timeout=1)
+
+        assert cancelled.status == "cancelled"
+        assert [snapshot.status for snapshot in completed] == ["cancelled"]
+        assert completed[0].completed_at is not None
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_wait_batch_waits_for_session_close_cleanup_to_finalize_records() -> None:
+    """Session close must publish terminal snapshots before forgetting records."""
+
+    async def exercise() -> None:
+        manager = make_manager()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="work",
+            agent_path=("researcher",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        execution = manager._records[spawned.task_id].execution
+        assert execution is not None
+        waiter = asyncio.create_task(
+            manager.wait_batch("session-a", [spawned.task_id])
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        closing = asyncio.create_task(manager.close_session("session-a"))
+
+        await asyncio.gather(execution, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not closing.done()
+        assert not waiter.done()
+
+        release_cleanup.set()
+        completed = await asyncio.wait_for(waiter, timeout=1)
+        await asyncio.wait_for(closing, timeout=1)
+
+        assert [snapshot.status for snapshot in completed] == ["cancelled"]
+        assert completed[0].completed_at is not None
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_concurrent_subagent_batches_share_atomic_capacity_limits() -> None:
     """Two simultaneous batches cannot both pass a shared capacity boundary."""
 

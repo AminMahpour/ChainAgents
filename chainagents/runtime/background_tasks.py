@@ -1203,14 +1203,15 @@ class BackgroundTaskManager:
                 )
                 for task_id in task_ids
             ]
-            executions = [
-                record.execution
+            completions = [
+                record.completion
                 for record in records
-                if record.execution is not None and not record.execution.done()
+                if record.status not in TERMINAL_BACKGROUND_TASK_STATUSES
+                and record.completion is not None
             ]
-        if executions:
+        if completions:
             await asyncio.shield(
-                asyncio.gather(*executions, return_exceptions=True)
+                asyncio.gather(*(completion.wait() for completion in completions))
             )
         async with self._lock:
             return [record.snapshot() for record in records]
