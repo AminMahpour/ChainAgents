@@ -1,4 +1,5 @@
 """Exercise runtime resource ownership without live transports or models."""
+
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -9,6 +10,7 @@ import pytest
 
 import deepagent_runtime as core
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.lifecycle as runtime_lifecycle
 import chainagents.runtime.middleware as runtime_middleware
@@ -20,6 +22,7 @@ from chainagents.runtime.types import BackgroundSubagentConfig
 from langchain.tools import ToolRuntime
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
+from deepagents.backends.protocol import DeleteResult
 from test_deepagent_runtime_rag import make_runtime_config, make_extensions_config
 
 
@@ -29,48 +32,83 @@ def runtime(tmp_path, monkeypatch):
     instance = core.AgentRuntime(config, project_root=tmp_path)
     instance._store = InMemoryStore()
     instance._checkpointer = MemorySaver()
-    monkeypatch.setattr(instance, '_build_model', lambda *a, **kw: object())
-    monkeypatch.setattr(runtime_middleware, 'create_deep_agent_with_configured_summarization', lambda *a, **kw: object())
+    monkeypatch.setattr(instance, "_build_model", lambda *a, **kw: object())
+    monkeypatch.setattr(
+        runtime_middleware,
+        "create_deep_agent_with_configured_summarization",
+        lambda *a, **kw: object(),
+    )
     return instance
 
 
 def test_stateful_context_closes_on_its_owner_task(runtime, monkeypatch):
-    runtime.config = replace(runtime.config, extensions=make_extensions_config(mcp_stateful=True, agent_mcp_servers=('repo',)))
+    runtime.config = replace(
+        runtime.config,
+        extensions=make_extensions_config(
+            mcp_stateful=True, agent_mcp_servers=("repo",)
+        ),
+    )
     events = []
 
     @asynccontextmanager
     async def session(server):
         async with anyio.create_task_group():
-            events.append(('open', asyncio.current_task()))
+            events.append(("open", asyncio.current_task()))
             try:
                 yield object()
             finally:
-                events.append(('close', asyncio.current_task()))
+                events.append(("close", asyncio.current_task()))
 
-    runtime._mcp_client = SimpleNamespace(session=session, callbacks=None, tool_interceptors=[])
+    runtime._mcp_client = SimpleNamespace(
+        session=session, callbacks=None, tool_interceptors=[]
+    )
+
     async def load(*a, **kw):
         return []
-    monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', load)
+
+    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
 
     async def exercise():
-        await asyncio.create_task(runtime.get_agent('medium', thread_id='thread', mcp_session_id='session'))
-        await runtime.close_mcp_session('session')
+        await asyncio.create_task(
+            runtime.get_agent("medium", thread_id="thread", mcp_session_id="session")
+        )
+        await runtime.close_mcp_session("session")
         assert len(events) == 2
         assert events[0][1] is events[1][1]
+
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize('stateful', [False, True])
+@pytest.mark.parametrize("stateful", [False, True])
 def test_conversation_close_evicts_graph_with_no_mcp_client(runtime, stateful):
-    runtime.config = replace(runtime.config, extensions=replace(runtime.config.extensions, mcp_stateful=stateful))
+    runtime.config = replace(
+        runtime.config,
+        extensions=replace(runtime.config.extensions, mcp_stateful=stateful),
+    )
+
     async def exercise():
-        first = await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session')
-        other = await runtime.get_agent('medium', thread_id='other', mcp_session_id='other-session')
-        await runtime.close_conversation(thread_id='thread', mcp_session_id='session')
+        first = await runtime.get_agent(
+            "medium", thread_id="thread", mcp_session_id="session"
+        )
+        other = await runtime.get_agent(
+            "medium", thread_id="other", mcp_session_id="other-session"
+        )
+        await runtime.close_conversation(thread_id="thread", mcp_session_id="session")
         assert first not in runtime._agents.values()
-        assert await runtime.get_agent('medium', thread_id='other', mcp_session_id='other-session') is other
-        assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session') is not first
+        assert (
+            await runtime.get_agent(
+                "medium", thread_id="other", mcp_session_id="other-session"
+            )
+            is other
+        )
+        assert (
+            await runtime.get_agent(
+                "medium", thread_id="thread", mcp_session_id="session"
+            )
+            is not first
+        )
         await runtime.close()
+
     asyncio.run(exercise())
 
 
@@ -119,34 +157,35 @@ def test_conversation_close_deletes_only_its_large_tool_results(runtime):
         backend = runtime_backends.build_deepagent_backend(
             project_root=runtime.project_root,
             include_memories=False,
+            artifact_registry=runtime.large_tool_result_artifacts,
         )
-        prefix = runtime_backends.deepagent_artifacts_route_prefix(
-            runtime.project_root
-        )
+        prefix = runtime_backends.deepagent_artifacts_route_prefix(runtime.project_root)
         first_path = f"{prefix}large_tool_results/first-call"
         second_path = f"{prefix}large_tool_results/second-call"
+        first = runtime.large_tool_result_artifacts.open_session("thread")
+        second = runtime.large_tool_result_artifacts.open_session("other")
+        token = runtime.large_tool_result_artifacts.activate(first)
         assert backend.write(first_path, "first").error is None
+        runtime.large_tool_result_artifacts.reset(token)
+        token = runtime.large_tool_result_artifacts.activate(second)
         assert backend.write(second_path, "second").error is None
-        runtime.large_tool_result_artifacts.register(
-            "thread",
-            first_path,
-            backend,
-        )
-        runtime.large_tool_result_artifacts.register(
-            "other",
-            second_path,
-            backend,
-        )
+        runtime.large_tool_result_artifacts.reset(token)
 
         await runtime.close_conversation(
             thread_id="thread",
             mcp_session_id="session",
         )
 
+        token = runtime.large_tool_result_artifacts.activate(first)
         assert backend.read(first_path).error is not None
+        runtime.large_tool_result_artifacts.reset(token)
+        token = runtime.large_tool_result_artifacts.activate(second)
         assert backend.read(second_path).error is None
+        runtime.large_tool_result_artifacts.reset(token)
         await runtime.close()
+        token = runtime.large_tool_result_artifacts.activate(second)
         assert backend.read(second_path).error is not None
+        runtime.large_tool_result_artifacts.reset(token)
 
     asyncio.run(exercise())
 
@@ -158,24 +197,22 @@ def test_registration_after_conversation_close_is_deleted_immediately(runtime):
         backend = runtime_backends.build_deepagent_backend(
             project_root=runtime.project_root,
             include_memories=False,
+            artifact_registry=runtime.large_tool_result_artifacts,
         )
         path = (
             f"{runtime_backends.deepagent_artifacts_route_prefix(runtime.project_root)}"
             "large_tool_results/late-call"
         )
+        handle = runtime.large_tool_result_artifacts.open_session("thread")
         await runtime.close_conversation(
             thread_id="thread",
             mcp_session_id="session",
         )
+        token = runtime.large_tool_result_artifacts.activate(handle)
         assert backend.write(path, "late").error is None
 
-        await runtime.large_tool_result_artifacts.aregister(
-            "thread",
-            path,
-            backend,
-        )
-
         assert backend.read(path).error is not None
+        runtime.large_tool_result_artifacts.reset(token)
         await runtime.close()
 
     asyncio.run(exercise())
@@ -236,21 +273,122 @@ def test_session_cannot_reopen_while_artifact_cleanup_is_running():
             return SimpleNamespace(error=None)
 
     async def exercise():
-        registry = runtime_middleware.LargeToolResultArtifactRegistry()
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
         backend = Backend()
-        registry.register("thread", "first", backend)
+        handle = registry.open_session("thread")
+        registry.register(handle, "first", backend)
         closing = asyncio.create_task(registry.close_session("thread"))
         await asyncio.wait_for(backend.started.wait(), timeout=1)
 
-        registry.open_session("thread")
+        with pytest.raises(RuntimeError, match="closing"):
+            registry.open_session("thread")
         late_registration = asyncio.create_task(
-            registry.aregister("thread", "late", backend)
+            registry.aregister(handle, "late", backend)
         )
         await asyncio.sleep(0)
         backend.release.set()
         await asyncio.gather(closing, late_registration)
 
         assert backend.files == set()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_async_write_finishes_registration_and_cleanup(tmp_path, monkeypatch):
+    """Cancellation cannot orphan a filesystem write still running in a worker."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        underlying = backend.backend
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_write(path, content):
+            started.set()
+            await release.wait()
+            return underlying.write(path, content)
+
+        monkeypatch.setattr(underlying, "awrite", blocking_write)
+        handle = registry.open_session("thread")
+        token = registry.activate(handle)
+        path = f"{backend.artifacts_root}/large_tool_results/cancelled"
+        task = asyncio.create_task(backend.awrite(path, "result"))
+        registry.reset(token)
+        await started.wait()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert list((tmp_path / ".files" / "deepagent").rglob("cancelled"))
+        await registry.close_session("thread")
+        assert not list((tmp_path / ".files" / "deepagent").rglob("cancelled"))
+
+    asyncio.run(exercise())
+
+
+def test_failed_artifact_delete_remains_retryable(tmp_path, monkeypatch):
+    """A failed close retains ownership so the next close can retry."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        handle = registry.open_session("thread")
+        token = registry.activate(handle)
+        path = f"{backend.artifacts_root}/large_tool_results/retry"
+        assert backend.write(path, "result").error is None
+        registry.reset(token)
+        underlying = backend.backend
+        original_delete = underlying.adelete
+        attempts = 0
+
+        async def flaky_delete(file_path):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return DeleteResult(error="temporary failure")
+            return await original_delete(file_path)
+
+        monkeypatch.setattr(underlying, "adelete", flaky_delete)
+        with pytest.raises(ExceptionGroup, match="cleanup failed"):
+            await registry.close_session("thread")
+        await registry.close_session("thread")
+
+        assert attempts == 2
+        assert not list((tmp_path / ".files" / "deepagent").rglob("retry"))
+
+    asyncio.run(exercise())
+
+
+def test_terminal_registry_deletes_late_writes_and_rejects_reopen(tmp_path):
+    """Shutdown is terminal even for work retaining an old context handle."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        handle = registry.open_session("thread")
+        await registry.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            registry.open_session("thread")
+
+        token = registry.activate(handle)
+        path = f"{backend.artifacts_root}/large_tool_results/late"
+        assert backend.write(path, "result").error is None
+        assert backend.read(path).error is not None
+        registry.reset(token)
 
     asyncio.run(exercise())
 
@@ -420,15 +558,9 @@ def test_conversation_close_invalidates_existing_background_tools(runtime):
         spawn_tool = next(
             tool for tool in tools if tool.name == "spawn_background_task"
         )
-        batch_tool = next(
-            tool for tool in tools if tool.name == "run_subagent_batch"
-        )
-        list_tool = next(
-            tool for tool in tools if tool.name == "list_background_tasks"
-        )
-        get_tool = next(
-            tool for tool in tools if tool.name == "get_background_task"
-        )
+        batch_tool = next(tool for tool in tools if tool.name == "run_subagent_batch")
+        list_tool = next(tool for tool in tools if tool.name == "list_background_tasks")
+        get_tool = next(tool for tool in tools if tool.name == "get_background_task")
         cancel_tool = next(
             tool for tool in tools if tool.name == "cancel_background_task"
         )
@@ -520,11 +652,14 @@ def test_runtime_close_cancels_background_tasks(tmp_path):
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize('factory', ['get', 'create'])
-@pytest.mark.parametrize('cancel', [False, True])
-def test_factory_unwinds_resources_after_failed_or_cancelled_startup(runtime, monkeypatch, factory, cancel):
+@pytest.mark.parametrize("factory", ["get", "create"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_factory_unwinds_resources_after_failed_or_cancelled_startup(
+    runtime, monkeypatch, factory, cancel
+):
     closed = []
     entered = asyncio.Event()
+
     @asynccontextmanager
     async def resource():
         try:
@@ -537,11 +672,14 @@ def test_factory_unwinds_resources_after_failed_or_cancelled_startup(runtime, mo
         entered.set()
         if cancel:
             await asyncio.Event().wait()
-        raise ValueError('startup failed')
+        raise ValueError("startup failed")
 
-    monkeypatch.setattr(runtime_lifecycle.AgentRuntime, '_instance', None)
-    monkeypatch.setattr(runtime_lifecycle.AgentRuntime, '_initialize', initialize)
-    monkeypatch.setattr(runtime_config.RuntimeConfig, 'from_env', lambda: runtime.config)
+    monkeypatch.setattr(runtime_lifecycle.AgentRuntime, "_instance", None)
+    monkeypatch.setattr(runtime_lifecycle.AgentRuntime, "_initialize", initialize)
+    monkeypatch.setattr(
+        runtime_config.RuntimeConfig, "from_env", lambda: runtime.config
+    )
+
     async def exercise():
         task = asyncio.create_task(getattr(core.AgentRuntime, factory)())
         await entered.wait()
@@ -551,20 +689,26 @@ def test_factory_unwinds_resources_after_failed_or_cancelled_startup(runtime, mo
             await task
         assert closed == [True]
         assert core.AgentRuntime.current() is None
+
     asyncio.run(exercise())
 
 
 def test_stateless_mcp_tools_are_shared_across_ended_chats(runtime):
-    runtime.config = replace(runtime.config, extensions=make_extensions_config(agent_mcp_servers=('repo',)))
+    runtime.config = replace(
+        runtime.config, extensions=make_extensions_config(agent_mcp_servers=("repo",))
+    )
     loads = []
+
     async def get_tools(**kwargs):
         loads.append(kwargs)
         return []
+
     runtime._mcp_client = SimpleNamespace(get_tools=get_tools)
+
     async def exercise():
         for index in range(10):
-            thread, session = f'thread-{index}', f'session-{index}'
-            await runtime.get_agent('medium', thread_id=thread, mcp_session_id=session)
+            thread, session = f"thread-{index}", f"session-{index}"
+            await runtime.get_agent("medium", thread_id=thread, mcp_session_id=session)
             await runtime.close_conversation(thread_id=thread, mcp_session_id=session)
             assert not runtime._agents
             assert not runtime._mcp_sessions
@@ -572,14 +716,21 @@ def test_stateless_mcp_tools_are_shared_across_ended_chats(runtime):
         assert len(loads) == 1
         await runtime.close()
         assert not runtime._mcp_tools_cache
+
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize('cancel', [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
 def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, cancel):
-    runtime.config = replace(runtime.config, extensions=make_extensions_config(mcp_stateful=True, agent_mcp_servers=('repo',)))
+    runtime.config = replace(
+        runtime.config,
+        extensions=make_extensions_config(
+            mcp_stateful=True, agent_mcp_servers=("repo",)
+        ),
+    )
     closed = []
     entered = asyncio.Event()
+
     @asynccontextmanager
     async def session(server):
         async with anyio.create_task_group():
@@ -587,15 +738,23 @@ def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, c
                 yield object()
             finally:
                 closed.append(True)
-    runtime._mcp_client = SimpleNamespace(session=session, callbacks=None, tool_interceptors=[])
+
+    runtime._mcp_client = SimpleNamespace(
+        session=session, callbacks=None, tool_interceptors=[]
+    )
+
     async def load(*a, **kw):
         entered.set()
         if cancel:
             await asyncio.Event().wait()
-        raise ValueError('tool loading failed')
-    monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', load)
+        raise ValueError("tool loading failed")
+
+    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+
     async def exercise():
-        task = asyncio.create_task(runtime.get_agent('medium', thread_id='thread', mcp_session_id='session'))
+        task = asyncio.create_task(
+            runtime.get_agent("medium", thread_id="thread", mcp_session_id="session")
+        )
         await entered.wait()
         if cancel:
             task.cancel()
@@ -605,21 +764,32 @@ def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, c
         assert not runtime._mcp_sessions
         assert not runtime._mcp_tools_cache
         assert not runtime._agents
+
         async def succeeds(*a, **kw):
             return []
-        monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', succeeds)
-        await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session')
+
+        monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", succeeds)
+        await runtime.get_agent("medium", thread_id="thread", mcp_session_id="session")
         await runtime.close()
         assert closed == [True, True]
+
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize('cancel', [False, True])
-def test_mcp_session_startup_unwinds_owner_and_allows_retry(runtime, monkeypatch, cancel):
-    runtime.config = replace(runtime.config, extensions=make_extensions_config(mcp_stateful=True, agent_mcp_servers=('repo',)))
+@pytest.mark.parametrize("cancel", [False, True])
+def test_mcp_session_startup_unwinds_owner_and_allows_retry(
+    runtime, monkeypatch, cancel
+):
+    runtime.config = replace(
+        runtime.config,
+        extensions=make_extensions_config(
+            mcp_stateful=True, agent_mcp_servers=("repo",)
+        ),
+    )
     closed = []
     entered = asyncio.Event()
     fail = True
+
     @asynccontextmanager
     async def session(server):
         async with anyio.create_task_group():
@@ -628,17 +798,25 @@ def test_mcp_session_startup_unwinds_owner_and_allows_retry(runtime, monkeypatch
                 if fail:
                     if cancel:
                         await asyncio.Event().wait()
-                    raise ValueError('transport startup failed')
+                    raise ValueError("transport startup failed")
                 yield object()
             finally:
                 closed.append(True)
-    runtime._mcp_client = SimpleNamespace(session=session, callbacks=None, tool_interceptors=[])
+
+    runtime._mcp_client = SimpleNamespace(
+        session=session, callbacks=None, tool_interceptors=[]
+    )
+
     async def load(*a, **kw):
         return []
-    monkeypatch.setattr(runtime_lifecycle, 'load_mcp_tools', load)
+
+    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+
     async def exercise():
         nonlocal fail
-        task = asyncio.create_task(runtime.get_agent('medium', thread_id='thread', mcp_session_id='session'))
+        task = asyncio.create_task(
+            runtime.get_agent("medium", thread_id="thread", mcp_session_id="session")
+        )
         await entered.wait()
         if cancel:
             task.cancel()
@@ -648,20 +826,34 @@ def test_mcp_session_startup_unwinds_owner_and_allows_retry(runtime, monkeypatch
         assert not runtime._mcp_sessions
         assert not runtime._mcp_session_owners
         fail = False
-        await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session')
+        await runtime.get_agent("medium", thread_id="thread", mcp_session_id="session")
         await runtime.close()
         assert closed == [True, True]
+
     asyncio.run(exercise())
 
 
 def test_conversation_close_rebuilds_other_session_on_same_thread(runtime):
-    runtime.config = replace(runtime.config, extensions=replace(runtime.config.extensions, mcp_stateful=True))
+    runtime.config = replace(
+        runtime.config, extensions=replace(runtime.config.extensions, mcp_stateful=True)
+    )
+
     async def exercise():
-        first = await runtime.get_agent('medium', thread_id='thread', mcp_session_id='session')
-        other = await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session')
-        await runtime.close_conversation(thread_id='thread', mcp_session_id='session')
+        first = await runtime.get_agent(
+            "medium", thread_id="thread", mcp_session_id="session"
+        )
+        other = await runtime.get_agent(
+            "medium", thread_id="thread", mcp_session_id="other-session"
+        )
+        await runtime.close_conversation(thread_id="thread", mcp_session_id="session")
         assert first not in runtime._agents.values()
         assert other not in runtime._agents.values()
-        assert await runtime.get_agent('medium', thread_id='thread', mcp_session_id='other-session') is not other
+        assert (
+            await runtime.get_agent(
+                "medium", thread_id="thread", mcp_session_id="other-session"
+            )
+            is not other
+        )
         await runtime.close()
+
     asyncio.run(exercise())

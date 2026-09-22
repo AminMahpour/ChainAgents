@@ -1,5 +1,7 @@
 """Exercise local background-task lifecycle for exported Agent Server graphs."""
 
+from contextlib import asynccontextmanager
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,13 +15,16 @@ def test_langgraph_http_app_closes_sessions_managers_and_artifacts(
     calls: list[tuple[str, str | None]] = []
 
     class Manager:
-        async def close_session(self, session_id: str) -> None:
+        @asynccontextmanager
+        async def closing_session(self, session_id: str):
             calls.append(("session", session_id))
+            yield
 
         async def close(self) -> None:
             calls.append(("manager", None))
 
     manager = Manager()
+
     class Artifacts:
         async def close_session(self, session_id: str) -> None:
             calls.append(("artifacts-session", session_id))
@@ -39,9 +44,7 @@ def test_langgraph_http_app_closes_sessions_managers_and_artifacts(
         response = client.delete("/background-tasks/sessions/thread-1")
         assert response.status_code == 200
         assert response.json() == {"closed": True, "thread_id": "thread-1"}
-        nested_response = client.delete(
-            "/background-tasks/sessions/team/research"
-        )
+        nested_response = client.delete("/background-tasks/sessions/team/research")
         assert nested_response.status_code == 200
         assert nested_response.json() == {
             "closed": True,

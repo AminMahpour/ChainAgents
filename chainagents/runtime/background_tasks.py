@@ -33,6 +33,10 @@ from chainagents.events.stream import (
     AgentStreamEventAdapter,
     langgraph_part_from_event_chunk,
 )
+from chainagents.runtime.artifacts import (
+    ArtifactSessionHandle,
+    LargeToolResultArtifactRegistry,
+)
 from chainagents.runtime.types import BackgroundSubagentConfig
 
 
@@ -67,9 +71,12 @@ class BackgroundSessionGeneration:
         self.session_id = session_id
         self.active = True
 
-_CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "chainagents_background_task_id",
-    default=None,
+
+_CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar(
+        "chainagents_background_task_id",
+        default=None,
+    )
 )
 _CURRENT_BACKGROUND_SESSION_ID: contextvars.ContextVar[str | None] = (
     contextvars.ContextVar(
@@ -198,10 +205,14 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         runnable: object,
         manager: "BackgroundTaskManager",
         on_session_open: Callable[[str], None] | None = None,
+        artifact_registry: LargeToolResultArtifactRegistry | None = None,
+        fixed_session_id: str | None = None,
     ) -> None:
         self.runnable = runnable
         self.manager = manager
         self.on_session_open = on_session_open
+        self.artifact_registry = artifact_registry
+        self.fixed_session_id = fixed_session_id
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.runnable, name)
@@ -230,13 +241,24 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
     def _set_generation(
         self,
         config: RunnableConfig | None,
-    ) -> contextvars.Token[BackgroundSessionGeneration | None] | None:
+    ) -> tuple[
+        contextvars.Token[BackgroundSessionGeneration | None] | None,
+        contextvars.Token[ArtifactSessionHandle | None] | None,
+    ]:
         configurable = (config or {}).get("configurable", {})
-        session_id = str(configurable.get("thread_id") or "").strip()
+        session_id = str(
+            self.fixed_session_id or configurable.get("thread_id") or ""
+        ).strip()
         if not session_id:
-            return None
-        return _CURRENT_BACKGROUND_SESSION_GENERATION.set(
-            self._session_generation(session_id)
+            return None, None
+        generation = self._session_generation(session_id)
+        artifact_token = None
+        if self.artifact_registry is not None:
+            handle = self.artifact_registry.open_session(session_id)
+            artifact_token = self.artifact_registry.activate(handle)
+        return (
+            _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation),
+            artifact_token,
         )
 
     def _session_generation(
@@ -249,8 +271,15 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
 
     @staticmethod
     def _reset_generation(
-        token: contextvars.Token[BackgroundSessionGeneration | None] | None,
+        tokens: tuple[
+            contextvars.Token[BackgroundSessionGeneration | None] | None,
+            contextvars.Token[ArtifactSessionHandle | None] | None,
+        ],
+        artifact_registry: LargeToolResultArtifactRegistry | None,
     ) -> None:
+        token, artifact_token = tokens
+        if artifact_token is not None and artifact_registry is not None:
+            artifact_registry.reset(artifact_token)
         if token is not None:
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
@@ -264,7 +293,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         try:
             return self.runnable.invoke(input, config, **kwargs)  # type: ignore[attr-defined]
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     async def ainvoke(
         self,
@@ -280,7 +309,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                 **kwargs,
             )
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     def stream(
         self,
@@ -296,7 +325,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                 **kwargs,
             )
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     async def astream(
         self,
@@ -313,7 +342,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
             ):
                 yield chunk
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     @overload
     def astream_events(
@@ -356,8 +385,15 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         **kwargs: Any,
     ) -> AsyncIterator[Any] | Awaitable[Any]:
         configurable = (config or {}).get("configurable", {})
-        session_id = str(configurable.get("thread_id") or "").strip()
+        session_id = str(
+            self.fixed_session_id or configurable.get("thread_id") or ""
+        ).strip()
         generation = self._session_generation(session_id) if session_id else None
+        artifact_handle = (
+            self.artifact_registry.open_session(session_id)
+            if session_id and self.artifact_registry is not None
+            else None
+        )
         if version == "v3":
             result = self.runnable.astream_events(  # type: ignore[attr-defined]
                 input,
@@ -368,6 +404,12 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
 
             async def await_events() -> Any:
                 token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation)
+                artifact_token = (
+                    self.artifact_registry.activate(artifact_handle)
+                    if artifact_handle is not None
+                    and self.artifact_registry is not None
+                    else None
+                )
                 try:
                     stream = await cast(Awaitable[Any], result)
                     graph_iterator = getattr(stream, "_graph_aiter", None)
@@ -376,10 +418,17 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                             _BackgroundSessionScopedAsyncIterator(
                                 graph_iterator,
                                 generation,
+                                self.artifact_registry,
+                                artifact_handle,
                             )
                         )
                     return stream
                 finally:
+                    if (
+                        artifact_token is not None
+                        and self.artifact_registry is not None
+                    ):
+                        self.artifact_registry.reset(artifact_token)
                     _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
             return await_events()
@@ -399,10 +448,17 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
 
         async def iterate_events() -> AsyncIterator[Any]:
             token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation)
+            artifact_token = (
+                self.artifact_registry.activate(artifact_handle)
+                if artifact_handle is not None and self.artifact_registry is not None
+                else None
+            )
             try:
                 async for event in cast(AsyncIterator[Any], result):
                     yield event
             finally:
+                if artifact_token is not None and self.artifact_registry is not None:
+                    self.artifact_registry.reset(artifact_token)
                 _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
         return iterate_events()
@@ -415,18 +471,29 @@ class _BackgroundSessionScopedAsyncIterator:
         self,
         iterator: AsyncIterator[Any],
         generation: BackgroundSessionGeneration | None,
+        artifact_registry: LargeToolResultArtifactRegistry | None = None,
+        artifact_handle: ArtifactSessionHandle | None = None,
     ) -> None:
         self.iterator = iterator
         self.generation = generation
+        self.artifact_registry = artifact_registry
+        self.artifact_handle = artifact_handle
 
     def __aiter__(self) -> "_BackgroundSessionScopedAsyncIterator":
         return self
 
     async def __anext__(self) -> Any:
         token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(self.generation)
+        artifact_token = (
+            self.artifact_registry.activate(self.artifact_handle)
+            if self.artifact_registry is not None and self.artifact_handle is not None
+            else None
+        )
         try:
             return await self.iterator.__anext__()
         finally:
+            if artifact_token is not None and self.artifact_registry is not None:
+                self.artifact_registry.reset(artifact_token)
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
     async def aclose(self) -> None:
@@ -434,9 +501,16 @@ class _BackgroundSessionScopedAsyncIterator:
         if close is None:
             return
         token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(self.generation)
+        artifact_token = (
+            self.artifact_registry.activate(self.artifact_handle)
+            if self.artifact_registry is not None and self.artifact_handle is not None
+            else None
+        )
         try:
             await close()
         finally:
+            if artifact_token is not None and self.artifact_registry is not None:
+                self.artifact_registry.reset(artifact_token)
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
 
@@ -445,12 +519,16 @@ def scope_background_session_invocation(
     manager: "BackgroundTaskManager",
     *,
     on_session_open: Callable[[str], None] | None = None,
+    artifact_registry: LargeToolResultArtifactRegistry | None = None,
+    fixed_session_id: str | None = None,
 ) -> Runnable[Any, Any]:
     """Wrap an exported graph with invocation-scoped session invalidation."""
     return _BackgroundSessionScopedRunnable(
         runnable,
         manager,
         on_session_open=on_session_open,
+        artifact_registry=artifact_registry,
+        fixed_session_id=fixed_session_id,
     )
 
 
@@ -567,9 +645,7 @@ BackgroundCleanup = Callable[[str], Awaitable[None]]
 def _session_id_from_runtime(runtime: ToolRuntime) -> str:
     configurable = runtime.config.get("configurable", {})
     session_id = str(
-        _CURRENT_BACKGROUND_SESSION_ID.get()
-        or configurable.get("thread_id")
-        or ""
+        _CURRENT_BACKGROUND_SESSION_ID.get() or configurable.get("thread_id") or ""
     ).strip()
     if not session_id:
         raise ValueError(
@@ -639,8 +715,7 @@ def create_background_task_tools(
             for tool in existing_tools
             if (
                 name := str(
-                    getattr(tool, "name", None)
-                    or getattr(tool, "__name__", "")
+                    getattr(tool, "name", None) or getattr(tool, "__name__", "")
                 ).strip()
             )
             in BACKGROUND_TASK_TOOL_NAMES
@@ -666,9 +741,7 @@ def create_background_task_tools(
     ) -> _BackgroundTaskSubmission:
         child = subagents.get(subagent_type)
         if child is None:
-            raise ValueError(
-                f"Allowed subagents for background work: {allowed_text}."
-            )
+            raise ValueError(f"Allowed subagents for background work: {allowed_text}.")
         parent_configurable = runtime.config.get("configurable", {})
         shared_checkpointer = parent_configurable.get(_LANGGRAPH_CHECKPOINTER_KEY)
         shared_store = runtime.store
@@ -724,10 +797,9 @@ def create_background_task_tools(
 
         cleanup: BackgroundCleanup | None = None
         if callable(delete_checkpoint_thread):
+
             async def cleanup_child(task_id: str) -> None:
-                await delete_checkpoint_thread(
-                    f"{session_id}:background:{task_id}"
-                )
+                await delete_checkpoint_thread(f"{session_id}:background:{task_id}")
 
             cleanup = cleanup_child
 
@@ -815,6 +887,7 @@ def create_background_task_tools(
                 expected_session_generation=generation,
             )
         except asyncio.CancelledError:
+
             async def cancel_batch() -> None:
                 await asyncio.gather(
                     *(
@@ -905,9 +978,7 @@ class BackgroundTaskManager:
         self._lock = asyncio.Lock()
         self._records: dict[str, _BackgroundTaskRecord] = {}
         self._session_task_ids: dict[str, list[str]] = {}
-        self._subscribers: dict[
-            str, set[asyncio.Queue[BackgroundTaskSnapshot]]
-        ] = {}
+        self._subscribers: dict[str, set[asyncio.Queue[BackgroundTaskSnapshot]]] = {}
         self._activity_subscribers: dict[
             str, set[asyncio.Queue[BackgroundTaskActivity]]
         ] = {}
@@ -1037,7 +1108,9 @@ class BackgroundTaskManager:
             if parent_task_id is not None:
                 parent = self._records.get(parent_task_id)
                 if parent is None or parent.session_id != normalized_session:
-                    raise ValueError("Background parent task does not exist in this session.")
+                    raise ValueError(
+                        "Background parent task does not exist in this session."
+                    )
                 if parent.cancelling:
                     raise RuntimeError("Background parent task is cancelling.")
 
@@ -1126,6 +1199,7 @@ class BackgroundTaskManager:
             cleanup = record.cleanup
             cleanup_task = record.cleanup_task
             if cleanup is not None and cleanup_task is None:
+
                 async def run_cleanup() -> None:
                     await cleanup(record.task_id)
 
@@ -1204,9 +1278,7 @@ class BackgroundTaskManager:
             record = self._records.get(task_id)
             if record is None:
                 return
-            subscribers = tuple(
-                self._activity_subscribers.get(record.session_id, ())
-            )
+            subscribers = tuple(self._activity_subscribers.get(record.session_id, ()))
             activity = BackgroundTaskActivity(
                 task_id=record.task_id,
                 session_id=record.session_id,
@@ -1377,7 +1449,9 @@ class BackgroundTaskManager:
                 ancestor_task_id,
             )
         ):
-            raise KeyError(f"Background task '{task_id}' is not visible in this session.")
+            raise KeyError(
+                f"Background task '{task_id}' is not visible in this session."
+            )
         return record
 
     async def cancel(

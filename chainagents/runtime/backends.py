@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from deepagents.backends import (
+    BackendProtocol,
     CompositeBackend,
     FilesystemBackend,
     StateBackend,
@@ -13,6 +14,10 @@ from deepagents.backends import (
 )
 
 import chainagents.runtime.constants as runtime_constants
+from chainagents.runtime.artifacts import (
+    ArtifactTrackingBackend,
+    LargeToolResultArtifactRegistry,
+)
 from chainagents.runtime.constants import (
     DEEPAGENT_ARTIFACTS_DIRECTORY,
     DEFAULT_AGENT_MEMORY_NAMESPACE,
@@ -151,6 +156,7 @@ def build_deepagent_backend(
     project_root: Path | None = None,
     include_memories: bool = True,
     memory_namespace: str = DEFAULT_AGENT_MEMORY_NAMESPACE,
+    artifact_registry: LargeToolResultArtifactRegistry | None = None,
 ) -> CompositeBackend:
     """Build deepagent backend.
 
@@ -165,7 +171,7 @@ def build_deepagent_backend(
     resolved_project_root = project_root or runtime_constants.PROJECT_ROOT
     artifacts_root = deepagent_artifacts_root(resolved_project_root)
     outputs_root = generated_outputs_root(resolved_project_root)
-    routes = {
+    routes: dict[str, BackendProtocol] = {
         deepagent_artifacts_route_prefix(resolved_project_root): FilesystemBackend(
             root_dir=str(artifacts_root),
             virtual_mode=True,
@@ -183,8 +189,11 @@ def build_deepagent_backend(
         routes["/memories/"] = StoreBackend(
             namespace=lambda _runtime: (memory_namespace,)
         )
-    return CompositeBackend(
+    backend = CompositeBackend(
         default=StateBackend(),
         routes=routes,
         artifacts_root=str(artifacts_root),
     )
+    if artifact_registry is None:
+        return backend
+    return ArtifactTrackingBackend(backend, artifact_registry)

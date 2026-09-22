@@ -471,7 +471,6 @@ class AgentRuntime:
         )
         middleware = runtime_middleware.build_agent_middleware(
             backend=backend,
-            artifact_registry=self.large_tool_result_artifacts,
             config=self.config,
             reasoning_level=effective_reasoning_level,
             model_name=effective_model.name,
@@ -611,8 +610,6 @@ class AgentRuntime:
             str(model_name or self.config.model_name).strip()
             or self.config.model_name
         )
-        if thread_id:
-            self.large_tool_result_artifacts.open_session(thread_id)
         selected_model_profile = runtime_models.resolve_runtime_model_profile(
             self.config,
             selected_model,
@@ -659,10 +656,10 @@ class AgentRuntime:
                     project_root=self.project_root,
                     include_memories=self.config.agent_state == "stateful",
                     memory_namespace=self.config.extensions.agent_memory_namespace,
+                    artifact_registry=self.large_tool_result_artifacts,
                 )
                 middleware = runtime_middleware.build_agent_middleware(
                     backend=backend,
-                    artifact_registry=self.large_tool_result_artifacts,
                     config=self.config,
                     reasoning_level=effective_reasoning_level,
                     model_name=selected_model,
@@ -744,6 +741,13 @@ class AgentRuntime:
                     self.config,
                     **agent_kwargs,
                 )
+                if thread_id:
+                    agent = runtime_background_tasks.scope_background_session_invocation(
+                        agent,
+                        self.background_tasks,
+                        artifact_registry=self.large_tool_result_artifacts,
+                        fixed_session_id=thread_id,
+                    )
                 self._agents[cache_key] = agent
             return agent
 
@@ -1242,4 +1246,5 @@ class AgentRuntime:
             project_root=self.project_root,
             include_memories=runtime.config.agent_state == "stateful",
             memory_namespace=runtime.config.extensions.agent_memory_namespace,
+            artifact_registry=self.large_tool_result_artifacts,
         )

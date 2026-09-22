@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -65,10 +66,13 @@ async def close_static_background_tasks() -> None:
 async def close_static_background_session(session_id: str) -> None:
     """Close one session across exported task and artifact owners."""
     managers = static_background_task_managers()
-    await asyncio.gather(
-        *(manager.close_session(session_id) for manager in managers),
-        _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close_session(session_id),
-    )
+    if managers:
+        async with AsyncExitStack() as stack:
+            for manager in managers:
+                await stack.enter_async_context(manager.closing_session(session_id))
+            await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close_session(session_id)
+        return
+    await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close_session(session_id)
 
 
 def _get_static_background_task_manager(
@@ -362,7 +366,6 @@ def build_static_sync_subagent_spec(
     effective_tools = inherited_model_tools
     middleware = runtime_middleware.build_agent_middleware(
         backend=backend,
-        artifact_registry=artifact_registry,
         config=config,
         reasoning_level=effective_reasoning_level,
         model_name=effective_model.name,
@@ -489,6 +492,7 @@ def build_graph_subagent_specs(
         project_root=project_root,
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
+        artifact_registry=artifact_registry,
     )
     inherited_model = runtime_models.resolve_runtime_model_profile(config)
     graph_reasoning_level = reasoning_level_for_profile(
@@ -555,6 +559,7 @@ def create_configured_graph(
     backend = runtime_backends.build_deepagent_backend(
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
+        artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
     )
     tools: list[Any] = []
     if config.extensions.chainlit_generative_ui_enabled:
@@ -635,7 +640,6 @@ def create_configured_graph(
         ),
         "middleware": runtime_middleware.build_agent_middleware(
             backend=backend,
-            artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
             config=config,
             reasoning_level=main_reasoning_level,
             source="main-agent",
@@ -655,5 +659,5 @@ def create_configured_graph(
     return runtime_background_tasks.scope_background_session_invocation(
         graph,
         session_manager,
-        on_session_open=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS.open_session,
+        artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
     )

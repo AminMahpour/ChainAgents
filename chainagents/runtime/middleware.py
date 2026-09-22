@@ -13,7 +13,6 @@ from typing import Any
 from deepagents import create_deep_agent
 from deepagents.backends import BackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
-from deepagents.backends.utils import sanitize_tool_call_id
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
@@ -23,8 +22,6 @@ import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.models as runtime_models
 from chainagents.runtime.config import RuntimeConfig
-from chainagents.runtime.artifacts import LargeToolResultArtifactRegistry
-from chainagents.runtime.background_tasks import current_background_session_id
 from chainagents.runtime.constants import (
     DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS,
     SUMMARIZATION_STATUS_EVENT_KIND,
@@ -35,82 +32,6 @@ logger = logging.getLogger("chainagents.runtime.core")
 
 
 _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
-
-
-class SessionFilesystemMiddleware(FilesystemMiddleware):
-    """Filesystem middleware that records session-owned result offloads."""
-
-    def __init__(
-        self,
-        *,
-        artifact_registry: LargeToolResultArtifactRegistry,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(**kwargs)
-        self._artifact_registry = artifact_registry
-
-    @staticmethod
-    def _session_id(request: ToolCallRequest) -> str:
-        background_session = current_background_session_id()
-        if background_session:
-            return background_session
-        configurable = request.runtime.config.get("configurable", {})
-        return str(configurable.get("thread_id") or "").strip()
-
-    def _offloaded_path(
-        self,
-        request: ToolCallRequest,
-        result: ToolMessage | Command,
-    ) -> str | None:
-        tool_call_id = str(request.tool_call.get("id") or "").strip()
-        if not tool_call_id:
-            return None
-        path = (
-            f"{self._large_tool_results_prefix}/"
-            f"{sanitize_tool_call_id(tool_call_id)}"
-        )
-        messages: list[object]
-        if isinstance(result, ToolMessage):
-            messages = [result]
-        else:
-            update = result.update or {}
-            candidate = update.get("messages", [])
-            messages = candidate if isinstance(candidate, list) else []
-        if any(
-            isinstance(message, ToolMessage)
-            and path in message.text
-            and "saved in the filesystem at this path" in message.text
-            for message in messages
-        ):
-            return path
-        return None
-
-    def wrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: Callable[[ToolCallRequest], ToolMessage | Command],
-    ) -> ToolMessage | Command:
-        result = super().wrap_tool_call(request, handler)
-        path = self._offloaded_path(request, result)
-        session_id = self._session_id(request)
-        if path is not None:
-            self._artifact_registry.register(session_id, path, self.backend)
-        return result
-
-    async def awrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: Callable[
-            [ToolCallRequest],
-            Awaitable[ToolMessage | Command],
-        ],
-    ) -> ToolMessage | Command:
-        result = await super().awrap_tool_call(request, handler)
-        path = self._offloaded_path(request, result)
-        session_id = self._session_id(request)
-        if path is not None:
-            await self._artifact_registry.aregister(session_id, path, self.backend)
-        return result
 
 
 class DisableSubagentDelegationMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -501,7 +422,6 @@ def create_deep_agent_with_configured_summarization(
 def build_agent_middleware(
     *,
     backend: BackendProtocol,
-    artifact_registry: LargeToolResultArtifactRegistry | None = None,
     config: RuntimeConfig | None = None,
     reasoning_level: ReasoningLevel | None = None,
     model_name: str | None = None,
@@ -525,23 +445,15 @@ def build_agent_middleware(
     # sync-subagent stacks. Passing another SummarizationMiddleware here creates
     # duplicate middleware names that LangChain rejects during agent creation.
     middleware: list[AgentMiddleware[Any, Any, Any]] = [TodoListMiddleware()]
-    filesystem_tools = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
+    filesystem_tools: list[Any] = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
     if config is not None:
         if config.extensions.delete_tool_enabled:
             filesystem_tools.append("delete")
         if config.extensions.execute_tool_enabled:
             filesystem_tools.append("execute")
-    filesystem_middleware = (
-        SessionFilesystemMiddleware(
-            backend=backend,
-            tools=filesystem_tools,
-            artifact_registry=artifact_registry,
-        )
-        if artifact_registry is not None
-        else FilesystemMiddleware(
-            backend=backend,
-            tools=filesystem_tools,
-        )
+    filesystem_middleware = FilesystemMiddleware(
+        backend=backend,
+        tools=filesystem_tools,
     )
     middleware.append(filesystem_middleware)
     middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
