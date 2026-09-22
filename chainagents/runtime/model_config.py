@@ -257,6 +257,19 @@ def normalize_model_temperature(value: Any | None) -> float:
     return temperature
 
 
+def normalize_model_max_tokens(
+    value: Any | None,
+    *,
+    field_name: str = "[model].max_tokens",
+) -> int | None:
+    """Normalize an optional positive model output-token limit."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"The {field_name} config must be a positive integer.")
+    return value
+
+
 def normalize_repeat_penalty(value: Any | None) -> float | None:
     """Normalize repeat penalty.
 
@@ -701,6 +714,16 @@ def parse_model_profile_defaults(
     )
     if "temperature" in raw_model or "tempreature" in raw_model:
         explicit_fields.add("temperature")
+    max_tokens = (
+        normalize_model_max_tokens(
+            raw_model.get("max_tokens"),
+            field_name=f"{field_prefix}.max_tokens",
+        )
+        if "max_tokens" in raw_model or base is None
+        else base.max_tokens
+    )
+    if "max_tokens" in raw_model:
+        explicit_fields.add("max_tokens")
     repeat_penalty = (
         normalize_repeat_penalty(raw_model.get("repeat_penalty"))
         if "repeat_penalty" in raw_model or base is None
@@ -741,6 +764,7 @@ def parse_model_profile_defaults(
         reasoning_effort=reasoning_effort,
         thinking=thinking,
         temperature=temperature,
+        max_tokens=max_tokens,
         repeat_penalty=repeat_penalty,
         disable_streaming=disable_streaming,
         modalities=modalities,
@@ -906,6 +930,7 @@ def rebase_model_profile_defaults(
         "reasoning_effort",
         "thinking",
         "temperature",
+        "max_tokens",
         "repeat_penalty",
         "disable_streaming",
         "modalities",

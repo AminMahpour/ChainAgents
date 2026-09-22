@@ -269,8 +269,8 @@ async def test_tui_mounts_expected_panes_and_prompt() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_posts_local_background_completion_and_unsubscribes() -> None:
-    """Terminal task results should arrive while the TUI remains interactive."""
+async def test_tui_posts_local_background_status_without_dumping_result() -> None:
+    """Terminal status should arrive without copying successful output into the UI."""
     runtime = _FakeRuntime(_FakeAgent([]))
     manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
     runtime.background_tasks = manager
@@ -294,7 +294,8 @@ async def test_tui_posts_local_background_completion_and_unsubscribes() -> None:
         await pilot.pause()
 
         assert any(spawned.task_id in entry for entry in app.tool_entries)
-        assert any("background result" in entry for entry in app.tool_entries)
+        assert any("status success" in entry for entry in app.tool_entries)
+        assert all("background result" not in entry for entry in app.tool_entries)
 
     entry_count = len(app.tool_entries)
 
@@ -344,7 +345,8 @@ async def test_tui_normalizes_thread_id_for_runs_and_background_notices() -> Non
         await manager.get("session-a", spawned.task_id, wait_seconds=1)
         await pilot.pause()
 
-        assert any("normalized result" in entry for entry in app.tool_entries)
+        assert any(spawned.task_id in entry for entry in app.tool_entries)
+        assert all("normalized result" not in entry for entry in app.tool_entries)
 
     await manager.close()
 

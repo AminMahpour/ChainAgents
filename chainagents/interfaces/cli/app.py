@@ -2050,16 +2050,20 @@ async def interactive_repl(
             await notice_task
 
 
-def format_background_task_notice(snapshot: BackgroundTaskSnapshot) -> str:
-    """Format one terminal local task result for terminal interfaces."""
+def format_background_task_notice(
+    snapshot: BackgroundTaskSnapshot,
+    *,
+    include_result: bool = False,
+) -> str:
+    """Format one terminal local task notice for a CLI delivery mode."""
     message = (
         f"Background subagent {snapshot.agent_name} finished with status "
         f"{snapshot.status}.\nTask ID: {snapshot.task_id}"
     )
-    if snapshot.result:
-        return f"{message}\n{snapshot.result}"
     if snapshot.error:
         return f"{message}\nError: {snapshot.error}"
+    if include_result and snapshot.result:
+        return f"{message}\n{snapshot.result}"
     return message
 
 
@@ -2202,7 +2206,10 @@ async def run_cli(
                 return 0
             return int(prompt_result)
         for snapshot in background_snapshots:
-            print(format_background_task_notice(snapshot), file=stderr)
+            print(
+                format_background_task_notice(snapshot, include_result=True),
+                file=stderr,
+            )
         return int(prompt_result)
 
     if args.status or args.list_commands or args.rebuild_rag or args.upload_rag:

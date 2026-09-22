@@ -13,17 +13,22 @@ from deepagents import create_deep_agent
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.store.memory import InMemoryStore
 
 from chainagents.runtime.background_tasks import (
+    BackgroundTaskActivity,
     BackgroundTaskManager,
     create_background_task_tools,
+    current_background_invocation_path,
     current_background_session_generation,
+    current_background_task_id,
     scope_background_session_invocation,
     scope_background_task_invocation,
 )
+from chainagents.events.stream import AgentStreamEvent
 from chainagents.runtime.types import BackgroundSubagentConfig
 from chainagents.interfaces.chainlit.async_tasks import LocalBackgroundTaskNotifier
 
@@ -85,6 +90,57 @@ def test_spawn_returns_before_runner_finishes_and_result_can_be_retrieved() -> N
     asyncio.run(exercise())
 
 
+def test_background_activity_channel_orders_live_events_before_completion() -> None:
+    """One session queue must receive live activity before its terminal snapshot."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        queue = manager.subscribe_activity("session-a")
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="Checking the repository",
+                ),
+            )
+            return "finished result"
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        live = await asyncio.wait_for(queue.get(), timeout=1)
+        terminal = await asyncio.wait_for(queue.get(), timeout=1)
+
+        assert live == BackgroundTaskActivity(
+            task_id=spawned.task_id,
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            event=AgentStreamEvent(
+                kind="reasoning_delta",
+                source="researcher",
+                text="Checking the repository",
+            ),
+        )
+        assert terminal.event is None
+        assert terminal.snapshot is not None
+        assert terminal.snapshot.status == "success"
+        assert terminal.snapshot.result == "finished result"
+        assert queue.empty()
+
+        manager.unsubscribe_activity("session-a", queue)
+        assert "session-a" not in manager._activity_subscribers
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_session_generation_entries_are_reclaimed() -> None:
     async def exercise() -> None:
         manager = make_manager()
@@ -114,6 +170,50 @@ def test_session_generation_rejects_runs_started_during_close() -> None:
 
         assert manager.session_generation("session-a").active
         await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_background_invocation_scope_wraps_each_stream_pull() -> None:
+    """Streaming a scoped child must not fall back to one final ainvoke result."""
+    async def exercise() -> None:
+        captured_paths: list[tuple[str, ...]] = []
+        captured_kwargs: list[dict[str, object]] = []
+
+        class Invocation:
+            async def ainvoke(self, input, config=None, **kwargs):
+                return "fallback"
+
+            async def astream(self, input, config=None, **kwargs):
+                captured_kwargs.append(kwargs)
+                captured_paths.append(current_background_invocation_path())
+                yield "first"
+                await asyncio.sleep(0)
+                captured_paths.append(current_background_invocation_path())
+                yield "second"
+
+        runnable = scope_background_task_invocation(Invocation())
+        streamed = [
+            chunk
+            async for chunk in runnable.astream(
+                {},
+                {"configurable": {"thread_id": "session-a"}},
+                stream_mode=["values", "messages"],
+                subgraphs=True,
+            )
+        ]
+
+        assert streamed == ["first", "second"]
+        assert len(captured_paths) == 2
+        assert captured_paths[0] == captured_paths[1]
+        assert captured_paths[0]
+        assert current_background_invocation_path() == ()
+        assert captured_kwargs == [
+            {
+                "stream_mode": ["values", "messages"],
+                "subgraphs": True,
+            }
+        ]
 
     asyncio.run(exercise())
 
@@ -1039,6 +1139,7 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
         by_name = {tool.name: tool for tool in tools}
         assert set(by_name) == {
             "spawn_background_task",
+            "run_subagent_batch",
             "list_background_tasks",
             "get_background_task",
             "cancel_background_task",
@@ -1094,6 +1195,802 @@ def test_background_tools_spawn_isolated_child_and_retrieve_result() -> None:
     asyncio.run(exercise())
 
 
+def test_background_tools_stream_child_activity_with_relabelled_sources() -> None:
+    """Opted-in children must publish root and nested activity before completion."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.calls: list[
+                tuple[dict[str, object], dict[str, object], dict[str, object]]
+            ] = []
+
+        async def ainvoke(self, state, config, **kwargs):
+            raise AssertionError("stream activity must not use ainvoke")
+
+        async def astream(self, state, config, **kwargs):
+            self.calls.append((state, config, kwargs))
+            root_token = SimpleNamespace(
+                type="AIMessageChunk",
+                additional_kwargs={"reasoning_content": "root thought"},
+                tool_call_chunks=[],
+                content="",
+            )
+            nested_token = SimpleNamespace(
+                type="AIMessageChunk",
+                additional_kwargs={"reasoning_content": "nested thought"},
+                tool_call_chunks=[],
+                content="",
+            )
+            yield ((), "messages", (root_token, {}))
+            yield (("worker:child-run",), "messages", (nested_token, {}))
+            yield (
+                (),
+                "values",
+                {
+                    "messages": [
+                        HumanMessage(content="investigate"),
+                        AIMessage(content="streamed result"),
+                    ]
+                },
+            )
+
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        child = ChildRunnable()
+        activity_queue = manager.subscribe_activity("session-a")
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": child},
+            agent_path=(),
+            recursion_limit=45,
+        )
+        spawn_tool = next(
+            tool for tool in tools if tool.name == "spawn_background_task"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="call-1",
+            store=None,
+        )
+
+        spawned = await spawn_tool.coroutine("investigate", "researcher", runtime)
+        activities = [
+            await asyncio.wait_for(activity_queue.get(), timeout=1)
+            for _ in range(3)
+        ]
+
+        assert [
+            activity.event.source
+            for activity in activities
+            if activity.event is not None
+        ] == ["researcher", "researcher / worker"]
+        assert [
+            activity.event.text
+            for activity in activities
+            if activity.event is not None
+        ] == ["root thought", "nested thought"]
+        assert activities[-1].snapshot is not None
+        assert activities[-1].snapshot.status == "success"
+        assert activities[-1].snapshot.result == "streamed result"
+        assert child.calls == [
+            (
+                {"messages": [HumanMessage(content="investigate")]},
+                {
+                    "configurable": {
+                        "thread_id": f"session-a:background:{spawned['task_id']}",
+                        "checkpoint_ns": "",
+                        "ls_agent_type": "background_subagent",
+                    },
+                    "recursion_limit": 45,
+                },
+                {
+                    "stream_mode": ["values", "messages", "updates"],
+                    "subgraphs": True,
+                },
+            )
+        ]
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_executes_repeated_targets_concurrently_in_input_order() -> None:
+    """A one-call fanout must overlap child runs and preserve request ordering."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+            self.configs: list[dict[str, object]] = []
+            self.both_started = asyncio.Event()
+            self.releases = {
+                "first": asyncio.Event(),
+                "second": asyncio.Event(),
+            }
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            self.started.append(description)
+            self.configs.append(config)
+            if len(self.started) == 2:
+                self.both_started.set()
+            await self.releases[description].wait()
+            return {"messages": [AIMessage(content=f"result:{description}")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": child},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        batch_tool = next(
+            tool for tool in tools if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "first", "subagent_type": "researcher"},
+                    {"description": "second", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.both_started.wait(), timeout=1)
+        child.releases["second"].set()
+        await asyncio.sleep(0)
+        assert not batch_call.done()
+        child.releases["first"].set()
+
+        result = await asyncio.wait_for(batch_call, timeout=1)
+
+        assert [item["description"] for item in result["results"]] == [
+            "first",
+            "second",
+        ]
+        assert [item["agent_name"] for item in result["results"]] == [
+            "researcher",
+            "researcher",
+        ]
+        assert [item["status"] for item in result["results"]] == [
+            "success",
+            "success",
+        ]
+        assert [item["result"] for item in result["results"]] == [
+            "result:first",
+            "result:second",
+        ]
+        thread_ids = [
+            str(config["configurable"]["thread_id"])
+            for config in child.configs
+        ]
+        assert len(set(thread_ids)) == 2
+        assert all(thread_id.startswith("session-a:background:bg-") for thread_id in thread_ids)
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_has_an_openai_compatible_nested_schema() -> None:
+    """Cortex-compatible tool conversion must retain both batch item fields."""
+    manager = make_manager()
+    batch_tool = next(
+        tool
+        for tool in create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": object()},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        if tool.name == "run_subagent_batch"
+    )
+
+    schema = convert_to_openai_tool(batch_tool)["function"]["parameters"]
+
+    assert schema["type"] == "object"
+    assert set(schema["properties"]) == {"tasks"}
+    assert schema["required"] == ["tasks"]
+    item_schema = schema["properties"]["tasks"]["items"]
+    assert item_schema["type"] == "object"
+    assert item_schema["required"] == ["description", "subagent_type"]
+
+
+def test_run_subagent_batch_rejects_the_whole_batch_when_capacity_is_insufficient() -> None:
+    """Batch admission must not launch a prefix that happens to fit."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started.set()
+            return {"messages": [AIMessage(content="unexpected")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=2, max_running_total=3)
+        blocker_release = asyncio.Event()
+
+        async def blocker(task_id: str) -> str:
+            await blocker_release.wait()
+            return task_id
+
+        existing = await manager.spawn(
+            session_id="session-a",
+            agent_name="existing",
+            description="existing",
+            agent_path=("existing",),
+            runner=blocker,
+        )
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        with pytest.raises(RuntimeError, match="running limit.*session"):
+            await batch_tool.coroutine(
+                [
+                    {"description": "one", "subagent_type": "researcher"},
+                    {"description": "two", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+
+        assert not child.started.is_set()
+        assert [task.task_id for task in await manager.list("session-a")] == [
+            existing.task_id
+        ]
+        blocker_release.set()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_validates_every_request_before_launching() -> None:
+    """Empty, blank, and unknown work must leave the session untouched."""
+
+    class ChildRunnable:
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            return {"messages": [AIMessage(content="unexpected")]}
+
+    async def exercise() -> None:
+        manager = make_manager()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": ChildRunnable()},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        with pytest.raises(ValueError, match="at least one"):
+            await batch_tool.coroutine([], runtime)
+        with pytest.raises(ValueError, match="description"):
+            await batch_tool.coroutine(
+                [{"description": "   ", "subagent_type": "researcher"}],
+                runtime,
+            )
+        with pytest.raises(ValueError, match="Allowed subagents"):
+            await batch_tool.coroutine(
+                [{"description": "work", "subagent_type": "unknown"}],
+                runtime,
+            )
+
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_keeps_sibling_results_when_one_child_fails() -> None:
+    """A failed child must become one result instead of failing the whole tool."""
+
+    class ChildRunnable:
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            if description == "fail":
+                raise RuntimeError("child failed")
+            return {"messages": [AIMessage(content="survived")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": ChildRunnable()},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        result = await batch_tool.coroutine(
+            [
+                {"description": "fail", "subagent_type": "researcher"},
+                {"description": "succeed", "subagent_type": "researcher"},
+            ],
+            runtime,
+        )
+
+        assert [item["status"] for item in result["results"]] == [
+            "error",
+            "success",
+        ]
+        assert result["results"][0]["error"] == "RuntimeError: child failed"
+        assert result["results"][1]["result"] == "survived"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelling_run_subagent_batch_cancels_every_unfinished_child() -> None:
+    """Cancelling a waiting batch call must not orphan its child tasks."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.both_started = asyncio.Event()
+            self.cancelled = 0
+            self.both_cancelled = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                if self.cancelled == 2:
+                    self.both_cancelled.set()
+                raise
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "one", "subagent_type": "researcher"},
+                    {"description": "two", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.both_started.wait(), timeout=1)
+
+        batch_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch_call
+
+        await asyncio.wait_for(child.both_cancelled.wait(), timeout=1)
+        assert [task.status for task in await manager.list("session-a")] == [
+            "cancelled",
+            "cancelled",
+        ]
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelling_batch_preserves_descendants_of_completed_children() -> None:
+    """Cancelling a batch wait must not cancel work owned by a finished child."""
+
+    class ChildRunnable:
+        def __init__(self, manager: BackgroundTaskManager) -> None:
+            self.manager = manager
+            self.finished_task_id: str | None = None
+            self.descendant_task_id: str | None = None
+            self.descendant_started = asyncio.Event()
+            self.descendant_cancelled = asyncio.Event()
+            self.unfinished_started = asyncio.Event()
+            self.unfinished_cancelled = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            if description == "finished":
+                self.finished_task_id = current_background_task_id()
+                assert self.finished_task_id is not None
+
+                async def run_descendant(task_id: str) -> str:
+                    self.descendant_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.descendant_cancelled.set()
+                        raise
+
+                descendant = await self.manager.spawn(
+                    session_id="session-a",
+                    agent_name="descendant",
+                    description="surviving descendant",
+                    agent_path=("researcher", "descendant"),
+                    parent_task_id=self.finished_task_id,
+                    runner=run_descendant,
+                )
+                self.descendant_task_id = descendant.task_id
+                return {"messages": [AIMessage(content="done")]}
+
+            self.unfinished_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.unfinished_cancelled.set()
+                raise
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=5, max_running_total=5)
+        child = ChildRunnable(manager)
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "finished", "subagent_type": "researcher"},
+                    {"description": "unfinished", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.descendant_started.wait(), timeout=1)
+        await asyncio.wait_for(child.unfinished_started.wait(), timeout=1)
+        assert child.finished_task_id is not None
+        finished = await manager.get(
+            "session-a",
+            child.finished_task_id,
+            wait_seconds=1,
+        )
+        assert finished.status == "success"
+
+        batch_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch_call
+
+        await asyncio.wait_for(child.unfinished_cancelled.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not child.descendant_cancelled.is_set()
+        assert child.descendant_task_id is not None
+        descendant = await manager.get("session-a", child.descendant_task_id)
+        assert descendant.status == "running"
+
+        await manager.close()
+        assert child.descendant_cancelled.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_returns_cancelled_results_when_session_closes() -> None:
+    """Session teardown must release a waiting batch call without orphaning work."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.both_started = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            await asyncio.Event().wait()
+            return {"messages": [AIMessage(content="unreachable")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "one", "subagent_type": "researcher"},
+                    {"description": "two", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await asyncio.wait_for(child.both_started.wait(), timeout=1)
+
+        await manager.close_session("session-a")
+        result = await asyncio.wait_for(batch_call, timeout=1)
+
+        assert [item["status"] for item in result["results"]] == [
+            "cancelled",
+            "cancelled",
+        ]
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_wait_batch_waits_for_cancellation_cleanup_to_finalize_records() -> None:
+    """A cancelled execution is not terminal until its cleanup has finished."""
+
+    async def exercise() -> None:
+        manager = make_manager()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="work",
+            agent_path=("researcher",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        execution = manager._records[spawned.task_id].execution
+        assert execution is not None
+        waiter = asyncio.create_task(
+            manager.wait_batch("session-a", [spawned.task_id])
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        cancellation = asyncio.create_task(
+            manager.cancel("session-a", spawned.task_id)
+        )
+
+        await asyncio.gather(execution, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not cancellation.done()
+        assert not waiter.done()
+
+        release_cleanup.set()
+        cancelled = await asyncio.wait_for(cancellation, timeout=1)
+        completed = await asyncio.wait_for(waiter, timeout=1)
+
+        assert cancelled.status == "cancelled"
+        assert [snapshot.status for snapshot in completed] == ["cancelled"]
+        assert completed[0].completed_at is not None
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_wait_batch_waits_for_session_close_cleanup_to_finalize_records() -> None:
+    """Session close must publish terminal snapshots before forgetting records."""
+
+    async def exercise() -> None:
+        manager = make_manager()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        async def cleanup(task_id: str) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="work",
+            agent_path=("researcher",),
+            runner=runner,
+            cleanup=cleanup,
+        )
+        execution = manager._records[spawned.task_id].execution
+        assert execution is not None
+        waiter = asyncio.create_task(
+            manager.wait_batch("session-a", [spawned.task_id])
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        closing = asyncio.create_task(manager.close_session("session-a"))
+
+        await asyncio.gather(execution, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not closing.done()
+        assert not waiter.done()
+
+        release_cleanup.set()
+        completed = await asyncio.wait_for(waiter, timeout=1)
+        await asyncio.wait_for(closing, timeout=1)
+
+        assert [snapshot.status for snapshot in completed] == ["cancelled"]
+        assert completed[0].completed_at is not None
+        assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_concurrent_subagent_batches_share_atomic_capacity_limits() -> None:
+    """Two simultaneous batches cannot both pass a shared capacity boundary."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.first_batch_started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.first_batch_started.set()
+            await self.release.wait()
+            return {"messages": [AIMessage(content="done")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=3, max_running_total=3)
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        requests = [
+            {"description": "one", "subagent_type": "researcher"},
+            {"description": "two", "subagent_type": "researcher"},
+        ]
+        first = asyncio.create_task(batch_tool.coroutine(requests, runtime))
+        await asyncio.wait_for(child.first_batch_started.wait(), timeout=1)
+
+        with pytest.raises(RuntimeError, match="running limit.*session"):
+            await batch_tool.coroutine(requests, runtime)
+
+        assert len(await manager.list("session-a")) == 2
+        child.release.set()
+        await asyncio.wait_for(first, timeout=1)
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_background_tools_reject_reserved_name_collisions() -> None:
     manager = make_manager()
 
@@ -1107,6 +2004,18 @@ def test_background_tools_reject_reserved_name_collisions() -> None:
             agent_path=(),
             recursion_limit=20,
             existing_tools=[SimpleNamespace(name="spawn_background_task")],
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="reserved background task tool name.*run_subagent_batch",
+    ):
+        create_background_task_tools(
+            manager=manager,
+            subagents={},
+            agent_path=(),
+            recursion_limit=20,
+            existing_tools=[SimpleNamespace(name="run_subagent_batch")],
         )
 
 
@@ -1423,6 +2332,86 @@ def test_real_graph_parent_continues_while_background_child_runs() -> None:
     asyncio.run(exercise())
 
 
+def test_real_graph_runs_a_subagent_batch_from_one_supervisor_tool_call() -> None:
+    """A single model tool call must fan out into separate concurrent child runs."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = 0
+            self.both_started = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            return {"messages": [AIMessage(content=f"report:{description}")]}
+
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=4, max_running_total=4)
+        child = ChildRunnable()
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": child},
+            agent_path=(),
+            recursion_limit=20,
+        )
+        parent = create_deep_agent(
+            model=_ToolCallingFakeModel(
+                responses=[
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "run_subagent_batch",
+                                "args": {
+                                    "tasks": [
+                                        {
+                                            "description": "alpha",
+                                            "subagent_type": "researcher",
+                                        },
+                                        {
+                                            "description": "beta",
+                                            "subagent_type": "researcher",
+                                        },
+                                    ]
+                                },
+                                "id": "batch-call",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="synthesized result"),
+                ]
+            ),
+            tools=tools,
+        )
+
+        result = await parent.ainvoke(
+            {"messages": [HumanMessage(content="research both topics")]},
+            {"configurable": {"thread_id": "session-a"}},
+        )
+
+        assert result["messages"][-1].text == "synthesized result"
+        completed = await manager.list("session-a")
+        assert [task.description for task in completed] == ["alpha", "beta"]
+        assert [task.result for task in completed] == [
+            "report:alpha",
+            "report:beta",
+        ]
+        assert len({task.task_id for task in completed}) == 2
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_background_spawn_tool_requires_explicit_session_and_allowed_child() -> None:
     async def exercise() -> None:
         manager = make_manager()
@@ -1520,8 +2509,8 @@ def test_foreground_cancellation_does_not_cancel_spawned_background_work() -> No
     asyncio.run(exercise())
 
 
-def test_chainlit_local_notifier_sends_one_terminal_result(monkeypatch) -> None:
-    """A completed task should notify the chat without starting another agent turn."""
+def test_chainlit_local_notifier_sends_status_without_dumping_result(monkeypatch) -> None:
+    """A completion notice should keep successful output available only on demand."""
     async def exercise() -> None:
         manager = make_manager()
         sent: list[tuple[str, str]] = []
@@ -1562,10 +2551,418 @@ def test_chainlit_local_notifier_sends_one_terminal_result(monkeypatch) -> None:
             (
                 "Background subagent",
                 "Local background subagent `researcher` finished with status "
-                f"`success`.\n\nTask ID: `{spawned.task_id}`\n\nfinished result",
+                f"`success`.\n\nTask ID: `{spawned.task_id}`",
             )
         ]
         notifier.cancel()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_streams_nested_activity_before_completion(
+    monkeypatch,
+) -> None:
+    """Enabled activity streaming should render one ordered nested task tree."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        timeline: list[tuple[str, str, str]] = []
+        steps: list[Step] = []
+        delivered = asyncio.Event()
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                self.tokens: list[str] = []
+                steps.append(self)
+
+            async def send(self) -> None:
+                timeline.append(("send", self.id, self.name))
+
+            async def update(self) -> None:
+                timeline.append(("update", self.id, str(self.output)))
+
+            async def stream_token(self, token: str) -> None:
+                self.tokens.append(token)
+                timeline.append(("token", self.id, token))
+
+        class Message:
+            def __init__(self, *, content: str, author: str) -> None:
+                self.content = content
+                self.author = author
+
+            async def send(self) -> None:
+                timeline.append(("message", self.author, self.content))
+                delivered.set()
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Message",
+            Message,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            for event in (
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="Inspecting ",
+                ),
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="the repository",
+                ),
+                AgentStreamEvent(
+                    kind="tool_call",
+                    source="researcher / worker",
+                    tool_call_id="researcher / worker:0",
+                    tool_name="read_file",
+                    tool_args='{"file_path":"skills/example/SKILL.md"}',
+                ),
+                AgentStreamEvent(
+                    kind="tool_result",
+                    source="researcher / worker",
+                    tool_call_id="call-real",
+                    tool_name="read_file",
+                    tool_result="skill contents",
+                    status="success",
+                ),
+            ):
+                await manager.publish_activity(task_id, event)
+            return "finished result"
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(delivered.wait(), timeout=2)
+
+        parent = next(step for step in steps if step.type == "run")
+        reasoning = next(step for step in steps if step.type == "llm")
+        tool = next(step for step in steps if step.type == "tool")
+        assert parent.name == "researcher (background)"
+        assert parent.parent_id is None
+        assert reasoning.name == "researcher reasoning"
+        assert reasoning.parent_id == parent.id
+        assert reasoning.tokens == ["Inspecting the repository"]
+        assert tool.name == "researcher / worker · read_file"
+        assert tool.parent_id == parent.id
+        assert tool.input == '{"file_path":"skills/example/SKILL.md"}'
+        assert tool.output == "skill contents"
+        assert parent.end is not None
+        assert reasoning.end is not None
+        assert tool.end is not None
+        assert timeline[-1] == (
+            "message",
+            "Background subagent",
+            "Local background subagent `researcher` finished with status "
+            f"`success`.\n\nTask ID: `{spawned.task_id}`",
+        )
+        assert sum(item[0] == "message" for item in timeline) == 1
+
+        notifier.cancel()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_closes_remaining_steps_after_update_failure(
+    monkeypatch,
+) -> None:
+    """One failed child update must not strand the rest of the activity tree."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        steps: list[Step] = []
+        delivered = asyncio.Event()
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                self.update_attempted = False
+                steps.append(self)
+
+            async def send(self) -> None:
+                return None
+
+            async def update(self) -> None:
+                self.update_attempted = True
+                if self.type == "llm":
+                    raise RuntimeError("reasoning update failed")
+
+            async def stream_token(self, token: str) -> None:
+                return None
+
+        class Message:
+            def __init__(self, *, content: str, author: str) -> None:
+                self.content = content
+                self.author = author
+
+            async def send(self) -> None:
+                delivered.set()
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Message",
+            Message,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="thinking",
+                ),
+            )
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="tool_call",
+                    source="researcher",
+                    tool_call_id="call-1",
+                    tool_name="search",
+                ),
+            )
+            return "finished"
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(delivered.wait(), timeout=2)
+
+        reasoning = next(step for step in steps if step.type == "llm")
+        tool = next(step for step in steps if step.type == "tool")
+        parent = next(step for step in steps if step.type == "run")
+        assert reasoning.update_attempted is True
+        assert tool.update_attempted is True
+        assert parent.update_attempted is True
+        assert tool.end is not None
+        assert parent.end is not None
+
+        notifier.cancel()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_async_close_ends_open_activity_steps(
+    monkeypatch,
+) -> None:
+    """Session teardown should close rendered steps before discarding state."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        steps: list[Step] = []
+        rendered = asyncio.Event()
+        release = asyncio.Event()
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                steps.append(self)
+
+            async def send(self) -> None:
+                if self.type == "llm":
+                    rendered.set()
+
+            async def update(self) -> None:
+                return None
+
+            async def stream_token(self, token: str) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="thinking",
+                ),
+            )
+            await release.wait()
+            return "finished"
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(rendered.wait(), timeout=2)
+
+        await notifier.aclose()
+
+        assert notifier.task is None
+        assert notifier.activity_queue is None
+        assert notifier.activity_states == {}
+        assert "session-a" not in manager._activity_subscribers
+        assert all(step.end is not None for step in steps)
+        assert next(step for step in steps if step.type == "run").output == "Stopped"
+
+        release.set()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_async_close_resumes_interrupted_terminal_close(
+    monkeypatch,
+) -> None:
+    """Cancelling the consumer mid-terminal-close must retain cleanup state."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        steps: list[Step] = []
+        terminal_close_started = asyncio.Event()
+        blocked_once = False
+
+        class Step:
+            def __init__(
+                self,
+                *,
+                name: str,
+                type: str,
+                parent_id: str | None = None,
+                **kwargs: object,
+            ) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.parent_id = parent_id
+                self.input = ""
+                self.output = ""
+                self.end = None
+                self.update_attempts = 0
+                steps.append(self)
+
+            async def send(self) -> None:
+                return None
+
+            async def update(self) -> None:
+                nonlocal blocked_once
+                self.update_attempts += 1
+                if self.type == "llm" and not blocked_once:
+                    blocked_once = True
+                    terminal_close_started.set()
+                    await asyncio.Event().wait()
+
+            async def stream_token(self, token: str) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step",
+            Step,
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=manager,
+            session_id="session-a",
+        )
+        notifier.start()
+
+        async def runner(task_id: str) -> str:
+            await manager.publish_activity(
+                task_id,
+                AgentStreamEvent(
+                    kind="reasoning_delta",
+                    source="researcher",
+                    text="thinking",
+                ),
+            )
+            return "finished"
+
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+            agent_path=("researcher",),
+            runner=runner,
+        )
+        await asyncio.wait_for(terminal_close_started.wait(), timeout=2)
+
+        await notifier.aclose()
+
+        reasoning = next(step for step in steps if step.type == "llm")
+        parent = next(step for step in steps if step.type == "run")
+        assert reasoning.update_attempts == 2
+        assert reasoning.end is not None
+        assert parent.update_attempts == 1
+        assert parent.end is not None
+        assert parent.output == "Stopped"
+        assert notifier.activity_states == {}
         await manager.close()
 
     asyncio.run(exercise())

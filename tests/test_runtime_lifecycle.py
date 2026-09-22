@@ -234,6 +234,9 @@ def test_conversation_close_invalidates_existing_background_tools(runtime):
         spawn_tool = next(
             tool for tool in tools if tool.name == "spawn_background_task"
         )
+        batch_tool = next(
+            tool for tool in tools if tool.name == "run_subagent_batch"
+        )
         list_tool = next(
             tool for tool in tools if tool.name == "list_background_tasks"
         )
@@ -268,6 +271,10 @@ def test_conversation_close_invalidates_existing_background_tools(runtime):
             runner=lambda task_id: asyncio.sleep(0, result=task_id),
         )
         for call in (
+            lambda: batch_tool.coroutine(
+                [{"description": "late work", "subagent_type": "worker"}],
+                tool_runtime,
+            ),
             lambda: list_tool.coroutine(tool_runtime),
             lambda: get_tool.coroutine(reopened.task_id, 0, tool_runtime),
             lambda: cancel_tool.coroutine(reopened.task_id, tool_runtime),

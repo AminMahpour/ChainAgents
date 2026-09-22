@@ -695,6 +695,9 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
     async def publish_modes(*args, **kwargs):
         return None
 
+    async def start_local_background_notifier(*, runtime, session_id):
+        lifecycle_events.append(f"start:{session_id}")
+
     monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
     monkeypatch.setattr(main, "coerce_settings", lambda *args, **kwargs: settings)
     monkeypatch.setattr(main.cl, "user_session", user_session)
@@ -702,9 +705,7 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
     monkeypatch.setattr(
         main,
         "start_local_background_notifier",
-        lambda *, runtime, session_id: lifecycle_events.append(
-            f"start:{session_id}"
-        ),
+        start_local_background_notifier,
     )
 
     await main.on_settings_update({"thread_id": "thread-new"})

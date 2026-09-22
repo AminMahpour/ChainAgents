@@ -2,6 +2,8 @@
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
+# Optional positive output-token limit for each response.
+#max_tokens = 4096
 name = "gpt-oss:20b"
 models = ["gpt-oss:20b"]
 # Declare ["text", "image"] only for models that accept image content.
@@ -16,6 +18,7 @@ reasoning_effort = "medium"
 #provider = "openai_compatible"
 #base_url = "http://127.0.0.1:1234/v1"
 #temperature = 0
+#max_tokens = 4096
 #name = "qwen3.6-35b-a3b-mtp"
 #reasoning_effort = "medium"
 #api_key = "optional"
@@ -78,8 +81,12 @@ summarization_keep_tokens = 10000
 [agent.background_subagents]
 # Local background execution is process-local and opt-in. Configured synchronous
 # subagents must also set `background = true` to be eligible for background
-# launch. Foreground delegation remains available for every configured subagent.
+# launch or waiting batch execution. Foreground delegation remains available
+# for every configured subagent.
 enabled = false
+# Set true to stream background reasoning and tool activity into nested Chainlit
+# steps. The CLI, TUI, and HTTP API remain completion-only.
+stream_activity = false
 max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100

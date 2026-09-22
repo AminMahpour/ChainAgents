@@ -97,6 +97,7 @@ class BackgroundSubagentConfig:
     """Configure process-local background execution for synchronous subagents."""
 
     enabled: bool = False
+    stream_activity: bool = False
     max_running_per_session: int = 4
     max_running_total: int = 16
     max_tasks_per_session: int = 100
@@ -345,6 +346,7 @@ class ModelDefaults:
         reasoning_effort: The reasoning effort value.
         thinking: The Anthropic thinking mode.
         temperature: The temperature value.
+        max_tokens: Maximum output tokens for one model response.
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
         cross_provider_base_url: Runtime endpoint override for provider-switched
@@ -367,6 +369,7 @@ class ModelDefaults:
     reasoning_effort: ReasoningLevel = DEFAULT_REASONING_LEVEL
     thinking: ModelThinking = DEFAULT_MODEL_THINKING
     temperature: float = DEFAULT_TEMPERATURE
+    max_tokens: int | None = None
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
     modalities: tuple[ModelModality, ...] = ("text",)

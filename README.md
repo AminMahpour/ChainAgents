@@ -352,6 +352,7 @@ You can keep the model defaults in `deepagent.toml`:
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 temperature = 0
+max_tokens = 4096
 repeat_penalty = 1.1
 name = "gpt-oss:20b"
 models = ["gpt-oss:20b", "gemma4:27b"]
@@ -397,6 +398,7 @@ Use either the Chat Completions base URL or the complete Chat Completions endpoi
 provider = "snowflake_cortex"
 base_url = "https://<account-identifier>.snowflakecomputing.com/api/v2/cortex/v1"
 name = "claude-sonnet-4-5"
+max_tokens = 4096
 # api_key = ""  # optional only when SNOWFLAKE_PAT or DEEPAGENT_MODEL_API_KEY is set
 ```
 
@@ -474,7 +476,8 @@ Notes:
 
 - `provider` selects `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic`.
 - `provider = "claude"` is accepted as an alias for `provider = "anthropic"`.
-- Preferred shared fields are `base_url`, `name`, `temperature`, and `reasoning_effort`.
+- Preferred shared fields are `base_url`, `name`, `temperature`, `max_tokens`, and `reasoning_effort`.
+- `max_tokens` is an optional positive output-token limit. It maps to `max_completion_tokens` for Snowflake Cortex and OpenAI-compatible providers, `max_tokens` for Anthropic, and `num_predict` for Ollama.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
@@ -732,7 +735,7 @@ Supported subagent fields:
 - `skills`: optional list of skill source paths for that subagent
 - `mcp_servers`: optional list of MCP server names to attach to that subagent
 - `model`: optional profile name or raw model name. Profile names can switch provider settings and tool-schema handling for that sync subagent. Raw model names inherit the parent/default provider settings.
-- `background`: optional boolean, defaulting to `false`. When global local background execution is enabled, `true` allows the subagent's direct parent to launch it with `spawn_background_task`. Foreground `task` delegation is unaffected.
+- `background`: optional boolean, defaulting to `false`. When global local background execution is enabled, `true` allows the subagent's direct parent to launch it with `spawn_background_task` or include it in `run_subagent_batch`. Foreground `task` delegation is unaffected.
 - `nested_subagents`: optional list of top-level sync subagent names exposed as children of this subagent
 - `[[subagents.subagents]]`: optional inline private sync child subagents under a parent subagent
 
@@ -840,7 +843,7 @@ Main `[agent]` additions:
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
-- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
+- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. `stream_activity = true` exposes live reasoning and tool activity as nested Chainlit steps while leaving other interfaces completion-only. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
@@ -860,6 +863,7 @@ start one of its configured children and continue immediately. Enable it with:
 ```toml
 [agent.background_subagents]
 enabled = true
+stream_activity = true
 max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100
@@ -883,13 +887,16 @@ background = true
 ```
 
 An unmarked subagent remains available through the blocking `task` tool but is
-rejected by `spawn_background_task`. Marking a parent does not implicitly mark
-its children; each background launch target opts in independently.
+rejected by `spawn_background_task` and `run_subagent_batch`. Marking a parent
+does not implicitly mark its children; each background launch target opts in
+independently.
 
-The agent receives four tools:
+The agent receives five tools:
 
 - `spawn_background_task(description, subagent_type)` starts an allowed direct
   child and returns a task ID immediately
+- `run_subagent_batch(tasks)` starts every independent task concurrently, waits
+  for all of them, and returns their terminal reports in input order
 - `list_background_tasks()` lists tasks visible to the calling agent
 - `get_background_task(task_id, wait_seconds=0)` returns current state or waits
   up to 60 seconds
@@ -902,6 +909,29 @@ shown above, the main agent can call:
 spawn_background_task("Investigate the failing API tests", "research-manager")
 ```
 
+When several tasks are independent, one tool call can fan out to separate
+subagent conversations:
+
+```text
+run_subagent_batch(tasks=[
+  {"subagent_type": "research-manager", "description": "Trace the API failures."},
+  {"subagent_type": "research-manager", "description": "Check the related tests."}
+])
+```
+
+The call waits for every child and returns one `results` array. Entries stay in
+request order even when children finish in another order. Each entry includes
+the normal task ID, status, result, and error fields. A failed child does not
+discard successful sibling reports. The manager validates capacity for the
+whole batch before launch, so a batch that exceeds a configured limit starts no
+children. Cancelling the waiting call cancels its unfinished children and their
+descendants.
+
+Batch delegation is provider-independent. It is useful when a supervisor model,
+including a Snowflake Cortex model, can emit only one tool call per assistant
+turn: that single call starts separate child graph runs, and each child uses its
+own model request stream.
+
 The running `research-manager` can independently launch its private child with
 `spawn_background_task("Identify the smallest fix", "repo-planner")`. Either
 agent can continue its current response, call `list_background_tasks()` later,
@@ -913,11 +943,20 @@ inspect only their own task subtree and can spawn only their configured direct
 children. Background runs receive an isolated user message and checkpoint
 thread while retaining their configured model, skills, MCP tools, workspace,
 and shared memory access. Their state and streamed tokens are not merged into
-the parent response.
+the parent response. Concurrent children can therefore observe the same
+workspace and memory resources; prompts should assign non-overlapping writes or
+otherwise coordinate shared updates.
 
-Chainlit and the interactive CLI/TUI post one notice when a task finishes. A
+By default, Chainlit and the interactive CLI/TUI post one status-only notice
+when a task finishes; successful output remains available through
+`get_background_task` instead of being copied into the notice. With
+`stream_activity = true`, Chainlit additionally renders each background task as
+a parent step with nested reasoning and tool-call steps, then closes that tree
+before posting the same single terminal notice. The setting does not expose
+live background activity through the CLI, TUI, or HTTP API. A
 one-shot CLI invocation prints the main response first, then waits for its
-remaining background work; JSON output includes a `background_tasks` array.
+remaining background work. One-shot text output prints terminal results because
+the process is about to exit; JSON output includes a `background_tasks` array.
 The HTTP API exposes conversation-scoped list, get, cancel, and close operations
 under `/api/background-tasks`.
 
