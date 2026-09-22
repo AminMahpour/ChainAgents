@@ -1363,22 +1363,12 @@ def test_run_subagent_batch_executes_repeated_targets_concurrently_in_input_orde
 
         result = await asyncio.wait_for(batch_call, timeout=1)
 
-        assert [item["description"] for item in result["results"]] == [
-            "first",
-            "second",
-        ]
-        assert [item["agent_name"] for item in result["results"]] == [
-            "researcher",
-            "researcher",
-        ]
-        assert [item["status"] for item in result["results"]] == [
-            "success",
-            "success",
-        ]
-        assert [item["result"] for item in result["results"]] == [
-            "result:first",
-            "result:second",
-        ]
+        assert isinstance(result, str)
+        assert result.startswith("# Subagent batch results\n\n## 1. researcher")
+        assert result.count("- Status: `success`") == 2
+        assert "### Request\nfirst\n\n### Report\nresult:first" in result
+        assert "### Request\nsecond\n\n### Report\nresult:second" in result
+        assert result.index("## 1. researcher") < result.index("## 2. researcher")
         thread_ids = [
             str(config["configurable"]["thread_id"])
             for config in child.configs
@@ -1579,12 +1569,13 @@ def test_run_subagent_batch_keeps_sibling_results_when_one_child_fails() -> None
             runtime,
         )
 
-        assert [item["status"] for item in result["results"]] == [
-            "error",
-            "success",
-        ]
-        assert result["results"][0]["error"] == "RuntimeError: child failed"
-        assert result["results"][1]["result"] == "survived"
+        assert isinstance(result, str)
+        assert "## 1. researcher" in result
+        assert "- Status: `error`" in result
+        assert "### Request\nfail\n\n### Error\nRuntimeError: child failed" in result
+        assert "## 2. researcher" in result
+        assert "- Status: `success`" in result
+        assert "### Request\nsucceed\n\n### Report\nsurvived" in result
         await manager.close()
 
     asyncio.run(exercise())
@@ -1824,11 +1815,54 @@ def test_run_subagent_batch_returns_cancelled_results_when_session_closes() -> N
         await manager.close_session("session-a")
         result = await asyncio.wait_for(batch_call, timeout=1)
 
-        assert [item["status"] for item in result["results"]] == [
-            "cancelled",
-            "cancelled",
-        ]
+        assert isinstance(result, str)
+        assert result.count("- Status: `cancelled`") == 2
+        assert result.count("### Report\n_No report returned._") == 2
         assert await manager.list("session-a") == []
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_marks_an_empty_success_report() -> None:
+    """An empty successful child response must remain explicit in Markdown."""
+
+    class ChildRunnable:
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            return {"messages": [AIMessage(content="")]}
+
+    async def exercise() -> None:
+        manager = make_manager()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": ChildRunnable()},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        result = await batch_tool.coroutine(
+            [{"description": "empty", "subagent_type": "researcher"}],
+            runtime,
+        )
+
+        assert "- Status: `success`" in result
+        assert "### Report\n_No report returned._" in result
         await manager.close()
 
     asyncio.run(exercise())

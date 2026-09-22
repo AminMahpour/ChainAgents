@@ -582,6 +582,30 @@ def _result_text(result: object) -> str:
     return ""
 
 
+def _format_batch_results(snapshots: list[BackgroundTaskSnapshot]) -> str:
+    """Render terminal batch snapshots as readable, pageable Markdown."""
+    sections: list[str] = []
+    for index, snapshot in enumerate(snapshots, start=1):
+        body_heading = "Error" if snapshot.error else "Report"
+        body = snapshot.error or snapshot.result or "_No report returned._"
+        sections.append(
+            "\n".join(
+                [
+                    f"## {index}. {snapshot.agent_name}",
+                    f"- Task ID: `{snapshot.task_id}`",
+                    f"- Status: `{snapshot.status}`",
+                    "",
+                    "### Request",
+                    snapshot.description,
+                    "",
+                    f"### {body_heading}",
+                    body,
+                ]
+            )
+        )
+    return "# Subagent batch results\n\n" + "\n\n---\n\n".join(sections)
+
+
 def create_background_task_tools(
     *,
     manager: "BackgroundTaskManager",
@@ -730,7 +754,7 @@ def create_background_task_tools(
     async def run_subagent_batch(
         tasks: list[BackgroundSubagentBatchRequest],
         runtime: ToolRuntime,
-    ) -> dict[str, object]:
+    ) -> str:
         """Run independent child tasks concurrently and return all reports in order."""
         if not tasks:
             raise ValueError("A subagent batch requires at least one task.")
@@ -796,7 +820,7 @@ def create_background_task_tools(
             )
             await await_preserving_cancellation(cancellation)
             raise
-        return {"results": [snapshot.to_payload() for snapshot in completed]}
+        return _format_batch_results(completed)
 
     @tool("list_background_tasks")
     async def list_background_tasks(runtime: ToolRuntime) -> list[dict[str, object]]:
