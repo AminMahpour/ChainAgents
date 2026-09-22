@@ -8,6 +8,7 @@ import anyio
 import pytest
 
 import deepagent_runtime as core
+import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.lifecycle as runtime_lifecycle
 import chainagents.runtime.middleware as runtime_middleware
@@ -107,6 +108,149 @@ def test_conversation_close_cancels_background_tasks_before_mcp(runtime, monkeyp
         assert events == [("mcp", True)]
         assert await runtime.background_tasks.list("thread") == []
         await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_conversation_close_deletes_only_its_large_tool_results(runtime):
+    """Conversation teardown must not delete another session's offloads."""
+
+    async def exercise():
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=runtime.project_root,
+            include_memories=False,
+        )
+        prefix = runtime_backends.deepagent_artifacts_route_prefix(
+            runtime.project_root
+        )
+        first_path = f"{prefix}large_tool_results/first-call"
+        second_path = f"{prefix}large_tool_results/second-call"
+        assert backend.write(first_path, "first").error is None
+        assert backend.write(second_path, "second").error is None
+        runtime.large_tool_result_artifacts.register(
+            "thread",
+            first_path,
+            backend,
+        )
+        runtime.large_tool_result_artifacts.register(
+            "other",
+            second_path,
+            backend,
+        )
+
+        await runtime.close_conversation(
+            thread_id="thread",
+            mcp_session_id="session",
+        )
+
+        assert backend.read(first_path).error is not None
+        assert backend.read(second_path).error is None
+        await runtime.close()
+        assert backend.read(second_path).error is not None
+
+    asyncio.run(exercise())
+
+
+def test_registration_after_conversation_close_is_deleted_immediately(runtime):
+    """A late tool result must not survive an already completed close."""
+
+    async def exercise():
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=runtime.project_root,
+            include_memories=False,
+        )
+        path = (
+            f"{runtime_backends.deepagent_artifacts_route_prefix(runtime.project_root)}"
+            "large_tool_results/late-call"
+        )
+        await runtime.close_conversation(
+            thread_id="thread",
+            mcp_session_id="session",
+        )
+        assert backend.write(path, "late").error is None
+
+        await runtime.large_tool_result_artifacts.aregister(
+            "thread",
+            path,
+            backend,
+        )
+
+        assert backend.read(path).error is not None
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_artifact_cleanup_failure_does_not_skip_other_conversation_teardown(
+    runtime,
+    monkeypatch,
+):
+    """A deletion error must surface only after MCP and agent cleanup continue."""
+
+    async def exercise():
+        mcp_calls = []
+
+        async def fail_artifact_cleanup(session_id):
+            assert session_id == "thread"
+            raise RuntimeError("artifact cleanup failed")
+
+        async def close_mcp_session(session_id):
+            mcp_calls.append(session_id)
+
+        monkeypatch.setattr(
+            runtime.large_tool_result_artifacts,
+            "close_session",
+            fail_artifact_cleanup,
+        )
+        monkeypatch.setattr(runtime, "close_mcp_session", close_mcp_session)
+
+        with pytest.raises(RuntimeError, match="artifact cleanup failed"):
+            await runtime.close_conversation(
+                thread_id="thread",
+                mcp_session_id="session",
+            )
+
+        assert mcp_calls == ["session"]
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_session_cannot_reopen_while_artifact_cleanup_is_running():
+    """An overlapping graph lookup must not let a late offload escape cleanup."""
+
+    class Backend:
+        def __init__(self) -> None:
+            self.files = {"first", "late"}
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def adelete(self, path):
+            self.started.set()
+            await self.release.wait()
+            self.files.discard(path)
+            return SimpleNamespace(error=None)
+
+        def delete(self, path):
+            self.files.discard(path)
+            return SimpleNamespace(error=None)
+
+    async def exercise():
+        registry = runtime_middleware.LargeToolResultArtifactRegistry()
+        backend = Backend()
+        registry.register("thread", "first", backend)
+        closing = asyncio.create_task(registry.close_session("thread"))
+        await asyncio.wait_for(backend.started.wait(), timeout=1)
+
+        registry.open_session("thread")
+        late_registration = asyncio.create_task(
+            registry.aregister("thread", "late", backend)
+        )
+        await asyncio.sleep(0)
+        backend.release.set()
+        await asyncio.gather(closing, late_registration)
+
+        assert backend.files == set()
 
     asyncio.run(exercise())
 
@@ -212,6 +356,48 @@ def test_cancelled_conversation_close_finishes_resource_teardown(
             )
         ).status == "success"
         await runtime.background_tasks.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_conversation_close_finishes_artifact_cleanup(
+    runtime,
+    monkeypatch,
+):
+    """Caller cancellation must not interrupt deletion of session offloads."""
+
+    async def exercise():
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        async def close_session(session_id):
+            assert session_id == "thread"
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            cleanup_finished.set()
+
+        monkeypatch.setattr(
+            runtime.large_tool_result_artifacts,
+            "close_session",
+            close_session,
+        )
+        close_task = asyncio.create_task(
+            runtime.close_conversation(
+                thread_id="thread",
+                mcp_session_id="session",
+            )
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        close_task.cancel()
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        allow_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=1)
+        assert cleanup_finished.is_set()
+        await runtime.close()
 
     asyncio.run(exercise())
 

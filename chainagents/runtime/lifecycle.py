@@ -18,6 +18,7 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
@@ -111,6 +112,9 @@ class AgentRuntime:
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
+        self.large_tool_result_artifacts = (
+            runtime_artifacts.LargeToolResultArtifactRegistry()
+        )
         self._exit_stack.push_async_callback(self.close_all_mcp_sessions)
         self.background_tasks = runtime_background_tasks.BackgroundTaskManager(
             config.extensions.background_subagents
@@ -467,6 +471,7 @@ class AgentRuntime:
         )
         middleware = runtime_middleware.build_agent_middleware(
             backend=backend,
+            artifact_registry=self.large_tool_result_artifacts,
             config=self.config,
             reasoning_level=effective_reasoning_level,
             model_name=effective_model.name,
@@ -606,6 +611,8 @@ class AgentRuntime:
             str(model_name or self.config.model_name).strip()
             or self.config.model_name
         )
+        if thread_id:
+            self.large_tool_result_artifacts.open_session(thread_id)
         selected_model_profile = runtime_models.resolve_runtime_model_profile(
             self.config,
             selected_model,
@@ -655,6 +662,7 @@ class AgentRuntime:
                 )
                 middleware = runtime_middleware.build_agent_middleware(
                     backend=backend,
+                    artifact_registry=self.large_tool_result_artifacts,
                     config=self.config,
                     reasoning_level=effective_reasoning_level,
                     model_name=selected_model,
@@ -1157,12 +1165,30 @@ class AgentRuntime:
         """Complete conversation teardown independently of its caller."""
         if thread_id:
             async with self.background_tasks.closing_session(thread_id):
-                await self.close_mcp_session(mcp_session_id or thread_id)
-                async with self._agent_lock:
-                    self._agents = {
-                        key: agent for key, agent in self._agents.items()
-                        if key.thread_id != thread_id
-                    }
+                errors: list[BaseException] = []
+                try:
+                    await self.large_tool_result_artifacts.close_session(thread_id)
+                except BaseException as exc:
+                    errors.append(exc)
+                try:
+                    await self.close_mcp_session(mcp_session_id or thread_id)
+                except BaseException as exc:
+                    errors.append(exc)
+                try:
+                    async with self._agent_lock:
+                        self._agents = {
+                            key: agent for key, agent in self._agents.items()
+                            if key.thread_id != thread_id
+                        }
+                except BaseException as exc:
+                    errors.append(exc)
+                if len(errors) == 1:
+                    raise errors[0]
+                if errors:
+                    raise BaseExceptionGroup(
+                        "Conversation resource cleanup failed.",
+                        errors,
+                    )
             return
         await self.close_mcp_session(mcp_session_id)
 
@@ -1194,11 +1220,14 @@ class AgentRuntime:
             await self.background_tasks.close()
         finally:
             try:
-                await self._exit_stack.aclose()
+                await self.large_tool_result_artifacts.close()
             finally:
-                self._checkpointer = None
-                self._store = None
-                self._mcp_client = None
+                try:
+                    await self._exit_stack.aclose()
+                finally:
+                    self._checkpointer = None
+                    self._store = None
+                    self._mcp_client = None
 
     def _build_backend(self, runtime):
         """Build the Deep Agent backend for the current runtime settings.

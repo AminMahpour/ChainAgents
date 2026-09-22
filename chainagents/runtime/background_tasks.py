@@ -96,6 +96,11 @@ def current_background_task_id() -> str | None:
     return _CURRENT_BACKGROUND_TASK_ID.get()
 
 
+def current_background_session_id() -> str | None:
+    """Return the conversation that owns the current background invocation."""
+    return _CURRENT_BACKGROUND_SESSION_ID.get()
+
+
 def current_background_invocation_path() -> tuple[str, ...]:
     """Return the ownership path of the current configured-agent invocation."""
     return _CURRENT_BACKGROUND_INVOCATION_PATH.get()
@@ -192,9 +197,11 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         self,
         runnable: object,
         manager: "BackgroundTaskManager",
+        on_session_open: Callable[[str], None] | None = None,
     ) -> None:
         self.runnable = runnable
         self.manager = manager
+        self.on_session_open = on_session_open
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.runnable, name)
@@ -229,8 +236,16 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         if not session_id:
             return None
         return _CURRENT_BACKGROUND_SESSION_GENERATION.set(
-            self.manager.session_generation(session_id)
+            self._session_generation(session_id)
         )
+
+    def _session_generation(
+        self,
+        session_id: str,
+    ) -> BackgroundSessionGeneration:
+        if self.on_session_open is not None:
+            self.on_session_open(session_id)
+        return self.manager.session_generation(session_id)
 
     @staticmethod
     def _reset_generation(
@@ -342,11 +357,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
     ) -> AsyncIterator[Any] | Awaitable[Any]:
         configurable = (config or {}).get("configurable", {})
         session_id = str(configurable.get("thread_id") or "").strip()
-        generation = (
-            self.manager.session_generation(session_id)
-            if session_id
-            else None
-        )
+        generation = self._session_generation(session_id) if session_id else None
         if version == "v3":
             result = self.runnable.astream_events(  # type: ignore[attr-defined]
                 input,
@@ -432,9 +443,15 @@ class _BackgroundSessionScopedAsyncIterator:
 def scope_background_session_invocation(
     runnable: object,
     manager: "BackgroundTaskManager",
+    *,
+    on_session_open: Callable[[str], None] | None = None,
 ) -> Runnable[Any, Any]:
     """Wrap an exported graph with invocation-scoped session invalidation."""
-    return _BackgroundSessionScopedRunnable(runnable, manager)
+    return _BackgroundSessionScopedRunnable(
+        runnable,
+        manager,
+        on_session_open=on_session_open,
+    )
 
 
 @dataclass(frozen=True)

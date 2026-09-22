@@ -7,7 +7,9 @@ import chainagents.runtime.graph as runtime_graph
 from chainagents.langgraph.http import app, lifespan
 
 
-def test_langgraph_http_app_closes_sessions_and_managers() -> None:
+def test_langgraph_http_app_closes_sessions_managers_and_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[tuple[str, str | None]] = []
 
     class Manager:
@@ -18,6 +20,19 @@ def test_langgraph_http_app_closes_sessions_and_managers() -> None:
             calls.append(("manager", None))
 
     manager = Manager()
+    class Artifacts:
+        async def close_session(self, session_id: str) -> None:
+            calls.append(("artifacts-session", session_id))
+
+        async def close(self) -> None:
+            calls.append(("artifacts", None))
+
+    monkeypatch.setattr(
+        runtime_graph,
+        "_STATIC_LARGE_TOOL_RESULT_ARTIFACTS",
+        Artifacts(),
+        raising=False,
+    )
     runtime_graph._STATIC_BACKGROUND_TASK_MANAGERS.add(manager)
 
     with TestClient(app) as client:
@@ -35,8 +50,11 @@ def test_langgraph_http_app_closes_sessions_and_managers() -> None:
 
     assert calls == [
         ("session", "thread-1"),
+        ("artifacts-session", "thread-1"),
         ("session", "team/research"),
+        ("artifacts-session", "team/research"),
         ("manager", None),
+        ("artifacts", None),
     ]
     assert runtime_graph.static_background_task_managers() == ()
 

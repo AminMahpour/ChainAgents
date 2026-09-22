@@ -3454,6 +3454,137 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     assert read_result.file_data["content"] == "tool output"
 
 
+def test_session_filesystem_middleware_tracks_real_offloads_and_paged_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real large result must remain pageable until its session closes."""
+    registry_cls = getattr(
+        runtime_middleware,
+        "LargeToolResultArtifactRegistry",
+        None,
+    )
+    middleware_cls = getattr(runtime_middleware, "SessionFilesystemMiddleware", None)
+    assert registry_cls is not None
+    assert middleware_cls is not None
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
+
+    async def exercise() -> None:
+        registry = registry_cls()
+        backend = deepagent_runtime.build_deepagent_backend(project_root=tmp_path)
+        middleware = middleware_cls(
+            backend=backend,
+            artifact_registry=registry,
+            tool_token_limit_before_evict=100,
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        request = ToolCallRequest(
+            tool_call={
+                "id": "batch-call",
+                "name": "run_subagent_batch",
+                "args": {},
+                "type": "tool_call",
+            },
+            tool=SimpleNamespace(name="run_subagent_batch"),
+            state={},
+            runtime=runtime,
+        )
+        report = "\n".join(f"line {index}" for index in range(1, 201))
+
+        async def handler(_request: ToolCallRequest) -> ToolMessage:
+            return ToolMessage(
+                content=report,
+                name=str(_request.tool_call["name"]),
+                tool_call_id=str(_request.tool_call["id"]),
+                status="success",
+            )
+
+        result = await middleware.awrap_tool_call(request, handler)
+        path = f"{deepagent_artifacts_route_prefix()}large_tool_results/batch-call"
+
+        assert isinstance(result, ToolMessage)
+        assert path in str(result.content)
+        assert "line 1" in str(result.content)
+        assert "line 200" in str(result.content)
+        read_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+        first_page = await read_tool.coroutine(path, runtime, 0, 2)
+        second_page = await read_tool.coroutine(path, runtime, 2, 2)
+        assert "line 1" in str(first_page.content)
+        assert "line 2" in str(first_page.content)
+        assert "line 3" not in str(first_page.content)
+        assert "line 3" in str(second_page.content)
+        assert "line 4" in str(second_page.content)
+
+        await registry.close_session("session-a")
+
+        assert backend.read(path).error is not None
+
+        unscoped_runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {}},
+            stream_writer=lambda _: None,
+            tool_call_id="unscoped-call",
+            store=None,
+        )
+        unscoped_request = ToolCallRequest(
+            tool_call={
+                "id": "unscoped-call",
+                "name": "repo_tool",
+                "args": {},
+                "type": "tool_call",
+            },
+            tool=SimpleNamespace(name="repo_tool"),
+            state={},
+            runtime=unscoped_runtime,
+        )
+        unscoped_result = await middleware.awrap_tool_call(
+            unscoped_request,
+            handler,
+        )
+        unscoped_path = (
+            f"{deepagent_artifacts_route_prefix()}"
+            "large_tool_results/unscoped-call"
+        )
+        assert unscoped_path in str(unscoped_result.content)
+        assert backend.read(unscoped_path).error is None
+
+        await registry.close()
+
+        assert backend.read(unscoped_path).error is not None
+
+    asyncio.run(exercise())
+
+
+def test_build_agent_middleware_uses_session_filesystem_when_registry_is_owned(
+    tmp_path: Path,
+) -> None:
+    """Runtime-owned middleware must install the session-aware filesystem."""
+    registry = runtime_middleware.LargeToolResultArtifactRegistry()
+    backend = deepagent_runtime.build_deepagent_backend(project_root=tmp_path)
+
+    middleware = runtime_middleware.build_agent_middleware(
+        backend=backend,
+        artifact_registry=registry,
+        project_root=tmp_path,
+    )
+
+    filesystem = [
+        item
+        for item in middleware
+        if isinstance(item, runtime_middleware.SessionFilesystemMiddleware)
+    ]
+    assert len(filesystem) == 1
+    assert filesystem[0]._artifact_registry is registry  # noqa: SLF001
+
+
 def test_build_deepagent_backend_routes_generated_outputs_separately(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4528,6 +4659,46 @@ def test_create_configured_graph_builds_local_background_subagents(
     deepagent_runtime.create_configured_graph(include_async_subagents=False)
     assert len(runtime_graph.static_background_task_managers()) == 1
 
+    asyncio.run(runtime_graph.close_static_background_tasks())
+
+
+def test_create_configured_graph_scopes_artifacts_without_background_subagents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every exported graph run must reopen artifact ownership by thread ID."""
+    created_graph = SimpleNamespace()
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(config_path=None),
+    )
+    monkeypatch.setattr(
+        runtime_config.RuntimeConfig,
+        "from_env",
+        staticmethod(lambda: config),
+    )
+    monkeypatch.setattr(
+        runtime_middleware,
+        "create_deep_agent",
+        lambda **kwargs: created_graph,
+    )
+    monkeypatch.setattr(
+        runtime_models,
+        "build_model",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        runtime_backends,
+        "build_deepagent_backend",
+        lambda **kwargs: SimpleNamespace(),
+    )
+
+    graph = deepagent_runtime.create_configured_graph(
+        include_async_subagents=False
+    )
+
+    assert graph.runnable is created_graph
+    assert len(runtime_graph.static_background_task_managers()) == 1
     asyncio.run(runtime_graph.close_static_background_tasks())
 
 
