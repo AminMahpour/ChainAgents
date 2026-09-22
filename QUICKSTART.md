@@ -29,7 +29,7 @@ cd ChainAgents
 uv sync
 ```
 
-This installs the locked DeepAgents 0.7.15 release. ChainAgents explicitly keeps
+This installs the locked DeepAgents 0.7.17 release. ChainAgents explicitly keeps
 its todo-planning middleware, so multi-step work can still use `write_todos`
 and appear as a task list in Chainlit.
 
