@@ -173,6 +173,7 @@ from chainagents.runtime.tracing import (
     shutdown_langfuse_client,
 )
 from chainagents.runtime.types import (
+    BatchResultFormat,
     BackgroundSubagentConfig,
     AgentCacheKey,
     AppSettings,
@@ -262,6 +263,7 @@ __all__ = [
     "AsyncPostgresStore",
     "AsyncSubAgent",
     "AsyncSubagentConfig",
+    "BatchResultFormat",
     "BackgroundSubagentConfig",
     "Awaitable",
     "BackendProtocol",

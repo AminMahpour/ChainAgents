@@ -6514,6 +6514,7 @@ stream_activity = true
 max_running_per_session = 3
 max_running_total = 7
 max_tasks_per_session = 21
+batch_result_format = "markdown_files"
 """.strip(),
         encoding="utf-8",
     )
@@ -6526,7 +6527,65 @@ max_tasks_per_session = 21
     assert background.max_running_per_session == 3
     assert background.max_running_total == 7
     assert background.max_tasks_per_session == 21
+    assert background.batch_result_format == "markdown_files"
     assert deepagent_runtime.load_extensions_config().enabled is True
+
+
+@pytest.mark.parametrize("value", ["json", "markdown", "markdown_files"])
+def test_load_extensions_config_parses_batch_result_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        "[agent.background_subagents]\n"
+        "enabled = true\n"
+        f'batch_result_format = "{value}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    background = deepagent_runtime.load_extensions_config().background_subagents
+
+    assert background.batch_result_format == value
+
+
+def test_load_extensions_config_defaults_batch_result_format_to_markdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text("[agent.background_subagents]\n", encoding="utf-8")
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    background = deepagent_runtime.load_extensions_config().background_subagents
+
+    assert background.batch_result_format == "markdown"
+
+
+@pytest.mark.parametrize("toml_value", ['""', '"yaml"', "42", "true"])
+def test_load_extensions_config_rejects_invalid_batch_result_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    toml_value: str,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        "[agent.background_subagents]\n"
+        f"batch_result_format = {toml_value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"agent\.background_subagents\.batch_result_format"
+            r".*json.*markdown.*markdown_files"
+        ),
+    ):
+        deepagent_runtime.load_extensions_config()
 
 
 @pytest.mark.parametrize(

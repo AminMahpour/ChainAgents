@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.model_config as runtime_model_config
@@ -17,6 +17,8 @@ from chainagents.runtime.constants import (
 )
 from chainagents.runtime.reflection import normalize_reflection_config
 from chainagents.runtime.types import (
+    BATCH_RESULT_FORMATS,
+    BatchResultFormat,
     BackgroundSubagentConfig,
     AsyncSubagentConfig,
     ChainlitCommandConfig,
@@ -45,6 +47,16 @@ def normalize_background_subagent_config(value: Any) -> BackgroundSubagentConfig
             "The top-level 'agent.background_subagents.stream_activity' config "
             "must be a boolean."
         )
+    batch_result_format = value.get("batch_result_format", "markdown")
+    if (
+        not isinstance(batch_result_format, str)
+        or batch_result_format not in BATCH_RESULT_FORMATS
+    ):
+        allowed = ", ".join(BATCH_RESULT_FORMATS)
+        raise ValueError(
+            "The top-level 'agent.background_subagents.batch_result_format' "
+            f"config must be one of: {allowed}."
+        )
     limits: dict[str, int] = {}
     defaults = BackgroundSubagentConfig()
     for field_name in (
@@ -62,6 +74,7 @@ def normalize_background_subagent_config(value: Any) -> BackgroundSubagentConfig
     return BackgroundSubagentConfig(
         enabled=enabled,
         stream_activity=stream_activity,
+        batch_result_format=cast("BatchResultFormat", batch_result_format),
         **limits,
     )
 
