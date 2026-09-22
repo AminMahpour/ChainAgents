@@ -29,7 +29,7 @@ from chainagents.runtime.background_tasks import (
     scope_background_task_invocation,
 )
 from chainagents.events.stream import AgentStreamEvent
-from chainagents.runtime.types import BackgroundSubagentConfig
+from chainagents.runtime.types import BatchResultFormat, BackgroundSubagentConfig
 from chainagents.interfaces.chainlit.async_tasks import LocalBackgroundTaskNotifier
 
 
@@ -46,15 +46,18 @@ class _ToolCallingFakeModel(FakeMessagesListChatModel):
         return self
 
 
-def make_manager(**overrides: int | bool) -> BackgroundTaskManager:
-    values: dict[str, int | bool] = {
+def make_manager(
+    **overrides: int | bool | BatchResultFormat,
+) -> BackgroundTaskManager:
+    values: dict[str, int | bool | BatchResultFormat] = {
         "enabled": True,
+        "batch_result_format": "markdown",
         "max_running_per_session": 2,
         "max_running_total": 3,
         "max_tasks_per_session": 5,
     }
     values.update(overrides)
-    return BackgroundTaskManager(BackgroundSubagentConfig(**values))
+    return BackgroundTaskManager(BackgroundSubagentConfig(**values))  # type: ignore[arg-type]
 
 
 def test_spawn_returns_before_runner_finishes_and_result_can_be_retrieved() -> None:
@@ -1363,18 +1366,128 @@ def test_run_subagent_batch_executes_repeated_targets_concurrently_in_input_orde
 
         result = await asyncio.wait_for(batch_call, timeout=1)
 
-        assert isinstance(result, str)
-        assert result.startswith("# Subagent batch results\n\n## 1. researcher")
-        assert result.count("- Status: `success`") == 2
-        assert "### Request\nfirst\n\n### Report\nresult:first" in result
-        assert "### Request\nsecond\n\n### Report\nresult:second" in result
-        assert result.index("## 1. researcher") < result.index("## 2. researcher")
+        snapshots = await manager.list("session-a")
+        assert result == (
+            "# Subagent batch results\n\n"
+            "## 1. researcher\n"
+            f"- Task ID: `{snapshots[0].task_id}`\n"
+            "- Status: `success`\n\n"
+            "### Request\nfirst\n\n"
+            "### Report\nresult:first\n\n"
+            "---\n\n"
+            "## 2. researcher\n"
+            f"- Task ID: `{snapshots[1].task_id}`\n"
+            "- Status: `success`\n\n"
+            "### Request\nsecond\n\n"
+            "### Report\nresult:second"
+        )
         thread_ids = [
             str(config["configurable"]["thread_id"])
             for config in child.configs
         ]
         assert len(set(thread_ids)) == 2
         assert all(thread_id.startswith("session-a:background:bg-") for thread_id in thread_ids)
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_restores_exact_json_payload_in_input_order() -> None:
+    """JSON mode must reproduce the original full snapshot payload."""
+
+    class ChildRunnable:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.releases = {"first": asyncio.Event(), "second": asyncio.Event()}
+            self.count = 0
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            messages = state["messages"]
+            assert isinstance(messages, list)
+            description = str(messages[0].content)
+            self.count += 1
+            if self.count == 2:
+                self.started.set()
+            await self.releases[description].wait()
+            return {"messages": [AIMessage(content=f"result:{description}")]}
+
+    async def exercise() -> None:
+        manager = make_manager(
+            batch_result_format="json",
+            max_running_per_session=4,
+            max_running_total=4,
+        )
+        child = ChildRunnable()
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": child},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        batch_call = asyncio.create_task(
+            batch_tool.coroutine(
+                [
+                    {"description": "first", "subagent_type": "researcher"},
+                    {"description": "second", "subagent_type": "researcher"},
+                ],
+                runtime,
+            )
+        )
+        await child.started.wait()
+        child.releases["second"].set()
+        await asyncio.sleep(0)
+        assert not batch_call.done()
+        child.releases["first"].set()
+
+        result = await batch_call
+        snapshots = await manager.list("session-a")
+
+        assert result == {
+            "results": [
+                {
+                    "task_id": snapshots[0].task_id,
+                    "session_id": "session-a",
+                    "agent_name": "researcher",
+                    "description": "first",
+                    "agent_path": ["researcher"],
+                    "parent_task_id": None,
+                    "status": "success",
+                    "result": "result:first",
+                    "error": None,
+                    "created_at": snapshots[0].created_at,
+                    "completed_at": snapshots[0].completed_at,
+                },
+                {
+                    "task_id": snapshots[1].task_id,
+                    "session_id": "session-a",
+                    "agent_name": "researcher",
+                    "description": "second",
+                    "agent_path": ["researcher"],
+                    "parent_task_id": None,
+                    "status": "success",
+                    "result": "result:second",
+                    "error": None,
+                    "created_at": snapshots[1].created_at,
+                    "completed_at": snapshots[1].completed_at,
+                },
+            ]
+        }
         await manager.close()
 
     asyncio.run(exercise())
