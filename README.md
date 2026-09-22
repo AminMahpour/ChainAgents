@@ -896,7 +896,7 @@ The agent receives five tools:
 - `spawn_background_task(description, subagent_type)` starts an allowed direct
   child and returns a task ID immediately
 - `run_subagent_batch(tasks)` starts every independent task concurrently, waits
-  for all of them, and returns their terminal reports in input order
+  for all of them, and returns their terminal reports as Markdown in input order
 - `list_background_tasks()` lists tasks visible to the calling agent
 - `get_background_task(task_id, wait_seconds=0)` returns current state or waits
   up to 60 seconds
@@ -919,13 +919,16 @@ run_subagent_batch(tasks=[
 ])
 ```
 
-The call waits for every child and returns one `results` array. Entries stay in
-request order even when children finish in another order. Each entry includes
-the normal task ID, status, result, and error fields. A failed child does not
-discard successful sibling reports. The manager validates capacity for the
-whole batch before launch, so a batch that exceeds a configured limit starts no
-children. Cancelling the waiting call cancels its unfinished children and their
-descendants.
+The call waits for every child and returns one newline-delimited Markdown
+document. Entries stay in request order even when children finish in another
+order. Each section includes the agent name, task ID, terminal status, original
+request, and either the report or error. Empty and cancelled reports are marked
+explicitly. A failed child does not discard successful sibling reports. The
+line-oriented format also gives oversized batches useful head/tail previews and
+lets the agent page through the complete offloaded result with `read_file`.
+The manager validates capacity for the whole batch before launch, so a batch
+that exceeds a configured limit starts no children. Cancelling the waiting call
+cancels its unfinished children and their descendants.
 
 Batch delegation is provider-independent. It is useful when a supervisor model,
 including a Snowflake Cortex model, can emit only one tool call per assistant
@@ -968,11 +971,14 @@ curl -X DELETE "http://127.0.0.1:8000/api/background-tasks?thread_id=$THREAD_ID"
 ```
 
 Tasks are retained until the conversation closes and are cancelled before its
-MCP resources are released. They are stored only in the current process and do
-not survive restarts. Agent Server deployments therefore require session
-affinity when multiple workers are used. The custom Agent Server app exposes
-`DELETE /background-tasks/sessions/{thread_id}` for explicit cleanup and closes
-all remaining managers during server shutdown.
+offloaded large tool results and MCP resources are released. Cleanup is scoped
+by thread ID, so closing one conversation does not remove another conversation's
+artifacts; workspace files, generated downloads, memories, and uploads are not
+part of this cleanup. Tasks and offload ownership are stored only in the current
+process and do not survive restarts. Agent Server deployments therefore require
+session affinity when multiple workers are used. The custom Agent Server app
+exposes `DELETE /background-tasks/sessions/{thread_id}` for explicit cleanup and
+closes all remaining managers and tracked offloads during server shutdown.
 
 ## Chainlit Native Commands
 
