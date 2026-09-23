@@ -1195,6 +1195,7 @@ class BackgroundTaskManager:
             str, BackgroundSessionGeneration
         ] = weakref.WeakValueDictionary()
         self._close_task: asyncio.Task[None] | None = None
+        self._terminal_close = False
         self._closed = False
 
     def session_generation(self, session_id: str) -> BackgroundSessionGeneration:
@@ -1899,6 +1900,7 @@ class BackgroundTaskManager:
     async def close(self) -> None:
         """Cancel all work and prevent future spawns."""
         async with self._lock:
+            self._terminal_close = True
             if self._close_task is None:
                 self._closed = True
                 session_ids = list(self._session_task_ids)
@@ -1908,6 +1910,25 @@ class BackgroundTaskManager:
                 )
             close_task = self._close_task
         await await_preserving_cancellation(close_task)
+
+    async def drain(self) -> None:
+        """Cancel all work and reopen the manager for a later lifespan."""
+        async with self._lock:
+            if self._terminal_close:
+                raise RuntimeError("The background task manager is closed.")
+            if self._close_task is None:
+                self._closed = True
+                session_ids = list(self._session_task_ids)
+                self._close_task = asyncio.create_task(
+                    self._close_all_sessions(session_ids),
+                    name="chainagents-drain-background-tasks",
+                )
+            close_task = self._close_task
+        await await_preserving_cancellation(close_task)
+        async with self._lock:
+            if self._close_task is close_task:
+                self._close_task = None
+                self._closed = False
 
     async def _close_all_sessions(
         self,

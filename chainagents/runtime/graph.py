@@ -61,14 +61,14 @@ async def close_static_background_tasks() -> None:
     errors: list[BaseException] = []
     if managers:
         results = await asyncio.gather(
-            *(manager.close() for manager in managers),
+            *(manager.drain() for manager in managers),
             return_exceptions=True,
         )
         errors.extend(
             result for result in results if isinstance(result, BaseException)
         )
     try:
-        await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close()
+        await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.drain()
     except BaseException as exc:
         errors.append(exc)
     if len(errors) == 1:
@@ -701,5 +701,8 @@ def create_configured_graph(
     return runtime_background_tasks.scope_background_session_invocation(
         graph,
         session_manager,
+        on_session_open=lambda _session_id: _STATIC_BACKGROUND_TASK_MANAGERS.add(
+            session_manager
+        ),
         artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
     )

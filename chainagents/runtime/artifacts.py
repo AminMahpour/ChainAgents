@@ -14,10 +14,12 @@ from typing import Any, TypeVar, cast
 from deepagents.backends import BackendProtocol, CompositeBackend
 from deepagents.backends.protocol import (
     FileDownloadResponse,
+    FileInfo,
     FileUploadResponse,
     DeleteResult,
     EditResult,
     GlobResult,
+    GrepMatch,
     GrepResult,
     LsResult,
     ReadResult,
@@ -70,6 +72,7 @@ class LargeToolResultArtifactRegistry:
         self._paths: dict[ArtifactSessionHandle, dict[str, BackendProtocol]] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._session_lock_users: dict[str, int] = {}
+        self._close_lock = asyncio.Lock()
         self._terminal = False
 
     def open_session(self, session_id: str) -> ArtifactSessionHandle:
@@ -178,22 +181,42 @@ class LargeToolResultArtifactRegistry:
 
     async def close(self) -> None:
         """Make the registry terminal and drain every known generation."""
-        with self._guard:
-            self._terminal = True
-            handles = tuple(self._states)
-            for handle in handles:
-                self._states[handle] = "closing"
-        results = await asyncio.gather(
-            *(self._drain_handle(handle) for handle in handles),
-            return_exceptions=True,
-        )
-        errors = [result for result in results if isinstance(result, Exception)]
-        if errors:
-            raise ExceptionGroup("Large tool-result cleanup failed.", errors)
-        with self._guard:
-            for handle in handles:
-                if not self._paths.get(handle):
-                    self._states[handle] = "closed"
+        await self._close(reopen=False)
+
+    async def drain(self) -> None:
+        """Drain every generation and reopen the registry for a later lifespan."""
+        await self._close(reopen=True)
+
+    async def _close(self, *, reopen: bool) -> None:
+        async with self._close_lock:
+            with self._guard:
+                self._terminal = True
+                handles = tuple(self._states)
+                for handle in handles:
+                    self._states[handle] = "closing"
+            results = await asyncio.gather(
+                *(self._drain_handle(handle) for handle in handles),
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, Exception)]
+            if errors:
+                raise ExceptionGroup("Large tool-result cleanup failed.", errors)
+            with self._guard:
+                if reopen:
+                    self._current.clear()
+                    self._states.clear()
+                    self._session_locks.clear()
+                    self._session_lock_users.clear()
+                    self._unscoped = ArtifactSessionHandle(
+                        "",
+                        f"unscoped-{uuid.uuid4().hex}",
+                    )
+                    self._states[self._unscoped] = "open"
+                    self._terminal = False
+                else:
+                    for handle in handles:
+                        if not self._paths.get(handle):
+                            self._states[handle] = "closed"
 
     async def _drain_handle(self, handle: ArtifactSessionHandle) -> None:
         with self._guard:
@@ -297,6 +320,27 @@ class ArtifactTrackingBackend(CompositeBackend):
             for root in self._hidden_roots
         )
 
+    def _is_logical_path(self, path: str) -> bool:
+        normalized = self._normalize_path(path)
+        return any(
+            normalized == root or normalized.startswith(f"{root}/")
+            for root in self._logical_roots
+        )
+
+    def _search_includes_artifacts(self, path: str | None) -> bool:
+        if path is None:
+            return True
+        normalized = self._normalize_path(path)
+        if normalized == "/":
+            return True
+        if normalized == ".":
+            return any(not root.startswith("/") for root in self._artifact_roots)
+        prefix = f"{normalized.rstrip('/')}/"
+        return any(
+            normalized == root or root.startswith(prefix)
+            for root in self._artifact_roots
+        )
+
     def _restore_active_path(self, path: str) -> str:
         handle = self.registry.current_handle()
         if not self.registry.owns(handle, self._physical_root(handle)):
@@ -322,11 +366,23 @@ class ArtifactTrackingBackend(CompositeBackend):
             return restored
         return path
 
-    def _visible_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _visible_items(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        hide_legacy: bool = False,
+    ) -> list[dict[str, Any]]:
         visible: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in items:
-            restored = self._restore_active_path(item["path"])
+            original = item["path"]
+            restored = self._restore_active_path(original)
+            if (
+                hide_legacy
+                and self._normalize_path(restored) == self._normalize_path(original)
+                and self._is_logical_path(original)
+            ):
+                continue
             if self._is_hidden_path(restored) or restored in seen:
                 continue
             seen.add(restored)
@@ -369,13 +425,21 @@ class ArtifactTrackingBackend(CompositeBackend):
         if self._is_hidden_path(path):
             return LsResult(error=_HIDDEN_ARTIFACT_ERROR)
         mapped, _ = self._map(path)
+        parent_search = mapped == path and self._search_includes_artifacts(path)
         result = self.backend.ls(mapped or path)
         if result.entries is not None:
-            result.entries = self._visible_items(
-                [
-                    {**entry, "path": self._restore_path(entry["path"], mapped, path)}
-                    for entry in result.entries
-                ]
+            result.entries = cast(
+                list[FileInfo],
+                self._visible_items(
+                    [
+                        {
+                            **entry,
+                            "path": self._restore_path(entry["path"], mapped, path),
+                        }
+                        for entry in result.entries
+                    ],
+                    hide_legacy=parent_search,
+                ),
             )
         return result
 
@@ -383,13 +447,21 @@ class ArtifactTrackingBackend(CompositeBackend):
         if self._is_hidden_path(path):
             return LsResult(error=_HIDDEN_ARTIFACT_ERROR)
         mapped, _ = self._map(path)
+        parent_search = mapped == path and self._search_includes_artifacts(path)
         result = await self.backend.als(mapped or path)
         if result.entries is not None:
-            result.entries = self._visible_items(
-                [
-                    {**entry, "path": self._restore_path(entry["path"], mapped, path)}
-                    for entry in result.entries
-                ]
+            result.entries = cast(
+                list[FileInfo],
+                self._visible_items(
+                    [
+                        {
+                            **entry,
+                            "path": self._restore_path(entry["path"], mapped, path),
+                        }
+                        for entry in result.entries
+                    ],
+                    hide_legacy=parent_search,
+                ),
             )
         return result
 
@@ -416,14 +488,35 @@ class ArtifactTrackingBackend(CompositeBackend):
         if self._is_hidden_path(path):
             return GrepResult(error=_HIDDEN_ARTIFACT_ERROR)
         mapped, _ = self._map(path)
-        result = self.backend.grep(pattern, mapped, glob, max_count=max_count)
+        parent_search = mapped == path and self._search_includes_artifacts(path)
+        deferred_limit = parent_search and max_count is not None and max_count >= 0
+        result = self.backend.grep(
+            pattern,
+            mapped,
+            glob,
+            max_count=None if deferred_limit else max_count,
+        )
         if result.matches is not None:
-            result.matches = self._visible_items(
-                [
-                    {**match, "path": self._restore_path(match["path"], mapped, path)}
-                    for match in result.matches
-                ]
+            result.matches = cast(
+                list[GrepMatch],
+                self._visible_items(
+                    [
+                        {
+                            **match,
+                            "path": self._restore_path(match["path"], mapped, path),
+                        }
+                        for match in result.matches
+                    ],
+                    hide_legacy=parent_search,
+                ),
             )
+            if (
+                deferred_limit
+                and max_count is not None
+                and len(result.matches) > max_count
+            ):
+                result.matches = result.matches[:max_count]
+                result.truncated = True
         return result
 
     async def agrep(
@@ -437,27 +530,56 @@ class ArtifactTrackingBackend(CompositeBackend):
         if self._is_hidden_path(path):
             return GrepResult(error=_HIDDEN_ARTIFACT_ERROR)
         mapped, _ = self._map(path)
-        result = await self.backend.agrep(pattern, mapped, glob, max_count=max_count)
+        parent_search = mapped == path and self._search_includes_artifacts(path)
+        deferred_limit = parent_search and max_count is not None and max_count >= 0
+        result = await self.backend.agrep(
+            pattern,
+            mapped,
+            glob,
+            max_count=None if deferred_limit else max_count,
+        )
         if result.matches is not None:
-            result.matches = self._visible_items(
-                [
-                    {**match, "path": self._restore_path(match["path"], mapped, path)}
-                    for match in result.matches
-                ]
+            result.matches = cast(
+                list[GrepMatch],
+                self._visible_items(
+                    [
+                        {
+                            **match,
+                            "path": self._restore_path(match["path"], mapped, path),
+                        }
+                        for match in result.matches
+                    ],
+                    hide_legacy=parent_search,
+                ),
             )
+            if (
+                deferred_limit
+                and max_count is not None
+                and len(result.matches) > max_count
+            ):
+                result.matches = result.matches[:max_count]
+                result.truncated = True
         return result
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         if self._is_hidden_path(path):
             return GlobResult(error=_HIDDEN_ARTIFACT_ERROR)
         mapped, _ = self._map(path)
+        parent_search = mapped == path and self._search_includes_artifacts(path)
         result = self.backend.glob(pattern, mapped)
         if result.matches is not None:
-            result.matches = self._visible_items(
-                [
-                    {**entry, "path": self._restore_path(entry["path"], mapped, path)}
-                    for entry in result.matches
-                ]
+            result.matches = cast(
+                list[FileInfo],
+                self._visible_items(
+                    [
+                        {
+                            **entry,
+                            "path": self._restore_path(entry["path"], mapped, path),
+                        }
+                        for entry in result.matches
+                    ],
+                    hide_legacy=parent_search,
+                ),
             )
         return result
 
@@ -465,13 +587,21 @@ class ArtifactTrackingBackend(CompositeBackend):
         if self._is_hidden_path(path):
             return GlobResult(error=_HIDDEN_ARTIFACT_ERROR)
         mapped, _ = self._map(path)
+        parent_search = mapped == path and self._search_includes_artifacts(path)
         result = await self.backend.aglob(pattern, mapped)
         if result.matches is not None:
-            result.matches = self._visible_items(
-                [
-                    {**entry, "path": self._restore_path(entry["path"], mapped, path)}
-                    for entry in result.matches
-                ]
+            result.matches = cast(
+                list[FileInfo],
+                self._visible_items(
+                    [
+                        {
+                            **entry,
+                            "path": self._restore_path(entry["path"], mapped, path),
+                        }
+                        for entry in result.matches
+                    ],
+                    hide_legacy=parent_search,
+                ),
             )
         return result
 

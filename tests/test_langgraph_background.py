@@ -7,6 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import chainagents.runtime.graph as runtime_graph
+from chainagents.runtime.background_tasks import (
+    BackgroundTaskManager,
+    scope_background_session_invocation,
+)
+from chainagents.runtime.artifacts import LargeToolResultArtifactRegistry
+from chainagents.runtime.types import BackgroundSubagentConfig
 from chainagents.langgraph.http import app, lifespan
 
 
@@ -21,7 +27,7 @@ def test_langgraph_http_app_closes_sessions_managers_and_artifacts(
             calls.append(("session", session_id))
             yield
 
-        async def close(self) -> None:
+        async def drain(self) -> None:
             calls.append(("manager", None))
 
     manager = Manager()
@@ -30,7 +36,7 @@ def test_langgraph_http_app_closes_sessions_managers_and_artifacts(
         async def close_session(self, session_id: str) -> None:
             calls.append(("artifacts-session", session_id))
 
-        async def close(self) -> None:
+        async def drain(self) -> None:
             calls.append(("artifacts", None))
 
     monkeypatch.setattr(
@@ -68,7 +74,7 @@ async def test_langgraph_lifespan_closes_managers_after_application_error() -> N
     calls: list[str] = []
 
     class Manager:
-        async def close(self) -> None:
+        async def drain(self) -> None:
             calls.append("manager")
 
     runtime_graph._STATIC_BACKGROUND_TASK_MANAGERS.add(Manager())
@@ -89,12 +95,12 @@ async def test_static_shutdown_preserves_manager_and_artifact_cleanup_failures(
     calls: list[str] = []
 
     class Manager:
-        async def close(self) -> None:
+        async def drain(self) -> None:
             calls.append("manager")
             raise RuntimeError("manager cleanup failed")
 
     class Artifacts:
-        async def close(self) -> None:
+        async def drain(self) -> None:
             calls.append("artifacts")
             raise RuntimeError("artifact cleanup failed")
 
@@ -170,3 +176,53 @@ async def test_exported_session_cleanup_finishes_before_cancellation_propagates(
         "manager-exit:thread",
     ]
     runtime_graph._STATIC_BACKGROUND_TASK_MANAGERS.discard(manager)
+
+
+@pytest.mark.anyio
+async def test_background_disabled_exported_graph_reopens_after_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A background-disabled graph remains usable after repeated shutdowns."""
+    calls: list[str] = []
+
+    class Runnable:
+        async def ainvoke(self, _input, config):
+            calls.append(config["configurable"]["thread_id"])
+            return "ok"
+
+    registry = LargeToolResultArtifactRegistry()
+    manager = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=False),
+        artifact_registry=registry,
+    )
+    graph = scope_background_session_invocation(
+        Runnable(),
+        manager,
+        on_session_open=lambda _session_id: (
+            runtime_graph._STATIC_BACKGROUND_TASK_MANAGERS.add(manager)
+        ),
+        artifact_registry=registry,
+    )
+    monkeypatch.setattr(
+        runtime_graph,
+        "_STATIC_BACKGROUND_TASK_MANAGERS",
+        {manager},
+    )
+    monkeypatch.setattr(
+        runtime_graph,
+        "_STATIC_LARGE_TOOL_RESULT_ARTIFACTS",
+        registry,
+    )
+
+    assert await graph.ainvoke(
+        {},
+        {"configurable": {"thread_id": "first"}},
+    ) == "ok"
+    await runtime_graph.close_static_background_tasks()
+    assert await graph.ainvoke(
+        {},
+        {"configurable": {"thread_id": "second"}},
+    ) == "ok"
+    await runtime_graph.close_static_background_tasks()
+
+    assert calls == ["first", "second"]

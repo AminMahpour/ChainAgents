@@ -568,6 +568,62 @@ def test_parent_searches_restore_only_the_active_logical_artifacts(tmp_path):
     asyncio.run(exercise())
 
 
+def test_parent_grep_isolates_before_limiting_and_hides_legacy_files(
+    tmp_path,
+    monkeypatch,
+):
+    """Foreign and pre-upgrade artifacts cannot consume or enter grep results."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        tokens = iter(("0000000000000000", "ffffffffffffffff"))
+        monkeypatch.setattr(
+            runtime_artifacts.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex=next(tokens)),
+        )
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        foreign = registry.open_session("foreign")
+        foreign_token = registry.activate(foreign)
+        assert backend.write(
+            f"{backend.artifacts_root}/large_tool_results/foreign.txt",
+            "shared-needle",
+        ).error is None
+        registry.reset(foreign_token)
+        active = registry.open_session("active")
+        active_token = registry.activate(active)
+        assert backend.write(
+            f"{backend.artifacts_root}/large_tool_results/active.txt",
+            "shared-needle",
+        ).error is None
+        legacy = tmp_path / ".files" / "deepagent" / "large_tool_results" / "legacy.txt"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text("shared-needle", encoding="utf-8")
+
+        result = backend.grep(
+            "shared-needle",
+            backend.artifacts_root,
+            max_count=1,
+        )
+        globbed = backend.glob("**/*", backend.artifacts_root)
+
+        assert result.error is None
+        assert [item["path"] for item in result.matches or []] == [
+            f"{backend.artifacts_root}/large_tool_results/active.txt"
+        ]
+        assert all(
+            "legacy.txt" not in item["path"] for item in globbed.matches or []
+        )
+        registry.reset(active_token)
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
 def test_workspace_alias_uses_the_active_artifact_generation(tmp_path):
     """Workspace logical paths must remain session-scoped and teardown-owned."""
 
@@ -611,6 +667,50 @@ def test_workspace_alias_uses_the_active_artifact_generation(tmp_path):
         assert not first_physical.exists()
         assert second_physical.read_text(encoding="utf-8") == "second"
         await registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_generic_runtime_agent_scopes_artifacts_from_invocation_config(
+    runtime,
+    monkeypatch,
+):
+    """A cached generic agent derives artifact ownership from each invocation."""
+
+    class Agent:
+        def __init__(self, backend):
+            self.backend = backend
+
+        async def ainvoke(self, payload, config):
+            del config
+            path = f"{self.backend.artifacts_root}/large_tool_results/result.txt"
+            if "content" in payload:
+                return self.backend.write(path, payload["content"])
+            return self.backend.read(path)
+
+    monkeypatch.setattr(
+        runtime_middleware,
+        "create_deep_agent_with_configured_summarization",
+        lambda _config, **kwargs: Agent(kwargs["backend"]),
+    )
+
+    async def exercise():
+        agent = await runtime.get_agent("medium", thread_id=None)
+        first_config = {"configurable": {"thread_id": "first"}}
+        second_config = {"configurable": {"thread_id": "second"}}
+        assert (await agent.ainvoke({"content": "first"}, first_config)).error is None
+        assert (await agent.ainvoke({}, second_config)).error is not None
+        assert (await agent.ainvoke({"content": "second"}, second_config)).error is None
+        first_read = await agent.ainvoke({}, first_config)
+        second_read = await agent.ainvoke({}, second_config)
+        assert first_read.file_data["content"] == "first"
+        assert second_read.file_data["content"] == "second"
+
+        await runtime.close_conversation(thread_id="first")
+
+        assert (await agent.ainvoke({}, first_config)).error is not None
+        assert (await agent.ainvoke({}, second_config)).file_data["content"] == "second"
+        await runtime.close()
 
     asyncio.run(exercise())
 

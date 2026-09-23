@@ -762,13 +762,12 @@ class AgentRuntime:
                     self.config,
                     **agent_kwargs,
                 )
-                if thread_id:
-                    agent = runtime_background_tasks.scope_background_session_invocation(
-                        agent,
-                        self.background_tasks,
-                        artifact_registry=self.large_tool_result_artifacts,
-                        fixed_session_id=thread_id,
-                    )
+                agent = runtime_background_tasks.scope_background_session_invocation(
+                    agent,
+                    self.background_tasks,
+                    artifact_registry=self.large_tool_result_artifacts,
+                    fixed_session_id=thread_id,
+                )
                 self._agents[cache_key] = agent
             return agent
 
