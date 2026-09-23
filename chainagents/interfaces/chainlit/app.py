@@ -62,6 +62,7 @@ from chainagents.runtime.reflection import (
     format_reflection_proposal,
     reflection_save_prompt as reflection_save_prompt,
 )
+from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.rag.runtime import UploadedRagFile
 from chainagents.exports.response import (
     DOWNLOAD_MARKDOWN_ACTION,
@@ -1719,7 +1720,8 @@ async def on_message(message: cl.Message) -> None:
             effective_model_name,
         )
     )
-    agent = await runtime.get_agent(
+    agent, mcp_failures = await agent_with_mcp_status(
+        runtime,
         effective_reasoning_level,
         model_name=effective_model_name,
         reasoning_level_is_explicit=reasoning_level_is_explicit,
@@ -1727,6 +1729,8 @@ async def on_message(message: cl.Message) -> None:
         async_subagent_url_override=async_url_override,
         mcp_session_id=mcp_session_id,
     )
+    if mcp_failures:
+        await cl.Message(content=mcp_outage_warning(mcp_failures)).send()
     async_task_notifier = get_async_task_notifier(
         agent=agent,
         runtime=runtime,

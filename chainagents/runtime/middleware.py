@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import logging
 import threading
@@ -14,8 +15,8 @@ from deepagents import create_deep_agent
 from deepagents.backends import BackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import TodoListMiddleware
-from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest, hook_config
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langgraph.types import Command
 
 import chainagents.runtime.backends as runtime_backends
@@ -32,6 +33,66 @@ logger = logging.getLogger("chainagents.runtime.core")
 
 
 _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
+_TOKEN_LIMIT_RETRY_MARKER = "chainagents_token_limit_retry"
+
+
+class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Prevent execution of model tool calls cut off by an output-token cap."""
+
+    @hook_config(can_jump_to=["model", "end"])
+    def after_model(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
+        messages = state.get("messages") or []
+        if not messages or not isinstance(messages[-1], AIMessage):
+            return None
+        message = messages[-1]
+        metadata = message.response_metadata
+        token_limited = (
+            metadata.get("finish_reason") in {"length", "max_tokens"}
+            or metadata.get("stop_reason") == "max_tokens"
+            or metadata.get("done_reason") == "length"
+            or (
+                metadata.get("status") == "incomplete"
+                and isinstance(metadata.get("incomplete_details"), dict)
+                and metadata["incomplete_details"].get("reason") == "max_output_tokens"
+            )
+        )
+        raw_calls = message.additional_kwargs.get("tool_calls")
+        if not token_limited or not (message.tool_calls or message.invalid_tool_calls or raw_calls):
+            return None
+
+        # Drop the incomplete assistant turn before another model request. This
+        # also prevents any valid call in the same truncated batch from running.
+        replacement: list[Any] = [RemoveMessage(id=message.id)] if message.id else []
+        already_retried = False
+        for prior in reversed(messages[:-1]):
+            if isinstance(prior, HumanMessage):
+                already_retried = bool(
+                    prior.additional_kwargs.get(_TOKEN_LIMIT_RETRY_MARKER)
+                )
+                break
+        if already_retried or not message.id:
+            replacement.append(
+                AIMessage(
+                    content=(
+                        "The model reached its output-token limit while generating a tool call "
+                        "again. The incomplete tool call was not executed. Increase the model "
+                        "output-token limit or use a smaller request."
+                    )
+                )
+            )
+            return {"messages": replacement, "jump_to": "end"}
+
+        replacement.append(
+            HumanMessage(
+                content=(
+                    "Your previous tool call was incomplete because you reached the "
+                    "output-token limit. It was not executed. Shorten or split the tool "
+                    "call; do not repeat the same long call. You have one retry."
+                ),
+                additional_kwargs={_TOKEN_LIMIT_RETRY_MARKER: True},
+            )
+        )
+        return {"messages": replacement, "jump_to": "model"}
 
 
 class DisableSubagentDelegationMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -404,19 +465,35 @@ def create_deep_agent_with_configured_summarization(
     Returns:
         The created DeepAgents graph.
     """
-    summarization_factory = _build_deepagents_summarization_factory(config)
-    if summarization_factory is None:
-        return create_deep_agent(**kwargs)
-
     import deepagents.graph as deepagents_graph
+
+    summarization_factory = _build_deepagents_summarization_factory(config)
 
     with _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK:
         original_factory = deepagents_graph.create_summarization_middleware
-        deepagents_graph.create_summarization_middleware = summarization_factory
+        original_profile = deepagents_graph._harness_profile_for_model
+
+        def profile_with_token_guard(model: Any, spec: str | None) -> Any:
+            # DeepAgents builds its implicit general-purpose delegate from the
+            # harness profile, rather than inheriting caller middleware.
+            profile = original_profile(model, spec)
+
+            def middleware_for_stacks() -> list[AgentMiddleware[Any, Any, Any]]:
+                existing = profile.materialize_extra_middleware()
+                if not any(isinstance(item, TokenLimitedToolCallMiddleware) for item in existing):
+                    existing.append(TokenLimitedToolCallMiddleware())
+                return existing
+
+            return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
+
+        if summarization_factory is not None:
+            deepagents_graph.create_summarization_middleware = summarization_factory
+        deepagents_graph._harness_profile_for_model = profile_with_token_guard
         try:
             return create_deep_agent(**kwargs)
         finally:
             deepagents_graph.create_summarization_middleware = original_factory
+            deepagents_graph._harness_profile_for_model = original_profile
 
 
 def build_agent_middleware(
@@ -456,5 +533,6 @@ def build_agent_middleware(
         tools=filesystem_tools,
     )
     middleware.append(filesystem_middleware)
+    middleware.append(TokenLimitedToolCallMiddleware())
     middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
     return middleware

@@ -66,6 +66,7 @@ from chainagents.runtime import (
     normalize_reasoning_level,
     resolve_runtime_model_profile,
 )
+from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.runtime.reflection import (
     ReflectionCollector,
     ReflectionProposal,
@@ -210,6 +211,7 @@ class AgentRunResponse(BaseModel):
     thread_id: str
     model: str
     reasoning: ReasoningLevel
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RuntimeStatusResponse(BaseModel):
@@ -659,10 +661,13 @@ def create_app(
                 detail=context.command_error,
             )
         response_parts: list[str] = []
+        warnings: list[str] = []
         try:
             async for event in _iter_agent_events(active_runtime, context):
                 if event.kind == "response_delta":
                     response_parts.append(event.text)
+                elif event.kind == "mcp_status":
+                    warnings.append(event.text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -673,6 +678,7 @@ def create_app(
             thread_id=context.thread_id,
             model=context.model_name,
             reasoning=context.reasoning_level,
+            warnings=warnings,
         )
 
     @app.post("/api/agent/stream")
@@ -1472,7 +1478,8 @@ async def _iter_agent_events(
         )
         return
 
-    agent = await runtime.get_agent(
+    agent, mcp_failures = await agent_with_mcp_status(
+        runtime,
         context.reasoning_level,
         model_name=context.model_name,
         reasoning_level_is_explicit=context.reasoning_level_is_explicit,
@@ -1480,6 +1487,13 @@ async def _iter_agent_events(
         async_subagent_url_override=context.async_subagent_url,
         mcp_session_id=context.mcp_session_id,
     )
+    if mcp_failures:
+        yield AgentStreamEvent(
+            kind="mcp_status",
+            source="mcp",
+            status="warning",
+            text=mcp_outage_warning(mcp_failures),
+        )
     payload = {
         "messages": [
             *context.history,

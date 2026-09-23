@@ -36,6 +36,7 @@ from chainagents.runtime import (
     normalize_reasoning_level,
 )
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
+from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 
 
 DEFAULT_TUI_THREAD_ID = "tui"
@@ -444,13 +445,16 @@ class ChainAgentsTuiApp(App[int]):
         return prompt if prompt.strip() else None
 
     async def _stream_agent_prompt(self, prompt: str) -> None:
-        agent = await self.runtime.get_agent(
+        agent, mcp_failures = await agent_with_mcp_status(
+            self.runtime,
             self.reasoning_level,
             model_name=self.model_name,
             thread_id=self.thread_id,
             async_subagent_url_override=self.async_subagent_url,
             mcp_session_id=self.mcp_session_id,
         )
+        if mcp_failures:
+            self._append_tool_entry(mcp_outage_warning(mcp_failures))
         payload = {"messages": [{"role": "user", "content": prompt}]}
         config = build_langgraph_run_config(
             self.runtime.config,

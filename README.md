@@ -254,6 +254,9 @@ JSON requests to `/api/agent/invoke` and `/api/agent/stream` accept an optional
 command as its argument text. The multipart `/api/agent/stream/multipart`
 endpoint accepts the same optional `command` form field alongside `prompt`,
 `thread_id`, and uploaded files.
+When an MCP server is unavailable, `/api/agent/invoke` includes a `warnings`
+array while `/api/agent/stream` emits an `mcp_status` warning event before the
+agent response. Healthy tools remain available.
 
 The `/api/status` response sources its `starters` and their optional `command`
 values from the active `deepagent.toml`. A client launching a configured starter
@@ -478,6 +481,7 @@ Notes:
 - `provider = "claude"` is accepted as an alias for `provider = "anthropic"`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, `max_tokens`, and `reasoning_effort`.
 - `max_tokens` is an optional positive output-token limit. It maps to `max_completion_tokens` for Snowflake Cortex and OpenAI-compatible providers, `max_tokens` for Anthropic, and `num_predict` for Ollama.
+- If the model reaches this limit while producing a tool call, ChainAgents discards the incomplete call and tells the model to shorten or split it once. A second truncated tool call ends that run with a clear message; increasing `max_tokens` may help.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
@@ -1213,6 +1217,7 @@ Notes:
 - `mcp_servers` on `[[subagents]]` attaches those MCP tools only to that subagent.
 - `mcp_servers` on `[[subagents.subagents]]` attaches those MCP tools only to that nested child subagent.
 - Skills and MCP servers are independent. You can use neither, either, or both on any subagent.
+- If one MCP server cannot load tools, the agent continues with tools from healthy servers and retries the failed server on the next run. The affected run shows an MCP warning in Chainlit, CLI/TUI, and API output. Tool invocation errors are returned to the model as recoverable tool errors.
 - Relative `cwd` values are resolved from the location of `deepagent.toml`.
 - `tool_name_prefix = true` is recommended when multiple MCP servers expose overlapping tool names.
 - `stateful = true` keeps MCP sessions open per LangGraph thread while the app process is running.
