@@ -28,6 +28,9 @@ PDF_IMAGE_MAX_PIXELS = 25_000_000
 PDF_SVG_MAX_ELEMENTS = 10_000
 PDF_SVG_MAX_DEPTH = 4_096
 PDF_SVG_MAX_ATTRIBUTES = 100_000
+PDF_SVG_MAX_ATTRIBUTE_VALUE_CHARS = 1_000_000
+PDF_SVG_MAX_PATH_DATA_CHARS = 500_000
+PDF_SVG_MAX_PATH_COMMANDS = 25_000
 PDF_SVG_MAX_USE_EXPANSION = 4_096
 PDF_IMAGE_MAX_REDIRECTS = 3
 PDF_IMAGE_TIMEOUT_SECONDS = 5.0
@@ -39,6 +42,7 @@ _RASTER_MIME_TYPES = {
     "PNG": "image/png",
     "WEBP": "image/webp",
 }
+_SVG_PATH_COMMANDS = frozenset("MmZzLlHhVvCcSsQqTtAa")
 
 
 class PdfImageError(ValueError):
@@ -505,6 +509,7 @@ def _preflight_svg_structure(content: bytes) -> None:
     """Reject unsafe or excessive XML before building an in-memory tree."""
     element_count = 0
     attribute_count = 0
+    attribute_value_chars = 0
     depth = 0
     parser = expat.ParserCreate()
 
@@ -520,16 +525,31 @@ def _preflight_svg_structure(content: bytes) -> None:
         raise PdfImageError("SVG declarations are not supported")
 
     def start_element(_name: str, attributes: dict[str, str]) -> None:
-        nonlocal element_count, attribute_count, depth
+        nonlocal element_count, attribute_count, attribute_value_chars, depth
         element_count += 1
         attribute_count += len(attributes)
+        attribute_value_chars += sum(len(value) for value in attributes.values())
         depth += 1
         if (
             element_count > PDF_SVG_MAX_ELEMENTS
             or attribute_count > PDF_SVG_MAX_ATTRIBUTES
+            or attribute_value_chars > PDF_SVG_MAX_ATTRIBUTE_VALUE_CHARS
             or depth > PDF_SVG_MAX_DEPTH
         ):
             raise PdfImageError("SVG structure limit exceeded")
+        if _name.rsplit(":", 1)[-1].lower() == "path":
+            path_data = next(
+                (
+                    value
+                    for name, value in attributes.items()
+                    if name.rsplit(":", 1)[-1].lower() == "d"
+                ),
+                "",
+            )
+            if len(path_data) > PDF_SVG_MAX_PATH_DATA_CHARS or sum(
+                character in _SVG_PATH_COMMANDS for character in path_data
+            ) > PDF_SVG_MAX_PATH_COMMANDS:
+                raise PdfImageError("SVG path complexity limit exceeded")
 
     def end_element(_name: str) -> None:
         nonlocal depth

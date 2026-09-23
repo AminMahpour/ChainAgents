@@ -701,6 +701,17 @@ def test_pdf_image_validation_rejects_excessive_svg_structure() -> None:
         pdf_images._validate_pdf_image(svg)
 
 
+def test_pdf_image_validation_rejects_excessive_svg_path_complexity() -> None:
+    """One path attribute must not hide an unbounded rendering workload."""
+    path_data = "M0 0" + "L1 1" * (pdf_images.PDF_SVG_MAX_PATH_COMMANDS + 1)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg"><path d="{path_data}" /></svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="path complexity limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
 def test_pdf_image_validation_rejects_circular_svg_use() -> None:
     """Circular local references must not recurse during PDF rendering."""
     svg = (
