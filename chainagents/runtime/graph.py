@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
@@ -40,6 +42,9 @@ logger = logging.getLogger("chainagents.runtime.core")
 _STATIC_BACKGROUND_TASK_MANAGERS: set[
     runtime_background_tasks.BackgroundTaskManager
 ] = set()
+_STATIC_LARGE_TOOL_RESULT_ARTIFACTS = (
+    runtime_artifacts.LargeToolResultArtifactRegistry()
+)
 
 
 def static_background_task_managers() -> tuple[
@@ -50,11 +55,47 @@ def static_background_task_managers() -> tuple[
 
 
 async def close_static_background_tasks() -> None:
-    """Close every task manager owned by an exported configured graph."""
+    """Close exported-graph task managers and remaining result artifacts."""
     managers = tuple(_STATIC_BACKGROUND_TASK_MANAGERS)
     _STATIC_BACKGROUND_TASK_MANAGERS.clear()
+    errors: list[BaseException] = []
     if managers:
-        await asyncio.gather(*(manager.close() for manager in managers))
+        results = await asyncio.gather(
+            *(manager.drain() for manager in managers),
+            return_exceptions=True,
+        )
+        errors.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
+    try:
+        await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.drain()
+    except BaseException as exc:
+        errors.append(exc)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Exported graph cleanup failed.", errors)
+
+
+async def close_static_background_session(session_id: str) -> None:
+    """Close one session across exported task and artifact owners."""
+    close_task = asyncio.create_task(
+        _close_static_background_session(session_id),
+        name=f"chainagents-close-static-session-{session_id}",
+    )
+    await runtime_background_tasks.await_preserving_cancellation(close_task)
+
+
+async def _close_static_background_session(session_id: str) -> None:
+    """Complete exported session teardown independently of its caller."""
+    managers = static_background_task_managers()
+    if managers:
+        async with AsyncExitStack() as stack:
+            for manager in managers:
+                await stack.enter_async_context(manager.closing_session(session_id))
+            await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close_session(session_id)
+        return
+    await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close_session(session_id)
 
 
 def _get_static_background_task_manager(
@@ -69,7 +110,10 @@ def _get_static_background_task_manager(
                 "Exported graphs must use one background_subagents configuration."
             )
         return manager
-    manager = runtime_background_tasks.BackgroundTaskManager(background_config)
+    manager = runtime_background_tasks.BackgroundTaskManager(
+        background_config,
+        artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
+    )
     _STATIC_BACKGROUND_TASK_MANAGERS.add(manager)
     return manager
 
@@ -326,6 +370,7 @@ def build_static_sync_subagent_spec(
     project_root: Path | None,
     reasoning_level_is_explicit: bool = False,
     background_manager: runtime_background_tasks.BackgroundTaskManager | None = None,
+    artifact_registry: runtime_artifacts.LargeToolResultArtifactRegistry | None = None,
     agent_path: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Build a sync subagent spec for configured graph creation."""
@@ -394,6 +439,7 @@ def build_static_sync_subagent_spec(
             reasoning_level=effective_reasoning_level,
             reasoning_level_is_explicit=reasoning_level_is_explicit,
             background_manager=background_manager,
+            artifact_registry=artifact_registry,
             agent_path=(*agent_path, child.name),
             inherited_model=effective_model,
             project_root=project_root,
@@ -412,6 +458,14 @@ def build_static_sync_subagent_spec(
             },
             agent_path=agent_path,
             recursion_limit=config.recursion_limit,
+            batch_output_store=(
+                runtime_background_tasks.create_batch_result_output_store(
+                    backend,
+                    backend_prefix=runtime_backends.generated_outputs_route_prefix(
+                        (project_root or runtime_constants.PROJECT_ROOT).resolve()
+                    ),
+                )
+            ),
             existing_tools=effective_tools,
         )
         if caller_background_enabled
@@ -453,6 +507,7 @@ def build_graph_subagent_specs(
     project_root: Path | None = None,
     inherited_tools: list[Any] | None = None,
     background_manager: runtime_background_tasks.BackgroundTaskManager | None = None,
+    artifact_registry: runtime_artifacts.LargeToolResultArtifactRegistry | None = None,
 ) -> list[Any]:
     """Build graph subagent specs.
 
@@ -471,6 +526,7 @@ def build_graph_subagent_specs(
         project_root=project_root,
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
+        artifact_registry=artifact_registry,
     )
     inherited_model = runtime_models.resolve_runtime_model_profile(config)
     graph_reasoning_level = reasoning_level_for_profile(
@@ -490,6 +546,7 @@ def build_graph_subagent_specs(
             inherited_model=inherited_model,
             project_root=project_root,
             background_manager=background_manager,
+            artifact_registry=artifact_registry,
             agent_path=(subagent.name,),
         )
         for subagent in config.extensions.subagents
@@ -536,6 +593,7 @@ def create_configured_graph(
     backend = runtime_backends.build_deepagent_backend(
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
+        artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
     )
     tools: list[Any] = []
     if config.extensions.chainlit_generative_ui_enabled:
@@ -551,9 +609,12 @@ def create_configured_graph(
             logger.warning("RAG is configured but unavailable: %s", config.rag_error)
     main_model_profile = runtime_models.resolve_runtime_model_profile(config)
     main_tools = sanitize_tools_for_model(main_model_profile.provider, tools)
-    background_manager = None
-    if config.extensions.background_subagents.enabled:
-        background_manager = _get_static_background_task_manager(config)
+    session_manager = _get_static_background_task_manager(config)
+    background_manager = (
+        session_manager
+        if config.extensions.background_subagents.enabled
+        else None
+    )
     main_reasoning_level = reasoning_level_for_profile(
         main_model_profile,
         config.default_reasoning,
@@ -566,6 +627,7 @@ def create_configured_graph(
         project_root=runtime_constants.PROJECT_ROOT,
         inherited_tools=main_tools,
         background_manager=background_manager,
+        artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
     )
     local_subagent_specs = [
         spec for spec in subagent_specs if "runnable" in spec
@@ -586,6 +648,14 @@ def create_configured_graph(
             subagents=background_subagents,
             agent_path=(),
             recursion_limit=config.recursion_limit,
+            batch_output_store=(
+                runtime_background_tasks.create_batch_result_output_store(
+                    backend,
+                    backend_prefix=runtime_backends.generated_outputs_route_prefix(
+                        runtime_constants.PROJECT_ROOT.resolve()
+                    ),
+                )
+            ),
             existing_tools=main_tools,
         )
         if background_manager is not None and background_subagents
@@ -628,12 +698,11 @@ def create_configured_graph(
         config,
         **agent_kwargs,
     )
-    if (
-        background_manager is not None
-        and has_background_subagent(config.extensions.subagents)
-    ):
-        return runtime_background_tasks.scope_background_session_invocation(
-            graph,
-            background_manager,
-        )
-    return graph
+    return runtime_background_tasks.scope_background_session_invocation(
+        graph,
+        session_manager,
+        on_session_open=lambda _session_id: _STATIC_BACKGROUND_TASK_MANAGERS.add(
+            session_manager
+        ),
+        artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
+    )

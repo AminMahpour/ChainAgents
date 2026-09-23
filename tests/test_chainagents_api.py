@@ -1048,6 +1048,72 @@ def test_stream_emits_generated_files_after_successful_output_write(
     }
 
 
+def test_stream_emits_batch_manifest_files_without_response_path_echo(
+    tmp_path: Path,
+) -> None:
+    """A successful batch manifest directly supplies generated downloads."""
+    output_path = (
+        tmp_path
+        / ".files"
+        / "outputs"
+        / "subagent-batches"
+        / "batch-call-unique"
+        / "01-researcher-task-1.md"
+    )
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("# researcher\n", encoding="utf-8")
+    public_path = (
+        "/workspace/.files/outputs/subagent-batches/"
+        "batch-call-unique/01-researcher-task-1.md"
+    )
+    tool_call = _Token()
+    tool_call.tool_call_chunks = [
+        {
+            "id": "call-1",
+            "name": "run_subagent_batch",
+            "args": '{"tasks":[{"description":"research"}]}',
+        }
+    ]
+    tool_result = SimpleNamespace(
+        type="tool",
+        name="run_subagent_batch",
+        status="success",
+        tool_call_id="call-1",
+        content=json.dumps({"files": [{"path": public_path}]}),
+    )
+    runtime = _FakeRuntime(
+        _FakeAgent(
+            [
+                _raw_event(((), "messages", (tool_call, {}))),
+                _raw_event(((), "messages", (tool_result, {}))),
+                _raw_event(((), "messages", (_Token("Batch complete."), {}))),
+            ]
+        )
+    )
+    runtime.project_root = tmp_path
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "run research", "thread_id": "thread-1"},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    generated = next(line for line in lines if line["kind"] == "generated_files")
+    assert generated["files"] == [
+        {
+            "name": "01-researcher-task-1.md",
+            "mime_type": "text/markdown",
+            "size_bytes": output_path.stat().st_size,
+            "download_url": (
+                "/api/generated-files/subagent-batches/batch-call-unique/"
+                "01-researcher-task-1.md"
+            ),
+        }
+    ]
+
+
 def test_stream_ignores_failed_or_missing_output_writes(tmp_path: Path) -> None:
     """Verify failed tools and paths without files do not create download metadata."""
     output_path = tmp_path / ".files" / "outputs" / "failed.txt"

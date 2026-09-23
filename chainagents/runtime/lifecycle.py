@@ -18,6 +18,7 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
@@ -111,9 +112,13 @@ class AgentRuntime:
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
+        self.large_tool_result_artifacts = (
+            runtime_artifacts.LargeToolResultArtifactRegistry()
+        )
         self._exit_stack.push_async_callback(self.close_all_mcp_sessions)
         self.background_tasks = runtime_background_tasks.BackgroundTaskManager(
-            config.extensions.background_subagents
+            config.extensions.background_subagents,
+            artifact_registry=self.large_tool_result_artifacts,
         )
         self._exit_stack.push_async_callback(self.background_tasks.close)
         self._chainlit_commands, self._chainlit_command_notes = runtime_commands.build_chainlit_command_catalog(
@@ -545,6 +550,16 @@ class AgentRuntime:
                     if thread_id
                     else None
                 ),
+                batch_output_store=(
+                    runtime_background_tasks.create_batch_result_output_store(
+                        backend,
+                        backend_prefix=(
+                            runtime_backends.generated_outputs_route_prefix(
+                                self.project_root
+                            )
+                        ),
+                    )
+                ),
                 existing_tools=effective_tools,
             )
             if caller_background_enabled
@@ -652,6 +667,7 @@ class AgentRuntime:
                     project_root=self.project_root,
                     include_memories=self.config.agent_state == "stateful",
                     memory_namespace=self.config.extensions.agent_memory_namespace,
+                    artifact_registry=self.large_tool_result_artifacts,
                 )
                 middleware = runtime_middleware.build_agent_middleware(
                     backend=backend,
@@ -699,6 +715,16 @@ class AgentRuntime:
                             if thread_id
                             else None
                         ),
+                        batch_output_store=(
+                            runtime_background_tasks.create_batch_result_output_store(
+                                backend,
+                                backend_prefix=(
+                                    runtime_backends.generated_outputs_route_prefix(
+                                        self.project_root
+                                    )
+                                ),
+                            )
+                        ),
                         existing_tools=main_tools,
                     )
                     if (
@@ -735,6 +761,12 @@ class AgentRuntime:
                 agent = runtime_middleware.create_deep_agent_with_configured_summarization(
                     self.config,
                     **agent_kwargs,
+                )
+                agent = runtime_background_tasks.scope_background_session_invocation(
+                    agent,
+                    self.background_tasks,
+                    artifact_registry=self.large_tool_result_artifacts,
+                    fixed_session_id=thread_id,
                 )
                 self._agents[cache_key] = agent
             return agent
@@ -1157,12 +1189,30 @@ class AgentRuntime:
         """Complete conversation teardown independently of its caller."""
         if thread_id:
             async with self.background_tasks.closing_session(thread_id):
-                await self.close_mcp_session(mcp_session_id or thread_id)
-                async with self._agent_lock:
-                    self._agents = {
-                        key: agent for key, agent in self._agents.items()
-                        if key.thread_id != thread_id
-                    }
+                errors: list[BaseException] = []
+                try:
+                    await self.large_tool_result_artifacts.close_session(thread_id)
+                except BaseException as exc:
+                    errors.append(exc)
+                try:
+                    await self.close_mcp_session(mcp_session_id or thread_id)
+                except BaseException as exc:
+                    errors.append(exc)
+                try:
+                    async with self._agent_lock:
+                        self._agents = {
+                            key: agent for key, agent in self._agents.items()
+                            if key.thread_id != thread_id
+                        }
+                except BaseException as exc:
+                    errors.append(exc)
+                if len(errors) == 1:
+                    raise errors[0]
+                if errors:
+                    raise BaseExceptionGroup(
+                        "Conversation resource cleanup failed.",
+                        errors,
+                    )
             return
         await self.close_mcp_session(mcp_session_id)
 
@@ -1194,11 +1244,14 @@ class AgentRuntime:
             await self.background_tasks.close()
         finally:
             try:
-                await self._exit_stack.aclose()
+                await self.large_tool_result_artifacts.close()
             finally:
-                self._checkpointer = None
-                self._store = None
-                self._mcp_client = None
+                try:
+                    await self._exit_stack.aclose()
+                finally:
+                    self._checkpointer = None
+                    self._store = None
+                    self._mcp_client = None
 
     def _build_backend(self, runtime):
         """Build the Deep Agent backend for the current runtime settings.
@@ -1213,4 +1266,5 @@ class AgentRuntime:
             project_root=self.project_root,
             include_memories=runtime.config.agent_state == "stateful",
             memory_namespace=runtime.config.extensions.agent_memory_namespace,
+            artifact_registry=self.large_tool_result_artifacts,
         )

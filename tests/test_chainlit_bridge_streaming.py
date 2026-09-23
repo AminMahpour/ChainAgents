@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -392,6 +393,49 @@ async def test_final_response_receives_generated_file_paths_from_write_tool(
     await bridge.finish()
 
     assert captured["generated_file_paths"] == ("/workspace/reports/summary.csv",)
+
+
+@pytest.mark.anyio
+async def test_final_response_receives_paths_from_batch_manifest(
+    monkeypatch,
+) -> None:
+    """Batch tool results supply downloads without a final-response path echo."""
+    captured: dict[str, Any] = {}
+    public_path = (
+        "/workspace/.files/outputs/subagent-batches/"
+        "batch-call-unique/01-researcher-task-1.md"
+    )
+
+    def capture_export_actions(_message: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    bridge = ChainlitEventBridge(prompt="run research")
+    monkeypatch.setattr(
+        chainlit_bridge,
+        "attach_response_export_actions",
+        capture_export_actions,
+    )
+
+    await bridge._stream_tool_call(
+        "main-agent",
+        {
+            "id": "call-1",
+            "name": "run_subagent_batch",
+            "args": '{"tasks":[{"description":"research"}]}',
+        },
+    )
+    await bridge._complete_tool_step(
+        "main-agent",
+        _ToolMessage(
+            name="run_subagent_batch",
+            tool_call_id="call-1",
+            content=json.dumps({"files": [{"path": public_path}]}),
+        ),
+    )
+    await bridge._stream_response("Batch complete.")
+    await bridge.finish()
+
+    assert captured["generated_file_paths"] == (public_path,)
 
 
 @pytest.mark.anyio

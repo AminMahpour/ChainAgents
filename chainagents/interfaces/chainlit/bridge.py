@@ -15,7 +15,10 @@ import chainlit as cl
 from chainlit.utils import utc_now
 
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
-from chainagents.exports.generated_files import generated_file_paths_from_tool_args
+from chainagents.exports.generated_files import (
+    generated_file_paths_from_tool_args,
+    generated_file_paths_from_tool_result,
+)
 from chainagents.runtime.reflection import ReflectionCollector, ReflectionProposal
 from chainagents.exports.response import attach_response_export_actions
 
@@ -1372,6 +1375,7 @@ class ChainlitEventBridge:
             )
         if event.status.lower() != "error":
             self._record_generated_file_paths(state.name, "".join(state.arg_chunks))
+            self._record_generated_file_result_paths(state.name, event.tool_result)
         if state.name == "write_todos" and self.run_task_list is not None:
             todos = todos_from_tool_message_content(event.tool_result)
             if todos:
@@ -1584,6 +1588,10 @@ class ChainlitEventBridge:
             )
         if str(getattr(tool_message, "status", "")).lower() != "error":
             self._record_generated_file_paths(state.name, "".join(state.arg_chunks))
+            self._record_generated_file_result_paths(
+                state.name,
+                getattr(tool_message, "content", ""),
+            )
         if state.name == "write_todos" and self.run_task_list is not None:
             todos = todos_from_tool_message_content(getattr(tool_message, "content", ""))
             if todos:
@@ -1593,6 +1601,16 @@ class ChainlitEventBridge:
     def _record_generated_file_paths(self, tool_name: str, raw_args: str) -> None:
         """Remember generated file paths from a completed tool call."""
         for path in generated_file_paths_from_tool_args(tool_name, raw_args):
+            if path not in self.generated_file_paths:
+                self.generated_file_paths.append(path)
+
+    def _record_generated_file_result_paths(
+        self,
+        tool_name: str,
+        result: Any,
+    ) -> None:
+        """Remember generated file paths returned by a completed batch call."""
+        for path in generated_file_paths_from_tool_result(tool_name, result):
             if path not in self.generated_file_paths:
                 self.generated_file_paths.append(path)
 

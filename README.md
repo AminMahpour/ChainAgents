@@ -843,7 +843,7 @@ Main `[agent]` additions:
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
-- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. `stream_activity = true` exposes live reasoning and tool activity as nested Chainlit steps while leaving other interfaces completion-only. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
+- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. `stream_activity = true` exposes live reasoning and tool activity as nested Chainlit steps while leaving other interfaces completion-only. `batch_result_format` selects `run_subagent_batch` results from `json`, `markdown`, or `markdown_files` and defaults to `markdown`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
@@ -864,6 +864,7 @@ start one of its configured children and continue immediately. Enable it with:
 [agent.background_subagents]
 enabled = true
 stream_activity = true
+batch_result_format = "markdown"
 max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100
@@ -896,7 +897,8 @@ The agent receives five tools:
 - `spawn_background_task(description, subagent_type)` starts an allowed direct
   child and returns a task ID immediately
 - `run_subagent_batch(tasks)` starts every independent task concurrently, waits
-  for all of them, and returns their terminal reports in input order
+  for all of them, and returns their terminal reports in the globally configured
+  format and in input order
 - `list_background_tasks()` lists tasks visible to the calling agent
 - `get_background_task(task_id, wait_seconds=0)` returns current state or waits
   up to 60 seconds
@@ -919,13 +921,74 @@ run_subagent_batch(tasks=[
 ])
 ```
 
-The call waits for every child and returns one `results` array. Entries stay in
-request order even when children finish in another order. Each entry includes
-the normal task ID, status, result, and error fields. A failed child does not
-discard successful sibling reports. The manager validates capacity for the
-whole batch before launch, so a batch that exceeds a configured limit starts no
-children. Cancelling the waiting call cancels its unfinished children and their
-descendants.
+The `tasks` input is unchanged across all result modes. Set
+`batch_result_format` once under `[agent.background_subagents]`; it is not a
+per-call argument. Entries stay in request order even when children finish in
+another order, and a failed child does not discard successful sibling reports.
+
+The default, `batch_result_format = "markdown"`, returns one newline-delimited
+Markdown document. Each section includes the agent name, task ID, terminal
+status, original request, and either the report or error. Empty and cancelled
+reports are marked explicitly. The line-oriented format also gives oversized
+batches useful head/tail previews and lets the agent page through a complete
+offloaded result with `read_file`.
+
+`batch_result_format = "json"` restores the original structured contract. It
+returns every terminal snapshot, including session, task-tree, and timing
+metadata:
+
+```json
+{
+  "results": [
+    {
+      "task_id": "bg-123",
+      "session_id": "thread-1",
+      "agent_name": "research-manager",
+      "description": "Trace the API failures.",
+      "agent_path": ["research-manager"],
+      "parent_task_id": null,
+      "status": "success",
+      "result": "The failure starts in ...",
+      "error": null,
+      "created_at": 1750000000.0,
+      "completed_at": 1750000001.5
+    }
+  ]
+}
+```
+
+`batch_result_format = "markdown_files"` writes one standalone Markdown file
+for every terminal result—including errors, cancellations, and empty reports—
+then returns an ordered manifest:
+
+```json
+{
+  "files": [
+    {
+      "task_id": "bg-123",
+      "agent_name": "research-manager",
+      "status": "success",
+      "path": "/workspace/.files/outputs/subagent-batches/batch-call-unique/01-research-manager-bg-123.md"
+    }
+  ]
+}
+```
+
+Each file contains its agent name, task ID, status, original request, and report
+or error. Batch directories are unique, filenames are sanitized and numbered in
+request order, and descriptions never enter filenames. Files are written
+through the generated-output backend under `.files/outputs/subagent-batches`,
+so the existing UI can discover and download them. They persist across
+conversation teardown and process restarts until removed as workspace outputs;
+they are not temporary large-result offloads. The batch returns only after every
+file succeeds; a write failure rolls back completed files, and a cleanup failure
+is reported together with the original error.
+
+The manager validates capacity for the whole batch before launch, so a batch
+that exceeds a configured limit starts no children. Cancelling the waiting call
+cancels its unfinished children and their descendants. In file mode,
+cancellation during output writes waits for the active write and removes every
+file completed by that interrupted batch.
 
 Batch delegation is provider-independent. It is useful when a supervisor model,
 including a Snowflake Cortex model, can emit only one tool call per assistant
@@ -968,11 +1031,14 @@ curl -X DELETE "http://127.0.0.1:8000/api/background-tasks?thread_id=$THREAD_ID"
 ```
 
 Tasks are retained until the conversation closes and are cancelled before its
-MCP resources are released. They are stored only in the current process and do
-not survive restarts. Agent Server deployments therefore require session
-affinity when multiple workers are used. The custom Agent Server app exposes
-`DELETE /background-tasks/sessions/{thread_id}` for explicit cleanup and closes
-all remaining managers during server shutdown.
+offloaded large tool results and MCP resources are released. Cleanup is scoped
+by thread ID, so closing one conversation does not remove another conversation's
+artifacts; workspace files, generated downloads, memories, and uploads are not
+part of this cleanup. Tasks and offload ownership are stored only in the current
+process and do not survive restarts. Agent Server deployments therefore require
+session affinity when multiple workers are used. The custom Agent Server app
+exposes `DELETE /background-tasks/sessions/{thread_id}` for explicit cleanup and
+closes all remaining managers and tracked offloads during server shutdown.
 
 ## Chainlit Native Commands
 

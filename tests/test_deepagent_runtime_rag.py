@@ -26,6 +26,7 @@ import pytest
 
 import deepagent_runtime
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.constants as runtime_constants
@@ -141,6 +142,7 @@ def make_extensions_config(
 
 def test_anthropic_tool_sanitization_adds_object_type_to_mcp_dict_schema() -> None:
     """Verify Anthropic tool sanitization fixes MCP-style dict schemas."""
+
     async def fake_mcp_tool(**kwargs):
         """Return fake MCP tool arguments.
 
@@ -405,9 +407,12 @@ def test_openai_compatible_stream_leaves_compliant_tool_call_indexes_unchanged(
 
     streamed = list(_cortex_model()._stream([]))
 
-    assert [
-        chunk.message.tool_call_chunks[0]["index"] for chunk in streamed
-    ] == [0, 0, 1, 1]
+    assert [chunk.message.tool_call_chunks[0]["index"] for chunk in streamed] == [
+        0,
+        0,
+        1,
+        1,
+    ]
 
 
 def test_openai_compatible_tool_call_index_repair_is_local_to_each_stream(
@@ -432,12 +437,17 @@ def test_openai_compatible_tool_call_index_repair_is_local_to_each_stream(
     list(model._stream([]))
     streamed = list(model._stream([]))
 
-    assert [
-        chunk.message.tool_call_chunks[0]["index"] for chunk in streamed
-    ] == [0, 0, 1, 1]
+    assert [chunk.message.tool_call_chunks[0]["index"] for chunk in streamed] == [
+        0,
+        0,
+        1,
+        1,
+    ]
 
 
-def test_openai_compatible_stream_callbacks_receive_repaired_chunks(monkeypatch) -> None:
+def test_openai_compatible_stream_callbacks_receive_repaired_chunks(
+    monkeypatch,
+) -> None:
     """Streaming callbacks must observe repaired indexes before emitting events."""
     source_chunks = _malformed_cortex_tool_call_chunks()
 
@@ -511,7 +521,9 @@ def test_openai_compatible_astream_callbacks_receive_repaired_chunks(
     ]
 
 
-def _cortex_messages(*, tool_call_ids: list[str], tool_result_ids: list[str]) -> list[Any]:
+def _cortex_messages(
+    *, tool_call_ids: list[str], tool_result_ids: list[str]
+) -> list[Any]:
     """Build a chat-completions tool-call exchange with literal raw IDs."""
     return [
         HumanMessage(content="Use the supplied tools."),
@@ -545,7 +557,10 @@ def _cortex_model() -> Any:
 
 def test_normalize_model_provider_accepts_only_canonical_snowflake_cortex() -> None:
     """Verify Cortex provider parsing rejects aliases that would hide config errors."""
-    assert deepagent_runtime.normalize_model_provider("snowflake_cortex") == "snowflake_cortex"
+    assert (
+        deepagent_runtime.normalize_model_provider("snowflake_cortex")
+        == "snowflake_cortex"
+    )
     with pytest.raises(ValueError, match="snowflake"):
         deepagent_runtime.normalize_model_provider("snowflake")
     with pytest.raises(ValueError, match="snowflake"):
@@ -574,7 +589,9 @@ api_key = "toml-pat"
     model = deepagent_runtime.build_model(config, "medium")
 
     assert config.model_provider == "snowflake_cortex"
-    assert config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    assert (
+        config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    )
     assert isinstance(model, deepagent_runtime.SnowflakeCortexChatOpenAI)
     assert model.openai_api_key.get_secret_value() == "toml-pat"
 
@@ -650,7 +667,9 @@ api_key = "toml-pat"
 
     config = deepagent_runtime.RuntimeConfig.from_env()
 
-    assert config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    assert (
+        config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    )
     assert config.model_endpoint_query == (("trace", "1"),)
 
 
@@ -682,7 +701,9 @@ api_key = "toml-pat"
         )
     )
 
-    assert config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    assert (
+        config.model_base_url == "https://acme.snowflakecomputing.com/api/v2/cortex/v1"
+    )
     assert config.model_endpoint_query == (("trace", "1"),)
 
 
@@ -693,8 +714,14 @@ api_key = "toml-pat"
         ("base_url", "http://acme.snowflakecomputing.com/api/v2/cortex/v1"),
         ("base_url", "https://api.example.test/api/v2/cortex/v1"),
         ("base_url", "https://acme.snowflakecomputing.com/v1"),
-        ("endpoint_url", "acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"),
-        ("endpoint_url", "http://acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions"),
+        (
+            "endpoint_url",
+            "acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions",
+        ),
+        (
+            "endpoint_url",
+            "http://acme.snowflakecomputing.com/api/v2/cortex/v1/chat/completions",
+        ),
         ("endpoint_url", "https://api.example.test/api/v2/cortex/v1/chat/completions"),
         ("endpoint_url", "https://acme.snowflakecomputing.com/api/v2/cortex/v1"),
     ],
@@ -743,7 +770,10 @@ api_key = "toml-pat"
 
     config = deepagent_runtime.RuntimeConfig.from_env()
 
-    assert config.model_base_url == "https://acme.privatelink.snowflakecomputing.com/api/v2/cortex/v1"
+    assert (
+        config.model_base_url
+        == "https://acme.privatelink.snowflakecomputing.com/api/v2/cortex/v1"
+    )
 
 
 def test_runtime_config_accepts_snowflake_cortex_cn_full_endpoint_url(
@@ -766,7 +796,9 @@ api_key = "toml-pat"
 
     config = deepagent_runtime.RuntimeConfig.from_env()
 
-    assert config.model_base_url == "https://acme.snowflakecomputing.cn/api/v2/cortex/v1"
+    assert (
+        config.model_base_url == "https://acme.snowflakecomputing.cn/api/v2/cortex/v1"
+    )
     assert config.model_endpoint_query == (("trace", "1"), ("trace", "2"))
 
 
@@ -865,7 +897,9 @@ model = "cortex"
     assert payload["extra_body"] == {"reasoning": {"effort": "high"}}
 
 
-def test_runtime_config_reads_named_snowflake_cortex_profile(tmp_path: Path, monkeypatch) -> None:
+def test_runtime_config_reads_named_snowflake_cortex_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Verify a selected named profile can switch to the Cortex provider."""
     config_path = tmp_path / "deepagent.toml"
     config_path.write_text(
@@ -1012,7 +1046,9 @@ api_key = "toml-key"
     assert deepagent_runtime.model_api_key_for_profile(config, profile) == expected
 
 
-def test_snowflake_cortex_requires_a_credential_before_model_construction(monkeypatch) -> None:
+def test_snowflake_cortex_requires_a_credential_before_model_construction(
+    monkeypatch,
+) -> None:
     """Verify Cortex never silently substitutes a placeholder API key."""
     monkeypatch.delenv("SNOWFLAKE_PAT", raising=False)
     monkeypatch.delenv("DEEPAGENT_MODEL_API_KEY", raising=False)
@@ -1065,7 +1101,9 @@ provider = "auto"
     assert "snowflake_cortex" in config.rag_error
 
 
-def test_snowflake_cortex_filters_tools_to_openai_compatible_schemas(monkeypatch) -> None:
+def test_snowflake_cortex_filters_tools_to_openai_compatible_schemas(
+    monkeypatch,
+) -> None:
     """Verify Cortex receives the same valid tool subset as OpenAI-compatible APIs."""
     object_schema_tool = SimpleNamespace(name="object-schema")
     unsupported_tool = SimpleNamespace(name="unsupported")
@@ -1081,7 +1119,9 @@ def test_snowflake_cortex_filters_tools_to_openai_compatible_schemas(monkeypatch
     ) == [object_schema_tool]
 
 
-def test_snowflake_cortex_payload_normalizes_a_single_tool_call_without_mutating_messages() -> None:
+def test_snowflake_cortex_payload_normalizes_a_single_tool_call_without_mutating_messages() -> (
+    None
+):
     """Verify raw tool IDs become canonical in a copied outbound Cortex payload."""
     messages = _cortex_messages(
         tool_call_ids=["raw-call-1"],
@@ -1096,13 +1136,17 @@ def test_snowflake_cortex_payload_normalizes_a_single_tool_call_without_mutating
         "tool",
     ]
     assert len(payload["messages"][1]["tool_calls"]) == 1
-    assert payload["messages"][1]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert (
+        payload["messages"][1]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    )
     assert payload["messages"][2]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
     assert messages[1].tool_calls[0]["id"] == "raw-call-1"
     assert messages[2].tool_call_id == "raw-call-1"
 
 
-def test_snowflake_cortex_payload_does_not_mutate_the_parent_payload(monkeypatch) -> None:
+def test_snowflake_cortex_payload_does_not_mutate_the_parent_payload(
+    monkeypatch,
+) -> None:
     """Verify ID normalization leaves the retained parent payload unchanged."""
     parent_payload = {
         "model": "llama3.3-70b",
@@ -1123,7 +1167,9 @@ def test_snowflake_cortex_payload_does_not_mutate_the_parent_payload(monkeypatch
     payload = _cortex_model()._get_request_payload([])
 
     assert payload is not parent_payload
-    assert payload["messages"][0]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert (
+        payload["messages"][0]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    )
     assert payload["messages"][1]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
     assert parent_payload["messages"][0]["tool_calls"][0]["id"] == "raw-call-1"
     assert parent_payload["messages"][1]["tool_call_id"] == "raw-call-1"
@@ -1213,7 +1259,9 @@ def test_snowflake_cortex_payload_keeps_already_canonical_ids() -> None:
     assert payload["messages"][2]["tool_call_id"] == canonical_id
 
 
-def test_snowflake_cortex_payload_allows_raw_ids_to_be_reused_after_a_completed_batch() -> None:
+def test_snowflake_cortex_payload_allows_raw_ids_to_be_reused_after_a_completed_batch() -> (
+    None
+):
     """Verify a completed batch does not reserve raw IDs for later assistant turns."""
     messages = [
         *_cortex_messages(
@@ -1231,7 +1279,9 @@ def test_snowflake_cortex_payload_allows_raw_ids_to_be_reused_after_a_completed_
 
     payload = _cortex_model()._get_request_payload(messages)
 
-    assert payload["messages"][5]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    assert (
+        payload["messages"][5]["tool_calls"][0]["id"] == "call_0d10c795ab49e92cef4fbfa5"
+    )
     assert payload["messages"][6]["tool_call_id"] == "call_0d10c795ab49e92cef4fbfa5"
 
 
@@ -1332,13 +1382,7 @@ def write_skill(
     skill_path = root / directory / "SKILL.md"
     skill_path.parent.mkdir(parents=True, exist_ok=True)
     skill_path.write_text(
-        (
-            "---\n"
-            f"name: {name}\n"
-            f"description: {description}\n"
-            "---\n\n"
-            f"# {name}\n"
-        ),
+        (f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
         encoding="utf-8",
     )
 
@@ -1363,14 +1407,20 @@ def test_virtual_workspace_path_to_local_leaves_unknown_paths_unchanged(
     Args:
         tmp_path: Path to the tmp.
     """
-    assert virtual_workspace_path_to_local(
-        "/memories/skills/reviewer/SKILL.md",
-        tmp_path,
-    ) == "/memories/skills/reviewer/SKILL.md"
-    assert virtual_workspace_path_to_local(
-        "/workspace/../outside/SKILL.md",
-        tmp_path,
-    ) == "/workspace/../outside/SKILL.md"
+    assert (
+        virtual_workspace_path_to_local(
+            "/memories/skills/reviewer/SKILL.md",
+            tmp_path,
+        )
+        == "/memories/skills/reviewer/SKILL.md"
+    )
+    assert (
+        virtual_workspace_path_to_local(
+            "/workspace/../outside/SKILL.md",
+            tmp_path,
+        )
+        == "/workspace/../outside/SKILL.md"
+    )
 
 
 def test_runtime_config_reports_rag_error_for_openai_auto_embeddings(
@@ -2322,7 +2372,9 @@ disable_streaming = "tool_calling"
 
     assert isinstance(model, ChatOpenAI)
     assert model.model_name == "tool-model"
-    assert str(model.openai_api_base).rstrip("/") == "https://openai-compatible.example/v1"
+    assert (
+        str(model.openai_api_base).rstrip("/") == "https://openai-compatible.example/v1"
+    )
     assert model.openai_api_key.get_secret_value() == "profile-key"
     assert model.temperature == 0.1
     assert model.disable_streaming == "tool_calling"
@@ -2400,7 +2452,8 @@ def test_shutdown_langfuse_client_skips_disabled_config(
     monkeypatch.setitem(sys.modules, "langfuse", None)
 
     assert (
-        deepagent_runtime.shutdown_langfuse_client(make_runtime_config(tmp_path)) is False
+        deepagent_runtime.shutdown_langfuse_client(make_runtime_config(tmp_path))
+        is False
     )
 
 
@@ -3289,7 +3342,7 @@ tool_failure_mode = "unrecovered"
             "agent.reflection.memory_file",
         ),
         (
-            '[agent.reflection]\nenabled = true\nmax_lesson_chars = 0',
+            "[agent.reflection]\nenabled = true\nmax_lesson_chars = 0",
             "agent.reflection.max_lesson_chars",
         ),
         (
@@ -3307,7 +3360,7 @@ def test_runtime_config_rejects_invalid_reflection_config(
     """Verify invalid reflection config fails clearly."""
     config_path = tmp_path / "deepagent.toml"
     if agent_config.startswith("[agent.reflection]"):
-        toml = f"[agent]\nstate = \"stateful\"\n\n{agent_config}"
+        toml = f'[agent]\nstate = "stateful"\n\n{agent_config}'
     else:
         toml = f"[agent]\n{agent_config}"
     config_path.write_text(toml, encoding="utf-8")
@@ -3433,7 +3486,9 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
 
     backend = deepagent_runtime.build_deepagent_backend()
     artifacts_root = deepagent_artifacts_root()
-    offloaded_path = f"{deepagent_artifacts_route_prefix()}large_tool_results/tool-call-1"
+    offloaded_path = (
+        f"{deepagent_artifacts_route_prefix()}large_tool_results/tool-call-1"
+    )
 
     assert artifacts_root == tmp_path / ".files" / "deepagent"
     assert offloaded_path.startswith(f"{tmp_path.as_posix()}/.files/deepagent/")
@@ -3452,6 +3507,161 @@ def test_build_deepagent_backend_stores_large_tool_results_inside_project(
     assert read_result.error is None
     assert read_result.file_data is not None
     assert read_result.file_data["content"] == "tool output"
+
+
+def test_artifact_backend_tracks_real_offloads_and_paged_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real large result must remain pageable until its session closes."""
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
+
+    async def exercise() -> None:
+        registry = runtime_lifecycle.runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = deepagent_runtime.build_deepagent_backend(
+            project_root=tmp_path,
+            artifact_registry=registry,
+        )
+        middleware = FilesystemMiddleware(
+            backend=backend,
+            tool_token_limit_before_evict=100,
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+        request = ToolCallRequest(
+            tool_call={
+                "id": "batch-call",
+                "name": "run_subagent_batch",
+                "args": {},
+                "type": "tool_call",
+            },
+            tool=SimpleNamespace(name="run_subagent_batch"),
+            state={},
+            runtime=runtime,
+        )
+        report = "\n".join(f"line {index}" for index in range(1, 201))
+
+        async def handler(_request: ToolCallRequest) -> ToolMessage:
+            return ToolMessage(
+                content=report,
+                name=str(_request.tool_call["name"]),
+                tool_call_id=str(_request.tool_call["id"]),
+                status="success",
+            )
+
+        handle = registry.open_session("session-a")
+        token = registry.activate(handle)
+        try:
+            result = await middleware.awrap_tool_call(request, handler)
+        finally:
+            registry.reset(token)
+        path = f"{deepagent_artifacts_route_prefix()}large_tool_results/batch-call"
+
+        assert isinstance(result, ToolMessage)
+        assert path in str(result.content)
+        assert "line 1" in str(result.content)
+        assert "line 200" in str(result.content)
+        read_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+        token = registry.activate(handle)
+        try:
+            first_page = await read_tool.coroutine(path, runtime, 0, 2)
+            second_page = await read_tool.coroutine(path, runtime, 2, 2)
+        finally:
+            registry.reset(token)
+        assert "line 1" in str(first_page.content)
+        assert "line 2" in str(first_page.content)
+        assert "line 3" not in str(first_page.content)
+        assert "line 3" in str(second_page.content)
+        assert "line 4" in str(second_page.content)
+
+        await registry.close_session("session-a")
+
+        assert not list((tmp_path / ".files" / "deepagent").rglob("batch-call"))
+
+        unscoped_runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {}},
+            stream_writer=lambda _: None,
+            tool_call_id="unscoped-call",
+            store=None,
+        )
+        unscoped_request = ToolCallRequest(
+            tool_call={
+                "id": "unscoped-call",
+                "name": "repo_tool",
+                "args": {},
+                "type": "tool_call",
+            },
+            tool=SimpleNamespace(name="repo_tool"),
+            state={},
+            runtime=unscoped_runtime,
+        )
+        unscoped_result = await middleware.awrap_tool_call(
+            unscoped_request,
+            handler,
+        )
+        unscoped_path = (
+            f"{deepagent_artifacts_route_prefix()}large_tool_results/unscoped-call"
+        )
+        assert unscoped_path in str(unscoped_result.content)
+        assert backend.read(unscoped_path).error is None
+
+        await registry.close()
+
+        assert backend.read(unscoped_path).error is not None
+
+    asyncio.run(exercise())
+
+
+def test_artifact_backend_namespaces_identical_tool_ids_by_session(
+    tmp_path: Path,
+) -> None:
+    """Closing one owner cannot remove another owner's same-ID result."""
+    registry = runtime_lifecycle.runtime_artifacts.LargeToolResultArtifactRegistry()
+    backend = deepagent_runtime.build_deepagent_backend(
+        project_root=tmp_path,
+        artifact_registry=registry,
+    )
+    path = f"{deepagent_artifacts_route_prefix(tmp_path)}large_tool_results/same"
+    first = registry.open_session("first")
+    second = registry.open_session("second")
+
+    first_token = registry.activate(first)
+    assert backend.write(path, "first").error is None
+    registry.reset(first_token)
+    second_token = registry.activate(second)
+    assert backend.write(path, "second").error is None
+    registry.reset(second_token)
+
+    asyncio.run(registry.close_session("first"))
+
+    second_token = registry.activate(second)
+    result = backend.read(path)
+    registry.reset(second_token)
+    assert result.file_data is not None
+    assert result.file_data["content"] == "second"
+    asyncio.run(registry.close())
+
+
+def test_build_agent_middleware_keeps_standard_filesystem_identity(
+    tmp_path: Path,
+) -> None:
+    """Tracking in the backend must not duplicate DeepAgents middleware."""
+    backend = deepagent_runtime.build_deepagent_backend(project_root=tmp_path)
+    middleware = runtime_middleware.build_agent_middleware(
+        backend=backend,
+        project_root=tmp_path,
+    )
+
+    filesystem = [item for item in middleware if isinstance(item, FilesystemMiddleware)]
+    assert len(filesystem) == 1
 
 
 def test_build_deepagent_backend_routes_generated_outputs_separately(
@@ -3534,7 +3744,9 @@ def test_tool_execution_resilience_middleware_returns_error_tool_message() -> No
     assert "without aborting the run" in str(result.content)
 
 
-def test_tool_execution_middleware_maps_workspace_path_tool_args(tmp_path: Path) -> None:
+def test_tool_execution_middleware_maps_workspace_path_tool_args(
+    tmp_path: Path,
+) -> None:
     """Verify that tool execution middleware maps workspace path tool args.
 
     Args:
@@ -3764,7 +3976,9 @@ def test_get_agent_includes_rag_tool_when_ready(
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" in tool_names
     middleware = captured["kwargs"]["middleware"]
-    assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+    assert any(
+        isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware
+    )
 
 
 def test_get_agent_passes_deepagents_backend_instance(
@@ -3828,7 +4042,11 @@ def test_deepagents_middleware_restores_todos_and_controls_high_risk_tools(
         execute_tool_enabled=execute_tool_enabled,
     )
     config = make_runtime_config(tmp_path, extensions=extensions)
-    backend = build_deepagent_backend(project_root=tmp_path)
+    registry = runtime_lifecycle.runtime_artifacts.LargeToolResultArtifactRegistry()
+    backend = build_deepagent_backend(
+        project_root=tmp_path,
+        artifact_registry=registry,
+    )
 
     middleware = deepagent_runtime.build_agent_middleware(
         config=config,
@@ -4074,7 +4292,9 @@ def test_get_agent_leaves_summarization_middleware_to_deepagents_when_enabled(
     asyncio.run(runtime.get_agent("medium", thread_id="thread-1"))
 
     middleware = captured["kwargs"]["middleware"]
-    assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+    assert any(
+        isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware
+    )
     assert any(isinstance(item, TodoListMiddleware) for item in middleware)
     assert not any(
         isinstance(item, deepagent_runtime.SummarizationStatusMiddleware)
@@ -4155,7 +4375,9 @@ def test_get_agent_applies_configured_deepagents_summarization_thresholds(
             """Return the public summarization middleware name."""
             return "SummarizationMiddleware"
 
-        def __init__(self, model, *, backend, trigger=None, keep=None, **kwargs) -> None:
+        def __init__(
+            self, model, *, backend, trigger=None, keep=None, **kwargs
+        ) -> None:
             """Initialize the fake summarization middleware instance."""
             created_summarizers.append(
                 {
@@ -4234,7 +4456,11 @@ def test_get_agent_builds_compiled_subagents_for_nested_sync_subagents(
                 mcp_servers={
                     "manager-mcp": {"transport": "stdio", "command": "npx", "args": []},
                     "private-mcp": {"transport": "stdio", "command": "npx", "args": []},
-                    "reviewer-mcp": {"transport": "stdio", "command": "npx", "args": []},
+                    "reviewer-mcp": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": [],
+                    },
                 },
                 subagents=(
                     SubagentConfig(
@@ -4316,6 +4542,16 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
 ) -> None:
     """Removing per-agent compilation would leak a parent's child registry."""
     created_graphs: list[SimpleNamespace] = []
+    recorded_stores: list[
+        runtime_background_tasks.BatchResultOutputStore | None
+    ] = []
+    create_background_task_tools = (
+        runtime_background_tasks.create_background_task_tools
+    )
+
+    def record_background_task_tools(**kwargs):
+        recorded_stores.append(kwargs.get("batch_output_store"))
+        return create_background_task_tools(**kwargs)
 
     def fake_create_deep_agent(**kwargs):
         graph = SimpleNamespace(kwargs=kwargs)
@@ -4323,6 +4559,11 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
         return graph
 
     monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        runtime_background_tasks,
+        "create_background_task_tools",
+        record_background_task_tools,
+    )
     monkeypatch.setattr(
         runtime_models,
         "build_model",
@@ -4362,12 +4603,23 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
 
     assert len(created_graphs) == 3
     reviewer_graph, manager_graph, main_graph = created_graphs
+    assert len(recorded_stores) == 2
+    assert all(store is not None for store in recorded_stores)
+    assert all(
+        store.backend_prefix == generated_outputs_route_prefix(tmp_path)
+        for store in recorded_stores
+        if store is not None
+    )
+    assert all(
+        store.backend is main_graph.kwargs["backend"]
+        for store in recorded_stores
+        if store is not None
+    )
     assert main_graph.kwargs["subagents"][0]["runnable"].runnable is manager_graph
     assert manager_graph.kwargs["subagents"][0]["runnable"] is reviewer_graph
     assert all(graph.kwargs["store"] is runtime.store for graph in created_graphs)
     assert all(
-        graph.kwargs["checkpointer"] is runtime.checkpointer
-        for graph in created_graphs
+        graph.kwargs["checkpointer"] is runtime.checkpointer for graph in created_graphs
     )
     background_names = {
         "spawn_background_task",
@@ -4447,6 +4699,16 @@ def test_create_configured_graph_builds_local_background_subagents(
 ) -> None:
     """Static Agent Server graphs must expose the same local task tools."""
     created_graphs: list[SimpleNamespace] = []
+    recorded_stores: list[
+        runtime_background_tasks.BatchResultOutputStore | None
+    ] = []
+    create_background_task_tools = (
+        runtime_background_tasks.create_background_task_tools
+    )
+
+    def record_background_task_tools(**kwargs):
+        recorded_stores.append(kwargs.get("batch_output_store"))
+        return create_background_task_tools(**kwargs)
 
     def fake_create_deep_agent(**kwargs):
         graph = SimpleNamespace(kwargs=kwargs)
@@ -4473,8 +4735,16 @@ def test_create_configured_graph_builds_local_background_subagents(
             ),
         ),
     )
-    monkeypatch.setattr(runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config))
+    monkeypatch.setattr(
+        runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config)
+    )
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        runtime_background_tasks,
+        "create_background_task_tools",
+        record_background_task_tools,
+    )
     monkeypatch.setattr(runtime_models, "build_model", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         runtime_backends,
@@ -4487,6 +4757,12 @@ def test_create_configured_graph_builds_local_background_subagents(
     assert graph.runnable is created_graphs[-1]
     assert len(created_graphs) == 2
     child_graph, main_graph = created_graphs
+    assert len(recorded_stores) == 1
+    assert recorded_stores[0] is not None
+    assert recorded_stores[0].backend is main_graph.kwargs["backend"]
+    assert recorded_stores[0].backend_prefix == generated_outputs_route_prefix(
+        tmp_path
+    )
     assert main_graph.kwargs["subagents"][0]["runnable"] is child_graph
     assert "runnable" not in main_graph.kwargs["subagents"][1]
     assert child_graph.kwargs["subagents"] == []
@@ -4497,12 +4773,8 @@ def test_create_configured_graph_builds_local_background_subagents(
         )
         for item in child_graph.kwargs["middleware"]
     )
-    assert "spawn_background_task" in {
-        tool.name for tool in main_graph.kwargs["tools"]
-    }
-    assert "run_subagent_batch" in {
-        tool.name for tool in main_graph.kwargs["tools"]
-    }
+    assert "spawn_background_task" in {tool.name for tool in main_graph.kwargs["tools"]}
+    assert "run_subagent_batch" in {tool.name for tool in main_graph.kwargs["tools"]}
 
     spawn_tool = next(
         tool
@@ -4521,13 +4793,54 @@ def test_create_configured_graph_builds_local_background_subagents(
         ValueError,
         match="Allowed subagents for background work: researcher",
     ):
-        asyncio.run(
-            spawn_tool.coroutine("work", "foreground-only", runtime)
-        )
+        asyncio.run(spawn_tool.coroutine("work", "foreground-only", runtime))
 
     deepagent_runtime.create_configured_graph(include_async_subagents=False)
     assert len(runtime_graph.static_background_task_managers()) == 1
+    static_manager = runtime_graph.static_background_task_managers()[0]
+    assert (
+        static_manager.artifact_registry
+        is runtime_graph._STATIC_LARGE_TOOL_RESULT_ARTIFACTS
+    )
 
+    asyncio.run(runtime_graph.close_static_background_tasks())
+
+
+def test_create_configured_graph_scopes_artifacts_without_background_subagents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every exported graph run must reopen artifact ownership by thread ID."""
+    created_graph = SimpleNamespace()
+    config = make_runtime_config(
+        tmp_path,
+        extensions=ExtensionsConfig(config_path=None),
+    )
+    monkeypatch.setattr(
+        runtime_config.RuntimeConfig,
+        "from_env",
+        staticmethod(lambda: config),
+    )
+    monkeypatch.setattr(
+        runtime_middleware,
+        "create_deep_agent",
+        lambda **kwargs: created_graph,
+    )
+    monkeypatch.setattr(
+        runtime_models,
+        "build_model",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        runtime_backends,
+        "build_deepagent_backend",
+        lambda **kwargs: SimpleNamespace(),
+    )
+
+    graph = deepagent_runtime.create_configured_graph(include_async_subagents=False)
+
+    assert graph.runnable is created_graph
+    assert len(runtime_graph.static_background_task_managers()) == 1
     asyncio.run(runtime_graph.close_static_background_tasks())
 
 
@@ -4537,6 +4850,16 @@ def test_create_configured_graph_scopes_nested_only_background_subagents(
 ) -> None:
     """Nested-only background targets still require main-run invalidation."""
     created_graphs: list[SimpleNamespace] = []
+    recorded_stores: list[
+        runtime_background_tasks.BatchResultOutputStore | None
+    ] = []
+    create_background_task_tools = (
+        runtime_background_tasks.create_background_task_tools
+    )
+
+    def record_background_task_tools(**kwargs):
+        recorded_stores.append(kwargs.get("batch_output_store"))
+        return create_background_task_tools(**kwargs)
 
     def fake_create_deep_agent(**kwargs):
         graph = SimpleNamespace(kwargs=kwargs)
@@ -4565,8 +4888,16 @@ def test_create_configured_graph_scopes_nested_only_background_subagents(
             ),
         ),
     )
-    monkeypatch.setattr(runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config))
+    monkeypatch.setattr(
+        runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config)
+    )
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        runtime_background_tasks,
+        "create_background_task_tools",
+        record_background_task_tools,
+    )
     monkeypatch.setattr(runtime_models, "build_model", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         runtime_backends,
@@ -4574,19 +4905,22 @@ def test_create_configured_graph_scopes_nested_only_background_subagents(
         lambda **kwargs: SimpleNamespace(),
     )
 
-    graph = deepagent_runtime.create_configured_graph(
-        include_async_subagents=False
-    )
+    graph = deepagent_runtime.create_configured_graph(include_async_subagents=False)
 
     assert graph.runnable is created_graphs[-1]
     assert len(created_graphs) == 3
     manager_graph = created_graphs[1]
+    main_graph = created_graphs[2]
+    assert len(recorded_stores) == 1
+    assert recorded_stores[0] is not None
+    assert recorded_stores[0].backend is main_graph.kwargs["backend"]
+    assert recorded_stores[0].backend_prefix == generated_outputs_route_prefix(
+        tmp_path
+    )
     assert "spawn_background_task" in {
         tool.name for tool in manager_graph.kwargs["tools"]
     }
-    assert "run_subagent_batch" in {
-        tool.name for tool in manager_graph.kwargs["tools"]
-    }
+    assert "run_subagent_batch" in {tool.name for tool in manager_graph.kwargs["tools"]}
 
     asyncio.run(runtime_graph.close_static_background_tasks())
 
@@ -4681,7 +5015,9 @@ def test_get_agent_uses_subagent_model_profile_for_model_and_tools(
     subagent_spec = captured["kwargs"]["subagents"][0]
     assert isinstance(subagent_spec["model"], ChatAnthropic)
     assert subagent_spec["model"].model == "claude-sonnet-4-6"
-    assert subagent_spec["model"].anthropic_api_key.get_secret_value() == "anthropic-key"
+    assert (
+        subagent_spec["model"].anthropic_api_key.get_secret_value() == "anthropic-key"
+    )
     assert subagent_spec["model"].effort == "high"
     assert len(subagent_spec["tools"]) == 1
     anthropic_tool = convert_to_anthropic_tool(subagent_spec["tools"][0])
@@ -4967,7 +5303,9 @@ def test_get_agent_inherits_selected_profile_for_model_less_compiled_subagent(
         created_graphs.append(graph)
         return graph
 
-    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+    def fake_build_model(
+        config, reasoning_level, *, model_name=None, model_profile=None
+    ):
         """Capture the effective model and reasoning level."""
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
@@ -5043,7 +5381,9 @@ def test_get_agent_uses_selected_profile_reasoning_effort(
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+    def fake_build_model(
+        config, reasoning_level, *, model_name=None, model_profile=None
+    ):
         """Capture the effective model and reasoning level."""
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
@@ -5078,7 +5418,9 @@ def test_get_agent_uses_selected_profile_reasoning_effort(
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
 
-    asyncio.run(runtime.get_agent("medium", model_name="fast-local", thread_id="thread-1"))
+    asyncio.run(
+        runtime.get_agent("medium", model_name="fast-local", thread_id="thread-1")
+    )
 
     assert captured["kwargs"]["model"] == "model:fast-model:low"
 
@@ -5112,7 +5454,9 @@ model = "fast"
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+    def fake_build_model(
+        config, reasoning_level, *, model_name=None, model_profile=None
+    ):
         """Capture the effective model and reasoning level."""
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
@@ -5145,7 +5489,9 @@ def test_get_agent_explicit_default_reasoning_overrides_profile_default(
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+    def fake_build_model(
+        config, reasoning_level, *, model_name=None, model_profile=None
+    ):
         """Capture the effective model and reasoning level."""
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
@@ -5205,7 +5551,9 @@ def test_get_agent_cache_distinguishes_reasoning_explicitness_for_subagents(
         created_graphs.append(graph)
         return graph
 
-    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+    def fake_build_model(
+        config, reasoning_level, *, model_name=None, model_profile=None
+    ):
         """Capture the effective model and reasoning level."""
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
@@ -5269,7 +5617,9 @@ def test_get_agent_cache_distinguishes_reasoning_explicitness_for_subagents(
 
     assert len(created_graphs) == 2
     assert created_graphs[0].kwargs["subagents"][0]["model"] == "model:review-model:low"
-    assert created_graphs[1].kwargs["subagents"][0]["model"] == "model:review-model:high"
+    assert (
+        created_graphs[1].kwargs["subagents"][0]["model"] == "model:review-model:high"
+    )
 
 
 def test_create_configured_graph_uses_agent_profile_reasoning_effort(
@@ -5305,7 +5655,9 @@ def test_create_configured_graph_uses_agent_profile_reasoning_effort(
         captured["kwargs"] = kwargs
         return SimpleNamespace(kwargs=kwargs)
 
-    def fake_build_model(config, reasoning_level, *, model_name=None, model_profile=None):
+    def fake_build_model(
+        config, reasoning_level, *, model_name=None, model_profile=None
+    ):
         """Capture the effective model and reasoning level."""
         selected_name = model_profile.name if model_profile is not None else model_name
         return f"model:{selected_name}:{reasoning_level}"
@@ -5575,7 +5927,9 @@ def test_get_agent_omits_rag_tool_when_service_is_missing(
     tool_names = [tool.name for tool in captured["tools"]]
     assert "search_workspace_knowledge" not in tool_names
     middleware = captured["kwargs"]["middleware"]
-    assert any(isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware)
+    assert any(
+        isinstance(item, ToolExecutionResilienceMiddleware) for item in middleware
+    )
 
 
 def test_get_agent_includes_render_chainlit_ui_tool_by_default(
@@ -5843,7 +6197,11 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
     monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
-    monkeypatch.setattr(runtime_middleware, "create_deep_agent_with_configured_summarization", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        runtime_middleware,
+        "create_deep_agent_with_configured_summarization",
+        lambda *args, **kwargs: object(),
+    )
 
     async def exercise_runtime():
         """Exercise runtime agent loading for a Chainlit session.
@@ -5866,17 +6224,28 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
             thread_id="thread-1",
             mcp_session_id="session-2",
         )
-        first = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-1")
-        other = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-2")
+        first = await runtime.get_agent(
+            "medium", thread_id="thread-1", mcp_session_id="session-1"
+        )
+        other = await runtime.get_agent(
+            "medium", thread_id="thread-1", mcp_session_id="session-2"
+        )
         await runtime.close_mcp_session("session-1")
         assert len(closed_sessions) == 1
         assert ("session-1", "repo") not in runtime._mcp_sessions
         assert ("session-1", ("repo",)) not in runtime._mcp_tools_cache
         assert first not in runtime._agents.values()
         assert other in runtime._agents.values()
-        reopened = await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-1")
+        reopened = await runtime.get_agent(
+            "medium", thread_id="thread-1", mcp_session_id="session-1"
+        )
         assert reopened is not first
-        assert await runtime.get_agent("medium", thread_id="thread-1", mcp_session_id="session-2") is other
+        assert (
+            await runtime.get_agent(
+                "medium", thread_id="thread-1", mcp_session_id="session-2"
+            )
+            is other
+        )
         await runtime.close_mcp_session("session-2")
         await runtime.close_mcp_session("session-1")
         return session_1_tools_first, session_1_tools_second, session_2_tools
@@ -5903,6 +6272,7 @@ def test_rebuild_rag_index_clears_cached_agents(
     Args:
         tmp_path: Path to the tmp.
     """
+
     class RebuildableRAG:
         """Represent rebuildable r a g."""
 
@@ -5931,7 +6301,11 @@ def test_rebuild_rag_index_clears_cached_agents(
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
     monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
-    monkeypatch.setattr(runtime_middleware, "create_deep_agent_with_configured_summarization", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        runtime_middleware,
+        "create_deep_agent_with_configured_summarization",
+        lambda *args, **kwargs: object(),
+    )
 
     async def exercise():
         await runtime.get_agent("medium", thread_id="thread-1")
@@ -5950,10 +6324,13 @@ def test_ingest_rag_uploads_delegates_to_rag_service(tmp_path: Path) -> None:
     Args:
         tmp_path: Path to the tmp.
     """
+
     class UploadableRAG:
         """Represent uploadable r a g."""
 
-        def ingest_uploaded_files(self, *, thread_id: str, uploads: list[UploadedRagFile]) -> RagUploadResult:
+        def ingest_uploaded_files(
+            self, *, thread_id: str, uploads: list[UploadedRagFile]
+        ) -> RagUploadResult:
             """Ingest uploaded files.
 
             Args:
@@ -6215,6 +6592,7 @@ stream_activity = true
 max_running_per_session = 3
 max_running_total = 7
 max_tasks_per_session = 21
+batch_result_format = "markdown_files"
 """.strip(),
         encoding="utf-8",
     )
@@ -6227,7 +6605,65 @@ max_tasks_per_session = 21
     assert background.max_running_per_session == 3
     assert background.max_running_total == 7
     assert background.max_tasks_per_session == 21
+    assert background.batch_result_format == "markdown_files"
     assert deepagent_runtime.load_extensions_config().enabled is True
+
+
+@pytest.mark.parametrize("value", ["json", "markdown", "markdown_files"])
+def test_load_extensions_config_parses_batch_result_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        "[agent.background_subagents]\n"
+        "enabled = true\n"
+        f'batch_result_format = "{value}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    background = deepagent_runtime.load_extensions_config().background_subagents
+
+    assert background.batch_result_format == value
+
+
+def test_load_extensions_config_defaults_batch_result_format_to_markdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text("[agent.background_subagents]\n", encoding="utf-8")
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    background = deepagent_runtime.load_extensions_config().background_subagents
+
+    assert background.batch_result_format == "markdown"
+
+
+@pytest.mark.parametrize("toml_value", ['""', '"yaml"', "42", "true"])
+def test_load_extensions_config_rejects_invalid_batch_result_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    toml_value: str,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        "[agent.background_subagents]\n"
+        f"batch_result_format = {toml_value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"agent\.background_subagents\.batch_result_format"
+            r".*json.*markdown.*markdown_files"
+        ),
+    ):
+        deepagent_runtime.load_extensions_config()
 
 
 @pytest.mark.parametrize(
@@ -7022,6 +7458,7 @@ def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:
     Args:
         tmp_path: Path to the tmp.
     """
+
     class FakeTool:
         """Represent fake tool.
 
@@ -7047,7 +7484,9 @@ def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:
             tmp_path,
             extensions=ExtensionsConfig(
                 config_path=None,
-                mcp_servers={"repo": {"transport": "stdio", "command": "npx", "args": []}},
+                mcp_servers={
+                    "repo": {"transport": "stdio", "command": "npx", "args": []}
+                },
             ),
         )
     )

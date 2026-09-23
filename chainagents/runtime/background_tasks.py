@@ -7,6 +7,7 @@ import builtins
 import contextvars
 import dataclasses
 import json
+import re
 import time
 import uuid
 import weakref
@@ -28,10 +29,16 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field
 
+from deepagents.backends import BackendProtocol
+
 from chainagents.events.stream import (
     AgentStreamEvent,
     AgentStreamEventAdapter,
     langgraph_part_from_event_chunk,
+)
+from chainagents.runtime.artifacts import (
+    ArtifactSessionHandle,
+    LargeToolResultArtifactRegistry,
 )
 from chainagents.runtime.types import BackgroundSubagentConfig
 
@@ -67,9 +74,12 @@ class BackgroundSessionGeneration:
         self.session_id = session_id
         self.active = True
 
-_CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "chainagents_background_task_id",
-    default=None,
+
+_CURRENT_BACKGROUND_TASK_ID: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar(
+        "chainagents_background_task_id",
+        default=None,
+    )
 )
 _CURRENT_BACKGROUND_SESSION_ID: contextvars.ContextVar[str | None] = (
     contextvars.ContextVar(
@@ -94,6 +104,11 @@ _CURRENT_BACKGROUND_SESSION_GENERATION: contextvars.ContextVar[
 def current_background_task_id() -> str | None:
     """Return the task ID of the currently executing background subagent."""
     return _CURRENT_BACKGROUND_TASK_ID.get()
+
+
+def current_background_session_id() -> str | None:
+    """Return the conversation that owns the current background invocation."""
+    return _CURRENT_BACKGROUND_SESSION_ID.get()
 
 
 def current_background_invocation_path() -> tuple[str, ...]:
@@ -192,9 +207,15 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         self,
         runnable: object,
         manager: "BackgroundTaskManager",
+        on_session_open: Callable[[str], None] | None = None,
+        artifact_registry: LargeToolResultArtifactRegistry | None = None,
+        fixed_session_id: str | None = None,
     ) -> None:
         self.runnable = runnable
         self.manager = manager
+        self.on_session_open = on_session_open
+        self.artifact_registry = artifact_registry
+        self.fixed_session_id = fixed_session_id
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.runnable, name)
@@ -223,19 +244,45 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
     def _set_generation(
         self,
         config: RunnableConfig | None,
-    ) -> contextvars.Token[BackgroundSessionGeneration | None] | None:
+    ) -> tuple[
+        contextvars.Token[BackgroundSessionGeneration | None] | None,
+        contextvars.Token[ArtifactSessionHandle | None] | None,
+    ]:
         configurable = (config or {}).get("configurable", {})
-        session_id = str(configurable.get("thread_id") or "").strip()
+        session_id = str(
+            self.fixed_session_id or configurable.get("thread_id") or ""
+        ).strip()
         if not session_id:
-            return None
-        return _CURRENT_BACKGROUND_SESSION_GENERATION.set(
-            self.manager.session_generation(session_id)
+            return None, None
+        generation = self._session_generation(session_id)
+        artifact_token = None
+        if self.artifact_registry is not None:
+            handle = self.artifact_registry.open_session(session_id)
+            artifact_token = self.artifact_registry.activate(handle)
+        return (
+            _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation),
+            artifact_token,
         )
+
+    def _session_generation(
+        self,
+        session_id: str,
+    ) -> BackgroundSessionGeneration:
+        if self.on_session_open is not None:
+            self.on_session_open(session_id)
+        return self.manager.session_generation(session_id)
 
     @staticmethod
     def _reset_generation(
-        token: contextvars.Token[BackgroundSessionGeneration | None] | None,
+        tokens: tuple[
+            contextvars.Token[BackgroundSessionGeneration | None] | None,
+            contextvars.Token[ArtifactSessionHandle | None] | None,
+        ],
+        artifact_registry: LargeToolResultArtifactRegistry | None,
     ) -> None:
+        token, artifact_token = tokens
+        if artifact_token is not None and artifact_registry is not None:
+            artifact_registry.reset(artifact_token)
         if token is not None:
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
@@ -249,7 +296,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         try:
             return self.runnable.invoke(input, config, **kwargs)  # type: ignore[attr-defined]
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     async def ainvoke(
         self,
@@ -265,7 +312,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                 **kwargs,
             )
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     def stream(
         self,
@@ -281,7 +328,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                 **kwargs,
             )
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     async def astream(
         self,
@@ -298,7 +345,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
             ):
                 yield chunk
         finally:
-            self._reset_generation(token)
+            self._reset_generation(token, self.artifact_registry)
 
     @overload
     def astream_events(
@@ -341,10 +388,13 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         **kwargs: Any,
     ) -> AsyncIterator[Any] | Awaitable[Any]:
         configurable = (config or {}).get("configurable", {})
-        session_id = str(configurable.get("thread_id") or "").strip()
-        generation = (
-            self.manager.session_generation(session_id)
-            if session_id
+        session_id = str(
+            self.fixed_session_id or configurable.get("thread_id") or ""
+        ).strip()
+        generation = self._session_generation(session_id) if session_id else None
+        artifact_handle = (
+            self.artifact_registry.open_session(session_id)
+            if session_id and self.artifact_registry is not None
             else None
         )
         if version == "v3":
@@ -357,6 +407,12 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
 
             async def await_events() -> Any:
                 token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation)
+                artifact_token = (
+                    self.artifact_registry.activate(artifact_handle)
+                    if artifact_handle is not None
+                    and self.artifact_registry is not None
+                    else None
+                )
                 try:
                     stream = await cast(Awaitable[Any], result)
                     graph_iterator = getattr(stream, "_graph_aiter", None)
@@ -365,10 +421,17 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                             _BackgroundSessionScopedAsyncIterator(
                                 graph_iterator,
                                 generation,
+                                self.artifact_registry,
+                                artifact_handle,
                             )
                         )
                     return stream
                 finally:
+                    if (
+                        artifact_token is not None
+                        and self.artifact_registry is not None
+                    ):
+                        self.artifact_registry.reset(artifact_token)
                     _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
             return await_events()
@@ -388,10 +451,17 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
 
         async def iterate_events() -> AsyncIterator[Any]:
             token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(generation)
+            artifact_token = (
+                self.artifact_registry.activate(artifact_handle)
+                if artifact_handle is not None and self.artifact_registry is not None
+                else None
+            )
             try:
                 async for event in cast(AsyncIterator[Any], result):
                     yield event
             finally:
+                if artifact_token is not None and self.artifact_registry is not None:
+                    self.artifact_registry.reset(artifact_token)
                 _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
         return iterate_events()
@@ -404,18 +474,29 @@ class _BackgroundSessionScopedAsyncIterator:
         self,
         iterator: AsyncIterator[Any],
         generation: BackgroundSessionGeneration | None,
+        artifact_registry: LargeToolResultArtifactRegistry | None = None,
+        artifact_handle: ArtifactSessionHandle | None = None,
     ) -> None:
         self.iterator = iterator
         self.generation = generation
+        self.artifact_registry = artifact_registry
+        self.artifact_handle = artifact_handle
 
     def __aiter__(self) -> "_BackgroundSessionScopedAsyncIterator":
         return self
 
     async def __anext__(self) -> Any:
         token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(self.generation)
+        artifact_token = (
+            self.artifact_registry.activate(self.artifact_handle)
+            if self.artifact_registry is not None and self.artifact_handle is not None
+            else None
+        )
         try:
             return await self.iterator.__anext__()
         finally:
+            if artifact_token is not None and self.artifact_registry is not None:
+                self.artifact_registry.reset(artifact_token)
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
     async def aclose(self) -> None:
@@ -423,18 +504,35 @@ class _BackgroundSessionScopedAsyncIterator:
         if close is None:
             return
         token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(self.generation)
+        artifact_token = (
+            self.artifact_registry.activate(self.artifact_handle)
+            if self.artifact_registry is not None and self.artifact_handle is not None
+            else None
+        )
         try:
             await close()
         finally:
+            if artifact_token is not None and self.artifact_registry is not None:
+                self.artifact_registry.reset(artifact_token)
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(token)
 
 
 def scope_background_session_invocation(
     runnable: object,
     manager: "BackgroundTaskManager",
+    *,
+    on_session_open: Callable[[str], None] | None = None,
+    artifact_registry: LargeToolResultArtifactRegistry | None = None,
+    fixed_session_id: str | None = None,
 ) -> Runnable[Any, Any]:
     """Wrap an exported graph with invocation-scoped session invalidation."""
-    return _BackgroundSessionScopedRunnable(runnable, manager)
+    return _BackgroundSessionScopedRunnable(
+        runnable,
+        manager,
+        on_session_open=on_session_open,
+        artifact_registry=artifact_registry,
+        fixed_session_id=fixed_session_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -514,6 +612,7 @@ class _BackgroundTaskRecord:
     agent_path: tuple[str, ...]
     owner_path: tuple[str, ...]
     session_generation: BackgroundSessionGeneration | None
+    artifact_handle: ArtifactSessionHandle | None
     parent_task_id: str | None
     status: BackgroundTaskStatus
     created_at: float
@@ -550,9 +649,7 @@ BackgroundCleanup = Callable[[str], Awaitable[None]]
 def _session_id_from_runtime(runtime: ToolRuntime) -> str:
     configurable = runtime.config.get("configurable", {})
     session_id = str(
-        _CURRENT_BACKGROUND_SESSION_ID.get()
-        or configurable.get("thread_id")
-        or ""
+        _CURRENT_BACKGROUND_SESSION_ID.get() or configurable.get("thread_id") or ""
     ).strip()
     if not session_id:
         raise ValueError(
@@ -582,6 +679,213 @@ def _result_text(result: object) -> str:
     return ""
 
 
+def _format_batch_markdown_section(
+    snapshot: BackgroundTaskSnapshot,
+    *,
+    title: str,
+    title_level: int,
+    blank_after_title: bool = False,
+) -> str:
+    """Render one self-describing batch result Markdown section."""
+    body_heading = "Error" if snapshot.error else "Report"
+    body = snapshot.error or snapshot.result or "_No report returned._"
+    title_prefix = "#" * title_level
+    body_prefix = "#" * (title_level + 1)
+    title_lines = [f"{title_prefix} {title}"]
+    if blank_after_title:
+        title_lines.append("")
+    return "\n".join(
+        [
+            *title_lines,
+            f"- Task ID: `{snapshot.task_id}`",
+            f"- Status: `{snapshot.status}`",
+            "",
+            f"{body_prefix} Request",
+            snapshot.description,
+            "",
+            f"{body_prefix} {body_heading}",
+            body,
+        ]
+    )
+
+
+def _format_batch_markdown(
+    snapshots: Sequence[BackgroundTaskSnapshot],
+) -> str:
+    """Render terminal batch snapshots as readable, pageable Markdown."""
+    sections = [
+        _format_batch_markdown_section(
+            snapshot,
+            title=f"{index}. {snapshot.agent_name}",
+            title_level=2,
+        )
+        for index, snapshot in enumerate(snapshots, start=1)
+    ]
+    return "# Subagent batch results\n\n" + "\n\n---\n\n".join(sections)
+
+
+def _format_batch_json(
+    snapshots: Sequence[BackgroundTaskSnapshot],
+) -> dict[str, object]:
+    """Restore the original structured batch result payload."""
+    return {
+        "results": [snapshot.to_payload() for snapshot in snapshots],
+    }
+
+
+@dataclass(frozen=True)
+class BatchResultOutputStore:
+    """Backend route and public path mapping for persistent batch reports."""
+
+    backend: BackendProtocol
+    backend_prefix: str
+    public_prefix: str = "/workspace/.files/outputs/"
+
+    def backend_path(self, relative_path: str) -> str:
+        """Return a backend-routed path for an output-relative path."""
+        return f"{self.backend_prefix.rstrip('/')}/{relative_path.lstrip('/')}"
+
+    def public_path(self, relative_path: str) -> str:
+        """Return the virtual workspace path exposed to the user."""
+        return f"{self.public_prefix.rstrip('/')}/{relative_path.lstrip('/')}"
+
+
+def create_batch_result_output_store(
+    backend: BackendProtocol,
+    *,
+    backend_prefix: str,
+) -> BatchResultOutputStore:
+    """Create persistent batch-result storage over an existing agent backend."""
+    return BatchResultOutputStore(
+        backend=backend,
+        backend_prefix=backend_prefix,
+    )
+
+
+def _safe_batch_path_component(value: str, *, fallback: str) -> str:
+    """Normalize an untrusted identifier into one bounded path component."""
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("._-")[:80]
+    normalized = normalized.strip("._-")
+    return normalized or fallback
+
+
+def _batch_file_markdown(snapshot: BackgroundTaskSnapshot) -> str:
+    """Render one standalone batch report file."""
+    return _format_batch_markdown_section(
+        snapshot,
+        title=snapshot.agent_name,
+        title_level=1,
+        blank_after_title=True,
+    )
+
+
+def _is_missing_delete_error(error: str) -> bool:
+    normalized = error.casefold()
+    return any(
+        marker in normalized
+        for marker in ("not found", "does not exist", "no such file")
+    )
+
+
+async def _write_batch_markdown_files(
+    snapshots: Sequence[BackgroundTaskSnapshot],
+    *,
+    tool_call_id: str,
+    store: BatchResultOutputStore,
+) -> dict[str, object]:
+    """Write one persistent Markdown file per snapshot with atomic visibility."""
+    call_component = _safe_batch_path_component(tool_call_id, fallback="batch")
+    directory = f"subagent-batches/{call_component}-{uuid.uuid4().hex}"
+    directory_backend_path = store.backend_path(directory)
+    width = max(2, len(str(len(snapshots))))
+    attempted_paths: list[str] = []
+    manifest: list[dict[str, object]] = []
+
+    async def write_one(backend_path: str, content: str) -> None:
+        attempted_paths.append(backend_path)
+        result = await store.backend.awrite(backend_path, content)
+        if result.error:
+            raise RuntimeError(
+                f"Failed to write batch result '{backend_path}': {result.error}"
+            )
+
+    async def rollback() -> list[BaseException]:
+        errors: list[BaseException] = []
+        for backend_path in [*reversed(attempted_paths), directory_backend_path]:
+            try:
+                result = await store.backend.adelete(backend_path)
+            except BaseException as exc:
+                errors.append(exc)
+                continue
+            if result.error and not _is_missing_delete_error(result.error):
+                errors.append(
+                    RuntimeError(
+                        f"Failed to clean up batch result '{backend_path}': "
+                        f"{result.error}"
+                    )
+                )
+        return errors
+
+    try:
+        for index, snapshot in enumerate(snapshots, start=1):
+            agent_component = _safe_batch_path_component(
+                snapshot.agent_name,
+                fallback="agent",
+            )
+            task_component = _safe_batch_path_component(
+                snapshot.task_id,
+                fallback="task",
+            )
+            relative_path = (
+                f"{directory}/{index:0{width}d}-{agent_component}-"
+                f"{task_component}.md"
+            )
+            backend_path = store.backend_path(relative_path)
+            write_task = asyncio.create_task(
+                write_one(backend_path, _batch_file_markdown(snapshot)),
+                name=f"chainagents-write-batch-result-{index}",
+            )
+            await await_preserving_cancellation(write_task)
+            manifest.append(
+                {
+                    "task_id": snapshot.task_id,
+                    "agent_name": snapshot.agent_name,
+                    "status": snapshot.status,
+                    "path": store.public_path(relative_path),
+                }
+            )
+    except BaseException as primary:
+        cleanup_task = asyncio.create_task(
+            rollback(),
+            name="chainagents-rollback-batch-results",
+        )
+        try:
+            cleanup_errors = await await_preserving_cancellation(cleanup_task)
+        except BaseException as cleanup_interruption:
+            cleanup_errors = []
+            if (
+                isinstance(cleanup_interruption, asyncio.CancelledError)
+                and cleanup_task.done()
+                and not cleanup_task.cancelled()
+            ):
+                cleanup_errors.extend(cleanup_task.result())
+            cleanup_errors.append(cleanup_interruption)
+        if cleanup_errors:
+            grouped = [primary, *cleanup_errors]
+            if any(not isinstance(error, Exception) for error in grouped):
+                raise BaseExceptionGroup(
+                    "Batch result write and cleanup failed.",
+                    grouped,
+                )
+            raise ExceptionGroup(
+                "Batch result write and cleanup failed.",
+                cast(list[Exception], grouped),
+            )
+        raise
+
+    return {"files": manifest}
+
+
 def create_background_task_tools(
     *,
     manager: "BackgroundTaskManager",
@@ -589,6 +893,7 @@ def create_background_task_tools(
     agent_path: tuple[str, ...],
     recursion_limit: int,
     session_generation: BackgroundSessionGeneration | None = None,
+    batch_output_store: BatchResultOutputStore | None = None,
     existing_tools: Iterable[object] = (),
 ) -> list[object]:
     """Create task tools scoped to the direct children of one agent."""
@@ -598,8 +903,7 @@ def create_background_task_tools(
             for tool in existing_tools
             if (
                 name := str(
-                    getattr(tool, "name", None)
-                    or getattr(tool, "__name__", "")
+                    getattr(tool, "name", None) or getattr(tool, "__name__", "")
                 ).strip()
             )
             in BACKGROUND_TASK_TOOL_NAMES
@@ -625,9 +929,7 @@ def create_background_task_tools(
     ) -> _BackgroundTaskSubmission:
         child = subagents.get(subagent_type)
         if child is None:
-            raise ValueError(
-                f"Allowed subagents for background work: {allowed_text}."
-            )
+            raise ValueError(f"Allowed subagents for background work: {allowed_text}.")
         parent_configurable = runtime.config.get("configurable", {})
         shared_checkpointer = parent_configurable.get(_LANGGRAPH_CHECKPOINTER_KEY)
         shared_store = runtime.store
@@ -683,10 +985,9 @@ def create_background_task_tools(
 
         cleanup: BackgroundCleanup | None = None
         if callable(delete_checkpoint_thread):
+
             async def cleanup_child(task_id: str) -> None:
-                await delete_checkpoint_thread(
-                    f"{session_id}:background:{task_id}"
-                )
+                await delete_checkpoint_thread(f"{session_id}:background:{task_id}")
 
             cleanup = cleanup_child
 
@@ -730,7 +1031,7 @@ def create_background_task_tools(
     async def run_subagent_batch(
         tasks: list[BackgroundSubagentBatchRequest],
         runtime: ToolRuntime,
-    ) -> dict[str, object]:
+    ) -> str | dict[str, object]:
         """Run independent child tasks concurrently and return all reports in order."""
         if not tasks:
             raise ValueError("A subagent batch requires at least one task.")
@@ -774,6 +1075,7 @@ def create_background_task_tools(
                 expected_session_generation=generation,
             )
         except asyncio.CancelledError:
+
             async def cancel_batch() -> None:
                 await asyncio.gather(
                     *(
@@ -796,7 +1098,19 @@ def create_background_task_tools(
             )
             await await_preserving_cancellation(cancellation)
             raise
-        return {"results": [snapshot.to_payload() for snapshot in completed]}
+        if manager.config.batch_result_format == "json":
+            return _format_batch_json(completed)
+        if manager.config.batch_result_format == "markdown":
+            return _format_batch_markdown(completed)
+        if batch_output_store is None:
+            raise RuntimeError(
+                "Markdown-file batch results require a generated-output store."
+            )
+        return await _write_batch_markdown_files(
+            completed,
+            tool_call_id=runtime.tool_call_id,
+            store=batch_output_store,
+        )
 
     @tool("list_background_tasks")
     async def list_background_tasks(runtime: ToolRuntime) -> list[dict[str, object]]:
@@ -859,14 +1173,18 @@ def create_background_task_tools(
 class BackgroundTaskManager:
     """Own process-local background subagent jobs for all conversations."""
 
-    def __init__(self, config: BackgroundSubagentConfig) -> None:
+    def __init__(
+        self,
+        config: BackgroundSubagentConfig,
+        *,
+        artifact_registry: LargeToolResultArtifactRegistry | None = None,
+    ) -> None:
         self.config = config
+        self.artifact_registry = artifact_registry
         self._lock = asyncio.Lock()
         self._records: dict[str, _BackgroundTaskRecord] = {}
         self._session_task_ids: dict[str, list[str]] = {}
-        self._subscribers: dict[
-            str, set[asyncio.Queue[BackgroundTaskSnapshot]]
-        ] = {}
+        self._subscribers: dict[str, set[asyncio.Queue[BackgroundTaskSnapshot]]] = {}
         self._activity_subscribers: dict[
             str, set[asyncio.Queue[BackgroundTaskActivity]]
         ] = {}
@@ -877,6 +1195,7 @@ class BackgroundTaskManager:
             str, BackgroundSessionGeneration
         ] = weakref.WeakValueDictionary()
         self._close_task: asyncio.Task[None] | None = None
+        self._terminal_close = False
         self._closed = False
 
     def session_generation(self, session_id: str) -> BackgroundSessionGeneration:
@@ -996,12 +1315,19 @@ class BackgroundTaskManager:
             if parent_task_id is not None:
                 parent = self._records.get(parent_task_id)
                 if parent is None or parent.session_id != normalized_session:
-                    raise ValueError("Background parent task does not exist in this session.")
+                    raise ValueError(
+                        "Background parent task does not exist in this session."
+                    )
                 if parent.cancelling:
                     raise RuntimeError("Background parent task is cancelling.")
 
             retained_ids = self._session_task_ids.setdefault(normalized_session, [])
             records: list[_BackgroundTaskRecord] = []
+            artifact_handle = (
+                self.artifact_registry.open_session(normalized_session)
+                if self.artifact_registry is not None
+                else None
+            )
             for submission in submissions:
                 task_id = f"bg-{uuid.uuid4().hex[:12]}"
                 record = _BackgroundTaskRecord(
@@ -1012,6 +1338,7 @@ class BackgroundTaskManager:
                     agent_path=submission.agent_path,
                     owner_path=owner_path,
                     session_generation=expected_session_generation,
+                    artifact_handle=artifact_handle,
                     parent_task_id=parent_task_id,
                     status="pending",
                     created_at=time.time(),
@@ -1039,6 +1366,12 @@ class BackgroundTaskManager:
         owner_token = _CURRENT_BACKGROUND_INVOCATION_PATH.set(record.owner_path)
         generation_token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(
             record.session_generation
+        )
+        artifact_token = (
+            self.artifact_registry.activate(record.artifact_handle)
+            if self.artifact_registry is not None
+            and record.artifact_handle is not None
+            else None
         )
         try:
             async with self._lock:
@@ -1075,6 +1408,8 @@ class BackgroundTaskManager:
             else:
                 await self._finish(record, status="success", result=str(result))
         finally:
+            if artifact_token is not None and self.artifact_registry is not None:
+                self.artifact_registry.reset(artifact_token)
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(generation_token)
             _CURRENT_BACKGROUND_INVOCATION_PATH.reset(owner_token)
             _CURRENT_BACKGROUND_SESSION_ID.reset(session_token)
@@ -1085,6 +1420,7 @@ class BackgroundTaskManager:
             cleanup = record.cleanup
             cleanup_task = record.cleanup_task
             if cleanup is not None and cleanup_task is None:
+
                 async def run_cleanup() -> None:
                     await cleanup(record.task_id)
 
@@ -1163,9 +1499,7 @@ class BackgroundTaskManager:
             record = self._records.get(task_id)
             if record is None:
                 return
-            subscribers = tuple(
-                self._activity_subscribers.get(record.session_id, ())
-            )
+            subscribers = tuple(self._activity_subscribers.get(record.session_id, ()))
             activity = BackgroundTaskActivity(
                 task_id=record.task_id,
                 session_id=record.session_id,
@@ -1336,7 +1670,9 @@ class BackgroundTaskManager:
                 ancestor_task_id,
             )
         ):
-            raise KeyError(f"Background task '{task_id}' is not visible in this session.")
+            raise KeyError(
+                f"Background task '{task_id}' is not visible in this session."
+            )
         return record
 
     async def cancel(
@@ -1564,6 +1900,7 @@ class BackgroundTaskManager:
     async def close(self) -> None:
         """Cancel all work and prevent future spawns."""
         async with self._lock:
+            self._terminal_close = True
             if self._close_task is None:
                 self._closed = True
                 session_ids = list(self._session_task_ids)
@@ -1573,6 +1910,25 @@ class BackgroundTaskManager:
                 )
             close_task = self._close_task
         await await_preserving_cancellation(close_task)
+
+    async def drain(self) -> None:
+        """Cancel all work and reopen the manager for a later lifespan."""
+        async with self._lock:
+            if self._terminal_close:
+                raise RuntimeError("The background task manager is closed.")
+            if self._close_task is None:
+                self._closed = True
+                session_ids = list(self._session_task_ids)
+                self._close_task = asyncio.create_task(
+                    self._close_all_sessions(session_ids),
+                    name="chainagents-drain-background-tasks",
+                )
+            close_task = self._close_task
+        await await_preserving_cancellation(close_task)
+        async with self._lock:
+            if self._close_task is close_task:
+                self._close_task = None
+                self._closed = False
 
     async def _close_all_sessions(
         self,

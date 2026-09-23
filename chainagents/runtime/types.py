@@ -92,12 +92,21 @@ class SubagentConfig:
         return spec
 
 
+BatchResultFormat = Literal["json", "markdown", "markdown_files"]
+BATCH_RESULT_FORMATS: tuple[BatchResultFormat, ...] = (
+    "json",
+    "markdown",
+    "markdown_files",
+)
+
+
 @dataclass(frozen=True)
 class BackgroundSubagentConfig:
     """Configure process-local background execution for synchronous subagents."""
 
     enabled: bool = False
     stream_activity: bool = False
+    batch_result_format: BatchResultFormat = "markdown"
     max_running_per_session: int = 4
     max_running_total: int = 16
     max_tasks_per_session: int = 100

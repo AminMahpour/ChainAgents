@@ -445,17 +445,16 @@ def build_agent_middleware(
     # sync-subagent stacks. Passing another SummarizationMiddleware here creates
     # duplicate middleware names that LangChain rejects during agent creation.
     middleware: list[AgentMiddleware[Any, Any, Any]] = [TodoListMiddleware()]
-    filesystem_tools = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
+    filesystem_tools: list[Any] = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
     if config is not None:
         if config.extensions.delete_tool_enabled:
             filesystem_tools.append("delete")
         if config.extensions.execute_tool_enabled:
             filesystem_tools.append("execute")
-    middleware.append(
-        FilesystemMiddleware(
-            backend=backend,
-            tools=filesystem_tools,
-        )
+    filesystem_middleware = FilesystemMiddleware(
+        backend=backend,
+        tools=filesystem_tools,
     )
+    middleware.append(filesystem_middleware)
     middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
     return middleware
