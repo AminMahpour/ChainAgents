@@ -442,8 +442,17 @@ def _validate_pdf_image(
 
 def _validate_svg_image(content: bytes) -> PdfImageResource:
     """Accept SVG only when it contains no external resource references."""
-    upper = content.upper()
-    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+    try:
+        if content.startswith((b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")):
+            decoded = content.decode("utf-32")
+        elif content.startswith((b"\xff\xfe", b"\xfe\xff")):
+            decoded = content.decode("utf-16")
+        else:
+            decoded = content.decode("utf-8-sig")
+    except UnicodeError as exc:
+        raise PdfImageError("SVG content is invalid") from exc
+    upper = decoded.upper()
+    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
         raise PdfImageError("SVG declarations are not supported")
     try:
         root = ElementTree.fromstring(content)
@@ -492,22 +501,27 @@ def _svg_has_circular_use(root: ElementTree.Element) -> bool:
                     if target in graph:
                         graph[identifier].add(target)
 
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(identifier: str) -> bool:
-        if identifier in visiting:
-            return True
-        if identifier in visited:
-            return False
-        visiting.add(identifier)
-        if any(visit(target) for target in graph[identifier]):
-            return True
-        visiting.remove(identifier)
-        visited.add(identifier)
-        return False
-
-    return any(visit(identifier) for identifier in graph)
+    state: dict[str, int] = {}
+    for start in graph:
+        if state.get(start) == 2:
+            continue
+        state[start] = 1
+        stack = [(start, iter(graph[start]))]
+        while stack:
+            identifier, targets = stack[-1]
+            try:
+                target = next(targets)
+            except StopIteration:
+                state[identifier] = 2
+                stack.pop()
+                continue
+            target_state = state.get(target, 0)
+            if target_state == 1:
+                return True
+            if target_state == 0:
+                state[target] = 1
+                stack.append((target, iter(graph[target])))
+    return False
 
 
 def _svg_css_has_external_resource(value: str) -> bool:

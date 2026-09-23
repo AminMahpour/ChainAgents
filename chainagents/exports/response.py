@@ -816,6 +816,7 @@ def _prepare_pdf_image_resources(
 
     image_tags = list(PDF_IMAGE_TAG_RE.finditer(document))
     urls: list[str] = []
+    failures: set[str] = set()
     for match in image_tags:
         attributes = _pdf_image_attributes(match.group(0))
         source = attributes.get("src", "")
@@ -823,9 +824,10 @@ def _prepare_pdf_image_resources(
             ("http://", "https://", "data:image/")
         ) and source not in urls:
             urls.append(source)
+        elif not source.lower().startswith(("http://", "https://", "data:image/")):
+            failures.add(source)
 
     resources: dict[str, PdfImageResource] = {}
-    failures: set[str] = set()
     deadline = time.monotonic() + PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS
     budget = PdfImageDownloadBudget(deadline, MAX_PDF_REMOTE_IMAGE_BYTES)
     total_pixels = 0

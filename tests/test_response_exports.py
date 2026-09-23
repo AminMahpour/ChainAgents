@@ -443,6 +443,20 @@ def test_prepare_pdf_images_accepts_case_insensitive_http_scheme(monkeypatch) ->
     assert url in resources
 
 
+def test_prepare_pdf_images_replaces_unsupported_sources() -> None:
+    """Relative and unsupported image URLs must retain labeled placeholders."""
+    document = (
+        '<img src="../figure.png" alt="relative" />'
+        '<img src="ftp://example.test/figure.png" alt="ftp" />'
+    )
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(document)
+
+    assert not resources
+    assert "Image unavailable: relative" in rendered
+    assert "Image unavailable: ftp" in rendered
+
+
 def test_prepare_pdf_images_redacts_source_in_warning(monkeypatch, caplog) -> None:
     """Signed URL secrets and data payloads must not be copied into logs."""
     secret = "super-secret-token"
@@ -578,6 +592,17 @@ def test_pdf_image_validation_detects_utf16_svg() -> None:
     assert resource.mime_type == "image/svg+xml"
 
 
+def test_pdf_image_validation_rejects_utf16_doctype() -> None:
+    """DTD detection must account for multibyte XML encodings."""
+    svg = (
+        '<!DOCTYPE svg [<!ENTITY payload "expanded">]>'
+        '<svg xmlns="http://www.w3.org/2000/svg"><text>&payload;</text></svg>'
+    ).encode("utf-16")
+
+    with pytest.raises(pdf_images.PdfImageError, match="declarations"):
+        pdf_images._validate_pdf_image(svg)
+
+
 def test_pdf_image_validation_rejects_circular_svg_use() -> None:
     """Circular local references must not recurse during PDF rendering."""
     svg = (
@@ -588,6 +613,22 @@ def test_pdf_image_validation_rejects_circular_svg_use() -> None:
 
     with pytest.raises(pdf_images.PdfImageError, match="circular"):
         pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_handles_deep_acyclic_svg_use_chain() -> None:
+    """Reference validation must not depend on Python recursion depth."""
+    definitions = "".join(
+        f'<g id="node-{index}"><use href="#node-{index + 1}" /></g>'
+        for index in range(1_100)
+    )
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg">{definitions}'
+        '<g id="node-1100"><rect width="1" height="1" /></g></svg>'
+    ).encode()
+
+    resource = pdf_images._validate_pdf_image(svg)
+
+    assert resource.mime_type == "image/svg+xml"
 
 
 def test_pdf_image_validation_preserves_svg_hyperlink() -> None:
