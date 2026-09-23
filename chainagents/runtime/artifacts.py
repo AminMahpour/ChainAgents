@@ -106,6 +106,11 @@ class LargeToolResultArtifactRegistry:
         """Return the active handle or the registry-owned unscoped fallback."""
         return self._current_context.get() or self._unscoped
 
+    def owns(self, handle: ArtifactSessionHandle, path: str) -> bool:
+        """Return whether one handle owns a registered cleanup target."""
+        with self._guard:
+            return path in self._paths.get(handle, {})
+
     def register(
         self, handle: ArtifactSessionHandle, path: str, backend: BackendProtocol
     ) -> None:
@@ -246,9 +251,7 @@ class ArtifactTrackingBackend(CompositeBackend):
         self.registry = registry
         self.artifacts_root = backend.artifacts_root.rstrip("/") or "/"
         self._logical_root = f"{self.artifacts_root.rstrip('/')}/large_tool_results"
-        self._logical_prefix = f"{self._logical_root}/"
-        physical_root = f"{self.artifacts_root.rstrip('/')}/session_tool_results"
-        hidden_roots = {self._normalize_path(physical_root)}
+        artifact_roots = {self._normalize_path(self.artifacts_root)}
         workspace_backend = backend.routes.get("/workspace/")
         workspace_root = getattr(workspace_backend, "cwd", None)
         if workspace_root is not None:
@@ -259,12 +262,24 @@ class ArtifactTrackingBackend(CompositeBackend):
             except ValueError:
                 pass
             else:
-                relative_hidden = (
-                    relative_artifacts / "session_tool_results"
-                ).as_posix()
-                hidden_roots.add(self._normalize_path(relative_hidden))
-                hidden_roots.add(self._normalize_path(f"/workspace/{relative_hidden}"))
-        self._hidden_roots = frozenset(hidden_roots)
+                relative_root = relative_artifacts.as_posix()
+                artifact_roots.add(self._normalize_path(relative_root))
+                artifact_roots.add(self._normalize_path(f"/workspace/{relative_root}"))
+        self._artifact_roots = frozenset(artifact_roots)
+        self._logical_roots = tuple(
+            sorted(
+                (
+                    self._normalize_path(f"{root}/large_tool_results")
+                    for root in self._artifact_roots
+                ),
+                key=len,
+                reverse=True,
+            )
+        )
+        self._hidden_roots = frozenset(
+            self._normalize_path(f"{root}/session_tool_results")
+            for root in self._artifact_roots
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.backend, name)
@@ -282,16 +297,58 @@ class ArtifactTrackingBackend(CompositeBackend):
             for root in self._hidden_roots
         )
 
+    def _restore_active_path(self, path: str) -> str:
+        handle = self.registry.current_handle()
+        if not self.registry.owns(handle, self._physical_root(handle)):
+            return path
+        normalized = self._normalize_path(path)
+        trailing_slash = path.endswith("/")
+        for artifact_root in self._artifact_roots:
+            hidden_root = self._normalize_path(
+                f"{artifact_root}/session_tool_results"
+            )
+            active_root = f"{hidden_root}/{handle.token}"
+            logical_root = self._normalize_path(
+                f"{artifact_root}/large_tool_results"
+            )
+            if normalized == hidden_root or normalized == active_root:
+                restored = logical_root
+            elif normalized.startswith(f"{active_root}/"):
+                restored = f"{logical_root}{normalized.removeprefix(active_root)}"
+            else:
+                continue
+            if trailing_slash:
+                return f"{restored}/"
+            return restored
+        return path
+
     def _visible_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [item for item in items if not self._is_hidden_path(item["path"])]
+        visible: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            restored = self._restore_active_path(item["path"])
+            if self._is_hidden_path(restored) or restored in seen:
+                continue
+            seen.add(restored)
+            visible.append({**item, "path": restored})
+        return visible
 
     def _map(self, path: str | None) -> tuple[str | None, ArtifactSessionHandle | None]:
-        if path is None or (
-            path != self._logical_root and not path.startswith(self._logical_prefix)
-        ):
+        if path is None:
+            return path, None
+        normalized = self._normalize_path(path)
+        logical_root = next(
+            (
+                root
+                for root in self._logical_roots
+                if normalized == root or normalized.startswith(f"{root}/")
+            ),
+            None,
+        )
+        if logical_root is None:
             return path, None
         handle = self.registry.current_handle()
-        relative = path.removeprefix(self._logical_root).lstrip("/")
+        relative = normalized.removeprefix(logical_root).lstrip("/")
         physical = self._physical_root(handle)
         if relative:
             physical = f"{physical}/{relative}"

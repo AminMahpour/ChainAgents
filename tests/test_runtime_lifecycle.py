@@ -505,6 +505,116 @@ def test_physical_artifact_namespaces_are_hidden_from_filesystem_tools(tmp_path)
     asyncio.run(exercise())
 
 
+def test_parent_searches_restore_only_the_active_logical_artifacts(tmp_path):
+    """Parent discovery exposes the caller's logical namespace, not physical tokens."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        first = registry.open_session("first")
+        first_token = registry.activate(first)
+        absolute_logical = f"{backend.artifacts_root}/large_tool_results/first.txt"
+        assert backend.write(absolute_logical, "first-secret").error is None
+        registry.reset(first_token)
+        second = registry.open_session("second")
+        second_token = registry.activate(second)
+        assert backend.write(
+            f"{backend.artifacts_root}/large_tool_results/second.txt",
+            "second-secret",
+        ).error is None
+        registry.reset(second_token)
+
+        first_token = registry.activate(first)
+        for root, logical_root in (
+            (
+                backend.artifacts_root,
+                f"{backend.artifacts_root}/large_tool_results",
+            ),
+            (
+                "/workspace/.files/deepagent",
+                "/workspace/.files/deepagent/large_tool_results",
+            ),
+        ):
+            listed = backend.ls(root)
+            globbed = backend.glob("**/*", root)
+            grepped = backend.grep("first-secret", root)
+            async_globbed = await backend.aglob("**/*", root)
+            assert listed.error is None
+            assert globbed.error is None
+            assert grepped.error is None
+            assert async_globbed.error is None
+            listed_paths = [item["path"].rstrip("/") for item in listed.entries or []]
+            globbed_paths = [item["path"] for item in globbed.matches or []]
+            grepped_paths = [item["path"] for item in grepped.matches or []]
+            async_globbed_paths = [
+                item["path"] for item in async_globbed.matches or []
+            ]
+            assert logical_root in listed_paths
+            assert f"{logical_root}/first.txt" in globbed_paths
+            assert f"{logical_root}/first.txt" in grepped_paths
+            assert f"{logical_root}/first.txt" in async_globbed_paths
+            assert all("second.txt" not in path for path in globbed_paths)
+            assert all(
+                "session_tool_results" not in path
+                for path in [*listed_paths, *globbed_paths, *grepped_paths]
+            )
+        registry.reset(first_token)
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_workspace_alias_uses_the_active_artifact_generation(tmp_path):
+    """Workspace logical paths must remain session-scoped and teardown-owned."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        alias = "/workspace/.files/deepagent/large_tool_results/result.txt"
+        first = registry.open_session("first")
+        first_token = registry.activate(first)
+        assert backend.write(alias, "first").error is None
+        assert backend.read(alias).file_data["content"] == "first"
+        registry.reset(first_token)
+        second = registry.open_session("second")
+        second_token = registry.activate(second)
+        assert backend.read(alias).error is not None
+        assert backend.write(alias, "second").error is None
+        assert backend.read(alias).file_data["content"] == "second"
+        registry.reset(second_token)
+
+        await registry.close_session("first")
+
+        first_physical = (
+            tmp_path
+            / ".files"
+            / "deepagent"
+            / "session_tool_results"
+            / first.token
+        )
+        second_physical = (
+            tmp_path
+            / ".files"
+            / "deepagent"
+            / "session_tool_results"
+            / second.token
+            / "result.txt"
+        )
+        assert not first_physical.exists()
+        assert second_physical.read_text(encoding="utf-8") == "second"
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
 def test_uploaded_artifacts_register_before_cancellation_propagates(
     tmp_path,
     monkeypatch,
