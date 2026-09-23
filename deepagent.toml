@@ -87,6 +87,10 @@ enabled = false
 # Set true to stream background reasoning and tool activity into nested Chainlit
 # steps. The CLI, TUI, and HTTP API remain completion-only.
 stream_activity = false
+# Select the waiting batch tool's result contract: "json", "markdown", or
+# "markdown_files". File mode creates persistent downloadable outputs under
+# .files/outputs/subagent-batches. The default preserves combined Markdown.
+batch_result_format = "markdown"
 max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100
