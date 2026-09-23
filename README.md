@@ -180,9 +180,9 @@ for your distribution before starting the app.
 
 Response PDFs include images referenced with public HTTP or HTTPS Markdown image
 URLs. Each export downloads at most 20 unique images, with a 10 MiB per-image and
-25 MiB aggregate limit. Images that are unavailable, invalid, oversized, or hosted
-on private network addresses are replaced with a labeled placeholder so the rest
-of the PDF can still be downloaded.
+25 MiB aggregate limit, and processes at most 50 million raster pixels. Images that
+are unavailable, invalid, oversized, or hosted on private network addresses are
+replaced with a labeled placeholder so the rest of the PDF can still be downloaded.
 
 If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
 If you are using Claude through Anthropic, set `[model].provider = "anthropic"` and provide `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY`.

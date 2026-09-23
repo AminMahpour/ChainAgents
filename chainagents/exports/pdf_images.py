@@ -50,6 +50,7 @@ class PdfImageResource:
 
     content: bytes
     mime_type: str
+    pixel_count: int = 0
 
 
 @dataclass
@@ -402,7 +403,9 @@ def _validate_pdf_image(
     if not content:
         raise PdfImageError("image response was empty")
     stripped = content.removeprefix(b"\xef\xbb\xbf").lstrip()
-    if stripped.startswith(b"<"):
+    if stripped.startswith(b"<") or content.startswith(
+        (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")
+    ):
         return _validate_svg_image(content)
     try:
         with warnings.catch_warnings():
@@ -413,6 +416,7 @@ def _validate_pdf_image(
                     raise PdfImageError("image format is not supported")
                 if image.width * image.height > PDF_IMAGE_MAX_PIXELS:
                     raise PdfImageError("image dimensions exceed the pixel limit")
+                pixel_count = image.width * image.height
                 if image_format == "GIF":
                     image.seek(0)
                     output = BytesIO()
@@ -420,7 +424,7 @@ def _validate_pdf_image(
                     normalized = output.getvalue()
                     if len(normalized) > max_bytes:
                         raise PdfImageError("image exceeds the download size limit")
-                    return PdfImageResource(normalized, "image/png")
+                    return PdfImageResource(normalized, "image/png", pixel_count)
                 image.verify()
     except PdfImageError:
         raise
@@ -433,7 +437,7 @@ def _validate_pdf_image(
         ValueError,
     ) as exc:
         raise PdfImageError("image content is invalid") from exc
-    return PdfImageResource(content, _RASTER_MIME_TYPES[image_format])
+    return PdfImageResource(content, _RASTER_MIME_TYPES[image_format], pixel_count)
 
 
 def _validate_svg_image(content: bytes) -> PdfImageResource:
@@ -448,12 +452,15 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
     if root.tag.rsplit("}", 1)[-1].lower() != "svg":
         raise PdfImageError("image content is not SVG")
     for element in root.iter():
+        element_name = element.tag.rsplit("}", 1)[-1].lower()
         for name, value in element.attrib.items():
             normalized = value.strip().lower()
-            if name.lower().endswith("href") and normalized and not normalized.startswith(
-                "#"
-            ):
-                raise PdfImageError("SVG contains an external resource")
+            if name.lower().endswith("href") and normalized:
+                if element_name == "a":
+                    if not normalized.startswith(("#", "http://", "https://", "mailto:")):
+                        raise PdfImageError("SVG contains an unsafe hyperlink")
+                elif not normalized.startswith("#"):
+                    raise PdfImageError("SVG contains an external resource")
             if _svg_css_has_external_resource(normalized):
                 raise PdfImageError("SVG contains an external resource")
         if element.tag.rsplit("}", 1)[-1].lower() == "style" and (
@@ -461,7 +468,46 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
             or _svg_css_has_external_resource(element.text or "")
         ):
             raise PdfImageError("SVG contains an external resource")
+    if _svg_has_circular_use(root):
+        raise PdfImageError("SVG contains a circular local reference")
     return PdfImageResource(content, "image/svg+xml")
+
+
+def _svg_has_circular_use(root: ElementTree.Element) -> bool:
+    """Return whether local SVG use references form a cycle."""
+    elements_by_id = {
+        identifier: element
+        for element in root.iter()
+        if (identifier := element.attrib.get("id", "").strip())
+    }
+    graph: dict[str, set[str]] = {identifier: set() for identifier in elements_by_id}
+    for identifier, element in elements_by_id.items():
+        for descendant in element.iter():
+            if descendant.tag.rsplit("}", 1)[-1].lower() != "use":
+                continue
+            for name, value in descendant.attrib.items():
+                normalized = value.strip()
+                if name.lower().endswith("href") and normalized.startswith("#"):
+                    target = normalized[1:]
+                    if target in graph:
+                        graph[identifier].add(target)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(identifier: str) -> bool:
+        if identifier in visiting:
+            return True
+        if identifier in visited:
+            return False
+        visiting.add(identifier)
+        if any(visit(target) for target in graph[identifier]):
+            return True
+        visiting.remove(identifier)
+        visited.add(identifier)
+        return False
+
+    return any(visit(identifier) for identifier in graph)
 
 
 def _svg_css_has_external_resource(value: str) -> bool:

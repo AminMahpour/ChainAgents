@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import builtins
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 from io import BytesIO
 import os
 from pathlib import Path
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -125,6 +127,31 @@ def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
     assert callable(html_calls[0]["url_fetcher"])
     with pytest.raises(ValueError, match="External resources are disabled"):
         html_calls[0]["url_fetcher"]("file:///etc/passwd")
+
+
+def test_build_pdf_bytes_serializes_concurrent_renders(monkeypatch) -> None:
+    """All interfaces must share one process-wide PDF render slot."""
+    active = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+
+    def render(_text: str) -> bytes:
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+        return b"%PDF"
+
+    monkeypatch.setattr(response_exports, "_build_pdf_bytes_unlocked", render)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(response_exports.build_pdf_bytes, ["one", "two"]))
+
+    assert results == [b"%PDF", b"%PDF"]
+    assert maximum_active == 1
 
 
 def test_build_pdf_bytes_embeds_downloaded_remote_image(monkeypatch) -> None:
@@ -416,6 +443,50 @@ def test_prepare_pdf_images_accepts_case_insensitive_http_scheme(monkeypatch) ->
     assert url in resources
 
 
+def test_prepare_pdf_images_redacts_source_in_warning(monkeypatch, caplog) -> None:
+    """Signed URL secrets and data payloads must not be copied into logs."""
+    secret = "super-secret-token"
+    url = f"https://images.example.test/private.png?token={secret}"
+
+    def fail_download(*_args: Any, **_kwargs: Any) -> Any:
+        raise response_exports.PdfImageError("invalid image")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", fail_download)
+
+    response_exports._prepare_pdf_image_resources(
+        f'<img src="{url}" alt="private" />'
+    )
+
+    assert secret not in caplog.text
+    assert "https://images.example.test" in caplog.text
+
+
+def test_prepare_pdf_images_limits_aggregate_pixels(monkeypatch) -> None:
+    """Encoded byte limits must also cap aggregate decoded raster work."""
+    calls = 0
+
+    def download(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return response_exports.PdfImageResource(
+            _png_bytes(),
+            "image/png",
+            pixel_count=25_000_000,
+        )
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    document = "".join(
+        f'<img src="https://images.example.test/{index}.png" alt="image {index}" />'
+        for index in range(3)
+    )
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(document)
+
+    assert calls == 3
+    assert len(resources) == 2
+    assert rendered.count("Image unavailable:") == 1
+
+
 def test_pdf_image_validation_uses_first_gif_frame() -> None:
     """Animated response images must become one deterministic PDF image."""
     output = BytesIO()
@@ -494,6 +565,42 @@ def test_pdf_image_validation_detects_svg_after_leading_comment() -> None:
     resource = pdf_images._validate_pdf_image(svg)
 
     assert resource == pdf_images.PdfImageResource(svg, "image/svg+xml")
+
+
+def test_pdf_image_validation_detects_utf16_svg() -> None:
+    """A UTF-16 BOM must route SVG content through the XML validator."""
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" />'.encode(
+        "utf-16"
+    )
+
+    resource = pdf_images._validate_pdf_image(svg)
+
+    assert resource.mime_type == "image/svg+xml"
+
+
+def test_pdf_image_validation_rejects_circular_svg_use() -> None:
+    """Circular local references must not recurse during PDF rendering."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg">'
+        b'<g id="loop"><use href=" #loop " /></g>'
+        b"</svg>"
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="circular"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_preserves_svg_hyperlink() -> None:
+    """Navigation links do not load resources and may remain in safe SVGs."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg">'
+        b'<a href="https://example.com/docs"><text>Docs</text></a>'
+        b"</svg>"
+    )
+
+    resource = pdf_images._validate_pdf_image(svg)
+
+    assert resource.mime_type == "image/svg+xml"
 
 
 def test_pdf_image_validation_rejects_late_svg_doctype() -> None:

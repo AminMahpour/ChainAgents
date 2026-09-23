@@ -9,9 +9,11 @@ import mimetypes
 import os
 import re
 import sys
+import threading
 import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import chainlit as cl
 from chainlit.element import Element, File, Pdf
@@ -40,6 +42,7 @@ DEFAULT_EXPORT_BASENAME = "response"
 MAX_GENERATED_FILE_ATTACHMENTS = MAX_GENERATED_FILES
 MAX_PDF_REMOTE_IMAGES = 20
 MAX_PDF_REMOTE_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_PDF_REMOTE_IMAGE_PIXELS = 50_000_000
 PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS = 30.0
 HOMEBREW_LIBRARY_PATH = Path("/opt/homebrew/lib")
 PDF_EXPORT_DEPENDENCY_ERROR = (
@@ -166,6 +169,7 @@ PDF_IMAGE_ATTRIBUTE_RE = re.compile(
     re.IGNORECASE,
 )
 logger = logging.getLogger(__name__)
+_PDF_RENDER_LOCK = threading.Lock()
 MOJIBAKE_MARKERS = ("Â", "Ã", "â", "ð", "�")
 PDF_SUBSCRIPT_CHARS = {
     **dict(zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789")),
@@ -605,6 +609,12 @@ def build_pdf_bytes(text: str) -> bytes:
     Returns:
         The constructed pdf bytes.
     """
+    with _PDF_RENDER_LOCK:
+        return _build_pdf_bytes_unlocked(text)
+
+
+def _build_pdf_bytes_unlocked(text: str) -> bytes:
+    """Render one PDF while the process-wide render lock is held."""
     _prepare_weasyprint_environment()
     try:
         from weasyprint import HTML
@@ -818,6 +828,7 @@ def _prepare_pdf_image_resources(
     failures: set[str] = set()
     deadline = time.monotonic() + PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS
     budget = PdfImageDownloadBudget(deadline, MAX_PDF_REMOTE_IMAGE_BYTES)
+    total_pixels = 0
     for index, url in enumerate(urls):
         if index >= MAX_PDF_REMOTE_IMAGES:
             failures.add(url)
@@ -844,11 +855,18 @@ def _prepare_pdf_image_resources(
             retained_difference = len(resource.content) - transferred_bytes
             if retained_difference > 0:
                 budget.consume(retained_difference)
+            if total_pixels + resource.pixel_count > MAX_PDF_REMOTE_IMAGE_PIXELS:
+                raise PdfImageError("PDF image pixel budget exceeded")
         except PdfImageError as exc:
-            logger.warning("Unable to include PDF image %s: %s", url, exc)
+            logger.warning(
+                "Unable to include PDF image %s: %s",
+                _pdf_image_log_identifier(url),
+                exc,
+            )
             failures.add(url)
             continue
         resources[url] = resource
+        total_pixels += resource.pixel_count
 
     def replace_failed_image(match: re.Match[str]) -> str:
         tag = match.group(0)
@@ -857,10 +875,14 @@ def _prepare_pdf_image_resources(
         if source not in failures:
             return tag
         alt = attributes.get("alt", "image").strip() or "image"
+        if source.lower().startswith("data:image/"):
+            source_label = "(embedded image)"
+        else:
+            source_label = f'(<a href="{html.escape(source, quote=True)}">source</a>)'
         return (
             '<span class="pdf-image-unavailable">'
             f"Image unavailable: {html.escape(alt)} "
-            f'(<a href="{html.escape(source, quote=True)}">source</a>)'
+            f"{source_label}"
             "</span>"
         )
 
@@ -875,8 +897,18 @@ def _pdf_image_attributes(tag: str) -> dict[str, str]:
     }
 
 
+def _pdf_image_log_identifier(source: str) -> str:
+    """Return a bounded image identifier without query tokens or data payloads."""
+    if source.lower().startswith("data:"):
+        return source.partition(",")[0][:80]
+    parsed = urlsplit(source)
+    if parsed.scheme and parsed.hostname:
+        return f"{parsed.scheme.lower()}://{parsed.hostname}"[:160]
+    return "invalid-image-source"
+
+
 def _pdf_url_fetcher(resources: dict[str, PdfImageResource]) -> object:
-    """Return a WeasyPrint fetcher limited to prefetched images and data URLs."""
+    """Return a WeasyPrint fetcher limited to validated in-memory images."""
     from weasyprint.urls import URLFetcher, URLFetcherResponse
 
     class PdfResourceFetcher(URLFetcher):
