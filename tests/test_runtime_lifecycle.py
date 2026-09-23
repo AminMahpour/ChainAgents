@@ -80,6 +80,14 @@ def test_stateful_context_closes_on_its_owner_task(runtime, monkeypatch):
     asyncio.run(exercise())
 
 
+def test_runtime_background_tasks_share_the_artifact_registry(runtime):
+    """Runtime background jobs must inherit the registry used by their backend."""
+    assert (
+        runtime.background_tasks.artifact_registry
+        is runtime.large_tool_result_artifacts
+    )
+
+
 @pytest.mark.parametrize("stateful", [False, True])
 def test_conversation_close_evicts_graph_with_no_mcp_client(runtime, stateful):
     runtime.config = replace(
@@ -187,6 +195,213 @@ def test_conversation_close_deletes_only_its_large_tool_results(runtime):
         token = runtime.large_tool_result_artifacts.activate(second)
         assert backend.read(second_path).error is not None
         runtime.large_tool_result_artifacts.reset(token)
+
+    asyncio.run(exercise())
+
+
+def test_background_tasks_keep_the_foreground_artifact_generation(tmp_path):
+    """An empty task context must reactivate its owning artifact generation."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        manager = BackgroundTaskManager(
+            BackgroundSubagentConfig(enabled=True),
+            artifact_registry=registry,
+        )
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        path = f"{backend.artifacts_root}/large_tool_results/background-call"
+        handle = registry.open_session("thread")
+        token = registry.activate(handle)
+
+        async def runner(task_id):
+            assert backend.write(path, task_id).error is None
+            return task_id
+
+        spawned = await manager.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="work",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        registry.reset(token)
+        finished = await manager.get("thread", spawned.task_id, wait_seconds=1)
+        assert finished.status == "success"
+        physical = (
+            tmp_path
+            / ".files"
+            / "deepagent"
+            / "session_tool_results"
+            / handle.token
+            / "background-call"
+        )
+        unscoped = tmp_path / ".files" / "deepagent" / "session_tool_results"
+        assert physical.read_text(encoding="utf-8") == spawned.task_id
+        assert not list(unscoped.glob("unscoped-*/background-call"))
+
+        await asyncio.gather(
+            registry.close_session("thread"),
+            registry.close_session("thread"),
+        )
+
+        assert not physical.exists()
+        await manager.close()
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_successful_artifact_close_releases_generation_state():
+    """Closed sessions must not accumulate handles or per-session locks."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        first = registry.open_session("thread")
+
+        await registry.close_session("thread")
+
+        assert "thread" not in registry._current
+        assert first not in registry._states
+        assert "thread" not in registry._session_locks
+
+        second = registry.open_session("thread")
+        assert second != first
+        await registry.close_session("thread")
+        assert "thread" not in registry._current
+        assert second not in registry._states
+        assert "thread" not in registry._session_locks
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_physical_artifact_namespaces_are_hidden_from_filesystem_tools(tmp_path):
+    """Only the active session's logical large-result namespace is accessible."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        handle = registry.open_session("first")
+        token = registry.activate(handle)
+        logical = f"{backend.artifacts_root}/large_tool_results/secret.txt"
+        assert backend.write(logical, "session secret").error is None
+        registry.reset(token)
+        physical_root = f"{backend.artifacts_root}/session_tool_results"
+        physical = f"{physical_root}/{handle.token}/secret.txt"
+        alias_root = "/workspace/.files/deepagent/session_tool_results"
+        alias = f"{alias_root}/{handle.token}/secret.txt"
+
+        for path in (physical, alias):
+            assert backend.read(path).error is not None
+            assert (await backend.aread(path)).error is not None
+            assert backend.write(path, "overwrite").error is not None
+            assert (await backend.awrite(path, "overwrite")).error is not None
+            assert backend.edit(path, "secret", "changed").error is not None
+            assert (await backend.aedit(path, "secret", "changed")).error is not None
+            assert backend.delete(path).error is not None
+            assert (await backend.adelete(path)).error is not None
+            assert backend.upload_files([(path, b"overwrite")])[0].error is not None
+            assert (await backend.aupload_files([(path, b"overwrite")]))[
+                0
+            ].error is not None
+            assert backend.download_files([path])[0].error is not None
+            assert (await backend.adownload_files([path]))[0].error is not None
+
+        for root in (physical_root, alias_root):
+            assert backend.ls(root).error is not None
+            assert (await backend.als(root)).error is not None
+            assert backend.glob("**/*", root).error is not None
+            assert (await backend.aglob("**/*", root)).error is not None
+            assert backend.grep("secret", root).error is not None
+            assert (await backend.agrep("secret", root)).error is not None
+
+        for root in (backend.artifacts_root, "/workspace/.files/deepagent"):
+            listed = backend.ls(root)
+            async_listed = await backend.als(root)
+            globbed = backend.glob("**/*", root)
+            async_globbed = await backend.aglob("**/*", root)
+            grepped = backend.grep("secret", root)
+            async_grepped = await backend.agrep("secret", root)
+            visible_paths = [
+                item["path"]
+                for result in (
+                    listed.entries,
+                    async_listed.entries,
+                    globbed.matches,
+                    async_globbed.matches,
+                    grepped.matches,
+                    async_grepped.matches,
+                )
+                for item in (result or [])
+            ]
+            assert all("session_tool_results" not in path for path in visible_paths)
+
+        token = registry.activate(handle)
+        assert backend.read(logical).file_data is not None
+        registry.reset(token)
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_uploaded_artifacts_register_before_cancellation_propagates(
+    tmp_path,
+    monkeypatch,
+):
+    """Sync and cancelled async uploads remain owned by the active session."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        handle = registry.open_session("thread")
+        token = registry.activate(handle)
+        sync_path = f"{backend.artifacts_root}/large_tool_results/sync-upload"
+        async_path = f"{backend.artifacts_root}/large_tool_results/async-upload"
+        assert backend.upload_files([(sync_path, b"sync")])[0].error is None
+
+        underlying = backend.backend
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_upload(files):
+            started.set()
+            await release.wait()
+            return underlying.upload_files(files)
+
+        monkeypatch.setattr(underlying, "aupload_files", blocking_upload)
+        upload_task = asyncio.create_task(
+            backend.aupload_files([(async_path, b"async")])
+        )
+        registry.reset(token)
+        await started.wait()
+        upload_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await upload_task
+
+        physical_root = (
+            tmp_path / ".files" / "deepagent" / "session_tool_results" / handle.token
+        )
+        assert (physical_root / "sync-upload").is_file()
+        assert (physical_root / "async-upload").is_file()
+
+        await registry.close_session("thread")
+
+        assert not (physical_root / "sync-upload").exists()
+        assert not (physical_root / "async-upload").exists()
+        await registry.close()
 
     asyncio.run(exercise())
 

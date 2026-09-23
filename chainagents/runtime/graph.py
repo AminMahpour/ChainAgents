@@ -87,7 +87,10 @@ def _get_static_background_task_manager(
                 "Exported graphs must use one background_subagents configuration."
             )
         return manager
-    manager = runtime_background_tasks.BackgroundTaskManager(background_config)
+    manager = runtime_background_tasks.BackgroundTaskManager(
+        background_config,
+        artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
+    )
     _STATIC_BACKGROUND_TASK_MANAGERS.add(manager)
     return manager
 

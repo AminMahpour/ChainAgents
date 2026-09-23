@@ -4797,6 +4797,11 @@ def test_create_configured_graph_builds_local_background_subagents(
 
     deepagent_runtime.create_configured_graph(include_async_subagents=False)
     assert len(runtime_graph.static_background_task_managers()) == 1
+    static_manager = runtime_graph.static_background_task_managers()[0]
+    assert (
+        static_manager.artifact_registry
+        is runtime_graph._STATIC_LARGE_TOOL_RESULT_ARTIFACTS
+    )
 
     asyncio.run(runtime_graph.close_static_background_tasks())
 

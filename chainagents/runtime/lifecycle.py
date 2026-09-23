@@ -117,7 +117,8 @@ class AgentRuntime:
         )
         self._exit_stack.push_async_callback(self.close_all_mcp_sessions)
         self.background_tasks = runtime_background_tasks.BackgroundTaskManager(
-            config.extensions.background_subagents
+            config.extensions.background_subagents,
+            artifact_registry=self.large_tool_result_artifacts,
         )
         self._exit_stack.push_async_callback(self.background_tasks.close)
         self._chainlit_commands, self._chainlit_command_notes = runtime_commands.build_chainlit_command_catalog(

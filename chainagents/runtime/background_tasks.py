@@ -612,6 +612,7 @@ class _BackgroundTaskRecord:
     agent_path: tuple[str, ...]
     owner_path: tuple[str, ...]
     session_generation: BackgroundSessionGeneration | None
+    artifact_handle: ArtifactSessionHandle | None
     parent_task_id: str | None
     status: BackgroundTaskStatus
     created_at: float
@@ -1171,8 +1172,14 @@ def create_background_task_tools(
 class BackgroundTaskManager:
     """Own process-local background subagent jobs for all conversations."""
 
-    def __init__(self, config: BackgroundSubagentConfig) -> None:
+    def __init__(
+        self,
+        config: BackgroundSubagentConfig,
+        *,
+        artifact_registry: LargeToolResultArtifactRegistry | None = None,
+    ) -> None:
         self.config = config
+        self.artifact_registry = artifact_registry
         self._lock = asyncio.Lock()
         self._records: dict[str, _BackgroundTaskRecord] = {}
         self._session_task_ids: dict[str, list[str]] = {}
@@ -1314,6 +1321,11 @@ class BackgroundTaskManager:
 
             retained_ids = self._session_task_ids.setdefault(normalized_session, [])
             records: list[_BackgroundTaskRecord] = []
+            artifact_handle = (
+                self.artifact_registry.open_session(normalized_session)
+                if self.artifact_registry is not None
+                else None
+            )
             for submission in submissions:
                 task_id = f"bg-{uuid.uuid4().hex[:12]}"
                 record = _BackgroundTaskRecord(
@@ -1324,6 +1336,7 @@ class BackgroundTaskManager:
                     agent_path=submission.agent_path,
                     owner_path=owner_path,
                     session_generation=expected_session_generation,
+                    artifact_handle=artifact_handle,
                     parent_task_id=parent_task_id,
                     status="pending",
                     created_at=time.time(),
@@ -1351,6 +1364,12 @@ class BackgroundTaskManager:
         owner_token = _CURRENT_BACKGROUND_INVOCATION_PATH.set(record.owner_path)
         generation_token = _CURRENT_BACKGROUND_SESSION_GENERATION.set(
             record.session_generation
+        )
+        artifact_token = (
+            self.artifact_registry.activate(record.artifact_handle)
+            if self.artifact_registry is not None
+            and record.artifact_handle is not None
+            else None
         )
         try:
             async with self._lock:
@@ -1387,6 +1406,8 @@ class BackgroundTaskManager:
             else:
                 await self._finish(record, status="success", result=str(result))
         finally:
+            if artifact_token is not None and self.artifact_registry is not None:
+                self.artifact_registry.reset(artifact_token)
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(generation_token)
             _CURRENT_BACKGROUND_INVOCATION_PATH.reset(owner_token)
             _CURRENT_BACKGROUND_SESSION_ID.reset(session_token)
