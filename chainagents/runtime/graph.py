@@ -432,6 +432,14 @@ def build_static_sync_subagent_spec(
             },
             agent_path=agent_path,
             recursion_limit=config.recursion_limit,
+            batch_output_store=(
+                runtime_background_tasks.create_batch_result_output_store(
+                    backend,
+                    backend_prefix=runtime_backends.generated_outputs_route_prefix(
+                        (project_root or runtime_constants.PROJECT_ROOT).resolve()
+                    ),
+                )
+            ),
             existing_tools=effective_tools,
         )
         if caller_background_enabled
@@ -614,6 +622,14 @@ def create_configured_graph(
             subagents=background_subagents,
             agent_path=(),
             recursion_limit=config.recursion_limit,
+            batch_output_store=(
+                runtime_background_tasks.create_batch_result_output_store(
+                    backend,
+                    backend_prefix=runtime_backends.generated_outputs_route_prefix(
+                        runtime_constants.PROJECT_ROOT.resolve()
+                    ),
+                )
+            ),
             existing_tools=main_tools,
         )
         if background_manager is not None and background_subagents

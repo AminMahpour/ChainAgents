@@ -11,6 +11,7 @@ import pytest
 import deepagent_runtime as core
 import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.artifacts as runtime_artifacts
+import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.lifecycle as runtime_lifecycle
 import chainagents.runtime.middleware as runtime_middleware
@@ -328,6 +329,57 @@ def test_cancelled_async_write_finishes_registration_and_cleanup(tmp_path, monke
         assert list((tmp_path / ".files" / "deepagent").rglob("cancelled"))
         await registry.close_session("thread")
         assert not list((tmp_path / ".files" / "deepagent").rglob("cancelled"))
+
+    asyncio.run(exercise())
+
+
+def test_conversation_close_preserves_generated_batch_outputs(
+    runtime,
+    tmp_path,
+):
+    """Conversation teardown removes temporary offloads but keeps deliverables."""
+
+    async def exercise():
+        registry = runtime.large_tool_result_artifacts
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        output_store = runtime_background_tasks.create_batch_result_output_store(
+            backend,
+            backend_prefix=runtime_backends.generated_outputs_route_prefix(tmp_path),
+        )
+        handle = registry.open_session("thread")
+        token = registry.activate(handle)
+        artifact_path = f"{backend.artifacts_root}/large_tool_results/temporary"
+        artifact_result = await backend.awrite(artifact_path, "temporary")
+        registry.reset(token)
+        assert artifact_result.error is None
+
+        relative_output = "subagent-batches/batch-call/01-researcher-task.md"
+        output_result = await output_store.backend.awrite(
+            output_store.backend_path(relative_output),
+            "# researcher\n",
+        )
+        assert output_result.error is None
+        physical_artifact = (
+            tmp_path
+            / ".files"
+            / "deepagent"
+            / "session_tool_results"
+            / handle.token
+            / "temporary"
+        )
+        physical_output = tmp_path / ".files" / "outputs" / relative_output
+        assert physical_artifact.is_file()
+        assert physical_output.is_file()
+
+        await runtime.close_conversation(thread_id="thread")
+
+        assert not physical_artifact.exists()
+        assert physical_output.read_text(encoding="utf-8") == "# researcher\n"
+        await runtime.close()
 
     asyncio.run(exercise())
 

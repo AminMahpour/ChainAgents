@@ -549,6 +549,16 @@ class AgentRuntime:
                     if thread_id
                     else None
                 ),
+                batch_output_store=(
+                    runtime_background_tasks.create_batch_result_output_store(
+                        backend,
+                        backend_prefix=(
+                            runtime_backends.generated_outputs_route_prefix(
+                                self.project_root
+                            )
+                        ),
+                    )
+                ),
                 existing_tools=effective_tools,
             )
             if caller_background_enabled
@@ -703,6 +713,16 @@ class AgentRuntime:
                             self.background_tasks.session_generation(thread_id)
                             if thread_id
                             else None
+                        ),
+                        batch_output_store=(
+                            runtime_background_tasks.create_batch_result_output_store(
+                                backend,
+                                backend_prefix=(
+                                    runtime_backends.generated_outputs_route_prefix(
+                                        self.project_root
+                                    )
+                                ),
+                            )
                         ),
                         existing_tools=main_tools,
                     )

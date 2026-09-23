@@ -26,6 +26,7 @@ import pytest
 
 import deepagent_runtime
 import chainagents.runtime.backends as runtime_backends
+import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.constants as runtime_constants
@@ -4541,6 +4542,16 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
 ) -> None:
     """Removing per-agent compilation would leak a parent's child registry."""
     created_graphs: list[SimpleNamespace] = []
+    recorded_stores: list[
+        runtime_background_tasks.BatchResultOutputStore | None
+    ] = []
+    create_background_task_tools = (
+        runtime_background_tasks.create_background_task_tools
+    )
+
+    def record_background_task_tools(**kwargs):
+        recorded_stores.append(kwargs.get("batch_output_store"))
+        return create_background_task_tools(**kwargs)
 
     def fake_create_deep_agent(**kwargs):
         graph = SimpleNamespace(kwargs=kwargs)
@@ -4548,6 +4559,11 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
         return graph
 
     monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        runtime_background_tasks,
+        "create_background_task_tools",
+        record_background_task_tools,
+    )
     monkeypatch.setattr(
         runtime_models,
         "build_model",
@@ -4587,6 +4603,18 @@ def test_get_agent_builds_scoped_background_tools_for_main_and_nested_agents(
 
     assert len(created_graphs) == 3
     reviewer_graph, manager_graph, main_graph = created_graphs
+    assert len(recorded_stores) == 2
+    assert all(store is not None for store in recorded_stores)
+    assert all(
+        store.backend_prefix == generated_outputs_route_prefix(tmp_path)
+        for store in recorded_stores
+        if store is not None
+    )
+    assert all(
+        store.backend is main_graph.kwargs["backend"]
+        for store in recorded_stores
+        if store is not None
+    )
     assert main_graph.kwargs["subagents"][0]["runnable"].runnable is manager_graph
     assert manager_graph.kwargs["subagents"][0]["runnable"] is reviewer_graph
     assert all(graph.kwargs["store"] is runtime.store for graph in created_graphs)
@@ -4671,6 +4699,16 @@ def test_create_configured_graph_builds_local_background_subagents(
 ) -> None:
     """Static Agent Server graphs must expose the same local task tools."""
     created_graphs: list[SimpleNamespace] = []
+    recorded_stores: list[
+        runtime_background_tasks.BatchResultOutputStore | None
+    ] = []
+    create_background_task_tools = (
+        runtime_background_tasks.create_background_task_tools
+    )
+
+    def record_background_task_tools(**kwargs):
+        recorded_stores.append(kwargs.get("batch_output_store"))
+        return create_background_task_tools(**kwargs)
 
     def fake_create_deep_agent(**kwargs):
         graph = SimpleNamespace(kwargs=kwargs)
@@ -4700,7 +4738,13 @@ def test_create_configured_graph_builds_local_background_subagents(
     monkeypatch.setattr(
         runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config)
     )
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        runtime_background_tasks,
+        "create_background_task_tools",
+        record_background_task_tools,
+    )
     monkeypatch.setattr(runtime_models, "build_model", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         runtime_backends,
@@ -4713,6 +4757,12 @@ def test_create_configured_graph_builds_local_background_subagents(
     assert graph.runnable is created_graphs[-1]
     assert len(created_graphs) == 2
     child_graph, main_graph = created_graphs
+    assert len(recorded_stores) == 1
+    assert recorded_stores[0] is not None
+    assert recorded_stores[0].backend is main_graph.kwargs["backend"]
+    assert recorded_stores[0].backend_prefix == generated_outputs_route_prefix(
+        tmp_path
+    )
     assert main_graph.kwargs["subagents"][0]["runnable"] is child_graph
     assert "runnable" not in main_graph.kwargs["subagents"][1]
     assert child_graph.kwargs["subagents"] == []
@@ -4795,6 +4845,16 @@ def test_create_configured_graph_scopes_nested_only_background_subagents(
 ) -> None:
     """Nested-only background targets still require main-run invalidation."""
     created_graphs: list[SimpleNamespace] = []
+    recorded_stores: list[
+        runtime_background_tasks.BatchResultOutputStore | None
+    ] = []
+    create_background_task_tools = (
+        runtime_background_tasks.create_background_task_tools
+    )
+
+    def record_background_task_tools(**kwargs):
+        recorded_stores.append(kwargs.get("batch_output_store"))
+        return create_background_task_tools(**kwargs)
 
     def fake_create_deep_agent(**kwargs):
         graph = SimpleNamespace(kwargs=kwargs)
@@ -4826,7 +4886,13 @@ def test_create_configured_graph_scopes_nested_only_background_subagents(
     monkeypatch.setattr(
         runtime_config.RuntimeConfig, "from_env", staticmethod(lambda: config)
     )
+    monkeypatch.setattr(runtime_constants, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(runtime_middleware, "create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr(
+        runtime_background_tasks,
+        "create_background_task_tools",
+        record_background_task_tools,
+    )
     monkeypatch.setattr(runtime_models, "build_model", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         runtime_backends,
@@ -4839,6 +4905,13 @@ def test_create_configured_graph_scopes_nested_only_background_subagents(
     assert graph.runnable is created_graphs[-1]
     assert len(created_graphs) == 3
     manager_graph = created_graphs[1]
+    main_graph = created_graphs[2]
+    assert len(recorded_stores) == 1
+    assert recorded_stores[0] is not None
+    assert recorded_stores[0].backend is main_graph.kwargs["backend"]
+    assert recorded_stores[0].backend_prefix == generated_outputs_route_prefix(
+        tmp_path
+    )
     assert "spawn_background_task" in {
         tool.name for tool in manager_graph.kwargs["tools"]
     }

@@ -749,6 +749,18 @@ class BatchResultOutputStore:
         return f"{self.public_prefix.rstrip('/')}/{relative_path.lstrip('/')}"
 
 
+def create_batch_result_output_store(
+    backend: BackendProtocol,
+    *,
+    backend_prefix: str,
+) -> BatchResultOutputStore:
+    """Create persistent batch-result storage over an existing agent backend."""
+    return BatchResultOutputStore(
+        backend=backend,
+        backend_prefix=backend_prefix,
+    )
+
+
 def _safe_batch_path_component(value: str, *, fallback: str) -> str:
     """Normalize an untrusted identifier into one bounded path component."""
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("._-")[:80]
