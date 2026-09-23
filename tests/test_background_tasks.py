@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import gc
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from deepagents import create_deep_agent
+from deepagents.backends.protocol import DeleteResult, WriteResult
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
@@ -18,9 +20,18 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.store.memory import InMemoryStore
 
+import chainagents.runtime.background_tasks as background_tasks
+from chainagents.runtime.backends import (
+    build_deepagent_backend,
+    generated_outputs_route_prefix,
+)
 from chainagents.runtime.background_tasks import (
+    BackgroundTaskStatus,
     BackgroundTaskActivity,
     BackgroundTaskManager,
+    BackgroundTaskSnapshot,
+    BatchResultOutputStore,
+    _write_batch_markdown_files,
     create_background_task_tools,
     current_background_invocation_path,
     current_background_session_generation,
@@ -29,6 +40,7 @@ from chainagents.runtime.background_tasks import (
     scope_background_task_invocation,
 )
 from chainagents.events.stream import AgentStreamEvent
+from chainagents.exports.generated_files import resolve_generated_output
 from chainagents.runtime.types import BatchResultFormat, BackgroundSubagentConfig
 from chainagents.interfaces.chainlit.async_tasks import LocalBackgroundTaskNotifier
 
@@ -58,6 +70,31 @@ def make_manager(
     }
     values.update(overrides)
     return BackgroundTaskManager(BackgroundSubagentConfig(**values))  # type: ignore[arg-type]
+
+
+def batch_snapshot(
+    *,
+    task_id: str,
+    agent_name: str = "researcher",
+    description: str = "Inspect the code.",
+    status: str = "success",
+    result: str | None = "Report text",
+    error: str | None = None,
+) -> BackgroundTaskSnapshot:
+    """Build a deterministic terminal snapshot for batch-output tests."""
+    return BackgroundTaskSnapshot(
+        task_id=task_id,
+        session_id="session-a",
+        agent_name=agent_name,
+        description=description,
+        agent_path=(agent_name,),
+        parent_task_id=None,
+        status=cast("BackgroundTaskStatus", status),
+        result=result,
+        error=error,
+        created_at=1.0,
+        completed_at=2.0,
+    )
 
 
 def test_spawn_returns_before_runner_finishes_and_result_can_be_retrieved() -> None:
@@ -1488,6 +1525,409 @@ def test_run_subagent_batch_restores_exact_json_payload_in_input_order() -> None
                 },
             ]
         }
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_batch_markdown_files_write_standalone_reports_in_input_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """File mode writes one complete, downloadable report per terminal snapshot."""
+
+    async def exercise() -> None:
+        backend = build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+        )
+        store = BatchResultOutputStore(
+            backend=backend,
+            backend_prefix=generated_outputs_route_prefix(tmp_path),
+        )
+        monkeypatch.setattr(
+            background_tasks.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="batchunique"),
+        )
+        snapshots = [
+            batch_snapshot(task_id="task-1"),
+            batch_snapshot(
+                task_id="task-2",
+                agent_name="reviewer",
+                description="Review the failure.",
+                status="error",
+                result=None,
+                error="Child failed",
+            ),
+            batch_snapshot(
+                task_id="task-3",
+                agent_name="worker",
+                description="Finish the change.",
+                status="cancelled",
+                result=None,
+            ),
+        ]
+
+        manifest = await _write_batch_markdown_files(
+            snapshots,
+            tool_call_id="batch-call",
+            store=store,
+        )
+
+        assert manifest == {
+            "files": [
+                {
+                    "task_id": "task-1",
+                    "agent_name": "researcher",
+                    "status": "success",
+                    "path": (
+                        "/workspace/.files/outputs/subagent-batches/"
+                        "batch-call-batchunique/01-researcher-task-1.md"
+                    ),
+                },
+                {
+                    "task_id": "task-2",
+                    "agent_name": "reviewer",
+                    "status": "error",
+                    "path": (
+                        "/workspace/.files/outputs/subagent-batches/"
+                        "batch-call-batchunique/02-reviewer-task-2.md"
+                    ),
+                },
+                {
+                    "task_id": "task-3",
+                    "agent_name": "worker",
+                    "status": "cancelled",
+                    "path": (
+                        "/workspace/.files/outputs/subagent-batches/"
+                        "batch-call-batchunique/03-worker-task-3.md"
+                    ),
+                },
+            ]
+        }
+        output_directory = (
+            tmp_path
+            / ".files"
+            / "outputs"
+            / "subagent-batches"
+            / "batch-call-batchunique"
+        )
+        assert (output_directory / "01-researcher-task-1.md").read_text() == (
+            "# researcher\n\n"
+            "- Task ID: `task-1`\n"
+            "- Status: `success`\n\n"
+            "## Request\n"
+            "Inspect the code.\n\n"
+            "## Report\n"
+            "Report text"
+        )
+        assert (output_directory / "02-reviewer-task-2.md").read_text() == (
+            "# reviewer\n\n"
+            "- Task ID: `task-2`\n"
+            "- Status: `error`\n\n"
+            "## Request\n"
+            "Review the failure.\n\n"
+            "## Error\n"
+            "Child failed"
+        )
+        assert (output_directory / "03-worker-task-3.md").read_text() == (
+            "# worker\n\n"
+            "- Task ID: `task-3`\n"
+            "- Status: `cancelled`\n\n"
+            "## Request\n"
+            "Finish the change.\n\n"
+            "## Report\n"
+            "_No report returned._"
+        )
+
+    asyncio.run(exercise())
+
+
+def test_batch_markdown_files_use_unique_sanitized_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Untrusted names cannot escape output roots and repeated calls do not collide."""
+
+    async def exercise() -> None:
+        backend = build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+        )
+        store = BatchResultOutputStore(
+            backend=backend,
+            backend_prefix=generated_outputs_route_prefix(tmp_path),
+        )
+        identifiers = iter(("firstunique", "secondunique"))
+        monkeypatch.setattr(
+            background_tasks.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex=next(identifiers)),
+        )
+        snapshots = [
+            batch_snapshot(
+                task_id="../task\\id",
+                agent_name="../../reviewer / 🔬",
+            ),
+            batch_snapshot(task_id="!!!", agent_name="..."),
+        ]
+
+        first = await _write_batch_markdown_files(
+            snapshots,
+            tool_call_id="../batch / call",
+            store=store,
+        )
+        second = await _write_batch_markdown_files(
+            snapshots,
+            tool_call_id="../batch / call",
+            store=store,
+        )
+
+        first_paths = [item["path"] for item in first["files"]]
+        second_paths = [item["path"] for item in second["files"]]
+        assert first_paths == [
+            (
+                "/workspace/.files/outputs/subagent-batches/"
+                "batch-call-firstunique/01-reviewer-task-id.md"
+            ),
+            (
+                "/workspace/.files/outputs/subagent-batches/"
+                "batch-call-firstunique/02-agent-task.md"
+            ),
+        ]
+        assert second_paths == [
+            path.replace("firstunique", "secondunique") for path in first_paths
+        ]
+        assert set(first_paths).isdisjoint(second_paths)
+        for path in [*first_paths, *second_paths]:
+            assert isinstance(path, str)
+            assert path.startswith(
+                "/workspace/.files/outputs/subagent-batches/"
+            )
+            assert ".." not in path
+            assert "\\" not in path
+            assert "🔬" not in path
+            assert path.endswith(".md")
+            assert resolve_generated_output(path, project_root=tmp_path) is not None
+
+    asyncio.run(exercise())
+
+
+class FailingOutputBackend:
+    """Backend double that fails the second write and optionally every delete."""
+
+    def __init__(self, *, fail_delete: bool = False) -> None:
+        self.contents: dict[str, str] = {}
+        self.write_count = 0
+        self.fail_delete = fail_delete
+
+    async def awrite(self, path: str, content: str) -> WriteResult:
+        self.write_count += 1
+        if self.write_count == 2:
+            return WriteResult(error="disk full")
+        self.contents[path] = content
+        return WriteResult(path=path)
+
+    async def adelete(self, path: str) -> DeleteResult:
+        if self.fail_delete:
+            return DeleteResult(error="cleanup denied")
+        self.contents.pop(path, None)
+        return DeleteResult(path=path)
+
+
+@pytest.mark.parametrize("fail_delete", [False, True])
+def test_batch_markdown_files_roll_back_partial_writes(
+    fail_delete: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed batch never returns a partial manifest or leaves cleanable files."""
+
+    async def exercise() -> None:
+        backend = FailingOutputBackend(fail_delete=fail_delete)
+        store = BatchResultOutputStore(
+            backend=cast(Any, backend),
+            backend_prefix="/backend/outputs/",
+        )
+        monkeypatch.setattr(
+            background_tasks.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="batchunique"),
+        )
+        writer = _write_batch_markdown_files(
+            [batch_snapshot(task_id="task-1"), batch_snapshot(task_id="task-2")],
+            tool_call_id="batch-call",
+            store=store,
+        )
+
+        if fail_delete:
+            with pytest.raises(ExceptionGroup) as raised:
+                await writer
+            messages = [str(error) for error in raised.value.exceptions]
+            assert any("disk full" in message for message in messages)
+            assert any("cleanup denied" in message for message in messages)
+            assert len(backend.contents) == 1
+        else:
+            with pytest.raises(RuntimeError, match="disk full") as raised:
+                await writer
+            assert "02-researcher-task-2.md" in str(raised.value)
+            assert backend.contents == {}
+
+    asyncio.run(exercise())
+
+
+def test_batch_markdown_files_clean_up_a_write_completed_during_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller cancellation waits for an in-flight write, then removes it."""
+
+    class BlockingOutputBackend:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.contents: dict[str, str] = {}
+            self.deleted_paths: list[str] = []
+
+        async def awrite(self, path: str, content: str) -> WriteResult:
+            self.started.set()
+            await self.release.wait()
+            self.contents[path] = content
+            return WriteResult(path=path)
+
+        async def adelete(self, path: str) -> DeleteResult:
+            self.deleted_paths.append(path)
+            self.contents.pop(path, None)
+            return DeleteResult(path=path)
+
+    async def exercise() -> None:
+        backend = BlockingOutputBackend()
+        store = BatchResultOutputStore(
+            backend=cast(Any, backend),
+            backend_prefix="/backend/outputs/",
+        )
+        monkeypatch.setattr(
+            background_tasks.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="batchunique"),
+        )
+        expected_backend_path = (
+            "/backend/outputs/subagent-batches/"
+            "batch-call-batchunique/01-researcher-task-1.md"
+        )
+        write_task = asyncio.create_task(
+            _write_batch_markdown_files(
+                [batch_snapshot(task_id="task-1")],
+                tool_call_id="batch-call",
+                store=store,
+            )
+        )
+        await backend.started.wait()
+        write_task.cancel()
+        backend.release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await write_task
+        assert backend.contents == {}
+        assert backend.deleted_paths == [expected_backend_path]
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_markdown_files_uses_the_native_output_store(
+    tmp_path: Path,
+) -> None:
+    """The tool selects file mode through a factory dependency, not a tool arg."""
+
+    class ChildRunnable:
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+            config: dict[str, object],
+        ) -> dict[str, object]:
+            del state, config
+            return {"messages": [AIMessage(content="Stored report")]}
+
+    async def exercise() -> None:
+        manager = make_manager(batch_result_format="markdown_files")
+        backend = build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+        )
+        store = BatchResultOutputStore(
+            backend=backend,
+            backend_prefix=generated_outputs_route_prefix(tmp_path),
+        )
+        tools = create_background_task_tools(
+            manager=manager,
+            subagents={"researcher": ChildRunnable()},
+            agent_path=(),
+            recursion_limit=20,
+            batch_output_store=store,
+        )
+        batch_tool = next(
+            tool for tool in tools if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        result = await batch_tool.coroutine(
+            [{"description": "Inspect it", "subagent_type": "researcher"}],
+            runtime,
+        )
+
+        assert isinstance(result, dict)
+        files = result["files"]
+        assert isinstance(files, list)
+        assert len(files) == 1
+        assert files[0]["path"].startswith(
+            "/workspace/.files/outputs/subagent-batches/batch-call-"
+        )
+        assert files[0]["path"].endswith("-researcher-" + files[0]["task_id"] + ".md")
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_run_subagent_batch_markdown_files_requires_an_output_store() -> None:
+    """Miswired file mode fails explicitly after the child reaches terminal state."""
+
+    class ChildRunnable:
+        async def ainvoke(self, state, config):
+            del state, config
+            return {"messages": [AIMessage(content="Stored report")]}
+
+    async def exercise() -> None:
+        manager = make_manager(batch_result_format="markdown_files")
+        batch_tool = next(
+            tool
+            for tool in create_background_task_tools(
+                manager=manager,
+                subagents={"researcher": ChildRunnable()},
+                agent_path=(),
+                recursion_limit=20,
+            )
+            if tool.name == "run_subagent_batch"
+        )
+        runtime = ToolRuntime(
+            state={},
+            context=None,
+            config={"configurable": {"thread_id": "session-a"}},
+            stream_writer=lambda _: None,
+            tool_call_id="batch-call",
+            store=None,
+        )
+
+        with pytest.raises(RuntimeError, match="generated-output store"):
+            await batch_tool.coroutine(
+                [{"description": "Inspect it", "subagent_type": "researcher"}],
+                runtime,
+            )
         await manager.close()
 
     asyncio.run(exercise())

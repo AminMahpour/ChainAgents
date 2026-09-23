@@ -2,15 +2,52 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import chainagents.exports.generated_files as generated_files
 from chainagents.exports.generated_files import (
     MAX_GENERATED_FILES,
     generated_file_descriptors,
+    generated_file_paths_from_text,
     resolve_generated_download,
     resolve_generated_output,
 )
+
+
+def test_generated_output_discovery_finds_batch_markdown_manifest_paths(
+    tmp_path: Path,
+) -> None:
+    """Batch manifests feed the existing generated-file download discovery."""
+    output = (
+        tmp_path
+        / ".files"
+        / "outputs"
+        / "subagent-batches"
+        / "batch-call-unique"
+        / "01-researcher-task-1.md"
+    )
+    output.parent.mkdir(parents=True)
+    output.write_text("# researcher\n", encoding="utf-8")
+    manifest = {
+        "files": [
+            {
+                "task_id": "task-1",
+                "agent_name": "researcher",
+                "status": "success",
+                "path": (
+                    "/workspace/.files/outputs/subagent-batches/"
+                    "batch-call-unique/01-researcher-task-1.md"
+                ),
+            }
+        ]
+    }
+
+    paths = generated_file_paths_from_text(json.dumps(manifest))
+    descriptors = generated_file_descriptors(list(paths), project_root=tmp_path)
+
+    assert [item.name for item in descriptors] == ["01-researcher-task-1.md"]
+    assert descriptors[0].mime_type == "text/markdown"
 
 
 def test_generated_descriptors_reject_unsafe_or_unavailable_paths(
