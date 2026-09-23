@@ -796,20 +796,20 @@ async def _write_batch_markdown_files(
     call_component = _safe_batch_path_component(tool_call_id, fallback="batch")
     directory = f"subagent-batches/{call_component}-{uuid.uuid4().hex}"
     width = max(2, len(str(len(snapshots))))
-    written_paths: list[str] = []
+    attempted_paths: list[str] = []
     manifest: list[dict[str, object]] = []
 
     async def write_one(backend_path: str, content: str) -> None:
+        attempted_paths.append(backend_path)
         result = await store.backend.awrite(backend_path, content)
         if result.error:
             raise RuntimeError(
                 f"Failed to write batch result '{backend_path}': {result.error}"
             )
-        written_paths.append(backend_path)
 
     async def rollback() -> list[BaseException]:
         errors: list[BaseException] = []
-        for backend_path in reversed(written_paths):
+        for backend_path in reversed(attempted_paths):
             try:
                 result = await store.backend.adelete(backend_path)
             except BaseException as exc:
@@ -860,7 +860,14 @@ async def _write_batch_markdown_files(
         try:
             cleanup_errors = await await_preserving_cancellation(cleanup_task)
         except BaseException as cleanup_interruption:
-            cleanup_errors = [cleanup_interruption]
+            cleanup_errors = []
+            if (
+                isinstance(cleanup_interruption, asyncio.CancelledError)
+                and cleanup_task.done()
+                and not cleanup_task.cancelled()
+            ):
+                cleanup_errors.extend(cleanup_task.result())
+            cleanup_errors.append(cleanup_interruption)
         if cleanup_errors:
             grouped = [primary, *cleanup_errors]
             if any(not isinstance(error, Exception) for error in grouped):

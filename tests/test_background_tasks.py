@@ -1776,6 +1776,147 @@ def test_batch_markdown_files_roll_back_partial_writes(
     asyncio.run(exercise())
 
 
+def test_batch_markdown_files_remove_the_failed_write_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backend error may arrive after a partial destination was created."""
+
+    class PartialWriteOutputBackend:
+        def __init__(self) -> None:
+            self.contents: dict[str, str] = {}
+            self.deleted_paths: list[str] = []
+
+        async def awrite(self, path: str, content: str) -> WriteResult:
+            del content
+            self.contents[path] = ""
+            return WriteResult(error="disk full")
+
+        async def adelete(self, path: str) -> DeleteResult:
+            self.deleted_paths.append(path)
+            self.contents.pop(path, None)
+            return DeleteResult(path=path)
+
+    async def exercise() -> None:
+        backend = PartialWriteOutputBackend()
+        store = BatchResultOutputStore(
+            backend=cast(Any, backend),
+            backend_prefix="/backend/outputs/",
+        )
+        monkeypatch.setattr(
+            background_tasks.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="batchunique"),
+        )
+        expected_path = (
+            "/backend/outputs/subagent-batches/"
+            "batch-call-batchunique/01-researcher-task-1.md"
+        )
+
+        with pytest.raises(RuntimeError, match="disk full"):
+            await _write_batch_markdown_files(
+                [batch_snapshot(task_id="task-1")],
+                tool_call_id="batch-call",
+                store=store,
+            )
+
+        assert backend.contents == {}
+        assert backend.deleted_paths == [expected_path]
+
+    asyncio.run(exercise())
+
+
+def test_batch_markdown_files_remove_real_filesystem_partial_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filesystem encoding failure must not leave its truncated destination."""
+
+    async def exercise() -> None:
+        backend = build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+        )
+        store = BatchResultOutputStore(
+            backend=backend,
+            backend_prefix=generated_outputs_route_prefix(tmp_path),
+        )
+        monkeypatch.setattr(
+            background_tasks.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="batchunique"),
+        )
+
+        with pytest.raises(RuntimeError, match="utf-8.*can't encode"):
+            await _write_batch_markdown_files(
+                [batch_snapshot(task_id="task-1", result="\ud800")],
+                tool_call_id="batch-call",
+                store=store,
+            )
+
+        output_root = tmp_path / ".files" / "outputs"
+        assert not list(output_root.rglob("*.md"))
+
+    asyncio.run(exercise())
+
+
+def test_batch_markdown_files_preserve_cleanup_errors_during_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during rollback cannot replace a returned delete failure."""
+
+    class BlockingCleanupOutputBackend(FailingOutputBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleanup_started = asyncio.Event()
+            self.release_cleanup = asyncio.Event()
+
+        async def adelete(self, path: str) -> DeleteResult:
+            del path
+            self.cleanup_started.set()
+            await self.release_cleanup.wait()
+            return DeleteResult(error="cleanup denied")
+
+    def leaf_errors(error: BaseException) -> list[BaseException]:
+        if isinstance(error, BaseExceptionGroup):
+            return [
+                leaf
+                for nested in error.exceptions
+                for leaf in leaf_errors(nested)
+            ]
+        return [error]
+
+    async def exercise() -> None:
+        backend = BlockingCleanupOutputBackend()
+        store = BatchResultOutputStore(
+            backend=cast(Any, backend),
+            backend_prefix="/backend/outputs/",
+        )
+        monkeypatch.setattr(
+            background_tasks.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="batchunique"),
+        )
+        write_task = asyncio.create_task(
+            _write_batch_markdown_files(
+                [batch_snapshot(task_id="task-1"), batch_snapshot(task_id="task-2")],
+                tool_call_id="batch-call",
+                store=store,
+            )
+        )
+        await backend.cleanup_started.wait()
+        write_task.cancel()
+        backend.release_cleanup.set()
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await write_task
+        leaves = leaf_errors(raised.value)
+        assert any("disk full" in str(error) for error in leaves)
+        assert any("cleanup denied" in str(error) for error in leaves)
+        assert any(isinstance(error, asyncio.CancelledError) for error in leaves)
+
+    asyncio.run(exercise())
+
+
 def test_batch_markdown_files_clean_up_a_write_completed_during_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
