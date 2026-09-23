@@ -23,7 +23,7 @@ from chainagents.runtime.types import BackgroundSubagentConfig
 from langchain.tools import ToolRuntime
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
-from deepagents.backends.protocol import DeleteResult
+from deepagents.backends.protocol import DeleteResult, FileUploadResponse
 from test_deepagent_runtime_rag import make_runtime_config, make_extensions_config
 
 
@@ -351,6 +351,77 @@ def test_successful_artifact_close_removes_generation_directory(tmp_path):
             / "session_tool_results"
             / handle.token
         )
+        assert generation_root.is_dir()
+
+        await registry.close_session("thread")
+
+        assert not generation_root.exists()
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_failed_artifact_mutations_remain_owned_until_session_close(
+    tmp_path,
+    monkeypatch,
+):
+    """Partial write and upload failures must not escape session cleanup."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        handle = registry.open_session("thread")
+        token = registry.activate(handle)
+        logical_root = f"{backend.artifacts_root}/large_tool_results"
+        sync_write = backend.write(f"{logical_root}/sync-write", "\ud800")
+        async_write = await backend.awrite(
+            f"{logical_root}/async-write",
+            "\ud800",
+        )
+        underlying = backend.backend
+        original_upload = underlying.upload_files
+
+        def partial_upload(files):
+            original_upload(files)
+            return [
+                FileUploadResponse(path=path, error="disk full")
+                for path, _content in files
+            ]
+
+        async def partial_async_upload(files):
+            original_upload(files)
+            return [
+                FileUploadResponse(path=path, error="disk full")
+                for path, _content in files
+            ]
+
+        monkeypatch.setattr(underlying, "upload_files", partial_upload)
+        monkeypatch.setattr(underlying, "aupload_files", partial_async_upload)
+        sync_upload = backend.upload_files(
+            [(f"{logical_root}/sync-upload", b"partial")]
+        )[0]
+        async_upload = (
+            await backend.aupload_files(
+                [(f"{logical_root}/async-upload", b"partial")]
+            )
+        )[0]
+        registry.reset(token)
+        generation_root = (
+            tmp_path
+            / ".files"
+            / "deepagent"
+            / "session_tool_results"
+            / handle.token
+        )
+
+        assert sync_write.error is not None
+        assert async_write.error is not None
+        assert sync_upload.error == "disk full"
+        assert async_upload.error == "disk full"
         assert generation_root.is_dir()
 
         await registry.close_session("thread")

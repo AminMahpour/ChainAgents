@@ -423,7 +423,7 @@ class ArtifactTrackingBackend(CompositeBackend):
             return WriteResult(error=_HIDDEN_ARTIFACT_ERROR)
         mapped, handle = self._map(file_path)
         result = self.backend.write(mapped or file_path, content)
-        if handle is not None and result.error is None:
+        if handle is not None:
             self.registry.register(handle, self._physical_root(handle), self.backend)
         if result.path is not None and mapped != file_path:
             result.path = file_path
@@ -436,7 +436,7 @@ class ArtifactTrackingBackend(CompositeBackend):
 
         async def complete_write():
             result = await self.backend.awrite(mapped or file_path, content)
-            if handle is not None and result.error is None:
+            if handle is not None:
                 await self.registry.aregister(
                     handle,
                     self._physical_root(handle),
@@ -522,7 +522,7 @@ class ArtifactTrackingBackend(CompositeBackend):
             results,
             strict=True,
         ):
-            if handle is not None and result.error is None:
+            if handle is not None:
                 self.registry.register(
                     handle,
                     self._physical_root(handle),
@@ -555,7 +555,7 @@ class ArtifactTrackingBackend(CompositeBackend):
                 results,
                 strict=True,
             ):
-                if handle is not None and result.error is None:
+                if handle is not None:
                     await self.registry.aregister(
                         handle,
                         self._physical_root(handle),

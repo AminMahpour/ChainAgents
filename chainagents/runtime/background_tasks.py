@@ -796,6 +796,7 @@ async def _write_batch_markdown_files(
     """Write one persistent Markdown file per snapshot with atomic visibility."""
     call_component = _safe_batch_path_component(tool_call_id, fallback="batch")
     directory = f"subagent-batches/{call_component}-{uuid.uuid4().hex}"
+    directory_backend_path = store.backend_path(directory)
     width = max(2, len(str(len(snapshots))))
     attempted_paths: list[str] = []
     manifest: list[dict[str, object]] = []
@@ -810,7 +811,7 @@ async def _write_batch_markdown_files(
 
     async def rollback() -> list[BaseException]:
         errors: list[BaseException] = []
-        for backend_path in reversed(attempted_paths):
+        for backend_path in [*reversed(attempted_paths), directory_backend_path]:
             try:
                 result = await store.backend.adelete(backend_path)
             except BaseException as exc:

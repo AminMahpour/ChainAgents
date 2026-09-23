@@ -37,6 +37,7 @@ from chainagents.exports.generated_files import (
     generated_file_descriptors,
     generated_file_paths_from_text,
     generated_file_paths_from_tool_args,
+    generated_file_paths_from_tool_result,
     resolve_generated_download,
 )
 from chainagents.exports.response import build_pdf_bytes
@@ -1059,6 +1060,12 @@ async def _agent_stream_lines(
                 if event.status.lower() != "error":
                     generated_file_paths.extend(
                         generated_file_paths_from_tool_args(tool_name, tool_args)
+                    )
+                    generated_file_paths.extend(
+                        generated_file_paths_from_tool_result(
+                            tool_name,
+                            event.tool_result,
+                        )
                     )
             elif event.kind == "response_delta":
                 response_parts.append(event.text)

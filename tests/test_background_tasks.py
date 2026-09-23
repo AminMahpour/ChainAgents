@@ -1811,6 +1811,9 @@ def test_batch_markdown_files_remove_the_failed_write_path(
             "/backend/outputs/subagent-batches/"
             "batch-call-batchunique/01-researcher-task-1.md"
         )
+        expected_directory = (
+            "/backend/outputs/subagent-batches/batch-call-batchunique"
+        )
 
         with pytest.raises(RuntimeError, match="disk full"):
             await _write_batch_markdown_files(
@@ -1820,7 +1823,7 @@ def test_batch_markdown_files_remove_the_failed_write_path(
             )
 
         assert backend.contents == {}
-        assert backend.deleted_paths == [expected_path]
+        assert backend.deleted_paths == [expected_path, expected_directory]
 
     asyncio.run(exercise())
 
@@ -1855,6 +1858,11 @@ def test_batch_markdown_files_remove_real_filesystem_partial_writes(
 
         output_root = tmp_path / ".files" / "outputs"
         assert not list(output_root.rglob("*.md"))
+        assert not (
+            output_root
+            / "subagent-batches"
+            / "batch-call-batchunique"
+        ).exists()
 
     asyncio.run(exercise())
 
@@ -1955,6 +1963,9 @@ def test_batch_markdown_files_clean_up_a_write_completed_during_cancellation(
             "/backend/outputs/subagent-batches/"
             "batch-call-batchunique/01-researcher-task-1.md"
         )
+        expected_directory = (
+            "/backend/outputs/subagent-batches/batch-call-batchunique"
+        )
         write_task = asyncio.create_task(
             _write_batch_markdown_files(
                 [batch_snapshot(task_id="task-1")],
@@ -1969,7 +1980,7 @@ def test_batch_markdown_files_clean_up_a_write_completed_during_cancellation(
         with pytest.raises(asyncio.CancelledError):
             await write_task
         assert backend.contents == {}
-        assert backend.deleted_paths == [expected_backend_path]
+        assert backend.deleted_paths == [expected_backend_path, expected_directory]
 
     asyncio.run(exercise())
 

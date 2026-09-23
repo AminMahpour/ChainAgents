@@ -82,6 +82,23 @@ def generated_file_paths_from_text(text: str) -> tuple[str, ...]:
     )
 
 
+def generated_file_paths_from_tool_result(
+    tool_name: str,
+    result: Any,
+) -> tuple[str, ...]:
+    """Return generated paths carried by a successful batch tool result."""
+    if tool_name.strip().lower() != "run_subagent_batch":
+        return ()
+    if isinstance(result, str):
+        text = result
+    else:
+        try:
+            text = json.dumps(result, ensure_ascii=True)
+        except (TypeError, ValueError):
+            text = str(result)
+    return generated_file_paths_from_text(text)
+
+
 def generated_file_descriptors(
     raw_paths: list[str],
     *,
