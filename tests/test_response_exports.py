@@ -183,6 +183,42 @@ async def test_chainlit_pdf_render_gates_before_thread_submission(monkeypatch) -
     assert maximum_active == 1
 
 
+@pytest.mark.anyio
+async def test_chainlit_pdf_render_keeps_gate_until_cancelled_worker_stops(
+    monkeypatch,
+) -> None:
+    """Cancellation must not admit another render while its worker still runs."""
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+    calls = 0
+
+    def render(_text: str) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            assert first_release.wait(timeout=2)
+        else:
+            second_started.set()
+        return b"%PDF"
+
+    monkeypatch.setattr(response_exports, "build_pdf_bytes", render)
+
+    first = asyncio.create_task(response_exports._build_chainlit_pdf_bytes("one"))
+    assert await asyncio.to_thread(first_started.wait, 1)
+    first.cancel()
+    second = asyncio.create_task(response_exports._build_chainlit_pdf_bytes("two"))
+    await asyncio.sleep(0.05)
+
+    assert not second_started.is_set()
+    first_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert await second == b"%PDF"
+    assert second_started.is_set()
+
+
 def test_build_pdf_bytes_embeds_downloaded_remote_image(monkeypatch) -> None:
     """Dropping remote image resources must not silently remove response figures."""
     image_url = "https://images.example.test/figure.png"
@@ -563,6 +599,15 @@ def test_pdf_image_validation_limits_normalized_gif_size() -> None:
         pdf_images._validate_pdf_image(output.getvalue(), max_bytes=10)
 
 
+def test_pdf_image_validation_rejects_truncated_jpeg() -> None:
+    """Raster validation must decode pixels instead of checking headers alone."""
+    output = BytesIO()
+    Image.new("RGB", (64, 64), "red").save(output, format="JPEG")
+
+    with pytest.raises(pdf_images.PdfImageError, match="image content is invalid"):
+        pdf_images._validate_pdf_image(output.getvalue()[:-2])
+
+
 def test_pdf_image_validation_rejects_svg_external_resource() -> None:
     """An embedded SVG must not create a second unvalidated network request."""
     svg = (
@@ -629,6 +674,30 @@ def test_pdf_image_validation_rejects_utf16_doctype() -> None:
     ).encode("utf-16")
 
     with pytest.raises(pdf_images.PdfImageError, match="declarations"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_bomless_utf16_doctype() -> None:
+    """DTD detection must recognize XML's BOM-less UTF-16 byte signature."""
+    svg = (
+        '<?xml version="1.0" encoding="utf-16"?>'
+        '<!DOCTYPE svg [<!ENTITY payload "expanded">]>'
+        '<svg xmlns="http://www.w3.org/2000/svg"><text>&payload;</text></svg>'
+    ).encode("utf-16-le")
+
+    with pytest.raises(pdf_images.PdfImageError, match="declarations"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_excessive_svg_structure() -> None:
+    """SVG structure must be bounded before an ElementTree is materialized."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        + '<path d="M0 0" />' * (pdf_images.PDF_SVG_MAX_ELEMENTS + 1)
+        + "</svg>"
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="structure limit"):
         pdf_images._validate_pdf_image(svg)
 
 

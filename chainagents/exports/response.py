@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 import unicodedata
+import weakref
 from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -170,7 +171,9 @@ PDF_IMAGE_ATTRIBUTE_RE = re.compile(
 )
 logger = logging.getLogger(__name__)
 _PDF_RENDER_LOCK = threading.Lock()
-_CHAINLIT_PDF_RENDER_SEMAPHORE = asyncio.Semaphore(1)
+_CHAINLIT_PDF_RENDER_SEMAPHORES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
 MOJIBAKE_MARKERS = ("Â", "Ã", "â", "ð", "�")
 PDF_SUBSCRIPT_CHARS = {
     **dict(zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789")),
@@ -996,8 +999,21 @@ async def _send_export_unavailable_message() -> None:
 
 async def _build_chainlit_pdf_bytes(text: str) -> bytes:
     """Gate Chainlit PDF work before submitting it to the shared executor."""
-    async with _CHAINLIT_PDF_RENDER_SEMAPHORE:
-        return await asyncio.to_thread(build_pdf_bytes, text)
+    loop = asyncio.get_running_loop()
+    semaphore = _CHAINLIT_PDF_RENDER_SEMAPHORES.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(1)
+        _CHAINLIT_PDF_RENDER_SEMAPHORES[loop] = semaphore
+    async with semaphore:
+        worker = asyncio.create_task(asyncio.to_thread(build_pdf_bytes, text))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await worker
+            except Exception:
+                pass
+            raise
 
 
 def _get_response_exports() -> dict[str, dict[str, str]]:

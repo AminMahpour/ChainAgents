@@ -18,12 +18,16 @@ from dataclasses import dataclass
 from io import BytesIO
 from urllib.parse import quote, unquote_to_bytes, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
+from xml.parsers import expat
 
 from PIL import Image, UnidentifiedImageError
 
 
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = 25_000_000
+PDF_SVG_MAX_ELEMENTS = 10_000
+PDF_SVG_MAX_DEPTH = 4_096
+PDF_SVG_MAX_ATTRIBUTES = 100_000
 PDF_IMAGE_MAX_REDIRECTS = 3
 PDF_IMAGE_TIMEOUT_SECONDS = 5.0
 PDF_IMAGE_USER_AGENT = "ChainAgents-PDF/1.0"
@@ -403,7 +407,9 @@ def _validate_pdf_image(
     if not content:
         raise PdfImageError("image response was empty")
     stripped = content.removeprefix(b"\xef\xbb\xbf").lstrip()
-    if stripped.startswith(b"<") or content.startswith(
+    if stripped.startswith(b"<") or _has_multibyte_xml_signature(content):
+        return _validate_svg_image(content)
+    if content.startswith(
         (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")
     ):
         return _validate_svg_image(content)
@@ -426,6 +432,10 @@ def _validate_pdf_image(
                         raise PdfImageError("image exceeds the download size limit")
                     return PdfImageResource(normalized, "image/png", pixel_count)
                 image.verify()
+            if image_format == "JPEG" and not content.rstrip().endswith(b"\xff\xd9"):
+                raise PdfImageError("image content is invalid")
+            with Image.open(BytesIO(content)) as decoded_image:
+                decoded_image.load()
     except PdfImageError:
         raise
     except (
@@ -442,18 +452,7 @@ def _validate_pdf_image(
 
 def _validate_svg_image(content: bytes) -> PdfImageResource:
     """Accept SVG only when it contains no external resource references."""
-    try:
-        if content.startswith((b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")):
-            decoded = content.decode("utf-32")
-        elif content.startswith((b"\xff\xfe", b"\xfe\xff")):
-            decoded = content.decode("utf-16")
-        else:
-            decoded = content.decode("utf-8-sig")
-    except UnicodeError as exc:
-        raise PdfImageError("SVG content is invalid") from exc
-    upper = decoded.upper()
-    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
-        raise PdfImageError("SVG declarations are not supported")
+    _preflight_svg_structure(content)
     try:
         root = ElementTree.fromstring(content)
     except (ElementTree.ParseError, LookupError, ValueError) as exc:
@@ -480,6 +479,65 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
     if _svg_has_circular_use(root):
         raise PdfImageError("SVG contains a circular local reference")
     return PdfImageResource(content, "image/svg+xml")
+
+
+def _has_multibyte_xml_signature(content: bytes) -> bool:
+    """Return whether bytes begin with a BOM-less UTF-16/32 XML signature."""
+    return content.startswith(
+        (
+            b"<\x00",
+            b"\x00<",
+            b"<\x00\x00\x00",
+            b"\x00\x00\x00<",
+        )
+    )
+
+
+def _preflight_svg_structure(content: bytes) -> None:
+    """Reject unsafe or excessive XML before building an in-memory tree."""
+    element_count = 0
+    attribute_count = 0
+    depth = 0
+    parser = expat.ParserCreate()
+
+    def reject_declaration(*_args: object) -> None:
+        raise PdfImageError("SVG declarations are not supported")
+
+    def reject_external_entity(
+        _context: str,
+        _base: str | None,
+        _system_id: str | None,
+        _public_id: str | None,
+    ) -> int:
+        raise PdfImageError("SVG declarations are not supported")
+
+    def start_element(_name: str, attributes: dict[str, str]) -> None:
+        nonlocal element_count, attribute_count, depth
+        element_count += 1
+        attribute_count += len(attributes)
+        depth += 1
+        if (
+            element_count > PDF_SVG_MAX_ELEMENTS
+            or attribute_count > PDF_SVG_MAX_ATTRIBUTES
+            or depth > PDF_SVG_MAX_DEPTH
+        ):
+            raise PdfImageError("SVG structure limit exceeded")
+
+    def end_element(_name: str) -> None:
+        nonlocal depth
+        depth -= 1
+
+    parser.StartDoctypeDeclHandler = reject_declaration
+    parser.EntityDeclHandler = reject_declaration
+    parser.ExternalEntityRefHandler = reject_external_entity
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = end_element
+    try:
+        parser.Parse(content, True)
+    except PdfImageError:
+        raise
+    except (expat.ExpatError, LookupError, ValueError) as exc:
+        raise PdfImageError("SVG content is invalid") from exc
 
 
 def _svg_has_circular_use(root: ElementTree.Element) -> bool:
