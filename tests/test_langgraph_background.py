@@ -1,5 +1,6 @@
 """Exercise local background-task lifecycle for exported Agent Server graphs."""
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import pytest
@@ -113,3 +114,59 @@ async def test_static_shutdown_preserves_manager_and_artifact_cleanup_failures(
         "artifact cleanup failed",
     ]
     assert runtime_graph.static_background_task_managers() == ()
+
+
+@pytest.mark.anyio
+async def test_exported_session_cleanup_finishes_before_cancellation_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Request cancellation must not interrupt coordinated session teardown."""
+    calls: list[str] = []
+    artifact_started = asyncio.Event()
+    release_artifact = asyncio.Event()
+
+    class Manager:
+        @asynccontextmanager
+        async def closing_session(self, session_id: str):
+            calls.append(f"manager-enter:{session_id}")
+            try:
+                yield
+            finally:
+                calls.append(f"manager-exit:{session_id}")
+
+    class Artifacts:
+        async def close_session(self, session_id: str) -> None:
+            calls.append(f"artifact-start:{session_id}")
+            artifact_started.set()
+            await release_artifact.wait()
+            calls.append(f"artifact-end:{session_id}")
+
+    manager = Manager()
+    monkeypatch.setattr(
+        runtime_graph,
+        "_STATIC_LARGE_TOOL_RESULT_ARTIFACTS",
+        Artifacts(),
+    )
+    runtime_graph._STATIC_BACKGROUND_TASK_MANAGERS.add(manager)
+    cleanup = asyncio.create_task(
+        runtime_graph.close_static_background_session("thread")
+    )
+    await artifact_started.wait()
+
+    cleanup.cancel()
+    await asyncio.sleep(0)
+
+    assert not cleanup.done()
+    assert calls == ["manager-enter:thread", "artifact-start:thread"]
+
+    release_artifact.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+
+    assert calls == [
+        "manager-enter:thread",
+        "artifact-start:thread",
+        "artifact-end:thread",
+        "manager-exit:thread",
+    ]
+    runtime_graph._STATIC_BACKGROUND_TASK_MANAGERS.discard(manager)

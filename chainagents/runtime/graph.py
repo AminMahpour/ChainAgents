@@ -79,6 +79,15 @@ async def close_static_background_tasks() -> None:
 
 async def close_static_background_session(session_id: str) -> None:
     """Close one session across exported task and artifact owners."""
+    close_task = asyncio.create_task(
+        _close_static_background_session(session_id),
+        name=f"chainagents-close-static-session-{session_id}",
+    )
+    await runtime_background_tasks.await_preserving_cancellation(close_task)
+
+
+async def _close_static_background_session(session_id: str) -> None:
+    """Complete exported session teardown independently of its caller."""
     managers = static_background_task_managers()
     if managers:
         async with AsyncExitStack() as stack:
