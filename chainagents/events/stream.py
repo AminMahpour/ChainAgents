@@ -29,6 +29,7 @@ LANGGRAPH_STREAM_MODES = {
 }
 SUMMARIZATION_STATUS_KIND = "summarization_status"
 ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
+TOKEN_LIMIT_RETRY_MARKER = "chainagents_token_limit_retry"
 
 
 @dataclass(frozen=True)
@@ -260,6 +261,13 @@ class AgentStreamEventAdapter:
         self, part: dict[str, Any]
     ) -> list[AgentStreamEvent]:
         token, metadata = part["data"]
+        if (
+            getattr(token, "type", None) in {"human", "HumanMessageChunk"}
+            and (getattr(token, "additional_kwargs", None) or {}).get(
+                TOKEN_LIMIT_RETRY_MARKER
+            )
+        ):
+            return []
         metadata = metadata if isinstance(metadata, dict) else {}
         ns = tuple(part.get("ns", ()))
         source = namespace_label(ns, metadata)

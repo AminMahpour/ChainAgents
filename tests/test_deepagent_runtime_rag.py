@@ -3822,6 +3822,47 @@ def test_token_limited_tool_call_never_reaches_tool_node(streamed: bool) -> None
     assert any("output-token limit" in message.content for message in result["messages"])
 
 
+def test_token_limit_retry_notice_is_absent_from_streamed_response() -> None:
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from chainagents.events.stream import AgentStreamEventAdapter
+    from chainagents.runtime.middleware import TokenLimitedToolCallMiddleware
+
+    class ToolAwareFakeModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    def dangerous_action(value: str) -> str:
+        """Return a value if the model invokes this tool."""
+        pytest.fail("the incomplete tool call must not execute")
+
+    model = ToolAwareFakeModel(responses=[
+        AIMessage(
+            content="",
+            response_metadata={"finish_reason": "length"},
+            tool_calls=[{"name": "dangerous_action", "args": {"value": "x"}, "id": "call-1"}],
+        ),
+        AIMessage(content="Done"),
+    ])
+    agent = create_agent(model, tools=[dangerous_action], middleware=[TokenLimitedToolCallMiddleware()])
+
+    async def collect():
+        adapter = AgentStreamEventAdapter(prompt="Act")
+        return [
+            event
+            async for raw in agent.astream_events(
+                {"messages": [{"role": "user", "content": "Act"}]},
+                version="v2",
+                stream_mode=["messages", "updates", "custom"],
+                subgraphs=True,
+            )
+            for event in adapter.events_from_raw_event(raw)
+        ]
+
+    responses = [event.text for event in asyncio.run(collect()) if event.kind == "response_delta"]
+    assert responses == ["Done"]
+
+
 def test_repeated_token_limit_ends_agent_run_without_tool_execution() -> None:
     from langchain.agents import create_agent
     from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -3858,6 +3899,7 @@ def test_repeated_token_limit_ends_agent_run_without_tool_execution() -> None:
         {"finish_reason": "length"},
         {"stop_reason": "max_tokens"},
         {"done_reason": "length"},
+        {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
     ],
 )
 def test_token_limit_detection_accepts_provider_stop_reasons(metadata) -> None:
@@ -3874,6 +3916,24 @@ def test_token_limit_detection_accepts_provider_stop_reasons(metadata) -> None:
         {"messages": [message]}, SimpleNamespace()
     )
     assert result is not None and result["jump_to"] == "model"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [{}, {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}}],
+)
+def test_token_limit_detection_requires_explicit_provider_report(metadata) -> None:
+    from chainagents.runtime.middleware import TokenLimitedToolCallMiddleware
+
+    message = AIMessage(
+        id="unreported",
+        content="",
+        response_metadata=metadata,
+        invalid_tool_calls=[{"name": "search", "args": "{", "id": "call-1"}],
+    )
+    assert TokenLimitedToolCallMiddleware().after_model(
+        {"messages": [message]}, SimpleNamespace()
+    ) is None
 
 
 def test_tool_execution_middleware_maps_workspace_path_tool_args(
@@ -4226,6 +4286,30 @@ def test_leaf_subagent_middleware_removes_implicit_task_tool(tmp_path: Path) -> 
 
     tool_names = set(graph.nodes["tools"].bound.tools_by_name)
     assert "task" not in tool_names
+
+
+def test_deepagent_factory_adds_token_guard_to_default_subagent(tmp_path: Path, monkeypatch) -> None:
+    """The DeepAgents profile also supplies middleware to its implicit delegate."""
+    import deepagents.graph as deepagents_graph
+
+    captured = []
+    original_middleware = deepagents_graph.SubAgentMiddleware
+
+    class RecordingSubAgentMiddleware(original_middleware):
+        def __init__(self, *args, **kwargs):
+            captured.extend(kwargs["subagents"])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(deepagents_graph, "SubAgentMiddleware", RecordingSubAgentMiddleware)
+    runtime_middleware.create_deep_agent_with_configured_summarization(
+        make_runtime_config(tmp_path),
+        model=FakeListChatModel(responses=["ok"]),
+    )
+    default = next(spec for spec in captured if spec["name"] == "general-purpose")
+    assert any(
+        isinstance(item, runtime_middleware.TokenLimitedToolCallMiddleware)
+        for item in default["middleware"]
+    )
 
 
 def test_get_agent_passes_agent_memory_files_when_stateful(
@@ -7637,9 +7721,9 @@ def test_invoke_mcp_tool_command_calls_configured_tool(tmp_path: Path) -> None:
         assert server_names == ("repo",)
         assert thread_id == "thread-1"
         assert mcp_session_id is None
-        return [FakeTool()]
+        return [FakeTool()], ()
 
-    runtime._get_mcp_tools = fake_get_mcp_tools  # type: ignore[assignment]
+    runtime.get_mcp_tools_with_status = fake_get_mcp_tools  # type: ignore[method-assign]
 
     result = asyncio.run(
         runtime.invoke_mcp_tool_command(

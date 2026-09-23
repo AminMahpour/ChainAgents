@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 
 from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
+from langchain_core.messages import HumanMessageChunk
 
 
 class _Token:
@@ -80,6 +81,20 @@ def test_adapter_streams_response_deltas_from_main_message_chunks() -> None:
     assert second == [
         AgentStreamEvent(kind="response_delta", source="main-agent", text=" world")
     ]
+
+
+def test_adapter_hides_internal_token_limit_retry_notice() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+    notice = HumanMessageChunk(
+        content="Shorten or split the tool call; you have one retry.",
+        additional_kwargs={"chainagents_token_limit_retry": True},
+    )
+    assert adapter.events_from_raw_event(
+        _raw_event(((), "messages", (notice, {})))
+    ) == []
+    assert adapter.events_from_raw_event(
+        _raw_event(((), "messages", (_Token("Done"), {})))
+    ) == [AgentStreamEvent(kind="response_delta", source="main-agent", text="Done")]
 
 
 def test_adapter_streams_reasoning_deltas_by_source() -> None:

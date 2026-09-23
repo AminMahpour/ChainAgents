@@ -105,6 +105,11 @@ class _MCPSessionOwner:
             self._task.cancel()
         await asyncio.shield(self._task)
 
+    @property
+    def terminal(self) -> bool:
+        """Whether the transport task has exited and cannot be closed again."""
+        return self._task.done()
+
 
 class AgentRuntime:
     """Own configured agents, MCP sessions, persistence handles, and RAG state."""
@@ -921,7 +926,7 @@ class AgentRuntime:
             available_servers = self.config.extensions.mcp_servers or {}
             candidate_servers = tuple(available_servers.keys())
 
-        tools = await self._get_mcp_tools(
+        tools, failures = await self.get_mcp_tools_with_status(
             candidate_servers,
             thread_id=thread_id,
             mcp_session_id=mcp_session_id,
@@ -935,6 +940,8 @@ class AgentRuntime:
             None,
         )
         if selected_tool is None:
+            if failures:
+                raise RuntimeError(mcp_outage_warning(failures))
             available = sorted(
                 {
                     str(getattr(tool, "name", "")).strip()
@@ -1061,7 +1068,13 @@ class AgentRuntime:
 
         stale_owner = self._mcp_session_owners.get(cache_key)
         if stale_owner is not None:
-            await stale_owner.aclose()
+            if not stale_owner.terminal:
+                try:
+                    await stale_owner.aclose()
+                except Exception:
+                    if not stale_owner.terminal:
+                        raise
+                    logger.exception("Failed to close terminal MCP session for %s", server_name)
             self._mcp_session_owners.pop(cache_key, None)
 
         if self._mcp_client is None:
@@ -1147,6 +1160,8 @@ class AgentRuntime:
                             except Exception:
                                 logger.exception("Failed to close MCP session for %s", server_name)
                             else:
+                                self._mcp_session_owners.pop(session_key, None)
+                            if owner.terminal:
                                 self._mcp_session_owners.pop(session_key, None)
                     if isinstance(exc, asyncio.CancelledError):
                         raise
@@ -1290,7 +1305,7 @@ class AgentRuntime:
         )
         async with self._mcp_lock:
             for (key, owner), result in zip(owners, results, strict=True):
-                if not isinstance(result, BaseException):
+                if not isinstance(result, BaseException) or getattr(owner, "terminal", False):
                     if self._mcp_session_owners.get(key) is owner:
                         self._mcp_session_owners.pop(key, None)
         for result in results:

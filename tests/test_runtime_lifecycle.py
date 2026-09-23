@@ -1444,7 +1444,7 @@ def test_mcp_discovery_keeps_healthy_tools_and_retries_failed_server(runtime):
     asyncio.run(exercise())
 
 
-def test_failed_mcp_discovery_retains_owner_when_transport_close_fails(runtime, monkeypatch):
+def test_failed_mcp_discovery_discards_terminal_owner_and_reconnects(runtime, monkeypatch):
     runtime.config = replace(
         runtime.config,
         extensions=make_extensions_config(
@@ -1452,15 +1452,22 @@ def test_failed_mcp_discovery_retains_owner_when_transport_close_fails(runtime, 
         ),
     )
 
+    sessions = 0
+
     @asynccontextmanager
     async def session(server):
+        nonlocal sessions
+        sessions += 1
         try:
             yield object()
         finally:
-            raise RuntimeError("transport close failed")
+            if sessions == 1:
+                raise RuntimeError("transport close failed")
 
     async def load(*args, **kwargs):
-        raise OSError("tool listing failed")
+        if sessions == 1:
+            raise OSError("tool listing failed")
+        return [SimpleNamespace(name="broken_tool")]
 
     runtime._mcp_client = SimpleNamespace(
         session=session, callbacks=None, tool_interceptors=[]
@@ -1472,7 +1479,34 @@ def test_failed_mcp_discovery_retains_owner_when_transport_close_fails(runtime, 
             ("broken",), mcp_session_id="session"
         )
         assert tools == [] and failures == ("broken",)
-        assert ("session", "broken") in runtime._mcp_session_owners
+        assert ("session", "broken") not in runtime._mcp_session_owners
+        recovered, failures = await runtime.get_mcp_tools_with_status(
+            ("broken",), mcp_session_id="session"
+        )
+        assert [tool.name for tool in recovered] == ["broken_tool"]
+        assert failures == ()
+        assert sessions == 2
+        await runtime.close_mcp_session("session")
+
+    asyncio.run(exercise())
+
+
+def test_direct_mcp_command_reports_failed_discovery_as_outage(runtime):
+    runtime.config = replace(
+        runtime.config,
+        extensions=make_extensions_config(agent_mcp_servers=("broken",)),
+    )
+
+    async def get_tools(*, server_name):
+        raise OSError("transport offline")
+
+    runtime._mcp_client = SimpleNamespace(get_tools=get_tools)
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="MCP server unavailable: broken"):
+            await runtime.invoke_mcp_tool_command(
+                tool_name="broken_tool", raw_args="{}", server_name="broken"
+            )
 
     asyncio.run(exercise())
 
@@ -1501,6 +1535,47 @@ def test_mcp_close_failure_keeps_owner_for_later_retry(runtime):
         await runtime.close_mcp_session("session")
         assert runtime._mcp_session_owners == {}
         assert owner.attempts == 2
+
+    asyncio.run(exercise())
+
+
+def test_mcp_close_failure_discards_terminal_transport_owner(runtime, monkeypatch):
+    runtime.config = replace(
+        runtime.config,
+        extensions=make_extensions_config(mcp_stateful=True),
+    )
+    sessions = 0
+
+    @asynccontextmanager
+    async def session(server):
+        nonlocal sessions
+        sessions += 1
+        try:
+            yield object()
+        finally:
+            if sessions == 1:
+                raise RuntimeError("transport close failed")
+
+    async def load(*args, **kwargs):
+        return [SimpleNamespace(name="repo_tool")]
+
+    runtime._mcp_client = SimpleNamespace(
+        session=session, callbacks=None, tool_interceptors=[]
+    )
+    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+
+    async def exercise():
+        await runtime.get_mcp_tools_with_status(("repo",), mcp_session_id="session")
+        with pytest.raises(RuntimeError, match="transport close failed"):
+            await runtime.close_mcp_session("session")
+        assert ("session", "repo") not in runtime._mcp_session_owners
+        tools, failures = await runtime.get_mcp_tools_with_status(
+            ("repo",), mcp_session_id="session"
+        )
+        assert [tool.name for tool in tools] == ["repo_tool"]
+        assert failures == ()
+        assert sessions == 2
+        await runtime.close_mcp_session("session")
 
     asyncio.run(exercise())
 

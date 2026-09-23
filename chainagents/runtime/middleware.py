@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import logging
 import threading
@@ -49,6 +50,11 @@ class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
             metadata.get("finish_reason") in {"length", "max_tokens"}
             or metadata.get("stop_reason") == "max_tokens"
             or metadata.get("done_reason") == "length"
+            or (
+                metadata.get("status") == "incomplete"
+                and isinstance(metadata.get("incomplete_details"), dict)
+                and metadata["incomplete_details"].get("reason") == "max_output_tokens"
+            )
         )
         raw_calls = message.additional_kwargs.get("tool_calls")
         if not token_limited or not (message.tool_calls or message.invalid_tool_calls or raw_calls):
@@ -459,19 +465,35 @@ def create_deep_agent_with_configured_summarization(
     Returns:
         The created DeepAgents graph.
     """
-    summarization_factory = _build_deepagents_summarization_factory(config)
-    if summarization_factory is None:
-        return create_deep_agent(**kwargs)
-
     import deepagents.graph as deepagents_graph
+
+    summarization_factory = _build_deepagents_summarization_factory(config)
 
     with _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK:
         original_factory = deepagents_graph.create_summarization_middleware
-        deepagents_graph.create_summarization_middleware = summarization_factory
+        original_profile = deepagents_graph._harness_profile_for_model
+
+        def profile_with_token_guard(model: Any, spec: str | None) -> Any:
+            # DeepAgents builds its implicit general-purpose delegate from the
+            # harness profile, rather than inheriting caller middleware.
+            profile = original_profile(model, spec)
+
+            def middleware_for_stacks() -> list[AgentMiddleware[Any, Any, Any]]:
+                existing = profile.materialize_extra_middleware()
+                if not any(isinstance(item, TokenLimitedToolCallMiddleware) for item in existing):
+                    existing.append(TokenLimitedToolCallMiddleware())
+                return existing
+
+            return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
+
+        if summarization_factory is not None:
+            deepagents_graph.create_summarization_middleware = summarization_factory
+        deepagents_graph._harness_profile_for_model = profile_with_token_guard
         try:
             return create_deep_agent(**kwargs)
         finally:
             deepagents_graph.create_summarization_middleware = original_factory
+            deepagents_graph._harness_profile_for_model = original_profile
 
 
 def build_agent_middleware(
