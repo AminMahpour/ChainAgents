@@ -58,9 +58,23 @@ async def close_static_background_tasks() -> None:
     """Close exported-graph task managers and remaining result artifacts."""
     managers = tuple(_STATIC_BACKGROUND_TASK_MANAGERS)
     _STATIC_BACKGROUND_TASK_MANAGERS.clear()
+    errors: list[BaseException] = []
     if managers:
-        await asyncio.gather(*(manager.close() for manager in managers))
-    await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close()
+        results = await asyncio.gather(
+            *(manager.close() for manager in managers),
+            return_exceptions=True,
+        )
+        errors.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
+    try:
+        await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.close()
+    except BaseException as exc:
+        errors.append(exc)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Exported graph cleanup failed.", errors)
 
 
 async def close_static_background_session(session_id: str) -> None:

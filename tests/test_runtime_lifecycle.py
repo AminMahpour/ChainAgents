@@ -279,6 +279,88 @@ def test_successful_artifact_close_releases_generation_state():
     asyncio.run(exercise())
 
 
+def test_artifact_context_is_scoped_to_its_registry(tmp_path):
+    """Activating one registry must not replace another registry's session."""
+
+    async def exercise():
+        first_registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        second_registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        second_backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=second_registry,
+        )
+        second_handle = second_registry.open_session("second")
+        second_token = second_registry.activate(second_handle)
+        first_handle = first_registry.open_session("first")
+        first_token = first_registry.activate(first_handle)
+        logical = f"{second_backend.artifacts_root}/large_tool_results/result"
+
+        try:
+            assert second_backend.write(logical, "owned by second").error is None
+            result = second_backend.read(logical)
+            assert result.file_data is not None
+            assert result.file_data["content"] == "owned by second"
+        finally:
+            first_registry.reset(first_token)
+            second_registry.reset(second_token)
+
+        physical = (
+            tmp_path
+            / ".files"
+            / "deepagent"
+            / "session_tool_results"
+            / second_handle.token
+            / "result"
+        )
+        assert physical.is_file()
+        assert not list(
+            (
+                tmp_path
+                / ".files"
+                / "deepagent"
+                / "session_tool_results"
+                / first_handle.token
+            ).glob("result")
+        )
+        await first_registry.close()
+        await second_registry.close()
+
+    asyncio.run(exercise())
+
+
+def test_successful_artifact_close_removes_generation_directory(tmp_path):
+    """Successful session cleanup must remove its physical token namespace."""
+
+    async def exercise():
+        registry = runtime_artifacts.LargeToolResultArtifactRegistry()
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=tmp_path,
+            include_memories=False,
+            artifact_registry=registry,
+        )
+        handle = registry.open_session("thread")
+        token = registry.activate(handle)
+        logical = f"{backend.artifacts_root}/large_tool_results/nested/result"
+        assert backend.write(logical, "temporary").error is None
+        registry.reset(token)
+        generation_root = (
+            tmp_path
+            / ".files"
+            / "deepagent"
+            / "session_tool_results"
+            / handle.token
+        )
+        assert generation_root.is_dir()
+
+        await registry.close_session("thread")
+
+        assert not generation_root.exists()
+        await registry.close()
+
+    asyncio.run(exercise())
+
+
 def test_physical_artifact_namespaces_are_hidden_from_filesystem_tools(tmp_path):
     """Only the active session's logical large-result namespace is accessible."""
 

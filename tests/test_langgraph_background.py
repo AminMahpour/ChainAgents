@@ -78,3 +78,38 @@ async def test_langgraph_lifespan_closes_managers_after_application_error() -> N
 
     assert calls == ["manager"]
     assert runtime_graph.static_background_task_managers() == ()
+
+
+@pytest.mark.anyio
+async def test_static_shutdown_preserves_manager_and_artifact_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Artifact shutdown must run even when exported manager cleanup fails."""
+    calls: list[str] = []
+
+    class Manager:
+        async def close(self) -> None:
+            calls.append("manager")
+            raise RuntimeError("manager cleanup failed")
+
+    class Artifacts:
+        async def close(self) -> None:
+            calls.append("artifacts")
+            raise RuntimeError("artifact cleanup failed")
+
+    monkeypatch.setattr(
+        runtime_graph,
+        "_STATIC_LARGE_TOOL_RESULT_ARTIFACTS",
+        Artifacts(),
+    )
+    runtime_graph._STATIC_BACKGROUND_TASK_MANAGERS.add(Manager())
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        await runtime_graph.close_static_background_tasks()
+
+    assert calls == ["manager", "artifacts"]
+    assert [str(error) for error in captured.value.exceptions] == [
+        "manager cleanup failed",
+        "artifact cleanup failed",
+    ]
+    assert runtime_graph.static_background_task_managers() == ()

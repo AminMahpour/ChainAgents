@@ -53,16 +53,17 @@ class ArtifactSessionHandle:
     token: str
 
 
-_CURRENT_ARTIFACT_SESSION: contextvars.ContextVar[ArtifactSessionHandle | None] = (
-    contextvars.ContextVar("chainagents_artifact_session", default=None)
-)
-
-
 class LargeToolResultArtifactRegistry:
     """Own physical large-result files until their session generation closes."""
 
     def __init__(self) -> None:
         self._guard = threading.RLock()
+        self._current_context: contextvars.ContextVar[
+            ArtifactSessionHandle | None
+        ] = contextvars.ContextVar(
+            f"chainagents_artifact_session_{uuid.uuid4().hex}",
+            default=None,
+        )
         self._unscoped = ArtifactSessionHandle("", f"unscoped-{uuid.uuid4().hex}")
         self._current: dict[str, ArtifactSessionHandle] = {}
         self._states: dict[ArtifactSessionHandle, str] = {self._unscoped: "open"}
@@ -95,16 +96,15 @@ class LargeToolResultArtifactRegistry:
         self, handle: ArtifactSessionHandle
     ) -> contextvars.Token[ArtifactSessionHandle | None]:
         """Activate one ownership generation in the current execution context."""
-        return _CURRENT_ARTIFACT_SESSION.set(handle)
+        return self._current_context.set(handle)
 
-    @staticmethod
-    def reset(token: contextvars.Token[ArtifactSessionHandle | None]) -> None:
+    def reset(self, token: contextvars.Token[ArtifactSessionHandle | None]) -> None:
         """Restore the preceding ownership context."""
-        _CURRENT_ARTIFACT_SESSION.reset(token)
+        self._current_context.reset(token)
 
     def current_handle(self) -> ArtifactSessionHandle:
         """Return the active handle or the registry-owned unscoped fallback."""
-        return _CURRENT_ARTIFACT_SESSION.get() or self._unscoped
+        return self._current_context.get() or self._unscoped
 
     def register(
         self, handle: ArtifactSessionHandle, path: str, backend: BackendProtocol
@@ -292,12 +292,15 @@ class ArtifactTrackingBackend(CompositeBackend):
             return path, None
         handle = self.registry.current_handle()
         relative = path.removeprefix(self._logical_root).lstrip("/")
-        physical = (
-            f"{self.artifacts_root.rstrip('/')}/session_tool_results/{handle.token}"
-        )
+        physical = self._physical_root(handle)
         if relative:
             physical = f"{physical}/{relative}"
         return physical, handle
+
+    def _physical_root(self, handle: ArtifactSessionHandle) -> str:
+        return (
+            f"{self.artifacts_root.rstrip('/')}/session_tool_results/{handle.token}"
+        )
 
     @staticmethod
     def _restore_path(path: str, mapped: str | None, logical: str | None) -> str:
@@ -421,7 +424,7 @@ class ArtifactTrackingBackend(CompositeBackend):
         mapped, handle = self._map(file_path)
         result = self.backend.write(mapped or file_path, content)
         if handle is not None and result.error is None:
-            self.registry.register(handle, mapped or file_path, self.backend)
+            self.registry.register(handle, self._physical_root(handle), self.backend)
         if result.path is not None and mapped != file_path:
             result.path = file_path
         return result
@@ -434,7 +437,11 @@ class ArtifactTrackingBackend(CompositeBackend):
         async def complete_write():
             result = await self.backend.awrite(mapped or file_path, content)
             if handle is not None and result.error is None:
-                await self.registry.aregister(handle, mapped or file_path, self.backend)
+                await self.registry.aregister(
+                    handle,
+                    self._physical_root(handle),
+                    self.backend,
+                )
             if result.path is not None and mapped != file_path:
                 result.path = file_path
             return result
@@ -516,7 +523,11 @@ class ArtifactTrackingBackend(CompositeBackend):
             strict=True,
         ):
             if handle is not None and result.error is None:
-                self.registry.register(handle, mapped, self.backend)
+                self.registry.register(
+                    handle,
+                    self._physical_root(handle),
+                    self.backend,
+                )
             responses[index] = replace(result, path=path)
         return cast(list[FileUploadResponse], responses)
 
@@ -545,7 +556,11 @@ class ArtifactTrackingBackend(CompositeBackend):
                 strict=True,
             ):
                 if handle is not None and result.error is None:
-                    await self.registry.aregister(handle, mapped, self.backend)
+                    await self.registry.aregister(
+                        handle,
+                        self._physical_root(handle),
+                        self.backend,
+                    )
                 responses[index] = replace(result, path=path)
             return cast(list[FileUploadResponse], responses)
 
