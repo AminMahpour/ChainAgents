@@ -13,6 +13,7 @@ StreamEventKind = Literal[
     "tool_call",
     "tool_result",
     "summarization_status",
+    "mcp_status",
     "ui_message",
     "ui_remove",
 ]

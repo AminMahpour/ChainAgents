@@ -1195,6 +1195,25 @@ class _FakePromptRuntime:
 
 
 @pytest.mark.anyio
+async def test_cli_reports_mcp_outage_and_keeps_response() -> None:
+    class DegradedRuntime(_FakePromptRuntime):
+        async def get_agent_with_status(self, *args, **kwargs):
+            return self.agent, ("docs",)
+
+    runtime = DegradedRuntime()
+    stderr = io.StringIO()
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        chainagents_cli.parse_args(["--prompt", "hello", "--no-stream"]),
+        prompt="hello",
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+    assert code == 0
+    assert "MCP server unavailable: docs" in stderr.getvalue()
+
+
+@pytest.mark.anyio
 async def test_one_shot_json_waits_for_background_tasks(monkeypatch) -> None:
     """One-shot JSON must contain terminal local background task results."""
     args = chainagents_cli.parse_args(

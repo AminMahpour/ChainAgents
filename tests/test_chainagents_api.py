@@ -598,6 +598,7 @@ def test_invoke_runs_prompt_through_agent() -> None:
         "thread_id": "thread-1",
         "model": "other-model",
         "reasoning": "high",
+        "warnings": [],
     }
     assert runtime.requests == [
         {
@@ -616,6 +617,31 @@ def test_invoke_runs_prompt_through_agent() -> None:
         "configurable": {"thread_id": "thread-1"},
         "recursion_limit": 100,
     }
+
+
+def test_api_run_reports_mcp_outage_without_losing_response() -> None:
+    class DegradedRuntime(_FakeRuntime):
+        async def get_agent_with_status(self, *args, **kwargs):
+            return self.agent, ("docs",)
+
+    runtime = DegradedRuntime(_FakeAgent([_raw_event(((), "messages", (_Token("Ready"), {})))]))
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        invoke = client.post(
+            "/api/agent/invoke", json={"prompt": "hello", "thread_id": "thread-1"}
+        )
+        streamed = client.post(
+            "/api/agent/stream", json={"prompt": "hello", "thread_id": "thread-2"}
+        )
+    warning = "MCP server unavailable: docs. Continuing with available tools."
+    assert invoke.status_code == 200
+    assert invoke.json()["response"] == "Ready"
+    assert invoke.json()["warnings"] == [warning]
+    assert streamed.status_code == 200
+    assert any(
+        event["kind"] == "mcp_status" and event["text"] == warning
+        for event in (json.loads(line) for line in streamed.text.splitlines())
+    )
 
 
 def test_invoke_requires_thread_id() -> None:

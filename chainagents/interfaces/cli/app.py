@@ -26,6 +26,7 @@ from rich.table import Table
 from rich.text import Text
 
 from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.runtime.reflection import (
     ReflectionCollector,
     ReflectionProposal,
@@ -1868,13 +1869,16 @@ async def run_agent_prompt(
     if photos is None:
         return 1
 
-    agent = await runtime.get_agent(
+    agent, mcp_failures = await agent_with_mcp_status(
+        runtime,
         settings.reasoning_level,
         model_name=settings.model_name,
         thread_id=settings.thread_id,
         async_subagent_url_override=args.async_subagent_url,
         mcp_session_id=args.mcp_session_id,
     )
+    if mcp_failures:
+        print(mcp_outage_warning(mcp_failures), file=stderr)
     payload = {
         "messages": [{"role": "user", "content": user_message_content(prompt, photos)}]
     }

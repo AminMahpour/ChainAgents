@@ -376,6 +376,22 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_shows_mcp_outage_warning() -> None:
+    class DegradedRuntime(_FakeRuntime):
+        async def get_agent_with_status(self, *args, **kwargs):
+            return self.agent, ("docs",)
+
+    app = ChainAgentsTuiApp(runtime=DegradedRuntime(_FakeAgent([])), args=_args())
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("hello")
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert any("MCP server unavailable: docs" in entry for entry in app.tool_entries)
+
+
+@pytest.mark.anyio
 async def test_tui_submits_multiline_prompt() -> None:
     agent = _FakeAgent(
         [
