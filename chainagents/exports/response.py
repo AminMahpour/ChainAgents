@@ -27,6 +27,7 @@ from chainagents.exports.pdf_images import (
     PdfImageDownloadBudget,
     PdfImageError,
     PdfImageResource,
+    decode_pdf_data_image as _decode_pdf_data_image,
     download_pdf_image as _download_pdf_image,
 )
 
@@ -808,7 +809,9 @@ def _prepare_pdf_image_resources(
     for match in image_tags:
         attributes = _pdf_image_attributes(match.group(0))
         source = attributes.get("src", "")
-        if source.lower().startswith(("http://", "https://")) and source not in urls:
+        if source.lower().startswith(
+            ("http://", "https://", "data:image/")
+        ) and source not in urls:
             urls.append(source)
 
     resources: dict[str, PdfImageResource] = {}
@@ -828,12 +831,15 @@ def _prepare_pdf_image_resources(
             continue
         try:
             previous_remaining = budget.remaining_bytes
-            resource = _download_pdf_image(
-                url,
-                deadline=deadline,
-                max_bytes=remaining_bytes,
-                budget=budget,
-            )
+            if url.lower().startswith("data:image/"):
+                resource = _decode_pdf_data_image(url, max_bytes=remaining_bytes)
+            else:
+                resource = _download_pdf_image(
+                    url,
+                    deadline=deadline,
+                    max_bytes=remaining_bytes,
+                    budget=budget,
+                )
             transferred_bytes = previous_remaining - budget.remaining_bytes
             retained_difference = len(resource.content) - transferred_bytes
             if retained_difference > 0:
@@ -875,7 +881,7 @@ def _pdf_url_fetcher(resources: dict[str, PdfImageResource]) -> object:
 
     class PdfResourceFetcher(URLFetcher):
         def __init__(self) -> None:
-            super().__init__(allowed_protocols={"data"}, fail_on_errors=False)
+            super().__init__(allowed_protocols=set(), fail_on_errors=False)
 
         def fetch(self, url: str, headers: object = None) -> object:
             resource = resources.get(url)

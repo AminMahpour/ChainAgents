@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import base64
 import gzip
 from io import BytesIO
 import os
@@ -164,6 +165,36 @@ def test_build_pdf_bytes_downloads_repeated_image_once(monkeypatch) -> None:
     )
 
     assert calls == [image_url]
+
+
+def test_build_pdf_bytes_embeds_valid_data_image() -> None:
+    """Top-level data images must pass validation before PDF rendering."""
+    encoded = base64.b64encode(_png_bytes()).decode("ascii")
+
+    pdf_bytes = response_exports.build_pdf_bytes(
+        f"Before\n\n![inline](data:image/png;base64,{encoded})\n\nAfter"
+    )
+
+    page = PdfReader(BytesIO(pdf_bytes)).pages[0]
+    assert len(page.images) == 1
+    assert "Before" in (page.extract_text() or "")
+    assert "After" in (page.extract_text() or "")
+
+
+def test_build_pdf_bytes_replaces_invalid_data_image() -> None:
+    """Invalid data images must use the recoverable placeholder path."""
+    encoded = base64.b64encode(b"not-an-image").decode("ascii")
+
+    pdf_bytes = response_exports.build_pdf_bytes(
+        f"Before\n\n![inline](data:image/png;base64,{encoded})\n\nAfter"
+    )
+
+    text = " ".join(
+        (page.extract_text() or "") for page in PdfReader(BytesIO(pdf_bytes)).pages
+    )
+    assert "Before" in text
+    assert "Image unavailable: inline" in text
+    assert "After" in text
 
 
 def test_build_pdf_bytes_keeps_document_when_remote_image_fails(monkeypatch) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import http.client
 import ipaddress
 import math
@@ -14,7 +16,7 @@ import warnings
 import zlib
 from dataclasses import dataclass
 from io import BytesIO
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, unquote_to_bytes, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 from PIL import Image, UnidentifiedImageError
@@ -362,6 +364,33 @@ def _decompress_pdf_image(content: bytes, *, encoding: str, max_bytes: int) -> b
             raise PdfImageError("image compression is invalid")
         return decoded
     raise PdfImageError("image compression is invalid") from last_error
+
+
+def decode_pdf_data_image(
+    url: str,
+    *,
+    max_bytes: int = PDF_IMAGE_MAX_BYTES,
+) -> PdfImageResource:
+    """Decode and validate one bounded image data URI."""
+    header, separator, payload = url.partition(",")
+    if not separator or not header[:5].lower() == "data:":
+        raise PdfImageError("invalid image data URI")
+    metadata = header[5:].split(";")
+    if not metadata[0].lower().startswith("image/"):
+        raise PdfImageError("data URI must contain an image")
+    encoded = unquote_to_bytes(payload)
+    if any(parameter.lower() == "base64" for parameter in metadata[1:]):
+        if len(encoded) > ((max_bytes + 2) // 3) * 4 + 4:
+            raise PdfImageError("image exceeds the download size limit")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise PdfImageError("image data URI is invalid") from exc
+    else:
+        content = encoded
+    if len(content) > max_bytes:
+        raise PdfImageError("image exceeds the download size limit")
+    return _validate_pdf_image(content, max_bytes=max_bytes)
 
 
 def _validate_pdf_image(
