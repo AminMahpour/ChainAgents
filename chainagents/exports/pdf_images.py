@@ -38,6 +38,10 @@ class PdfImageError(ValueError):
     """An image cannot be safely included in a response PDF."""
 
 
+class _PdfImageConnectionError(PdfImageError):
+    """A validated address could not complete an HTTP request."""
+
+
 @dataclass(frozen=True)
 class PdfImageResource:
     """Validated image bytes ready for WeasyPrint."""
@@ -101,18 +105,30 @@ def download_pdf_image(
     for redirect_count in range(PDF_IMAGE_MAX_REDIRECTS + 1):
         if time.monotonic() >= deadline:
             raise PdfImageError("image download budget expired")
-        normalized_url, host, port, address = _resolve_public_image_url(
+        normalized_url, host, port, addresses = _resolve_public_image_url(
             current_url,
             deadline=download_budget.deadline,
         )
-        response = _request_pdf_image_url(
-            normalized_url,
-            host=host,
-            port=port,
-            address=address,
-            max_bytes=max_bytes,
-            budget=download_budget,
-        )
+        response: _PdfHttpResponse | None = None
+        last_connection_error: _PdfImageConnectionError | None = None
+        for address in addresses:
+            try:
+                response = _request_pdf_image_url(
+                    normalized_url,
+                    host=host,
+                    port=port,
+                    address=address,
+                    max_bytes=max_bytes,
+                    budget=download_budget,
+                )
+            except _PdfImageConnectionError as exc:
+                last_connection_error = exc
+                if time.monotonic() >= download_budget.deadline:
+                    raise PdfImageError("image download budget expired") from exc
+                continue
+            break
+        if response is None:
+            raise last_connection_error or PdfImageError("image download failed")
         if response.status in _REDIRECT_STATUSES:
             location = response.headers.get("location", "").strip()
             if not location or redirect_count >= PDF_IMAGE_MAX_REDIRECTS:
@@ -129,7 +145,7 @@ def _resolve_public_image_url(
     url: str,
     *,
     deadline: float = float("inf"),
-) -> tuple[str, str, int, str]:
+) -> tuple[str, str, int, tuple[str, ...]]:
     """Resolve one strict HTTP(S) URL to a public address."""
     if not url or any(char.isspace() or ord(char) < 33 for char in url):
         raise PdfImageError("invalid image URL")
@@ -180,7 +196,7 @@ def _resolve_public_image_url(
     path = quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
     query = quote(parsed.query, safe="%/?@!$&'()*+,;=:-._~")
     normalized_url = urlunsplit((scheme, netloc, path, query, ""))
-    return normalized_url, ascii_host, port, addresses[0]
+    return normalized_url, ascii_host, port, tuple(addresses)
 
 
 def _getaddrinfo_before_deadline(
@@ -273,10 +289,11 @@ def _request_pdf_image_url(
         declared_length = headers.get("content-length")
         if declared_length:
             try:
-                if int(declared_length) > max_bytes:
-                    raise PdfImageError("image exceeds the download size limit")
+                content_length = int(declared_length)
             except ValueError as exc:
                 raise PdfImageError("image has an invalid content length") from exc
+            if content_length > max_bytes:
+                raise PdfImageError("image exceeds the download size limit")
         chunks: list[bytes] = []
         transferred = 0
         while True:
@@ -297,7 +314,7 @@ def _request_pdf_image_url(
                 raise PdfImageError("image exceeds the download size limit")
         content = b"".join(chunks)
     except (OSError, http.client.HTTPException) as exc:
-        raise PdfImageError("image download failed") from exc
+        raise _PdfImageConnectionError("image download failed") from exc
     finally:
         if deadline_timer is not None:
             deadline_timer.cancel()
@@ -356,7 +373,7 @@ def _validate_pdf_image(
     if not content:
         raise PdfImageError("image response was empty")
     stripped = content.removeprefix(b"\xef\xbb\xbf").lstrip()
-    if stripped.startswith((b"<svg", b"<?xml")):
+    if stripped.startswith(b"<"):
         return _validate_svg_image(content)
     try:
         with warnings.catch_warnings():
@@ -397,7 +414,7 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
         raise PdfImageError("SVG declarations are not supported")
     try:
         root = ElementTree.fromstring(content)
-    except ElementTree.ParseError as exc:
+    except (ElementTree.ParseError, LookupError, ValueError) as exc:
         raise PdfImageError("SVG content is invalid") from exc
     if root.tag.rsplit("}", 1)[-1].lower() != "svg":
         raise PdfImageError("image content is not SVG")
@@ -405,7 +422,7 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
         for name, value in element.attrib.items():
             normalized = value.strip().lower()
             if name.lower().endswith("href") and normalized and not normalized.startswith(
-                ("#", "data:")
+                "#"
             ):
                 raise PdfImageError("SVG contains an external resource")
             if _svg_css_has_external_resource(normalized):
@@ -427,6 +444,6 @@ def _svg_css_has_external_resource(value: str) -> bool:
         if not separator:
             return True
         normalized = reference.strip(" \t\r\n'\"")
-        if normalized and not normalized.startswith(("#", "data:")):
+        if normalized and not normalized.startswith("#"):
             return True
     return False

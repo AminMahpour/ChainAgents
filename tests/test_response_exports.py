@@ -209,9 +209,9 @@ def test_pdf_image_download_rejects_private_destination(monkeypatch) -> None:
 
 def test_pdf_image_download_revalidates_redirect_destination(monkeypatch) -> None:
     """Redirects must pass the same public-address policy as original URLs."""
-    def resolve(url: str, **_kwargs: Any) -> tuple[str, str, int, str]:
+    def resolve(url: str, **_kwargs: Any) -> tuple[str, str, int, tuple[str, ...]]:
         if "public.example" in url:
-            return url, "public.example", 443, "203.0.113.10"
+            return url, "public.example", 443, ("203.0.113.10",)
         raise pdf_images.PdfImageError("image host resolved outside the public internet")
 
     monkeypatch.setattr(pdf_images, "_resolve_public_image_url", resolve)
@@ -230,6 +230,38 @@ def test_pdf_image_download_revalidates_redirect_destination(monkeypatch) -> Non
             "https://public.example/image.png",
             deadline=float("inf"),
         )
+
+
+def test_pdf_image_download_tries_each_validated_address(monkeypatch) -> None:
+    """An unreachable first DNS result must not hide a healthy public address."""
+    attempts: list[str] = []
+    image = _png_bytes()
+    monkeypatch.setattr(
+        pdf_images,
+        "_resolve_public_image_url",
+        lambda *_args, **_kwargs: (
+            "https://images.example.test/figure.png",
+            "images.example.test",
+            443,
+            ("2001:4860:4860::8888", "8.8.8.8"),
+        ),
+    )
+
+    def request(*_args: Any, address: str, **_kwargs: Any) -> Any:
+        attempts.append(address)
+        if len(attempts) == 1:
+            raise pdf_images._PdfImageConnectionError("image download failed")
+        return pdf_images._PdfHttpResponse(200, {}, image)
+
+    monkeypatch.setattr(pdf_images, "_request_pdf_image_url", request)
+
+    resource = pdf_images.download_pdf_image(
+        "https://images.example.test/figure.png",
+        deadline=float("inf"),
+    )
+
+    assert attempts == ["2001:4860:4860::8888", "8.8.8.8"]
+    assert resource.mime_type == "image/png"
 
 
 def test_prepare_pdf_images_limits_unique_downloads(monkeypatch) -> None:
@@ -396,6 +428,41 @@ def test_pdf_image_validation_rejects_svg_external_resource() -> None:
 
     with pytest.raises(pdf_images.PdfImageError, match="external resource"):
         pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_svg_data_resource() -> None:
+    """Nested data images must not bypass raster validation limits."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg">'
+        b'<image href="data:image/png;base64,iVBORw0KGgo=" />'
+        b"</svg>"
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="external resource"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_wraps_unknown_xml_encoding() -> None:
+    """Malformed SVG encodings must remain recoverable image failures."""
+    svg = (
+        b'<?xml version="1.0" encoding="not-a-real-encoding"?>'
+        b'<svg xmlns="http://www.w3.org/2000/svg" />'
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="SVG content is invalid"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_detects_svg_after_leading_comment() -> None:
+    """Valid SVGs may contain comments before the document element."""
+    svg = (
+        b"<!-- generated image -->"
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" />'
+    )
+
+    resource = pdf_images._validate_pdf_image(svg)
+
+    assert resource == pdf_images.PdfImageResource(svg, "image/svg+xml")
 
 
 def test_pdf_image_validation_rejects_late_svg_doctype() -> None:
