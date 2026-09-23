@@ -490,16 +490,22 @@ def _svg_has_circular_use(root: ElementTree.Element) -> bool:
         if (identifier := element.attrib.get("id", "").strip())
     }
     graph: dict[str, set[str]] = {identifier: set() for identifier in elements_by_id}
-    for identifier, element in elements_by_id.items():
-        for descendant in element.iter():
-            if descendant.tag.rsplit("}", 1)[-1].lower() != "use":
-                continue
-            for name, value in descendant.attrib.items():
+    pending: list[tuple[ElementTree.Element, str | None]] = [(root, None)]
+    while pending:
+        element, owner = pending.pop()
+        identifier = element.attrib.get("id", "").strip()
+        if identifier:
+            if owner is not None:
+                graph[owner].add(identifier)
+            owner = identifier
+        if owner is not None and element.tag.rsplit("}", 1)[-1].lower() == "use":
+            for name, value in element.attrib.items():
                 normalized = value.strip()
                 if name.lower().endswith("href") and normalized.startswith("#"):
                     target = normalized[1:]
                     if target in graph:
-                        graph[identifier].add(target)
+                        graph[owner].add(target)
+        pending.extend((child, owner) for child in element)
 
     state: dict[str, int] = {}
     for start in graph:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import base64
 from concurrent.futures import ThreadPoolExecutor
@@ -149,6 +150,34 @@ def test_build_pdf_bytes_serializes_concurrent_renders(monkeypatch) -> None:
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(response_exports.build_pdf_bytes, ["one", "two"]))
+
+    assert results == [b"%PDF", b"%PDF"]
+    assert maximum_active == 1
+
+
+@pytest.mark.anyio
+async def test_chainlit_pdf_render_gates_before_thread_submission(monkeypatch) -> None:
+    """Chainlit PDF requests must not occupy executor workers while waiting."""
+    active = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+
+    def render(_text: str) -> bytes:
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+        return b"%PDF"
+
+    monkeypatch.setattr(response_exports, "build_pdf_bytes", render)
+
+    results = await asyncio.gather(
+        response_exports._build_chainlit_pdf_bytes("one"),
+        response_exports._build_chainlit_pdf_bytes("two"),
+    )
 
     assert results == [b"%PDF", b"%PDF"]
     assert maximum_active == 1
@@ -624,6 +653,22 @@ def test_pdf_image_validation_handles_deep_acyclic_svg_use_chain() -> None:
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg">{definitions}'
         '<g id="node-1100"><rect width="1" height="1" /></g></svg>'
+    ).encode()
+
+    resource = pdf_images._validate_pdf_image(svg)
+
+    assert resource.mime_type == "image/svg+xml"
+
+
+def test_pdf_image_validation_handles_deeply_nested_svg_ids() -> None:
+    """Reference graph construction must stay linear for nested IDs."""
+    depth = 2_000
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        + "".join(f'<g id="node-{index}">' for index in range(depth))
+        + '<rect width="1" height="1" />'
+        + "</g>" * depth
+        + "</svg>"
     ).encode()
 
     resource = pdf_images._validate_pdf_image(svg)

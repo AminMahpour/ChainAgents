@@ -170,6 +170,7 @@ PDF_IMAGE_ATTRIBUTE_RE = re.compile(
 )
 logger = logging.getLogger(__name__)
 _PDF_RENDER_LOCK = threading.Lock()
+_CHAINLIT_PDF_RENDER_SEMAPHORE = asyncio.Semaphore(1)
 MOJIBAKE_MARKERS = ("Â", "Ã", "â", "ð", "�")
 PDF_SUBSCRIPT_CHARS = {
     **dict(zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789")),
@@ -518,9 +519,7 @@ async def send_pdf_export(action: cl.Action) -> None:
         return
 
     try:
-        pdf_content = await asyncio.to_thread(
-            build_pdf_bytes, export["response_text"]
-        )
+        pdf_content = await _build_chainlit_pdf_bytes(export["response_text"])
     except RuntimeError as exc:
         await cl.Message(content=str(exc), author="System").send()
         return
@@ -993,6 +992,12 @@ async def _send_export_unavailable_message() -> None:
         content="That response is no longer available for download in this session.",
         author="System",
     ).send()
+
+
+async def _build_chainlit_pdf_bytes(text: str) -> bytes:
+    """Gate Chainlit PDF work before submitting it to the shared executor."""
+    async with _CHAINLIT_PDF_RENDER_SEMAPHORE:
+        return await asyncio.to_thread(build_pdf_bytes, text)
 
 
 def _get_response_exports() -> dict[str, dict[str, str]]:
