@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import builtins
+import gzip
+from io import BytesIO
 import os
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from PIL import Image
+from pypdf import PdfReader
 
 import response_exports
+import chainagents.exports.pdf_images as pdf_images
+
+
+def _png_bytes(*, width: int = 48, height: int = 32) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (width, height), "#2563eb").save(output, format="PNG")
+    return output.getvalue()
 
 
 def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
@@ -95,6 +107,11 @@ def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
             return b"%PDF-WEASYPRINT"
 
     monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=FakeHTML))
+    monkeypatch.setattr(
+        response_exports,
+        "_pdf_url_fetcher",
+        lambda _resources: response_exports._blocked_pdf_url_fetcher,
+    )
 
     pdf_bytes = response_exports.build_pdf_bytes("# Export\n\n- item")
 
@@ -107,6 +124,302 @@ def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
     assert callable(html_calls[0]["url_fetcher"])
     with pytest.raises(ValueError, match="External resources are disabled"):
         html_calls[0]["url_fetcher"]("file:///etc/passwd")
+
+
+def test_build_pdf_bytes_embeds_downloaded_remote_image(monkeypatch) -> None:
+    """Dropping remote image resources must not silently remove response figures."""
+    image_url = "https://images.example.test/figure.png"
+    monkeypatch.setattr(
+        response_exports,
+        "_download_pdf_image",
+        lambda url, **_kwargs: response_exports.PdfImageResource(
+            content=_png_bytes(), mime_type="image/png"
+        ),
+    )
+
+    pdf_bytes = response_exports.build_pdf_bytes(
+        f"# Result\n\n![Dose response]({image_url})"
+    )
+
+    page = PdfReader(BytesIO(pdf_bytes)).pages[0]
+    assert len(page.images) == 1
+    assert "Dose response" not in (page.extract_text() or "")
+
+
+def test_build_pdf_bytes_downloads_repeated_image_once(monkeypatch) -> None:
+    """Repeated Markdown references must reuse one bounded download."""
+    calls: list[str] = []
+    image_url = "https://images.example.test/repeated.png"
+
+    def download(url: str, **_kwargs: Any) -> Any:
+        calls.append(url)
+        return response_exports.PdfImageResource(
+            content=_png_bytes(), mime_type="image/png"
+        )
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+
+    response_exports.build_pdf_bytes(
+        f"![First]({image_url})\n\n![Second]({image_url})"
+    )
+
+    assert calls == [image_url]
+
+
+def test_build_pdf_bytes_keeps_document_when_remote_image_fails(monkeypatch) -> None:
+    """One unavailable image must not abort the whole response export."""
+    def fail_download(_url: str, **_kwargs: Any) -> Any:
+        raise response_exports.PdfImageError("network unavailable")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", fail_download)
+
+    pdf_bytes = response_exports.build_pdf_bytes(
+        "Before\n\n![Dose response](https://images.example.test/missing.png)\n\nAfter"
+    )
+
+    text = " ".join(
+        (page.extract_text() or "") for page in PdfReader(BytesIO(pdf_bytes)).pages
+    )
+    assert "Before" in text
+    assert "Image unavailable: Dose response" in text
+    assert "After" in text
+
+
+def test_pdf_image_download_rejects_private_destination(monkeypatch) -> None:
+    """Remote response images must not turn PDF export into an SSRF primitive."""
+    monkeypatch.setattr(
+        pdf_images.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (pdf_images.socket.AF_INET, pdf_images.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))
+        ],
+    )
+    monkeypatch.setattr(
+        pdf_images,
+        "_request_pdf_image_url",
+        lambda *_args, **_kwargs: pytest.fail("private address must not be requested"),
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="public internet"):
+        pdf_images.download_pdf_image(
+            "http://metadata.example.test/latest",
+            deadline=float("inf"),
+        )
+
+
+def test_pdf_image_download_revalidates_redirect_destination(monkeypatch) -> None:
+    """Redirects must pass the same public-address policy as original URLs."""
+    def resolve(url: str, **_kwargs: Any) -> tuple[str, str, int, str]:
+        if "public.example" in url:
+            return url, "public.example", 443, "203.0.113.10"
+        raise pdf_images.PdfImageError("image host resolved outside the public internet")
+
+    monkeypatch.setattr(pdf_images, "_resolve_public_image_url", resolve)
+    monkeypatch.setattr(
+        pdf_images,
+        "_request_pdf_image_url",
+        lambda *_args, **_kwargs: pdf_images._PdfHttpResponse(
+            302,
+            {"location": "http://127.0.0.1/private.png"},
+            b"",
+        ),
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="public internet"):
+        pdf_images.download_pdf_image(
+            "https://public.example/image.png",
+            deadline=float("inf"),
+        )
+
+
+def test_prepare_pdf_images_limits_unique_downloads(monkeypatch) -> None:
+    """Responses with many image tags must keep network work bounded."""
+    calls: list[str] = []
+
+    def download(url: str, **_kwargs: Any) -> Any:
+        calls.append(url)
+        return response_exports.PdfImageResource(
+            content=_png_bytes(), mime_type="image/png"
+        )
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    document = "".join(
+        f'<img src="https://images.example.test/{index}.png" alt="image {index}" />'
+        for index in range(22)
+    )
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(document)
+
+    assert len(calls) == response_exports.MAX_PDF_REMOTE_IMAGES
+    assert len(resources) == response_exports.MAX_PDF_REMOTE_IMAGES
+    assert rendered.count("Image unavailable:") == 2
+
+
+def test_prepare_pdf_images_limits_total_download_bytes(monkeypatch) -> None:
+    """Several valid images must share one aggregate in-memory byte budget."""
+    allowed_sizes: list[int] = []
+
+    def download(_url: str, *, max_bytes: int, **_kwargs: Any) -> Any:
+        allowed_sizes.append(max_bytes)
+        return response_exports.PdfImageResource(
+            content=bytes(max_bytes), mime_type="image/png"
+        )
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    document = "".join(
+        f'<img src="https://images.example.test/{index}.png" alt="image {index}" />'
+        for index in range(4)
+    )
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(document)
+
+    assert allowed_sizes == [10 * 1024 * 1024, 10 * 1024 * 1024, 5 * 1024 * 1024]
+    assert len(resources) == 3
+    assert rendered.count("Image unavailable:") == 1
+
+
+def test_prepare_pdf_images_counts_failed_downloads_against_total(monkeypatch) -> None:
+    """Invalid image bodies must still consume the export's transfer budget."""
+    allowed_sizes: list[int] = []
+
+    def download(
+        _url: str,
+        *,
+        max_bytes: int,
+        budget: pdf_images.PdfImageDownloadBudget,
+        **_kwargs: Any,
+    ) -> Any:
+        allowed_sizes.append(max_bytes)
+        budget.consume(max_bytes)
+        raise response_exports.PdfImageError("invalid image")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    document = "".join(
+        f'<img src="https://images.example.test/{index}.png" alt="image {index}" />'
+        for index in range(4)
+    )
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(document)
+
+    assert allowed_sizes == [10 * 1024 * 1024, 10 * 1024 * 1024, 5 * 1024 * 1024]
+    assert not resources
+    assert rendered.count("Image unavailable:") == 4
+
+
+def test_prepare_pdf_images_counts_expanded_resource_bytes(monkeypatch) -> None:
+    """Retained decoded bytes must count toward the aggregate memory budget."""
+    allowed_sizes: list[int] = []
+
+    def download(
+        _url: str,
+        *,
+        max_bytes: int,
+        budget: pdf_images.PdfImageDownloadBudget,
+        **_kwargs: Any,
+    ) -> Any:
+        allowed_sizes.append(max_bytes)
+        budget.consume(1)
+        return response_exports.PdfImageResource(bytes(max_bytes), "image/png")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    document = "".join(
+        f'<img src="https://images.example.test/{index}.png" alt="image {index}" />'
+        for index in range(4)
+    )
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(document)
+
+    assert allowed_sizes == [10 * 1024 * 1024, 10 * 1024 * 1024, 5 * 1024 * 1024]
+    assert len(resources) == 3
+    assert rendered.count("Image unavailable:") == 1
+
+
+def test_prepare_pdf_images_accepts_case_insensitive_http_scheme(monkeypatch) -> None:
+    """URL scheme casing must not bypass the prefetch step."""
+    calls: list[str] = []
+    url = "HTTPS://images.example.test/figure.png"
+
+    def download(requested_url: str, **_kwargs: Any) -> Any:
+        calls.append(requested_url)
+        return response_exports.PdfImageResource(_png_bytes(), "image/png")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+
+    _document, resources = response_exports._prepare_pdf_image_resources(
+        f'<img src="{url}" alt="figure" />'
+    )
+
+    assert calls == [url]
+    assert url in resources
+
+
+def test_pdf_image_validation_uses_first_gif_frame() -> None:
+    """Animated response images must become one deterministic PDF image."""
+    output = BytesIO()
+    frames = [
+        Image.new("RGB", (10, 10), "red"),
+        Image.new("RGB", (10, 10), "blue"),
+    ]
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=100,
+        loop=0,
+    )
+
+    resource = pdf_images._validate_pdf_image(output.getvalue())
+
+    assert resource.mime_type == "image/png"
+    with Image.open(BytesIO(resource.content)) as image:
+        assert image.n_frames == 1
+        assert image.getpixel((0, 0))[:3] == (255, 0, 0)
+
+
+def test_pdf_image_validation_limits_normalized_gif_size() -> None:
+    """GIF normalization must stay within the caller's in-memory byte budget."""
+    output = BytesIO()
+    Image.new("RGB", (10, 10), "red").save(output, format="GIF")
+
+    with pytest.raises(pdf_images.PdfImageError, match="download size limit"):
+        pdf_images._validate_pdf_image(output.getvalue(), max_bytes=10)
+
+
+def test_pdf_image_validation_rejects_svg_external_resource() -> None:
+    """An embedded SVG must not create a second unvalidated network request."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg">'
+        b'<image href="https://private.example/image.png" />'
+        b"</svg>"
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="external resource"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_late_svg_doctype() -> None:
+    """DTD rejection must inspect the complete bounded SVG payload."""
+    svg = (
+        b'<?xml version="1.0"?>'
+        + b" " * 5000
+        + b'<!DOCTYPE svg><svg xmlns="http://www.w3.org/2000/svg" />'
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="declarations"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_decompression_enforces_expanded_size_limit() -> None:
+    """Compressed responses must not bypass the per-image memory limit."""
+    compressed = gzip.compress(b"x" * 1025)
+
+    with pytest.raises(pdf_images.PdfImageError, match="download size limit"):
+        pdf_images._decompress_pdf_image(
+            compressed,
+            encoding="gzip",
+            max_bytes=1024,
+        )
 
 
 def test_build_pdf_bytes_escapes_raw_html_before_rendering(monkeypatch) -> None:
@@ -256,6 +569,8 @@ def test_build_pdf_bytes_reports_missing_weasyprint_runtime(monkeypatch) -> None
 async def test_send_pdf_export_reports_generation_errors(monkeypatch) -> None:
     """Verify that PDF generation failures are sent to the Chainlit chat."""
     sent_messages: list[Any] = []
+    caller_thread = threading.get_ident()
+    render_threads: list[int] = []
 
     class FakeUserSession:
         def __init__(self) -> None:
@@ -284,6 +599,7 @@ async def test_send_pdf_export_reports_generation_errors(monkeypatch) -> None:
             sent_messages.append(self)
 
     def fail_pdf_generation(_text: str) -> bytes:
+        render_threads.append(threading.get_ident())
         raise RuntimeError("PDF export requires WeasyPrint native libraries.")
 
     monkeypatch.setattr(response_exports.cl, "user_session", FakeUserSession())
@@ -295,5 +611,6 @@ async def test_send_pdf_export_reports_generation_errors(monkeypatch) -> None:
     await response_exports.send_pdf_export(action)  # type: ignore[arg-type]
 
     assert len(sent_messages) == 1
+    assert render_threads and render_threads[0] != caller_thread
     assert sent_messages[0].author == "System"
     assert "PDF export requires WeasyPrint native libraries" in sent_messages[0].content
