@@ -713,6 +713,24 @@ def test_pdf_image_validation_rejects_circular_svg_use() -> None:
         pdf_images._validate_pdf_image(svg)
 
 
+def test_pdf_image_validation_rejects_excessive_svg_use_expansion() -> None:
+    """Acyclic local references must not expand exponentially at render time."""
+    definitions = ['<g id="node-0"><rect width="1" height="1" /></g>']
+    definitions.extend(
+        f'<g id="node-{index}"><use href="#node-{index - 1}" />'
+        f'<use href="#node-{index - 1}" /></g>'
+        for index in range(1, 16)
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        + "".join(definitions)
+        + '</defs><use href="#node-15" /></svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="expansion limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
 def test_pdf_image_validation_handles_deep_acyclic_svg_use_chain() -> None:
     """Reference validation must not depend on Python recursion depth."""
     definitions = "".join(

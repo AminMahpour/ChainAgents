@@ -28,6 +28,7 @@ PDF_IMAGE_MAX_PIXELS = 25_000_000
 PDF_SVG_MAX_ELEMENTS = 10_000
 PDF_SVG_MAX_DEPTH = 4_096
 PDF_SVG_MAX_ATTRIBUTES = 100_000
+PDF_SVG_MAX_USE_EXPANSION = 4_096
 PDF_IMAGE_MAX_REDIRECTS = 3
 PDF_IMAGE_TIMEOUT_SECONDS = 5.0
 PDF_IMAGE_USER_AGENT = "ChainAgents-PDF/1.0"
@@ -476,8 +477,15 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
             or _svg_css_has_external_resource(element.text or "")
         ):
             raise PdfImageError("SVG contains an external resource")
-    if _svg_has_circular_use(root):
+    use_graph, use_base_costs, referenced_ids = _svg_use_graph(root)
+    if _svg_graph_has_cycle(use_graph):
         raise PdfImageError("SVG contains a circular local reference")
+    if _svg_graph_exceeds_expansion_limit(
+        use_graph,
+        use_base_costs,
+        referenced_ids,
+    ):
+        raise PdfImageError("SVG local reference expansion limit exceeded")
     return PdfImageResource(content, "image/svg+xml")
 
 
@@ -540,30 +548,43 @@ def _preflight_svg_structure(content: bytes) -> None:
         raise PdfImageError("SVG content is invalid") from exc
 
 
-def _svg_has_circular_use(root: ElementTree.Element) -> bool:
-    """Return whether local SVG use references form a cycle."""
+def _svg_use_graph(
+    root: ElementTree.Element,
+) -> tuple[dict[str, list[str]], dict[str, int], set[str]]:
+    """Build a local-reference graph and direct element costs for SVG IDs."""
     elements_by_id = {
         identifier: element
         for element in root.iter()
         if (identifier := element.attrib.get("id", "").strip())
     }
-    graph: dict[str, set[str]] = {identifier: set() for identifier in elements_by_id}
+    graph: dict[str, list[str]] = {identifier: [] for identifier in elements_by_id}
+    base_costs = dict.fromkeys(elements_by_id, 0)
+    referenced_ids: set[str] = set()
     pending: list[tuple[ElementTree.Element, str | None]] = [(root, None)]
     while pending:
         element, owner = pending.pop()
         identifier = element.attrib.get("id", "").strip()
         if identifier:
             if owner is not None:
-                graph[owner].add(identifier)
+                graph[owner].append(identifier)
             owner = identifier
-        if owner is not None and element.tag.rsplit("}", 1)[-1].lower() == "use":
+        if owner is not None:
+            base_costs[owner] += 1
+        if element.tag.rsplit("}", 1)[-1].lower() == "use":
             for name, value in element.attrib.items():
                 normalized = value.strip()
                 if name.lower().endswith("href") and normalized.startswith("#"):
                     target = normalized[1:]
                     if target in graph:
-                        graph[owner].add(target)
+                        referenced_ids.add(target)
+                        if owner is not None:
+                            graph[owner].append(target)
         pending.extend((child, owner) for child in element)
+    return graph, base_costs, referenced_ids
+
+
+def _svg_graph_has_cycle(graph: dict[str, list[str]]) -> bool:
+    """Return whether a local SVG reference graph contains a cycle."""
 
     state: dict[str, int] = {}
     for start in graph:
@@ -585,6 +606,38 @@ def _svg_has_circular_use(root: ElementTree.Element) -> bool:
             if target_state == 0:
                 state[target] = 1
                 stack.append((target, iter(graph[target])))
+    return False
+
+
+def _svg_graph_exceeds_expansion_limit(
+    graph: dict[str, list[str]],
+    base_costs: dict[str, int],
+    referenced_ids: set[str],
+) -> bool:
+    """Return whether expanding any local SVG reference exceeds the limit."""
+    expanded_costs: dict[str, int] = {}
+    for start in referenced_ids:
+        if start in expanded_costs:
+            continue
+        stack = [(start, False)]
+        while stack:
+            identifier, dependencies_visited = stack.pop()
+            if identifier in expanded_costs:
+                continue
+            if not dependencies_visited:
+                stack.append((identifier, True))
+                stack.extend(
+                    (target, False)
+                    for target in graph[identifier]
+                    if target not in expanded_costs
+                )
+                continue
+            cost = base_costs[identifier]
+            for target in graph[identifier]:
+                cost += expanded_costs[target]
+                if cost > PDF_SVG_MAX_USE_EXPANSION:
+                    return True
+            expanded_costs[identifier] = cost
     return False
 
 
