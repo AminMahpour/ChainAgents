@@ -771,6 +771,19 @@ def test_pdf_image_validation_rejects_excessive_svg_css_cascade() -> None:
         pdf_images._validate_pdf_image(svg)
 
 
+def test_pdf_image_validation_rejects_multi_selector_svg_css_cascade() -> None:
+    """Comma-separated selectors must each count toward cascade work."""
+    selectors = ",".join("*" for _ in range(501))
+    rectangles = '<rect width="1" height="1" />' * 2_001
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg"><style>{selectors}'
+        f"{{fill:red}}</style>{rectangles}</svg>"
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="stylesheet complexity"):
+        pdf_images._validate_pdf_image(svg)
+
+
 def test_pdf_image_validation_rejects_repeating_gradient() -> None:
     """Repeating gradients must not create an unbounded renderer loop."""
     svg = (
@@ -830,6 +843,20 @@ def test_pdf_image_validation_rejects_aggregate_root_svg_use_expansion() -> None
         pdf_images._validate_pdf_image(svg)
 
 
+def test_pdf_image_validation_rejects_visible_id_svg_use_expansion() -> None:
+    """References nested under a visible unreferenced ID count in the document."""
+    children = '<rect width="1" height="1" />' * 400
+    references = '<use href="#shape" />' * 400
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        f'<defs><g id="shape">{children}</g></defs>'
+        f'<g id="visible">{references}</g></svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="expansion limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
 def test_pdf_image_validation_rejects_deep_svg_inheritance_chain() -> None:
     """Gradient and pattern inheritance must stay below renderer recursion."""
     definitions = "".join(
@@ -866,8 +893,9 @@ def test_pdf_image_validation_handles_deep_acyclic_svg_use_chain() -> None:
         for index in range(1_100)
     )
     svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg">{definitions}'
-        '<g id="node-1100"><rect width="1" height="1" /></g></svg>'
+        f'<svg xmlns="http://www.w3.org/2000/svg"><defs>{definitions}'
+        '<g id="node-1100"><rect width="1" height="1" /></g></defs>'
+        '<use href="#node-0" /></svg>'
     ).encode()
 
     resource = pdf_images._validate_pdf_image(svg)

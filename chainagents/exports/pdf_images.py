@@ -37,6 +37,7 @@ PDF_SVG_MAX_CHARACTER_DATA_CHARS = 1_000_000
 PDF_SVG_MAX_TEXT_CHARS = 250_000
 PDF_SVG_MAX_STYLE_CHARS = 100_000
 PDF_SVG_MAX_STYLE_RULES = 1_000
+PDF_SVG_MAX_STYLE_SELECTORS = 1_000
 PDF_SVG_MAX_STYLE_DECLARATIONS = 10_000
 PDF_SVG_MAX_STYLE_MATCH_WORK = 1_000_000
 PDF_SVG_MAX_USE_EXPANSION = 4_096
@@ -593,6 +594,7 @@ def _preflight_svg_structure(content: bytes) -> None:
     style_chars = 0
     style_rules = 0
     style_declarations = 0
+    style_fragments: list[str] = []
     depth = 0
     element_stack: list[str] = []
     parser = expat.ParserCreate()
@@ -668,6 +670,7 @@ def _preflight_svg_structure(content: bytes) -> None:
             style_chars += size
             style_rules += data.count("{")
             style_declarations += data.count(":")
+            style_fragments.append(data)
         if (
             character_data_chars > PDF_SVG_MAX_CHARACTER_DATA_CHARS
             or text_chars > PDF_SVG_MAX_TEXT_CHARS
@@ -689,7 +692,13 @@ def _preflight_svg_structure(content: bytes) -> None:
         raise
     except (expat.ExpatError, LookupError, ValueError) as exc:
         raise PdfImageError("SVG content is invalid") from exc
-    if style_rules * element_count > PDF_SVG_MAX_STYLE_MATCH_WORK:
+    style_selectors = style_rules + sum(
+        fragment.count(",") for fragment in style_fragments
+    )
+    if (
+        style_selectors > PDF_SVG_MAX_STYLE_SELECTORS
+        or style_selectors * element_count > PDF_SVG_MAX_STYLE_MATCH_WORK
+    ):
         raise PdfImageError("SVG stylesheet complexity limit exceeded")
 
 
@@ -707,10 +716,13 @@ def _svg_use_graph(
     referenced_ids: set[str] = set()
     document_references: list[str] = []
     document_element_count = 0
-    pending: list[tuple[ElementTree.Element, str | None]] = [(root, None)]
+    pending: list[tuple[ElementTree.Element, str | None, bool]] = [
+        (root, None, True)
+    ]
     while pending:
-        element, owner = pending.pop()
+        element, owner, visible = pending.pop()
         document_element_count += 1
+        element_name = element.tag.rsplit("}", 1)[-1].lower()
         identifier = element.attrib.get("id", "").strip()
         if identifier:
             if owner is not None:
@@ -718,7 +730,7 @@ def _svg_use_graph(
             owner = identifier
         if owner is not None:
             base_costs[owner] += 1
-        if element.tag.rsplit("}", 1)[-1].lower() == "use":
+        if element_name == "use":
             for name, value in element.attrib.items():
                 normalized = value.strip()
                 if name.lower().endswith("href") and normalized.startswith("#"):
@@ -727,9 +739,10 @@ def _svg_use_graph(
                         referenced_ids.add(target)
                         if owner is not None:
                             graph[owner].append(target)
-                        else:
+                        if visible:
                             document_references.append(target)
-        pending.extend((child, owner) for child in element)
+        children_visible = visible and element_name != "defs"
+        pending.extend((child, owner, children_visible) for child in element)
     return (
         graph,
         base_costs,
