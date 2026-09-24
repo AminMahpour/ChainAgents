@@ -3299,10 +3299,16 @@ def test_chainlit_local_notifier_sends_status_without_dumping_result(monkeypatch
     asyncio.run(exercise())
 
 
-def test_chainlit_local_notifier_streams_nested_activity_before_completion(
+@pytest.mark.parametrize(
+    ("reasoning_steps_enabled", "tool_steps_enabled"),
+    ((True, True), (False, True), (True, False), (False, False)),
+)
+def test_chainlit_local_notifier_respects_step_visibility_before_completion(
     monkeypatch,
+    reasoning_steps_enabled: bool,
+    tool_steps_enabled: bool,
 ) -> None:
-    """Enabled activity streaming should render one ordered nested task tree."""
+    """Background activity respects each Chainlit step setting independently."""
     async def exercise() -> None:
         manager = make_manager(stream_activity=True)
         timeline: list[tuple[str, str, str]] = []
@@ -3358,6 +3364,8 @@ def test_chainlit_local_notifier_streams_nested_activity_before_completion(
         notifier = LocalBackgroundTaskNotifier(
             manager=manager,
             session_id="session-a",
+            reasoning_steps_enabled=reasoning_steps_enabled,
+            tool_steps_enabled=tool_steps_enabled,
         )
         notifier.start()
 
@@ -3402,20 +3410,26 @@ def test_chainlit_local_notifier_streams_nested_activity_before_completion(
         await asyncio.wait_for(delivered.wait(), timeout=2)
 
         parent = next(step for step in steps if step.type == "run")
-        reasoning = next(step for step in steps if step.type == "llm")
-        tool = next(step for step in steps if step.type == "tool")
         assert parent.name == "researcher (background)"
         assert parent.parent_id is None
-        assert reasoning.name == "researcher reasoning"
-        assert reasoning.parent_id == parent.id
-        assert reasoning.tokens == ["Inspecting the repository"]
-        assert tool.name == "researcher / worker · read_file"
-        assert tool.parent_id == parent.id
-        assert tool.input == '{"file_path":"skills/example/SKILL.md"}'
-        assert tool.output == "skill contents"
         assert parent.end is not None
-        assert reasoning.end is not None
-        assert tool.end is not None
+        reasoning_steps = [step for step in steps if step.type == "llm"]
+        tool_steps = [step for step in steps if step.type == "tool"]
+        assert len(reasoning_steps) == int(reasoning_steps_enabled)
+        assert len(tool_steps) == int(tool_steps_enabled)
+        if reasoning_steps_enabled:
+            reasoning = reasoning_steps[0]
+            assert reasoning.name == "researcher reasoning"
+            assert reasoning.parent_id == parent.id
+            assert reasoning.tokens == ["Inspecting the repository"]
+            assert reasoning.end is not None
+        if tool_steps_enabled:
+            tool = tool_steps[0]
+            assert tool.name == "researcher / worker · read_file"
+            assert tool.parent_id == parent.id
+            assert tool.input == '{"file_path":"skills/example/SKILL.md"}'
+            assert tool.output == "skill contents"
+            assert tool.end is not None
         assert timeline[-1] == (
             "message",
             "Background subagent",
@@ -3426,6 +3440,117 @@ def test_chainlit_local_notifier_streams_nested_activity_before_completion(
 
         notifier.cancel()
         await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_finishes_visible_tool_after_switch_is_disabled(
+    monkeypatch,
+) -> None:
+    """Changing settings mid-call completes an existing step without adding more."""
+    async def exercise() -> None:
+        steps: list[Step] = []
+
+        class Step:
+            def __init__(self, *, name: str, type: str, **kwargs: object) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.output = ""
+                self.end = None
+                steps.append(self)
+
+            async def send(self) -> None:
+                return None
+
+            async def update(self) -> None:
+                return None
+
+            async def stream_token(self, token: str) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Step", Step
+        )
+        notifier = LocalBackgroundTaskNotifier(
+            manager=make_manager(stream_activity=True),
+            session_id="session-a",
+        )
+        activity = BackgroundTaskActivity(
+            task_id="task-1",
+            session_id="session-a",
+            agent_name="researcher",
+            description="research",
+        )
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_call",
+                source="researcher",
+                tool_call_id="call-1",
+                tool_name="search",
+            ),
+        )
+        notifier.configure(reasoning_steps_enabled=False, tool_steps_enabled=False)
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_result",
+                source="researcher",
+                tool_call_id="call-1",
+                tool_name="search",
+                tool_result="found it",
+            ),
+        )
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_call",
+                source="researcher",
+                tool_call_id="call-2",
+                tool_name="read_file",
+            ),
+        )
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_result",
+                source="researcher",
+                tool_call_id="call-2",
+                tool_name="read_file",
+                tool_result="hidden result",
+            ),
+        )
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_call",
+                source="researcher",
+                tool_call_id="call-3",
+                tool_name="search",
+            ),
+        )
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_result",
+                source="researcher",
+                tool_call_id="call-3",
+                tool_name="search",
+                tool_result="also hidden",
+            ),
+        )
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="reasoning_delta", source="researcher", text="thinking"
+            ),
+        )
+
+        assert [step.type for step in steps] == ["run", "tool"]
+        assert steps[1].name == "researcher · search"
+        assert steps[1].output == "found it"
+        assert steps[1].end is not None
 
     asyncio.run(exercise())
 

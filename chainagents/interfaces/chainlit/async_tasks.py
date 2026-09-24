@@ -56,14 +56,25 @@ class _LocalTaskActivityState:
     parent: cl.Step
     reasoning_steps: dict[str, cl.Step] = field(default_factory=dict)
     tool_steps: dict[str, _LocalToolActivityState] = field(default_factory=dict)
+    suppressed_tool_call_ids: set[str] = field(default_factory=set)
+    suppressed_tool_keys: set[tuple[str, str]] = field(default_factory=set)
 
 
 class LocalBackgroundTaskNotifier:
     """Deliver local task activity and one terminal Chainlit message."""
 
-    def __init__(self, *, manager: BackgroundTaskManager, session_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        manager: BackgroundTaskManager,
+        session_id: str,
+        reasoning_steps_enabled: bool = True,
+        tool_steps_enabled: bool = True,
+    ) -> None:
         self.manager = manager
         self.session_id = session_id
+        self.reasoning_steps_enabled = reasoning_steps_enabled
+        self.tool_steps_enabled = tool_steps_enabled
         self.queue: asyncio.Queue[BackgroundTaskSnapshot] | None = None
         self.activity_queue: asyncio.Queue[BackgroundTaskActivity] | None = None
         self.activity_states: dict[str, _LocalTaskActivityState] = {}
@@ -79,6 +90,13 @@ class LocalBackgroundTaskNotifier:
         else:
             self.queue = self.manager.subscribe(self.session_id)
             self.task = asyncio.create_task(self._run())
+
+    def configure(
+        self, *, reasoning_steps_enabled: bool, tool_steps_enabled: bool
+    ) -> None:
+        """Apply the current chat's visibility switches to future activity."""
+        self.reasoning_steps_enabled = reasoning_steps_enabled
+        self.tool_steps_enabled = tool_steps_enabled
 
     async def _run(self) -> None:
         if self.queue is None:
@@ -193,6 +211,8 @@ class LocalBackgroundTaskNotifier:
         event: AgentStreamEvent,
     ) -> None:
         if event.kind == "reasoning_delta" and event.text:
+            if not self.reasoning_steps_enabled:
+                return
             state = await self._activity_state(activity)
             step = state.reasoning_steps.get(event.source)
             if step is None:
@@ -209,6 +229,13 @@ class LocalBackgroundTaskNotifier:
             return
 
         if event.kind == "tool_call":
+            if not self.tool_steps_enabled:
+                state = await self._activity_state(activity)
+                if event.tool_call_id:
+                    state.suppressed_tool_call_ids.add(event.tool_call_id)
+                if event.tool_name:
+                    state.suppressed_tool_keys.add((event.source, event.tool_name))
+                return
             state = await self._activity_state(activity)
             if event.previous_tool_call_id and event.tool_call_id:
                 previous = state.tool_steps.pop(event.previous_tool_call_id, None)
@@ -246,6 +273,28 @@ class LocalBackgroundTaskNotifier:
             return
 
         if event.kind == "tool_result":
+            if not self.tool_steps_enabled:
+                existing_state = self.activity_states.get(activity.task_id)
+                if existing_state is None:
+                    return
+                if event.tool_call_id not in existing_state.tool_steps:
+                    if (
+                        event.tool_call_id in existing_state.suppressed_tool_call_ids
+                        or event.previous_tool_call_id
+                        in existing_state.suppressed_tool_call_ids
+                        or (event.source, event.tool_name)
+                        in existing_state.suppressed_tool_keys
+                    ):
+                        return
+                    visible = self._resolve_tool_state(existing_state, event)
+                    if (
+                        visible is None
+                        or not event.tool_name
+                        or visible.name != event.tool_name
+                    ):
+                        return
+                elif event.tool_call_id in existing_state.suppressed_tool_call_ids:
+                    return
             state = await self._activity_state(activity)
             call_id = event.tool_call_id or event.source
             tool_state = self._resolve_tool_state(state, event)
