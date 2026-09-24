@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import html
+import logging
 import mimetypes
 import os
 import re
 import sys
+import threading
 import unicodedata
+import weakref
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import chainlit as cl
 from chainlit.element import Element, File, Pdf
@@ -19,6 +25,14 @@ from chainagents.exports.generated_files import (
     GENERATED_OUTPUTS_DIRECTORY,
     MAX_GENERATED_FILES,
 )
+from chainagents.exports.pdf_images import (
+    PDF_IMAGE_MAX_BYTES,
+    PdfImageDownloadBudget,
+    PdfImageError,
+    PdfImageResource,
+    decode_pdf_data_image as _decode_pdf_data_image,
+    download_pdf_image as _download_pdf_image,
+)
 
 
 DOWNLOAD_MARKDOWN_ACTION = "download_response_markdown"
@@ -27,6 +41,10 @@ RESPONSE_EXPORTS_SESSION_KEY = "response_exports"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
 MAX_GENERATED_FILE_ATTACHMENTS = MAX_GENERATED_FILES
+MAX_PDF_REMOTE_IMAGES = 20
+MAX_PDF_REMOTE_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_PDF_REMOTE_IMAGE_PIXELS = 50_000_000
+PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS = 30.0
 HOMEBREW_LIBRARY_PATH = Path("/opt/homebrew/lib")
 PDF_EXPORT_DEPENDENCY_ERROR = (
     "PDF export requires WeasyPrint and its native runtime libraries. "
@@ -60,6 +78,24 @@ sub,
 sup {
   font-size: 75%;
   line-height: 0;
+}
+
+img {
+  display: block;
+  height: auto;
+  margin: 0 auto 0.85em;
+  max-height: 8.25in;
+  max-width: 100%;
+  object-fit: contain;
+}
+
+.pdf-image-unavailable {
+  background: #f3f4f6;
+  border: 1px solid #d1d5db;
+  color: #4b5563;
+  display: block;
+  margin: 0 0 0.85em;
+  padding: 0.6em;
 }
 
 sub {
@@ -128,6 +164,16 @@ PDF_MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False}).enable("table"
 PDF_TEXT_REWRITE_SKIP_TAGS = frozenset({"code", "kbd", "pre", "samp"})
 PDF_HTML_TAG_RE = re.compile(r"(<[^>]+>)")
 PDF_HTML_TAG_NAME_RE = re.compile(r"^<\s*/?\s*([a-zA-Z][a-zA-Z0-9-]*)")
+PDF_IMAGE_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+PDF_IMAGE_ATTRIBUTE_RE = re.compile(
+    r"\b(?P<name>src|alt)\s*=\s*\"(?P<value>[^\"]*)\"",
+    re.IGNORECASE,
+)
+logger = logging.getLogger(__name__)
+_PDF_RENDER_LOCK = threading.Lock()
+_CHAINLIT_PDF_RENDER_SEMAPHORES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
 MOJIBAKE_MARKERS = ("Â", "Ã", "â", "ð", "�")
 PDF_SUBSCRIPT_CHARS = {
     **dict(zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789")),
@@ -476,7 +522,7 @@ async def send_pdf_export(action: cl.Action) -> None:
         return
 
     try:
-        pdf_content = build_pdf_bytes(export["response_text"])
+        pdf_content = await _build_chainlit_pdf_bytes(export["response_text"])
     except RuntimeError as exc:
         await cl.Message(content=str(exc), author="System").send()
         return
@@ -565,6 +611,12 @@ def build_pdf_bytes(text: str) -> bytes:
     Returns:
         The constructed pdf bytes.
     """
+    with _PDF_RENDER_LOCK:
+        return _build_pdf_bytes_unlocked(text)
+
+
+def _build_pdf_bytes_unlocked(text: str) -> bytes:
+    """Render one PDF while the process-wide render lock is held."""
     _prepare_weasyprint_environment()
     try:
         from weasyprint import HTML
@@ -572,10 +624,9 @@ def build_pdf_bytes(text: str) -> bytes:
         raise RuntimeError(PDF_EXPORT_DEPENDENCY_ERROR) from exc
 
     try:
-        return HTML(
-            string=build_pdf_html_document(text),
-            url_fetcher=_blocked_pdf_url_fetcher,
-        ).write_pdf()
+        document = build_pdf_html_document(text)
+        document, resources = _prepare_pdf_image_resources(document)
+        return HTML(string=document, url_fetcher=_pdf_url_fetcher(resources)).write_pdf()
     except OSError as exc:
         raise RuntimeError(PDF_EXPORT_DEPENDENCY_ERROR) from exc
 
@@ -759,8 +810,139 @@ def _is_unicode_noncharacter(codepoint: int) -> bool:
     return 0xFDD0 <= codepoint <= 0xFDEF or (codepoint & 0xFFFE) == 0xFFFE
 
 
-def _blocked_pdf_url_fetcher(url: str, *_args: object, **_kwargs: object) -> dict[str, str]:
-    """Reject external resource fetches while rendering response PDFs.
+def _prepare_pdf_image_resources(
+    document: str,
+) -> tuple[str, dict[str, PdfImageResource]]:
+    """Download unique public images and replace failures with placeholders."""
+    import time
+
+    image_tags = list(PDF_IMAGE_TAG_RE.finditer(document))
+    urls: list[str] = []
+    failures: set[str] = set()
+    for match in image_tags:
+        attributes = _pdf_image_attributes(match.group(0))
+        source = attributes.get("src", "")
+        if source.lower().startswith(
+            ("http://", "https://", "data:image/")
+        ) and source not in urls:
+            urls.append(source)
+        elif not source.lower().startswith(("http://", "https://", "data:image/")):
+            failures.add(source)
+
+    resources: dict[str, PdfImageResource] = {}
+    deadline = time.monotonic() + PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS
+    budget = PdfImageDownloadBudget(deadline, MAX_PDF_REMOTE_IMAGE_BYTES)
+    total_pixels = 0
+    for index, url in enumerate(urls):
+        if index >= MAX_PDF_REMOTE_IMAGES:
+            failures.add(url)
+            continue
+        remaining_bytes = min(
+            PDF_IMAGE_MAX_BYTES,
+            budget.remaining_bytes,
+        )
+        if remaining_bytes <= 0:
+            failures.add(url)
+            continue
+        remaining_pixels = MAX_PDF_REMOTE_IMAGE_PIXELS - total_pixels
+        if remaining_pixels <= 0:
+            failures.update(urls[index:])
+            break
+        try:
+            previous_remaining = budget.remaining_bytes
+            if url.lower().startswith("data:image/"):
+                resource = _decode_pdf_data_image(
+                    url,
+                    max_bytes=remaining_bytes,
+                    max_pixels=remaining_pixels,
+                )
+            else:
+                resource = _download_pdf_image(
+                    url,
+                    deadline=deadline,
+                    max_bytes=remaining_bytes,
+                    max_pixels=remaining_pixels,
+                    budget=budget,
+                )
+            transferred_bytes = previous_remaining - budget.remaining_bytes
+            retained_difference = len(resource.content) - transferred_bytes
+            if retained_difference > 0:
+                budget.consume(retained_difference)
+            if total_pixels + resource.pixel_count > MAX_PDF_REMOTE_IMAGE_PIXELS:
+                raise PdfImageError("PDF image pixel budget exceeded")
+        except PdfImageError as exc:
+            logger.warning(
+                "Unable to include PDF image %s: %s",
+                _pdf_image_log_identifier(url),
+                exc,
+            )
+            failures.add(url)
+            continue
+        resources[url] = resource
+        total_pixels += resource.pixel_count
+
+    def replace_failed_image(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        attributes = _pdf_image_attributes(tag)
+        source = attributes.get("src", "")
+        if source not in failures:
+            return tag
+        alt = attributes.get("alt", "image").strip() or "image"
+        if source.lower().startswith("data:image/"):
+            source_label = "(embedded image)"
+        else:
+            source_label = f'(<a href="{html.escape(source, quote=True)}">source</a>)'
+        return (
+            '<span class="pdf-image-unavailable">'
+            f"Image unavailable: {html.escape(alt)} "
+            f"{source_label}"
+            "</span>"
+        )
+
+    return PDF_IMAGE_TAG_RE.sub(replace_failed_image, document), resources
+
+
+def _pdf_image_attributes(tag: str) -> dict[str, str]:
+    """Return decoded src and alt attributes from generated Markdown HTML."""
+    return {
+        match.group("name").lower(): html.unescape(match.group("value"))
+        for match in PDF_IMAGE_ATTRIBUTE_RE.finditer(tag)
+    }
+
+
+def _pdf_image_log_identifier(source: str) -> str:
+    """Return a bounded image identifier without query tokens or data payloads."""
+    if source.lower().startswith("data:"):
+        return source.partition(",")[0][:80]
+    parsed = urlsplit(source)
+    if parsed.scheme and parsed.hostname:
+        return f"{parsed.scheme.lower()}://{parsed.hostname}"[:160]
+    return "invalid-image-source"
+
+
+def _pdf_url_fetcher(resources: dict[str, PdfImageResource]) -> object:
+    """Return a WeasyPrint fetcher limited to validated in-memory images."""
+    from weasyprint.urls import URLFetcher, URLFetcherResponse
+
+    class PdfResourceFetcher(URLFetcher):
+        def __init__(self) -> None:
+            super().__init__(allowed_protocols=set(), fail_on_errors=False)
+
+        def fetch(self, url: str, headers: object = None) -> object:
+            resource = resources.get(url)
+            if resource is not None:
+                return URLFetcherResponse(
+                    url,
+                    resource.content,
+                    {"Content-Type": resource.mime_type},
+                )
+            return super().fetch(url, headers)
+
+    return PdfResourceFetcher()
+
+
+def _blocked_pdf_url_fetcher(url: str, *_args: object, **_kwargs: object) -> object:
+    """Compatibility wrapper around the restricted WeasyPrint fetcher.
 
     Args:
         url: The URL WeasyPrint attempted to fetch.
@@ -822,6 +1004,25 @@ async def _send_export_unavailable_message() -> None:
         content="That response is no longer available for download in this session.",
         author="System",
     ).send()
+
+
+async def _build_chainlit_pdf_bytes(text: str) -> bytes:
+    """Gate Chainlit PDF work before submitting it to the shared executor."""
+    loop = asyncio.get_running_loop()
+    semaphore = _CHAINLIT_PDF_RENDER_SEMAPHORES.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(1)
+        _CHAINLIT_PDF_RENDER_SEMAPHORES[loop] = semaphore
+    async with semaphore:
+        worker = asyncio.create_task(asyncio.to_thread(build_pdf_bytes, text))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await worker
+            except Exception:
+                pass
+            raise
 
 
 def _get_response_exports() -> dict[str, dict[str, str]]:
