@@ -886,6 +886,32 @@ def test_pdf_image_validation_rejects_circular_svg_inheritance() -> None:
         pdf_images._validate_pdf_image(svg)
 
 
+def test_pdf_image_validation_rejects_circular_svg_presentation_reference() -> None:
+    """Mask, clip-path, and marker resources must not reference themselves."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        b'<mask id="loop" mask="url(#loop)"><rect width="1" height="1" /></mask>'
+        b'</defs><rect width="10" height="10" mask="url(#loop)" /></svg>'
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="circular"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_marker_expansion() -> None:
+    """Repeated markers must contribute every painted instance to the budget."""
+    marker_children = '<rect width="1" height="1" />' * 100
+    points = "0,0 " * 500
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        f'<marker id="dot">{marker_children}</marker></defs>'
+        f'<polyline points="{points}" marker-mid="url(#dot)" /></svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="expansion limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
 def test_pdf_image_validation_handles_deep_acyclic_svg_use_chain() -> None:
     """Reference validation must not depend on Python recursion depth."""
     definitions = "".join(

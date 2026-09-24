@@ -57,6 +57,14 @@ _SVG_PATH_COMMANDS = frozenset("MmZzLlHhVvCcSsQqTtAa")
 _SVG_NUMBER_RE = re.compile(
     r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 )
+_SVG_LOCAL_URL_RE = re.compile(
+    r"url\(\s*['\"]?#([^'\"\s)]+)['\"]?\s*\)",
+    re.IGNORECASE,
+)
+_SVG_PRESENTATION_STYLE_RE = re.compile(
+    r"(?:^|;)\s*(mask|clip-path|filter|marker(?:-start|-mid|-end)?)\s*:\s*([^;]+)",
+    re.IGNORECASE,
+)
 _PDF_RASTER_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
 
 
@@ -741,6 +749,14 @@ def _svg_use_graph(
                             graph[owner].append(target)
                         if visible:
                             document_references.append(target)
+        for target, repetitions in _svg_presentation_references(element):
+            if target not in graph:
+                continue
+            referenced_ids.add(target)
+            if owner is not None:
+                graph[owner].extend([target] * repetitions)
+            if visible:
+                document_references.extend([target] * repetitions)
         children_visible = visible and element_name != "defs"
         pending.extend((child, owner, children_visible) for child in element)
     return (
@@ -750,6 +766,71 @@ def _svg_use_graph(
         document_references,
         document_element_count,
     )
+
+
+def _svg_presentation_references(
+    element: ElementTree.Element,
+) -> list[tuple[str, int]]:
+    """Return local mask, clipping, filter, and marker references with fan-out."""
+    references: list[tuple[str, int]] = []
+    presentation_attributes = {
+        "mask",
+        "clip-path",
+        "filter",
+        "marker",
+        "marker-start",
+        "marker-mid",
+        "marker-end",
+    }
+    for name, value in element.attrib.items():
+        property_name = name.rsplit("}", 1)[-1].lower()
+        if property_name in presentation_attributes:
+            references.extend(
+                (
+                    match.group(1),
+                    _svg_presentation_repetitions(element, property_name),
+                )
+                for match in _SVG_LOCAL_URL_RE.finditer(value)
+            )
+        elif property_name == "style":
+            for style_match in _SVG_PRESENTATION_STYLE_RE.finditer(value):
+                style_property = style_match.group(1).lower()
+                references.extend(
+                    (
+                        url_match.group(1),
+                        _svg_presentation_repetitions(element, style_property),
+                    )
+                    for url_match in _SVG_LOCAL_URL_RE.finditer(
+                        style_match.group(2)
+                    )
+                )
+    return references
+
+
+def _svg_presentation_repetitions(
+    element: ElementTree.Element,
+    property_name: str,
+) -> int:
+    """Estimate how many times one presentation resource is painted."""
+    if property_name not in {"marker", "marker-mid"}:
+        return 1
+    attributes = {
+        name.rsplit("}", 1)[-1].lower(): value
+        for name, value in element.attrib.items()
+    }
+    if "points" in attributes:
+        painted_positions = sum(
+            1 for _match in _SVG_NUMBER_RE.finditer(attributes["points"])
+        ) // 2
+    elif "d" in attributes:
+        painted_positions = sum(
+            character in _SVG_PATH_COMMANDS for character in attributes["d"]
+        )
+    else:
+        painted_positions = 1
+    if property_name == "marker-mid":
+        painted_positions = max(1, painted_positions - 2)
+    return min(painted_positions, PDF_SVG_MAX_TOTAL_EXPANSION + 1)
 
 
 def _svg_graph_has_cycle(graph: dict[str, list[str]]) -> bool:
