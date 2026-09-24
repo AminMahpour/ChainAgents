@@ -1264,6 +1264,8 @@ async def start_local_background_notifier(
     *,
     runtime: AgentRuntime,
     session_id: str,
+    reasoning_steps_enabled: bool,
+    tool_steps_enabled: bool,
 ) -> None:
     """Start one local background completion subscriber for this chat."""
     existing = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
@@ -1274,6 +1276,8 @@ async def start_local_background_notifier(
     notifier = LocalBackgroundTaskNotifier(
         manager=runtime.background_tasks,
         session_id=session_id,
+        reasoning_steps_enabled=reasoning_steps_enabled,
+        tool_steps_enabled=tool_steps_enabled,
     )
     notifier.start()
     cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, notifier)
@@ -1307,6 +1311,8 @@ async def on_chat_start() -> None:
     await start_local_background_notifier(
         runtime=runtime,
         session_id=settings.thread_id,
+        reasoning_steps_enabled=settings.show_reasoning_stream,
+        tool_steps_enabled=settings.show_tool_calls,
     )
     await publish_modes(
         settings,
@@ -1415,6 +1421,8 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     await start_local_background_notifier(
         runtime=runtime,
         session_id=settings.thread_id,
+        reasoning_steps_enabled=settings.show_reasoning_stream,
+        tool_steps_enabled=settings.show_tool_calls,
     )
     run_task_list = await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
@@ -1507,6 +1515,13 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         await start_local_background_notifier(
             runtime=runtime,
             session_id=settings.thread_id,
+            reasoning_steps_enabled=settings.show_reasoning_stream,
+            tool_steps_enabled=settings.show_tool_calls,
+        )
+    else:
+        local_notifier.configure(
+            reasoning_steps_enabled=settings.show_reasoning_stream,
+            tool_steps_enabled=settings.show_tool_calls,
         )
     run_task_list = cl.user_session.get(SESSION_TASK_LIST_KEY)
     if isinstance(run_task_list, RunTaskList):

@@ -1026,10 +1026,13 @@ when a task finishes; successful output remains available through
 `get_background_task` instead of being copied into the notice. With
 `stream_activity = true`, Chainlit additionally renders each background task as
 a parent step with nested reasoning and tool-call steps, then closes that tree
-before posting the same single terminal notice. The setting does not expose
-live background activity through the CLI, TUI, or HTTP API. A
-one-shot CLI invocation prints the main response first, then waits for its
-remaining background work. One-shot text output prints terminal results because
+before posting the same single terminal notice. Background reasoning and tool
+steps follow `[chainlit].reasoning_steps_enabled` and
+`[chainlit].tool_steps_enabled`, including the current chat settings switches;
+the parent step and terminal notice remain visible when either is disabled.
+The setting does not expose live background activity through the CLI, TUI, or
+HTTP API. A one-shot CLI invocation prints the main response first, then waits
+for its remaining background work. One-shot text output prints terminal results because
 the process is about to exit; JSON output includes a `background_tasks` array.
 The HTTP API exposes conversation-scoped list, get, cancel, and close operations
 under `/api/background-tasks`.

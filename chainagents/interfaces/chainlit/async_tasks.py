@@ -56,14 +56,25 @@ class _LocalTaskActivityState:
     parent: cl.Step
     reasoning_steps: dict[str, cl.Step] = field(default_factory=dict)
     tool_steps: dict[str, _LocalToolActivityState] = field(default_factory=dict)
+    suppressed_tool_call_ids: set[str] = field(default_factory=set)
+    pending_hidden_tool_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 class LocalBackgroundTaskNotifier:
     """Deliver local task activity and one terminal Chainlit message."""
 
-    def __init__(self, *, manager: BackgroundTaskManager, session_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        manager: BackgroundTaskManager,
+        session_id: str,
+        reasoning_steps_enabled: bool = True,
+        tool_steps_enabled: bool = True,
+    ) -> None:
         self.manager = manager
         self.session_id = session_id
+        self.reasoning_steps_enabled = reasoning_steps_enabled
+        self.tool_steps_enabled = tool_steps_enabled
         self.queue: asyncio.Queue[BackgroundTaskSnapshot] | None = None
         self.activity_queue: asyncio.Queue[BackgroundTaskActivity] | None = None
         self.activity_states: dict[str, _LocalTaskActivityState] = {}
@@ -79,6 +90,13 @@ class LocalBackgroundTaskNotifier:
         else:
             self.queue = self.manager.subscribe(self.session_id)
             self.task = asyncio.create_task(self._run())
+
+    def configure(
+        self, *, reasoning_steps_enabled: bool, tool_steps_enabled: bool
+    ) -> None:
+        """Apply the current chat's visibility switches to future activity."""
+        self.reasoning_steps_enabled = reasoning_steps_enabled
+        self.tool_steps_enabled = tool_steps_enabled
 
     async def _run(self) -> None:
         if self.queue is None:
@@ -194,6 +212,8 @@ class LocalBackgroundTaskNotifier:
     ) -> None:
         if event.kind == "reasoning_delta" and event.text:
             state = await self._activity_state(activity)
+            if not self.reasoning_steps_enabled:
+                return
             step = state.reasoning_steps.get(event.source)
             if step is None:
                 step = cl.Step(
@@ -215,6 +235,23 @@ class LocalBackgroundTaskNotifier:
                 if previous is not None:
                     previous.call_id = event.tool_call_id
                     state.tool_steps[event.tool_call_id] = previous
+                hidden = state.pending_hidden_tool_calls.pop(
+                    event.previous_tool_call_id, None
+                )
+                if hidden is not None:
+                    state.pending_hidden_tool_calls[event.tool_call_id] = hidden
+                    state.suppressed_tool_call_ids.add(event.tool_call_id)
+            if not self.tool_steps_enabled:
+                if event.tool_call_id not in state.tool_steps:
+                    if event.tool_call_id:
+                        state.suppressed_tool_call_ids.add(event.tool_call_id)
+                        state.pending_hidden_tool_calls[event.tool_call_id] = (
+                            event.source,
+                            event.tool_name,
+                        )
+                    return
+            state.suppressed_tool_call_ids.discard(event.tool_call_id)
+            state.pending_hidden_tool_calls.pop(event.tool_call_id, None)
             call_id = event.tool_call_id or event.source
             tool_state = state.tool_steps.get(call_id)
             if tool_state is None:
@@ -247,8 +284,45 @@ class LocalBackgroundTaskNotifier:
 
         if event.kind == "tool_result":
             state = await self._activity_state(activity)
+            visible: _LocalToolActivityState | None = None
+            if not self.tool_steps_enabled:
+                if event.tool_call_id in state.tool_steps:
+                    visible = state.tool_steps[event.tool_call_id]
+                    if (
+                        event.tool_call_id in state.suppressed_tool_call_ids
+                        or visible.step.end is not None
+                    ):
+                        return
+                else:
+                    if (
+                        event.tool_call_id in state.suppressed_tool_call_ids
+                        or event.previous_tool_call_id in state.suppressed_tool_call_ids
+                    ):
+                        state.pending_hidden_tool_calls.pop(event.tool_call_id, None)
+                        state.pending_hidden_tool_calls.pop(
+                            event.previous_tool_call_id, None
+                        )
+                        return
+                    # An unseen ID could belong to a pending hidden synthetic call.
+                    if any(
+                        hidden_source == event.source
+                        and (
+                            hidden_name in {"", "tool"}
+                            or event.tool_name in {"", "tool", hidden_name}
+                        )
+                        for hidden_source, hidden_name in state.pending_hidden_tool_calls.values()
+                    ):
+                        return
+                    visible = self._resolve_tool_state(
+                        state, event, unfinished_only=True
+                    )
+                    if (
+                        visible is None
+                        or event.tool_name not in {"", "tool", visible.name}
+                    ):
+                        return
             call_id = event.tool_call_id or event.source
-            tool_state = self._resolve_tool_state(state, event)
+            tool_state = visible or self._resolve_tool_state(state, event)
             if tool_state is None:
                 step = cl.Step(
                     name=f"{event.source} · {event.tool_name or 'tool'}",
@@ -274,7 +348,9 @@ class LocalBackgroundTaskNotifier:
                 tool_state.call_id = call_id
                 state.tool_steps[call_id] = tool_state
             step = tool_state.step
-            if event.tool_name:
+            if event.tool_name and (
+                event.tool_name != "tool" or tool_state.name == "tool"
+            ):
                 tool_state.name = event.tool_name
                 step.name = f"{event.source} · {event.tool_name}"
             step.output = event.tool_result
@@ -285,10 +361,17 @@ class LocalBackgroundTaskNotifier:
     def _resolve_tool_state(
         state: _LocalTaskActivityState,
         event: AgentStreamEvent,
+        *,
+        unfinished_only: bool = False,
     ) -> _LocalToolActivityState | None:
         if event.tool_call_id and event.tool_call_id in state.tool_steps:
-            return state.tool_steps[event.tool_call_id]
+            tool_state = state.tool_steps[event.tool_call_id]
+            if not unfinished_only or tool_state.step.end is None:
+                return tool_state
+            return None
         candidates = list({id(item): item for item in state.tool_steps.values()}.values())
+        if unfinished_only:
+            candidates = [item for item in candidates if item.step.end is None]
         source_name = [
             item
             for item in candidates

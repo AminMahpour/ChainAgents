@@ -695,8 +695,12 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
     async def publish_modes(*args, **kwargs):
         return None
 
-    async def start_local_background_notifier(*, runtime, session_id):
-        lifecycle_events.append(f"start:{session_id}")
+    async def start_local_background_notifier(
+        *, runtime, session_id, reasoning_steps_enabled, tool_steps_enabled
+    ):
+        lifecycle_events.append(
+            f"start:{session_id}:{reasoning_steps_enabled}:{tool_steps_enabled}"
+        )
 
     monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
     monkeypatch.setattr(main, "coerce_settings", lambda *args, **kwargs: settings)
@@ -712,9 +716,57 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
 
     assert lifecycle_events == [
         "close:thread-old:actual-session",
-        "start:thread-new",
+        "start:thread-new:False:True",
     ]
     assert session_data[main.SESSION_SETTINGS_KEY]["thread_id"] == "thread-new"
+
+
+@pytest.mark.anyio
+async def test_settings_update_changes_background_step_visibility(monkeypatch) -> None:
+    """An existing background notifier follows the chat's current switches."""
+    settings = AppSettings(
+        model_name="gpt-oss:20b",
+        reasoning_level="medium",
+        thread_id="thread-1",
+        show_reasoning_stream=False,
+        show_tool_calls=False,
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            model_name="gpt-oss:20b",
+            model_choices=("gpt-oss:20b",),
+            extensions=SimpleNamespace(
+                chainlit_reasoning_steps_enabled=True,
+                chainlit_tool_steps_enabled=True,
+                chainlit_model_mode_enabled=False,
+                chainlit_reasoning_mode_enabled=False,
+            ),
+        ),
+    )
+    notifier = main.LocalBackgroundTaskNotifier(
+        manager=SimpleNamespace(), session_id="thread-1"
+    )
+    session_data = {main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY: notifier}
+    user_session = SimpleNamespace(
+        get=session_data.get,
+        set=session_data.__setitem__,
+    )
+
+    async def get_runtime():
+        return runtime
+
+    async def publish_modes(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "coerce_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(main.cl, "user_session", user_session)
+    monkeypatch.setattr(main, "publish_modes", publish_modes)
+
+    await main.on_settings_update({"show_reasoning_stream": False, "show_tool_calls": False})
+
+    assert notifier.reasoning_steps_enabled is False
+    assert notifier.tool_steps_enabled is False
 
 
 @pytest.mark.anyio
