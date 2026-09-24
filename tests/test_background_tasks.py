@@ -3555,6 +3555,108 @@ def test_chainlit_local_notifier_finishes_visible_tool_after_switch_is_disabled(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("hidden_call_id", ("hidden-call", "visible-call"))
+def test_chainlit_local_notifier_does_not_replace_completed_tool_with_hidden_result(
+    monkeypatch, hidden_call_id: str,
+) -> None:
+    """A result-only hidden invocation cannot reuse a completed visible step."""
+    async def exercise() -> None:
+        steps: list[Step] = []
+
+        class Step:
+            def __init__(self, *, name: str, type: str, **kwargs: object) -> None:
+                self.id = f"step-{len(steps) + 1}"
+                self.name = name
+                self.type = type
+                self.output = ""
+                self.end = None
+                steps.append(self)
+
+            async def send(self) -> None:
+                return None
+
+            async def update(self) -> None:
+                return None
+
+        monkeypatch.setattr("chainagents.interfaces.chainlit.async_tasks.cl.Step", Step)
+        notifier = LocalBackgroundTaskNotifier(
+            manager=make_manager(stream_activity=True), session_id="session-a"
+        )
+        activity = BackgroundTaskActivity(
+            task_id="task-1", session_id="session-a", agent_name="researcher",
+            description="research",
+        )
+
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_call", source="researcher", tool_call_id="visible-call",
+                tool_name="search",
+            ),
+        )
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_result", source="researcher", tool_call_id="visible-call",
+                tool_name="search", tool_result="visible result",
+            ),
+        )
+        notifier.configure(reasoning_steps_enabled=True, tool_steps_enabled=False)
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_result", source="researcher", tool_call_id=hidden_call_id,
+                tool_name="search", tool_result="hidden result",
+            ),
+        )
+
+        assert [step.type for step in steps] == ["run", "tool"]
+        assert steps[1].output == "visible result"
+        assert steps[1].end is not None
+
+    asyncio.run(exercise())
+
+
+def test_chainlit_local_notifier_sends_parent_for_hidden_result_only(
+    monkeypatch,
+) -> None:
+    """The background parent appears when a disabled result is first activity."""
+    async def exercise() -> None:
+        sent: list[str] = []
+
+        class Step:
+            def __init__(self, *, name: str, type: str, **kwargs: object) -> None:
+                self.id = f"step-{len(sent) + 1}"
+                self.name = name
+                self.type = type
+
+            async def send(self) -> None:
+                sent.append(self.type)
+
+        monkeypatch.setattr("chainagents.interfaces.chainlit.async_tasks.cl.Step", Step)
+        notifier = LocalBackgroundTaskNotifier(
+            manager=make_manager(stream_activity=True), session_id="session-a",
+            tool_steps_enabled=False,
+        )
+        activity = BackgroundTaskActivity(
+            task_id="task-1", session_id="session-a", agent_name="researcher",
+            description="research",
+        )
+
+        await notifier._handle_live_event(
+            activity,
+            AgentStreamEvent(
+                kind="tool_result", source="researcher", tool_call_id="result-only",
+                tool_name="search", tool_result="hidden result",
+            ),
+        )
+
+        assert sent == ["run"]
+        assert "task-1" in notifier.activity_states
+
+    asyncio.run(exercise())
+
+
 def test_chainlit_local_notifier_sends_parent_for_hidden_reasoning(monkeypatch) -> None:
     """Reasoning-only activity still shows the live background parent."""
     async def exercise() -> None:

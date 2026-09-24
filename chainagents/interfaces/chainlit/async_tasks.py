@@ -277,29 +277,28 @@ class LocalBackgroundTaskNotifier:
             return
 
         if event.kind == "tool_result":
+            state = await self._activity_state(activity)
             if not self.tool_steps_enabled:
-                existing_state = self.activity_states.get(activity.task_id)
-                if existing_state is None:
-                    return
-                if event.tool_call_id not in existing_state.tool_steps:
+                if event.tool_call_id not in state.tool_steps:
                     if (
-                        event.tool_call_id in existing_state.suppressed_tool_call_ids
-                        or event.previous_tool_call_id
-                        in existing_state.suppressed_tool_call_ids
-                        or (event.source, event.tool_name)
-                        in existing_state.suppressed_tool_keys
+                        event.tool_call_id in state.suppressed_tool_call_ids
+                        or event.previous_tool_call_id in state.suppressed_tool_call_ids
+                        or (event.source, event.tool_name) in state.suppressed_tool_keys
                     ):
                         return
-                    visible = self._resolve_tool_state(existing_state, event)
+                    visible = self._resolve_tool_state(state, event)
                     if (
                         visible is None
                         or not event.tool_name
                         or visible.name != event.tool_name
+                        or visible.step.end is not None
                     ):
                         return
-                elif event.tool_call_id in existing_state.suppressed_tool_call_ids:
+                elif (
+                    event.tool_call_id in state.suppressed_tool_call_ids
+                    or state.tool_steps[event.tool_call_id].step.end is not None
+                ):
                     return
-            state = await self._activity_state(activity)
             call_id = event.tool_call_id or event.source
             tool_state = self._resolve_tool_state(state, event)
             if tool_state is None:
