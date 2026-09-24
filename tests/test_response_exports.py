@@ -330,6 +330,29 @@ def test_pdf_image_download_rejects_private_destination(monkeypatch) -> None:
         )
 
 
+def test_pdf_image_download_rejects_multicast_destination(monkeypatch) -> None:
+    """Public-only downloads must reject non-unicast global addresses."""
+    monkeypatch.setattr(
+        pdf_images.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                pdf_images.socket.AF_INET,
+                pdf_images.socket.SOCK_STREAM,
+                6,
+                "",
+                ("224.0.0.251", 80),
+            )
+        ],
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="public internet"):
+        pdf_images.download_pdf_image(
+            "http://multicast.example.test/image.png",
+            deadline=float("inf"),
+        )
+
+
 def test_pdf_image_download_revalidates_redirect_destination(monkeypatch) -> None:
     """Redirects must pass the same public-address policy as original URLs."""
     def resolve(url: str, **_kwargs: Any) -> tuple[str, str, int, tuple[str, ...]]:
@@ -893,6 +916,45 @@ def test_pdf_image_validation_rejects_circular_svg_presentation_reference() -> N
         b'<mask id="loop" mask="url(#loop)"><rect width="1" height="1" /></mask>'
         b'</defs><rect width="10" height="10" mask="url(#loop)" /></svg>'
     )
+
+    with pytest.raises(pdf_images.PdfImageError, match="circular"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_decodes_css_escaped_presentation_reference() -> None:
+    """CSS escapes must not hide a circular local presentation reference."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        '<mask id="loop" style="mask:u\\72l(#loop)">'
+        '<rect width="1" height="1" /></mask></defs></svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="circular"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_stylesheet_presentation_reference() -> None:
+    """Stylesheet presentation URLs must not bypass graph validation."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg"><style>'
+        b'.loop { mask: url(#mask); }</style><defs>'
+        b'<mask id="mask"><rect class="loop" width="1" height="1" /></mask>'
+        b'</defs><rect class="loop" width="10" height="10" /></svg>'
+    )
+
+    with pytest.raises(
+        pdf_images.PdfImageError,
+        match="stylesheet presentation reference",
+    ):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_normalizes_encoded_fragment_ids() -> None:
+    """IRI-equivalent encoded IDs and references must form the same graph node."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        '<g id="%C3%A9"><use href="#é" /></g></svg>'
+    ).encode()
 
     with pytest.raises(pdf_images.PdfImageError, match="circular"):
         pdf_images._validate_pdf_image(svg)

@@ -17,7 +17,7 @@ import warnings
 import zlib
 from dataclasses import dataclass
 from io import BytesIO
-from urllib.parse import quote, unquote_to_bytes, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, unquote_to_bytes, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 from xml.parsers import expat
 
@@ -63,6 +63,15 @@ _SVG_LOCAL_URL_RE = re.compile(
 )
 _SVG_PRESENTATION_STYLE_RE = re.compile(
     r"(?:^|;)\s*(mask|clip-path|filter|marker(?:-start|-mid|-end)?)\s*:\s*([^;]+)",
+    re.IGNORECASE,
+)
+_CSS_ESCAPE_RE = re.compile(
+    r"\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?|(\r\n|[\n\r\f])|(.))",
+    re.DOTALL,
+)
+_SVG_STYLESHEET_PRESENTATION_RE = re.compile(
+    r"(?:^|[;{])\s*(?:mask|clip-path|filter|marker(?:-start|-mid|-end)?)"
+    r"\s*:[^;{}]*url\(\s*['\"]?#",
     re.IGNORECASE,
 )
 _PDF_RASTER_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
@@ -222,7 +231,12 @@ def _resolve_public_image_url(
             raise PdfImageError("image host resolved to an invalid address") from exc
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
             address = address.ipv4_mapped
-        if not address.is_global:
+        if (
+            not address.is_global
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        ):
             raise PdfImageError("image host resolved outside the public internet")
         normalized = str(address)
         if normalized not in addresses:
@@ -533,7 +547,7 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
         ).strip().lower() in {"repeat", "reflect"}:
             raise PdfImageError("SVG contains a repeating gradient")
         for name, value in element.attrib.items():
-            normalized = value.strip().lower()
+            normalized = _decode_css_escapes(value.strip()).lower()
             if name.lower().endswith("href") and normalized:
                 if element_name == "a":
                     if not normalized.startswith(("#", "http://", "https://", "mailto:")):
@@ -542,11 +556,17 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
                     raise PdfImageError("SVG contains an external resource")
             if _svg_css_has_external_resource(normalized):
                 raise PdfImageError("SVG contains an external resource")
-        if element.tag.rsplit("}", 1)[-1].lower() == "style" and (
-            "@import" in (element.text or "").lower()
-            or _svg_css_has_external_resource(element.text or "")
-        ):
-            raise PdfImageError("SVG contains an external resource")
+        if element_name == "style":
+            stylesheet = _decode_css_escapes(element.text or "")
+            if (
+                "@import" in stylesheet.lower()
+                or _svg_css_has_external_resource(stylesheet)
+            ):
+                raise PdfImageError("SVG contains an external resource")
+            if _SVG_STYLESHEET_PRESENTATION_RE.search(stylesheet):
+                raise PdfImageError(
+                    "SVG stylesheet presentation references are not supported"
+                )
     (
         use_graph,
         use_base_costs,
@@ -714,11 +734,15 @@ def _svg_use_graph(
     root: ElementTree.Element,
 ) -> tuple[dict[str, list[str]], dict[str, int], set[str], list[str], int]:
     """Build a local-reference graph and direct element costs for SVG IDs."""
-    elements_by_id = {
-        identifier: element
-        for element in root.iter()
-        if (identifier := element.attrib.get("id", "").strip())
-    }
+    elements_by_id: dict[str, ElementTree.Element] = {}
+    for element in root.iter():
+        raw_identifier = element.attrib.get("id", "").strip()
+        if not raw_identifier:
+            continue
+        identifier = _normalize_svg_fragment(raw_identifier)
+        if identifier in elements_by_id:
+            raise PdfImageError("SVG contains ambiguous fragment identifiers")
+        elements_by_id[identifier] = element
     graph: dict[str, list[str]] = {identifier: [] for identifier in elements_by_id}
     base_costs = dict.fromkeys(elements_by_id, 0)
     referenced_ids: set[str] = set()
@@ -731,7 +755,7 @@ def _svg_use_graph(
         element, owner, visible = pending.pop()
         document_element_count += 1
         element_name = element.tag.rsplit("}", 1)[-1].lower()
-        identifier = element.attrib.get("id", "").strip()
+        identifier = _normalize_svg_fragment(element.attrib.get("id", "").strip())
         if identifier:
             if owner is not None:
                 graph[owner].append(identifier)
@@ -742,7 +766,7 @@ def _svg_use_graph(
             for name, value in element.attrib.items():
                 normalized = value.strip()
                 if name.lower().endswith("href") and normalized.startswith("#"):
-                    target = normalized[1:]
+                    target = _normalize_svg_fragment(normalized[1:])
                     if target in graph:
                         referenced_ids.add(target)
                         if owner is not None:
@@ -784,20 +808,21 @@ def _svg_presentation_references(
     }
     for name, value in element.attrib.items():
         property_name = name.rsplit("}", 1)[-1].lower()
+        decoded_value = _decode_css_escapes(value)
         if property_name in presentation_attributes:
             references.extend(
                 (
-                    match.group(1),
+                    _normalize_svg_fragment(match.group(1)),
                     _svg_presentation_repetitions(element, property_name),
                 )
-                for match in _SVG_LOCAL_URL_RE.finditer(value)
+                for match in _SVG_LOCAL_URL_RE.finditer(decoded_value)
             )
         elif property_name == "style":
-            for style_match in _SVG_PRESENTATION_STYLE_RE.finditer(value):
+            for style_match in _SVG_PRESENTATION_STYLE_RE.finditer(decoded_value):
                 style_property = style_match.group(1).lower()
                 references.extend(
                     (
-                        url_match.group(1),
+                        _normalize_svg_fragment(url_match.group(1)),
                         _svg_presentation_repetitions(element, style_property),
                     )
                     for url_match in _SVG_LOCAL_URL_RE.finditer(
@@ -905,13 +930,14 @@ def _validate_svg_inheritance(root: ElementTree.Element) -> None:
     for element in root.iter():
         if element.tag.rsplit("}", 1)[-1].lower() not in inheritable_elements:
             continue
-        identifier = element.attrib.get("id", "").strip()
-        if not identifier:
+        raw_identifier = element.attrib.get("id", "").strip()
+        if not raw_identifier:
             continue
+        identifier = _normalize_svg_fragment(raw_identifier)
         for name, value in element.attrib.items():
             reference = value.strip()
             if name.lower().endswith("href") and reference.startswith("#"):
-                graph[identifier] = reference[1:]
+                graph[identifier] = _normalize_svg_fragment(reference[1:])
                 break
 
     depths: dict[str, int] = {}
@@ -933,6 +959,31 @@ def _validate_svg_inheritance(root: ElementTree.Element) -> None:
             if depth > PDF_SVG_MAX_INHERITANCE_DEPTH:
                 raise PdfImageError("SVG inheritance depth limit exceeded")
             depths[identifier] = depth
+
+
+def _decode_css_escapes(value: str) -> str:
+    """Decode CSS escapes before inspecting resource-bearing values."""
+
+    def replace(match: re.Match[str]) -> str:
+        hexadecimal = match.group(1)
+        if hexadecimal is not None:
+            codepoint = int(hexadecimal, 16)
+            if codepoint == 0 or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                return "\ufffd"
+            return chr(codepoint)
+        if match.group(2) is not None:
+            return ""
+        return match.group(3) or ""
+
+    return _CSS_ESCAPE_RE.sub(replace, value)
+
+
+def _normalize_svg_fragment(value: str) -> str:
+    """Return the canonical URI encoding used for SVG fragment matching."""
+    return quote(
+        unquote(value),
+        safe="!$&'()*+,;=:@/?-._~",
+    )
 
 
 def _svg_css_has_external_resource(value: str) -> bool:
