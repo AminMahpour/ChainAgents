@@ -234,6 +234,7 @@ async def test_saved_response_actions_are_sent_for_original_message(monkeypatch)
 
     monkeypatch.setattr(main.cl, "user_session", session)
     monkeypatch.setattr(main.cl.Action, "send", send_action)
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=SimpleNamespace()))
     thread = {"steps": [{
         "id": "saved", "type": "assistant_message", "output": "Prior response",
         "metadata": {exports.RESPONSE_CONTEXT_METADATA_KEY: {

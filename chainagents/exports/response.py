@@ -43,7 +43,7 @@ DOWNLOAD_MARKDOWN_ACTION = "download_response_markdown"
 DOWNLOAD_PDF_ACTION = "download_response_pdf"
 RESPONSE_EXPORTS_SESSION_KEY = "response_exports"
 RESPONSE_CONTEXT_METADATA_KEY = "chainagents_response_context"
-RESTORED_RESPONSE_ACTIONS_SESSION_KEY = "restored_response_action_ids"
+RESTORED_RESPONSE_ACTIONS_CONNECTION_ATTR = "_chainagents_restored_response_action_ids"
 RUN_RESPONSE_ACTION = "run_configured_response_action"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
@@ -441,7 +441,11 @@ def restore_response_export_actions(
 ) -> list[cl.Action]:
     """Restore actions for saved final responses with reliable context."""
     exports = _get_response_exports()
-    emitted = set(cl.user_session.get(RESTORED_RESPONSE_ACTIONS_SESSION_KEY) or ())
+    # Chainlit persists user_session in thread metadata, so deduplicate per connection.
+    connection = cl.context.session
+    emitted = getattr(connection, RESTORED_RESPONSE_ACTIONS_CONNECTION_ATTR, None)
+    if not isinstance(emitted, set):
+        emitted = set()
     restored: list[cl.Action] = []
     for step in thread.get("steps", ()):
         if not isinstance(step, dict) or step.get("type") != "assistant_message":
@@ -476,7 +480,7 @@ def restore_response_export_actions(
             restored.append(action)
             emitted.add(action.id)
     cl.user_session.set(RESPONSE_EXPORTS_SESSION_KEY, exports)
-    cl.user_session.set(RESTORED_RESPONSE_ACTIONS_SESSION_KEY, list(emitted))
+    setattr(connection, RESTORED_RESPONSE_ACTIONS_CONNECTION_ATTR, emitted)
     return restored
 
 

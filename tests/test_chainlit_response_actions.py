@@ -26,6 +26,7 @@ class Session:
 def session(monkeypatch) -> Session:
     session = Session()
     monkeypatch.setattr(exports.cl, "user_session", session)
+    monkeypatch.setattr(exports.cl, "context", SimpleNamespace(session=SimpleNamespace()))
     return session
 
 
@@ -105,7 +106,9 @@ def test_resolve_response_action_targets_clicked_older_response(session: Session
     ) is None
 
 
-def test_restore_response_actions_from_saved_step_and_legacy_record(session: Session) -> None:
+def test_restore_response_actions_from_saved_step_and_legacy_record(
+    session: Session, monkeypatch
+) -> None:
     session.set(
         exports.RESPONSE_EXPORTS_SESSION_KEY,
         {"legacy": {"prompt": "Old prompt", "response_text": "Old answer", "basename": "old"}},
@@ -125,12 +128,19 @@ def test_restore_response_actions_from_saved_step_and_legacy_record(session: Ses
 
     restored = exports.restore_response_export_actions(thread, response_actions=ACTIONS)
     repeated = exports.restore_response_export_actions(thread, response_actions=ACTIONS)
+    session.set("restored_response_action_ids", [action.id for action in restored])
+    monkeypatch.setattr(exports.cl.context, "session", SimpleNamespace())
+    reopened = exports.restore_response_export_actions(thread, response_actions=ACTIONS)
 
     assert [(action.forId, action.label) for action in restored] == [
         ("saved", "Markdown"), ("saved", "PDF"), ("saved", "Summarize"), ("saved", "Explain"),
         ("legacy", "Markdown"), ("legacy", "PDF"), ("legacy", "Summarize"), ("legacy", "Explain"),
     ]
     assert repeated == []
+    assert [(action.forId, action.label) for action in reopened] == [
+        (action.forId, action.label) for action in restored
+    ]
+    assert exports.RESTORED_RESPONSE_ACTIONS_CONNECTION_ATTR not in session.values
     assert exports.resolve_response_action(
         SimpleNamespace(forId="saved", payload={"response_id": "saved", "action_name": "summarize"}),
         ACTIONS,
