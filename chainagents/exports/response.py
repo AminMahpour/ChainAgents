@@ -11,9 +11,12 @@ import re
 import sys
 import threading
 import unicodedata
+import uuid
 import weakref
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import chainlit as cl
@@ -33,11 +36,15 @@ from chainagents.exports.pdf_images import (
     decode_pdf_data_image as _decode_pdf_data_image,
     download_pdf_image as _download_pdf_image,
 )
+from chainagents.runtime.types import ChainlitResponseActionConfig
 
 
 DOWNLOAD_MARKDOWN_ACTION = "download_response_markdown"
 DOWNLOAD_PDF_ACTION = "download_response_pdf"
 RESPONSE_EXPORTS_SESSION_KEY = "response_exports"
+RESPONSE_CONTEXT_METADATA_KEY = "chainagents_response_context"
+RESTORED_RESPONSE_ACTIONS_SESSION_KEY = "restored_response_action_ids"
+RUN_RESPONSE_ACTION = "run_configured_response_action"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
 MAX_GENERATED_FILE_ATTACHMENTS = MAX_GENERATED_FILES
@@ -301,6 +308,8 @@ def attach_response_export_actions(
     response_text: str,
     generated_file_paths: Iterable[str | Path] = (),
     project_root: Path | None = None,
+    response_actions: Iterable[ChainlitResponseActionConfig] = (),
+    export_label: str = "",
 ) -> None:
     """Attach response export actions.
 
@@ -319,11 +328,35 @@ def attach_response_export_actions(
     exports[message_id] = {
         "prompt": prompt,
         "response_text": response_text,
-        "basename": suggested_export_basename(prompt, message_id),
+        "basename": suggested_export_basename(export_label or prompt, message_id),
     }
     cl.user_session.set(RESPONSE_EXPORTS_SESSION_KEY, exports)
 
-    message.actions = [
+    metadata = dict(getattr(message, "metadata", None) or {})
+    metadata[RESPONSE_CONTEXT_METADATA_KEY] = {
+        "version": 1,
+        "prompt": prompt,
+        "export_label": export_label,
+    }
+    message.metadata = metadata
+    message.actions = response_actions_for_message(message_id, response_actions)
+
+    generated_elements = generated_file_elements_from_text(
+        response_text,
+        generated_file_paths=generated_file_paths,
+        project_root=project_root,
+    )
+    if generated_elements:
+        existing_elements = list(getattr(message, "elements", []) or [])
+        message.elements = [*existing_elements, *generated_elements]
+
+
+def response_actions_for_message(
+    message_id: str,
+    response_actions: Iterable[ChainlitResponseActionConfig],
+) -> list[cl.Action]:
+    """Build export and configured actions in their UI order."""
+    actions = [
         cl.Action(
             name=DOWNLOAD_MARKDOWN_ACTION,
             payload={"response_id": message_id},
@@ -339,15 +372,112 @@ def attach_response_export_actions(
             icon="download",
         ),
     ]
-
-    generated_elements = generated_file_elements_from_text(
-        response_text,
-        generated_file_paths=generated_file_paths,
-        project_root=project_root,
+    actions.extend(
+        cl.Action(
+            name=RUN_RESPONSE_ACTION,
+            payload={"response_id": message_id, "action_name": configured.name},
+            label=configured.label,
+            tooltip=configured.tooltip or "",
+            icon=configured.icon,
+        )
+        for configured in response_actions
     )
-    if generated_elements:
-        existing_elements = list(getattr(message, "elements", []) or [])
-        message.elements = [*existing_elements, *generated_elements]
+    return actions
+
+
+@dataclass(frozen=True)
+class ResolvedResponseAction:
+    """A configured request resolved against the clicked response."""
+
+    prompt: str
+    label: str
+
+
+def expand_response_action_prompt(
+    template: str, *, prompt: str, response_text: str
+) -> str:
+    """Expand supported tokens once, without interpreting inserted braces."""
+    return re.sub(
+        r"\{(prompt|response)\}",
+        lambda match: prompt if match.group(1) == "prompt" else response_text,
+        template,
+    )
+
+
+def resolve_response_action(
+    action: cl.Action,
+    response_actions: Iterable[ChainlitResponseActionConfig],
+) -> ResolvedResponseAction | None:
+    """Resolve the action using server-owned configuration and response text."""
+    payload = action.payload if isinstance(action.payload, dict) else {}
+    response_id = payload.get("response_id")
+    action_name = payload.get("action_name")
+    if not isinstance(response_id, str) or not response_id:
+        return None
+    if not isinstance(action_name, str) or not action_name:
+        return None
+    if action.forId and action.forId != response_id:
+        return None
+    export = _get_response_exports().get(response_id)
+    if not isinstance(export, dict) or not str(export.get("response_text", "")).strip():
+        return None
+    for configured in response_actions:
+        if configured.name == action_name:
+            return ResolvedResponseAction(
+                prompt=expand_response_action_prompt(
+                    configured.prompt,
+                    prompt=str(export.get("prompt", "")),
+                    response_text=str(export["response_text"]),
+                ),
+                label=configured.label,
+            )
+    return None
+
+
+def restore_response_export_actions(
+    thread: Mapping[str, Any],
+    *,
+    response_actions: Iterable[ChainlitResponseActionConfig] = (),
+) -> list[cl.Action]:
+    """Restore actions for saved final responses with reliable context."""
+    exports = _get_response_exports()
+    emitted = set(cl.user_session.get(RESTORED_RESPONSE_ACTIONS_SESSION_KEY) or ())
+    restored: list[cl.Action] = []
+    for step in thread.get("steps", ()):
+        if not isinstance(step, dict) or step.get("type") != "assistant_message":
+            continue
+        message_id = str(step.get("id") or "").strip()
+        response_text = str(step.get("output") or "")
+        if not message_id or not response_text.strip():
+            continue
+        metadata = step.get("metadata")
+        context = (
+            metadata.get(RESPONSE_CONTEXT_METADATA_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if isinstance(context, dict) and context.get("version") == 1:
+            prompt = context.get("prompt")
+            export_label = context.get("export_label", "")
+            if not isinstance(prompt, str) or not isinstance(export_label, str):
+                continue
+            exports[message_id] = {
+                "prompt": prompt,
+                "response_text": response_text,
+                "basename": suggested_export_basename(export_label or prompt, message_id),
+            }
+        elif message_id not in exports:
+            continue
+        for action in response_actions_for_message(message_id, response_actions):
+            action.id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{message_id}:{action.name}:{action.payload}"))
+            if action.id in emitted:
+                continue
+            action.forId = message_id
+            restored.append(action)
+            emitted.add(action.id)
+    cl.user_session.set(RESPONSE_EXPORTS_SESSION_KEY, exports)
+    cl.user_session.set(RESTORED_RESPONSE_ACTIONS_SESSION_KEY, list(emitted))
+    return restored
 
 
 def generated_file_elements_from_text(

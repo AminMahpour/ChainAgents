@@ -6690,6 +6690,58 @@ starters = [
     assert extensions.chainlit_starters[1].icon is None
 
 
+def test_load_extensions_config_parses_chainlit_response_actions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        """
+[chainlit]
+response_actions = [
+  { name = "summarize", label = "Summarize", prompt = "Summarize: {response}", icon = "list" },
+  { name = "explain", label = "Explain", prompt = "Explain {prompt}: {response}", tooltip = "Explain this answer" }
+]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    actions = deepagent_runtime.load_extensions_config().chainlit_response_actions
+
+    assert [(action.name, action.label, action.prompt) for action in actions] == [
+        ("summarize", "Summarize", "Summarize: {response}"),
+        ("explain", "Explain", "Explain {prompt}: {response}"),
+    ]
+    assert actions[0].icon == "list"
+    assert actions[1].tooltip == "Explain this answer"
+
+
+@pytest.mark.parametrize(
+    ("entries", "error"),
+    [
+        ('{ name = "a", label = "A", prompt = "Do it" }, { name = "a", label = "B", prompt = "Again" }', "defined more than once"),
+        ('{ name = "", label = "A", prompt = "Do it" }', "non-empty 'name'"),
+        ('{ name = "a", label = "", prompt = "Do it" }', "non-empty 'label'"),
+        ('{ name = "a", label = "A", prompt = "" }', "non-empty 'prompt'"),
+    ],
+)
+def test_load_extensions_config_rejects_invalid_response_actions(
+    tmp_path: Path,
+    monkeypatch,
+    entries: str,
+    error: str,
+) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        f"[chainlit]\nresponse_actions = [{entries}]\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
+
+    with pytest.raises(ValueError, match=error):
+        deepagent_runtime.load_extensions_config()
+
+
 def test_load_extensions_config_parses_agent_custom_instruction_file(
     tmp_path: Path,
     monkeypatch,

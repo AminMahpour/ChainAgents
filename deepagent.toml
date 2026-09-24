@@ -136,3 +136,7 @@ starters = [
   { label = "Explain this repo", message = "Explain the architecture of this repository and identify the most important files.", icon = "book-open" },
   { label = "Review current changes", message = "Review the current working tree changes for bugs, regressions, and missing tests." }
 ]
+response_actions = [
+  { name = "summarize", label = "Summarize", icon = "list", prompt = "Summarize this response concisely:\n\n{response}" },
+  { name = "explain", label = "Explain", icon = "book-open", prompt = "Explain this response in more detail.\n\nOriginal request:\n{prompt}\n\nResponse:\n{response}" }
+]

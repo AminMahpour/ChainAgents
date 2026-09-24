@@ -21,6 +21,7 @@ from chainagents.exports.generated_files import (
 )
 from chainagents.runtime.reflection import ReflectionCollector, ReflectionProposal
 from chainagents.exports.response import attach_response_export_actions
+from chainagents.runtime.types import ChainlitResponseActionConfig
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
 RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
@@ -792,6 +793,14 @@ class RunTaskList:
                 task.status = cl.TaskStatus.FAILED
         await self.task_list.send()
 
+    async def cancel(self) -> None:
+        """Mark a stopped run so the task panel does not remain running."""
+        self.task_list.status = "Stopped"
+        for task in self.task_list.tasks:
+            if task.status == cl.TaskStatus.RUNNING:
+                task.status = cl.TaskStatus.FAILED
+        await self.task_list.send()
+
     async def update_todos(self, todos: list[dict[str, str]]) -> None:
         """Refresh dynamic todo tasks from streamed todo updates.
 
@@ -944,6 +953,9 @@ class ChainlitEventBridge:
         generative_ui_enabled: bool = True,
         generated_ui_elements: dict[str, cl.CustomElement] | None = None,
         reflection_collector: ReflectionCollector | None = None,
+        display_prompt: str | None = None,
+        export_label: str = "",
+        response_actions: tuple[ChainlitResponseActionConfig, ...] = (),
     ) -> None:
         """Initialize the chainlit event bridge instance.
 
@@ -958,6 +970,9 @@ class ChainlitEventBridge:
             reflection_collector: Optional collector for post-run memory proposals.
         """
         self.prompt = prompt
+        self.display_prompt = prompt if display_prompt is None else display_prompt
+        self.export_label = export_label
+        self.response_actions = response_actions
         self.run_task_list = run_task_list
         self.response_message: cl.Message | None = None
         self.response_buffer = ""
@@ -1059,6 +1074,12 @@ class ChainlitEventBridge:
         if self.run_task_list is not None:
             await self.run_task_list.finish()
 
+    async def cancel(self) -> None:
+        """Close the visible steps and task panel of a cancelled turn."""
+        await self._close_all_open_steps()
+        if self.run_task_list is not None:
+            await self.run_task_list.cancel()
+
     async def fail(self, exc: Exception, details: str) -> None:
         """Fail the chainlit event bridge.
 
@@ -1072,7 +1093,7 @@ class ChainlitEventBridge:
         if self.run_task_list is not None:
             await self.run_task_list.fail()
         async with cl.Step(name="runtime error", type="tool") as step:
-            step.input = self.prompt
+            step.input = self.display_prompt
             step.output = details
         await cl.Message(content=f"{type(exc).__name__}: {exc}", author="System").send()
 
@@ -1168,7 +1189,7 @@ class ChainlitEventBridge:
                 type="llm",
                 default_open=True,
             )
-            step.input = self.prompt if source == "main-agent" else ""
+            step.input = self.display_prompt if source == "main-agent" else ""
             step.start = utc_now()
             await step.send()
             self.summarization_steps[source] = step
@@ -1191,7 +1212,7 @@ class ChainlitEventBridge:
                 type="llm",
                 default_open=True,
             )
-            step.input = self.prompt if source == "main-agent" else ""
+            step.input = self.display_prompt if source == "main-agent" else ""
             step.start = utc_now()
             await step.send()
             self.summarization_steps[source] = step
@@ -1405,7 +1426,7 @@ class ChainlitEventBridge:
                 type="llm",
                 default_open=True,
             )
-            step.input = self.prompt if source == "main-agent" else ""
+            step.input = self.display_prompt if source == "main-agent" else ""
             step.start = utc_now()
             await step.send()
             self.reasoning_steps[source] = step
@@ -1463,6 +1484,8 @@ class ChainlitEventBridge:
             prompt=self.prompt,
             response_text=self.response_buffer,
             generated_file_paths=tuple(self.generated_file_paths),
+            response_actions=self.response_actions,
+            export_label=self.export_label,
         )
         await self.response_message.update()
 

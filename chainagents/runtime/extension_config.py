@@ -23,6 +23,7 @@ from chainagents.runtime.types import (
     AsyncSubagentConfig,
     ChainlitCommandConfig,
     ChainlitStarterConfig,
+    ChainlitResponseActionConfig,
     ExtensionsConfig,
     SubagentConfig,
 )
@@ -767,6 +768,9 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_chainlit_starters = chainlit_section.get("starters", [])
     if not isinstance(raw_chainlit_starters, list):
         raise ValueError("The top-level 'chainlit.starters' config must be an array of tables.")
+    raw_response_actions = chainlit_section.get("response_actions", [])
+    if not isinstance(raw_response_actions, list):
+        raise ValueError("The top-level 'chainlit.response_actions' config must be an array of tables.")
     raw_reasoning_mode_enabled = chainlit_section.get("reasoning_mode_enabled", True)
     raw_reasoning_steps_enabled = chainlit_section.get("reasoning_steps_enabled", True)
     raw_tool_steps_enabled = chainlit_section.get("tool_steps_enabled", True)
@@ -881,6 +885,34 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
             )
         )
 
+    chainlit_response_actions: list[ChainlitResponseActionConfig] = []
+    seen_response_action_names: set[str] = set()
+    for index, raw_action in enumerate(raw_response_actions, start=1):
+        if not isinstance(raw_action, dict):
+            raise ValueError(f"Chainlit response action entry #{index} must be a table/object.")
+        name = raw_action.get("name")
+        action_label = raw_action.get("label")
+        prompt = raw_action.get("prompt")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Chainlit response action entry #{index} must include a non-empty 'name'.")
+        if not isinstance(action_label, str) or not action_label.strip():
+            raise ValueError(f"Chainlit response action '{name}' must include a non-empty 'label'.")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"Chainlit response action '{name}' must include a non-empty 'prompt'.")
+        name = name.strip()
+        if name in seen_response_action_names:
+            raise ValueError(f"Chainlit response action '{name}' is defined more than once.")
+        seen_response_action_names.add(name)
+        chainlit_response_actions.append(
+            ChainlitResponseActionConfig(
+                name=name,
+                label=action_label.strip(),
+                prompt=prompt,
+                icon=runtime_model_config.normalize_optional_string(raw_action.get("icon")),
+                tooltip=runtime_model_config.normalize_optional_string(raw_action.get("tooltip")),
+            )
+        )
+
     return ExtensionsConfig(
         config_path=config_path,
         mcp_tool_name_prefix=bool(mcp_section.get("tool_name_prefix", True)),
@@ -901,6 +933,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         background_subagents=background_subagents,
         chainlit_commands=tuple(chainlit_commands),
         chainlit_starters=tuple(chainlit_starters),
+        chainlit_response_actions=tuple(chainlit_response_actions),
         chainlit_model_mode_enabled=raw_model_mode_enabled,
         chainlit_reasoning_mode_enabled=raw_reasoning_mode_enabled,
         chainlit_reasoning_steps_enabled=raw_reasoning_steps_enabled,

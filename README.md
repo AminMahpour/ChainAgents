@@ -35,6 +35,7 @@ Highlights
 - config-driven synchronous and async DeepAgents subagents
 - DeepAgents `==0.7.17` with explicit todo planning and safe filesystem defaults
 - per-response download buttons for Markdown and PDF exports
+- configurable Chainlit response actions that ask the agent without showing a user prompt
 - Postgres-backed LangGraph checkpoints and durable `/memories/` when `DATABASE_URL` is set
 - repo files mounted for the agent under `/workspace/`
 - Chainlit Modes support for per-message reasoning selection (`Low`, `Medium`, `High`)
@@ -1085,6 +1086,10 @@ starters = [
   { label = "Explain this repo", message = "Explain the architecture of this repository and identify the most important files.", command = "ask-researcher", icon = "book-open" },
   { label = "Review current changes", message = "Review the current working tree changes for bugs, regressions, and missing tests." }
 ]
+response_actions = [
+  { name = "summarize", label = "Summarize", icon = "list", prompt = "Summarize this response concisely:\n\n{response}" },
+  { name = "explain", label = "Explain", icon = "book-open", prompt = "Explain this response in more detail.\n\nOriginal request:\n{prompt}\n\nResponse:\n{response}" }
+]
 ```
 
 `target` modes:
@@ -1111,6 +1116,9 @@ Notes:
 - If a configured `[chainlit].commands` entry and a skill share the same slash name, the configured command wins.
 - `starters` define starter prompts shown by Chainlit before the first message in a thread.
 - Starter `label` and `message` are required. Starter `command` and `icon` are optional.
+- `response_actions` appear after Markdown and PDF beneath completed Chainlit replies. Each action needs a unique `name`, a `label`, and a `prompt`; `icon` and `tooltip` are optional. Omit the list or set it to `[]` to hide custom actions.
+- A response-action prompt can use `{response}` for the clicked reply and `{prompt}` for the request that produced it. Other braces stay literal. The agent receives the expanded prompt in the current conversation and displays its reply normally, but Chainlit does not show a user message or prompt text in reasoning panels for the action. The prompt remains part of agent state and persisted response context.
+- Saved Chainlit chats restore response actions when response context is available. Restart the app after editing `deepagent.toml` to reload action definitions.
 
 ## Add Async Subagents
 
