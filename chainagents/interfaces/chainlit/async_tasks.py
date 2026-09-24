@@ -57,7 +57,6 @@ class _LocalTaskActivityState:
     reasoning_steps: dict[str, cl.Step] = field(default_factory=dict)
     tool_steps: dict[str, _LocalToolActivityState] = field(default_factory=dict)
     suppressed_tool_call_ids: set[str] = field(default_factory=set)
-    suppressed_tool_keys: set[tuple[str, str]] = field(default_factory=set)
 
 
 class LocalBackgroundTaskNotifier:
@@ -240,12 +239,8 @@ class LocalBackgroundTaskNotifier:
                     return
                 if event.tool_call_id:
                     state.suppressed_tool_call_ids.add(event.tool_call_id)
-                if event.tool_name:
-                    state.suppressed_tool_keys.add((event.source, event.tool_name))
                 return
             state.suppressed_tool_call_ids.discard(event.tool_call_id)
-            if event.tool_name:
-                state.suppressed_tool_keys.discard((event.source, event.tool_name))
             call_id = event.tool_call_id or event.source
             tool_state = state.tool_steps.get(call_id)
             if tool_state is None:
@@ -278,29 +273,31 @@ class LocalBackgroundTaskNotifier:
 
         if event.kind == "tool_result":
             state = await self._activity_state(activity)
+            visible: _LocalToolActivityState | None = None
             if not self.tool_steps_enabled:
-                if event.tool_call_id not in state.tool_steps:
+                if event.tool_call_id in state.tool_steps:
+                    visible = state.tool_steps[event.tool_call_id]
                     if (
                         event.tool_call_id in state.suppressed_tool_call_ids
-                        or event.previous_tool_call_id in state.suppressed_tool_call_ids
-                        or (event.source, event.tool_name) in state.suppressed_tool_keys
-                    ):
-                        return
-                    visible = self._resolve_tool_state(state, event)
-                    if (
-                        visible is None
-                        or not event.tool_name
-                        or visible.name != event.tool_name
                         or visible.step.end is not None
                     ):
                         return
-                elif (
-                    event.tool_call_id in state.suppressed_tool_call_ids
-                    or state.tool_steps[event.tool_call_id].step.end is not None
-                ):
-                    return
+                else:
+                    if (
+                        event.tool_call_id in state.suppressed_tool_call_ids
+                        or event.previous_tool_call_id in state.suppressed_tool_call_ids
+                    ):
+                        return
+                    visible = self._resolve_tool_state(
+                        state, event, unfinished_only=True
+                    )
+                    if (
+                        visible is None
+                        or event.tool_name not in {"", "tool", visible.name}
+                    ):
+                        return
             call_id = event.tool_call_id or event.source
-            tool_state = self._resolve_tool_state(state, event)
+            tool_state = visible or self._resolve_tool_state(state, event)
             if tool_state is None:
                 step = cl.Step(
                     name=f"{event.source} · {event.tool_name or 'tool'}",
@@ -326,7 +323,9 @@ class LocalBackgroundTaskNotifier:
                 tool_state.call_id = call_id
                 state.tool_steps[call_id] = tool_state
             step = tool_state.step
-            if event.tool_name:
+            if event.tool_name and (
+                event.tool_name != "tool" or tool_state.name == "tool"
+            ):
                 tool_state.name = event.tool_name
                 step.name = f"{event.source} · {event.tool_name}"
             step.output = event.tool_result
@@ -337,10 +336,17 @@ class LocalBackgroundTaskNotifier:
     def _resolve_tool_state(
         state: _LocalTaskActivityState,
         event: AgentStreamEvent,
+        *,
+        unfinished_only: bool = False,
     ) -> _LocalToolActivityState | None:
         if event.tool_call_id and event.tool_call_id in state.tool_steps:
-            return state.tool_steps[event.tool_call_id]
+            tool_state = state.tool_steps[event.tool_call_id]
+            if not unfinished_only or tool_state.step.end is None:
+                return tool_state
+            return None
         candidates = list({id(item): item for item in state.tool_steps.values()}.values())
+        if unfinished_only:
+            candidates = [item for item in candidates if item.step.end is None]
         source_name = [
             item
             for item in candidates
