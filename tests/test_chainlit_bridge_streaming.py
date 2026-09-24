@@ -357,6 +357,47 @@ async def test_response_message_is_created_on_finish_after_reasoning_steps(monke
 
 
 @pytest.mark.anyio
+async def test_hidden_action_turn_hides_prompt_in_steps_and_keeps_response_context(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture_actions(_message: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(chainlit_bridge, "attach_response_export_actions", capture_actions)
+    bridge = ChainlitEventBridge(
+        prompt="A hidden request with private text",
+        display_prompt="",
+        export_label="Summarize",
+        response_actions=("configured action",),
+    )
+
+    await bridge._stream_reasoning("main-agent", "thinking")
+    await bridge._stream_response("Visible answer")
+    await bridge.finish()
+
+    assert _Step.instances[0].input == ""
+    assert captured["prompt"] == "A hidden request with private text"
+    assert captured["export_label"] == "Summarize"
+    assert captured["response_actions"] == ("configured action",)
+    assert _Message.instances[0].content == "Visible answer"
+
+
+@pytest.mark.anyio
+async def test_cancelled_turn_closes_steps_and_marks_task_list_stopped() -> None:
+    task_list = _TaskList()
+    run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
+    bridge = ChainlitEventBridge(prompt="hidden", run_task_list=run_task_list)
+
+    await bridge.start()
+    await bridge._stream_reasoning("main-agent", "thinking")
+    await bridge.cancel()
+
+    assert _Step.instances[0].end is not None
+    assert task_list.status == "Stopped"
+    assert all(task.status != _TaskStatus.RUNNING for task in task_list.tasks)
+
+
+@pytest.mark.anyio
 async def test_final_response_receives_generated_file_paths_from_write_tool(
     monkeypatch,
 ) -> None:

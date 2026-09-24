@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import traceback
@@ -17,6 +18,7 @@ from chainagents.util.langchain_warnings import install_langchain_warning_filter
 install_langchain_warning_filters()
 
 import chainlit as cl
+from chainlit.config import config as chainlit_config
 from chainlit.input_widget import Select, Switch, TextInput
 from chainlit.types import ThreadDict
 
@@ -67,10 +69,14 @@ from chainagents.rag.runtime import UploadedRagFile
 from chainagents.exports.response import (
     DOWNLOAD_MARKDOWN_ACTION,
     DOWNLOAD_PDF_ACTION,
+    RUN_RESPONSE_ACTION,
+    resolve_response_action,
+    restore_response_export_actions,
     send_markdown_export,
     send_pdf_export,
 )
 
+logger = logging.getLogger(__name__)
 
 SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
@@ -78,6 +84,7 @@ SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY = "local_background_task_notifier"
 SESSION_MCP_SESSION_ID_KEY = "mcp_session_id"
 SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
+SESSION_ACTIVE_TURN_KEY = "active_agent_turn"
 REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
 UPLOAD_RAG_FILE_ACTION = "upload_rag_file"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
@@ -1059,7 +1066,7 @@ def resolve_reasoning_level_for_message(
     settings: AppSettings,
     *,
     reasoning_mode_enabled: bool = True,
-) -> str:
+) -> ReasoningLevel:
     """Resolve reasoning level for message.
 
     Args:
@@ -1415,6 +1422,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     )
     await run_task_list.show_ready()
     store_settings(settings)
+    await _restore_saved_response_actions(thread, runtime)
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1447,6 +1455,18 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     if async_task_notifier is not None:
         with suppress(Exception):
             await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
+
+
+async def _restore_saved_response_actions(
+    thread: ThreadDict,
+    runtime: AgentRuntime,
+) -> None:
+    """Reattach actions after Chainlit restores persisted response steps."""
+    for action in restore_response_export_actions(
+        thread,
+        response_actions=runtime.config.extensions.chainlit_response_actions,
+    ):
+        await action.send(for_id=action.forId or "")
 
 
 @cl.on_settings_update
@@ -1520,6 +1540,98 @@ async def download_response_pdf(action: cl.Action) -> None:
         action: The action value.
     """
     await send_pdf_export(action)
+
+
+def _claim_active_turn() -> bool:
+    """Reserve this Chainlit session for one agent turn."""
+    active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
+    if isinstance(active, asyncio.Task) and not active.done():
+        return False
+    cl.user_session.set(SESSION_ACTIVE_TURN_KEY, asyncio.current_task())
+    return True
+
+
+def _release_active_turn() -> None:
+    """Release the session turn only when owned by this task."""
+    if cl.user_session.get(SESSION_ACTIVE_TURN_KEY) is asyncio.current_task():
+        cl.user_session.set(SESSION_ACTIVE_TURN_KEY, None)
+
+
+async def _send_turn_busy() -> None:
+    await cl.Message(
+        content="The agent is already responding. Your request was not sent; please resend it after this turn finishes.",
+        author="System",
+    ).send()
+
+
+@cl.action_callback(RUN_RESPONSE_ACTION)
+async def run_response_action(action: cl.Action) -> None:
+    """Run a configured response action without creating a user message."""
+    if not _claim_active_turn():
+        await _send_turn_busy()
+        return
+    try:
+        runtime = await get_runtime_or_notify()
+        if runtime is None:
+            return
+        resolved = resolve_response_action(
+            action, runtime.config.extensions.chainlit_response_actions
+        )
+        if resolved is None:
+            await cl.Message(
+                content="This response action is no longer available.", author="System"
+            ).send()
+            return
+        settings = coerce_settings(
+            cl.user_session.get(SESSION_SETTINGS_KEY),
+            default_model_name=runtime.config.model_name,
+            available_models=runtime.config.model_choices,
+            show_reasoning_stream_default=(
+                runtime.config.extensions.chainlit_reasoning_steps_enabled
+            ),
+            show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
+        )
+        active_task = asyncio.current_task()
+        previous_task = cl.context.session.current_task
+        cl.context.session.current_task = active_task
+        try:
+            await cl.context.emitter.task_start()
+            try:
+                await _run_agent_turn(
+                    runtime=runtime,
+                    settings=settings,
+                    agent_prompt=resolved.prompt,
+                    effective_reasoning_level=settings.reasoning_level,
+                    effective_model_name=settings.model_name,
+                    reasoning_level_is_explicit=settings_reasoning_level_is_explicit(
+                        runtime.config, settings, settings.model_name
+                    ),
+                    mcp_session_id=current_mcp_session_id(),
+                    display_prompt="",
+                    export_label=resolved.label,
+                )
+            finally:
+                await cl.context.emitter.task_end()
+        finally:
+            if cl.context.session.current_task is active_task:
+                cl.context.session.current_task = previous_task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("Response action failed")
+        await cl.Message(
+            content="The response action failed. Please try again.", author="System"
+        ).send()
+    finally:
+        _release_active_turn()
+
+
+@cl.on_stop
+async def on_stop() -> None:
+    """Stop the active agent turn, including an action callback turn."""
+    active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
+    if isinstance(active, asyncio.Task) and active is not asyncio.current_task():
+        active.cancel()
 
 
 @cl.action_callback(REBUILD_RAG_INDEX_ACTION)
@@ -1597,6 +1709,29 @@ async def on_message(message: cl.Message) -> None:
     Args:
         message: Chainlit message or LangChain message to process.
     """
+    await _handle_message(message)
+
+
+_chainlit_message_callback = chainlit_config.code.on_message
+
+
+async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
+    """Reject a busy message before Chainlit creates its on_message run step."""
+    if not _claim_active_turn():
+        await _send_turn_busy()
+        return
+    try:
+        assert _chainlit_message_callback is not None
+        await _chainlit_message_callback(message)
+    finally:
+        _release_active_turn()
+
+
+chainlit_config.code.on_message = _guarded_chainlit_message_callback
+
+
+async def _handle_message(message: cl.Message) -> None:
+    """Prepare a normal user request for the shared agent turn."""
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
@@ -1621,7 +1756,7 @@ async def on_message(message: cl.Message) -> None:
         model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     )
     mcp_session_id = current_mcp_session_id()
-    run_task_list = await get_run_task_list(
+    await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
     )
@@ -1708,7 +1843,6 @@ async def on_message(message: cl.Message) -> None:
         image_names=uploaded_image_names,
         prompt_note=prompt_note,
     )
-    async_url_override = async_subagent_url_override()
     reasoning_level_is_explicit = (
         message_has_reasoning_level_override(
             message,
@@ -1719,6 +1853,37 @@ async def on_message(message: cl.Message) -> None:
             settings,
             effective_model_name,
         )
+    )
+    await _run_agent_turn(
+        runtime=runtime,
+        settings=settings,
+        agent_prompt=agent_prompt,
+        effective_reasoning_level=effective_reasoning_level,
+        effective_model_name=effective_model_name,
+        reasoning_level_is_explicit=reasoning_level_is_explicit,
+        mcp_session_id=mcp_session_id,
+        uploaded_image_parts=uploaded_image_parts,
+    )
+
+
+async def _run_agent_turn(
+    *,
+    runtime: AgentRuntime,
+    settings: AppSettings,
+    agent_prompt: str,
+    effective_reasoning_level: ReasoningLevel,
+    effective_model_name: str,
+    reasoning_level_is_explicit: bool,
+    mcp_session_id: str | None,
+    uploaded_image_parts: list[dict[str, Any]] | None = None,
+    display_prompt: str | None = None,
+    export_label: str = "",
+) -> None:
+    """Stream one ordinary or response-action turn through the same agent."""
+    async_url_override = async_subagent_url_override()
+    run_task_list = await get_run_task_list(
+        reasoning_steps_enabled=settings.show_reasoning_stream,
+        tool_steps_enabled=settings.show_tool_calls,
     )
     agent, mcp_failures = await agent_with_mcp_status(
         runtime,
@@ -1748,6 +1913,9 @@ async def on_message(message: cl.Message) -> None:
             runtime.config,
             prompt=agent_prompt,
         ),
+        display_prompt=display_prompt,
+        export_label=export_label,
+        response_actions=runtime.config.extensions.chainlit_response_actions,
     )
     await bridge.start()
 
@@ -1762,7 +1930,7 @@ async def on_message(message: cl.Message) -> None:
                 "role": "user",
                 "content": chainlit_user_message_content(
                     agent_prompt,
-                    image_parts=uploaded_image_parts,
+                    image_parts=uploaded_image_parts or [],
                 ),
             }
         ]
@@ -1785,6 +1953,8 @@ async def on_message(message: cl.Message) -> None:
     except asyncio.CancelledError:
         with suppress(Exception):
             await stream.aclose()
+        with suppress(Exception):
+            await bridge.cancel()
         return
     except Exception as exc:
         with suppress(Exception):
@@ -1829,6 +1999,11 @@ async def on_message(message: cl.Message) -> None:
 @cl.on_chat_end
 async def on_chat_end() -> None:
     """Clean up runtime resources when the Chainlit chat ends."""
+    active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
+    if isinstance(active, asyncio.Task) and active is not asyncio.current_task():
+        active.cancel()
+        with suppress(asyncio.CancelledError):
+            await active
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if isinstance(notifier, AsyncTaskNotifier):
         notifier.cancel()

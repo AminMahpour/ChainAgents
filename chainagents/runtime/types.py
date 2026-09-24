@@ -197,6 +197,17 @@ class ChainlitStarterConfig:
 
 
 @dataclass(frozen=True)
+class ChainlitResponseActionConfig:
+    """Configure an action attached to completed Chainlit responses."""
+
+    name: str
+    label: str
+    prompt: str
+    icon: str | None = None
+    tooltip: str | None = None
+
+
+@dataclass(frozen=True)
 class SkillCommandMetadata:
     """Track metadata required to expose a configured skill as a command.
 
@@ -308,6 +319,7 @@ class ExtensionsConfig:
     background_subagents: BackgroundSubagentConfig = BackgroundSubagentConfig()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
+    chainlit_response_actions: tuple[ChainlitResponseActionConfig, ...] = ()
     chainlit_model_mode_enabled: bool = True
     chainlit_reasoning_mode_enabled: bool = True
     chainlit_reasoning_steps_enabled: bool = True
@@ -337,6 +349,7 @@ class ExtensionsConfig:
             or self.background_subagents.enabled
             or self.chainlit_commands
             or self.chainlit_starters
+            or self.chainlit_response_actions
         )
 
 

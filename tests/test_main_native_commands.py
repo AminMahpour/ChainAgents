@@ -230,7 +230,7 @@ async def test_on_message_rejects_unknown_selected_command_with_slash_input(
     monkeypatch.setattr(
         main.cl,
         "user_session",
-        SimpleNamespace(get=lambda _key: None),
+        SimpleNamespace(get=lambda _key: None, set=lambda _key, _value: None),
     )
     monkeypatch.setattr(
         main,
