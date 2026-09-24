@@ -211,9 +211,9 @@ class LocalBackgroundTaskNotifier:
         event: AgentStreamEvent,
     ) -> None:
         if event.kind == "reasoning_delta" and event.text:
+            state = await self._activity_state(activity)
             if not self.reasoning_steps_enabled:
                 return
-            state = await self._activity_state(activity)
             step = state.reasoning_steps.get(event.source)
             if step is None:
                 step = cl.Step(
@@ -229,19 +229,23 @@ class LocalBackgroundTaskNotifier:
             return
 
         if event.kind == "tool_call":
-            if not self.tool_steps_enabled:
-                state = await self._activity_state(activity)
-                if event.tool_call_id:
-                    state.suppressed_tool_call_ids.add(event.tool_call_id)
-                if event.tool_name:
-                    state.suppressed_tool_keys.add((event.source, event.tool_name))
-                return
             state = await self._activity_state(activity)
             if event.previous_tool_call_id and event.tool_call_id:
                 previous = state.tool_steps.pop(event.previous_tool_call_id, None)
                 if previous is not None:
                     previous.call_id = event.tool_call_id
                     state.tool_steps[event.tool_call_id] = previous
+            if not self.tool_steps_enabled:
+                if event.tool_call_id in state.tool_steps:
+                    return
+                if event.tool_call_id:
+                    state.suppressed_tool_call_ids.add(event.tool_call_id)
+                if event.tool_name:
+                    state.suppressed_tool_keys.add((event.source, event.tool_name))
+                return
+            state.suppressed_tool_call_ids.discard(event.tool_call_id)
+            if event.tool_name:
+                state.suppressed_tool_keys.discard((event.source, event.tool_name))
             call_id = event.tool_call_id or event.source
             tool_state = state.tool_steps.get(call_id)
             if tool_state is None:
