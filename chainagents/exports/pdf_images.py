@@ -8,6 +8,7 @@ import http.client
 import ipaddress
 import math
 import queue
+import re
 import socket
 import ssl
 import threading
@@ -26,11 +27,15 @@ from PIL import Image, UnidentifiedImageError
 PDF_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_IMAGE_MAX_PIXELS = 25_000_000
 PDF_SVG_MAX_ELEMENTS = 10_000
-PDF_SVG_MAX_DEPTH = 4_096
+PDF_SVG_MAX_DEPTH = 256
 PDF_SVG_MAX_ATTRIBUTES = 100_000
 PDF_SVG_MAX_ATTRIBUTE_VALUE_CHARS = 1_000_000
 PDF_SVG_MAX_PATH_DATA_CHARS = 500_000
 PDF_SVG_MAX_PATH_COMMANDS = 25_000
+PDF_SVG_MAX_POINT_COORDINATES = 50_000
+PDF_SVG_MAX_CHARACTER_DATA_CHARS = 1_000_000
+PDF_SVG_MAX_TEXT_CHARS = 250_000
+PDF_SVG_MAX_STYLE_CHARS = 100_000
 PDF_SVG_MAX_USE_EXPANSION = 4_096
 PDF_IMAGE_MAX_REDIRECTS = 3
 PDF_IMAGE_TIMEOUT_SECONDS = 5.0
@@ -43,6 +48,10 @@ _RASTER_MIME_TYPES = {
     "WEBP": "image/webp",
 }
 _SVG_PATH_COMMANDS = frozenset("MmZzLlHhVvCcSsQqTtAa")
+_SVG_NUMBER_RE = re.compile(
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+)
+_PDF_RASTER_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
 
 
 class PdfImageError(ValueError):
@@ -109,6 +118,7 @@ def download_pdf_image(
     *,
     deadline: float,
     max_bytes: int = PDF_IMAGE_MAX_BYTES,
+    max_pixels: int = PDF_IMAGE_MAX_PIXELS,
     budget: PdfImageDownloadBudget | None = None,
 ) -> PdfImageResource:
     """Download and validate one public HTTP(S) image."""
@@ -149,7 +159,11 @@ def download_pdf_image(
             continue
         if not 200 <= response.status < 300:
             raise PdfImageError(f"image server returned HTTP {response.status}")
-        return _validate_pdf_image(response.content, max_bytes=max_bytes)
+        return _validate_pdf_image(
+            response.content,
+            max_bytes=max_bytes,
+            max_pixels=max_pixels,
+        )
     raise PdfImageError("image redirect limit exceeded")
 
 
@@ -380,6 +394,7 @@ def decode_pdf_data_image(
     url: str,
     *,
     max_bytes: int = PDF_IMAGE_MAX_BYTES,
+    max_pixels: int = PDF_IMAGE_MAX_PIXELS,
 ) -> PdfImageResource:
     """Decode and validate one bounded image data URI."""
     header, separator, payload = url.partition(",")
@@ -400,13 +415,18 @@ def decode_pdf_data_image(
         content = encoded
     if len(content) > max_bytes:
         raise PdfImageError("image exceeds the download size limit")
-    return _validate_pdf_image(content, max_bytes=max_bytes)
+    return _validate_pdf_image(
+        content,
+        max_bytes=max_bytes,
+        max_pixels=max_pixels,
+    )
 
 
 def _validate_pdf_image(
     content: bytes,
     *,
     max_bytes: int = PDF_IMAGE_MAX_BYTES,
+    max_pixels: int = PDF_IMAGE_MAX_PIXELS,
 ) -> PdfImageResource:
     """Validate supported image bytes and normalize animated GIFs."""
     if not content:
@@ -425,7 +445,7 @@ def _validate_pdf_image(
                 image_format = str(image.format or "").upper()
                 if image_format not in _RASTER_MIME_TYPES:
                     raise PdfImageError("image format is not supported")
-                if image.width * image.height > PDF_IMAGE_MAX_PIXELS:
+                if image.width * image.height > min(PDF_IMAGE_MAX_PIXELS, max_pixels):
                     raise PdfImageError("image dimensions exceed the pixel limit")
                 pixel_count = image.width * image.height
                 if image_format == "GIF":
@@ -441,6 +461,12 @@ def _validate_pdf_image(
                 raise PdfImageError("image content is invalid")
             with Image.open(BytesIO(content)) as decoded_image:
                 decoded_image.load()
+                normalized = _normalize_pdf_raster_mode(
+                    decoded_image,
+                    max_bytes=max_bytes,
+                )
+                if normalized is not None:
+                    return PdfImageResource(normalized, "image/png", pixel_count)
     except PdfImageError:
         raise
     except (
@@ -455,6 +481,27 @@ def _validate_pdf_image(
     return PdfImageResource(content, _RASTER_MIME_TYPES[image_format], pixel_count)
 
 
+def _normalize_pdf_raster_mode(
+    image: Image.Image,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    """Return an 8-bit PNG when a raster mode is unsafe for PDF rendering."""
+    if image.mode in _PDF_RASTER_MODES:
+        return None
+    if image.mode.startswith("I;16"):
+        normalized_image = image.point(lambda value: value / 257).convert("L")
+    else:
+        target_mode = "RGBA" if "A" in image.getbands() else "RGB"
+        normalized_image = image.convert(target_mode)
+    output = BytesIO()
+    normalized_image.save(output, format="PNG")
+    normalized = output.getvalue()
+    if len(normalized) > max_bytes:
+        raise PdfImageError("image exceeds the download size limit")
+    return normalized
+
+
 def _validate_svg_image(content: bytes) -> PdfImageResource:
     """Accept SVG only when it contains no external resource references."""
     _preflight_svg_structure(content)
@@ -466,6 +513,11 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
         raise PdfImageError("image content is not SVG")
     for element in root.iter():
         element_name = element.tag.rsplit("}", 1)[-1].lower()
+        if element_name in {"lineargradient", "radialgradient"} and element.attrib.get(
+            "spreadMethod",
+            "",
+        ).strip().lower() in {"repeat", "reflect"}:
+            raise PdfImageError("SVG contains a repeating gradient")
         for name, value in element.attrib.items():
             normalized = value.strip().lower()
             if name.lower().endswith("href") and normalized:
@@ -494,15 +546,27 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
 
 
 def _has_multibyte_xml_signature(content: bytes) -> bool:
-    """Return whether bytes begin with a BOM-less UTF-16/32 XML signature."""
-    return content.startswith(
+    """Return whether BOM-less UTF-16/32 starts with XML after whitespace."""
+    signatures = (
+        (b"<\x00", (b" \x00", b"\t\x00", b"\r\x00", b"\n\x00")),
+        (b"\x00<", (b"\x00 ", b"\x00\t", b"\x00\r", b"\x00\n")),
         (
-            b"<\x00",
-            b"\x00<",
             b"<\x00\x00\x00",
+            (b" \x00\x00\x00", b"\t\x00\x00\x00", b"\r\x00\x00\x00", b"\n\x00\x00\x00"),
+        ),
+        (
             b"\x00\x00\x00<",
-        )
+            (b"\x00\x00\x00 ", b"\x00\x00\x00\t", b"\x00\x00\x00\r", b"\x00\x00\x00\n"),
+        ),
     )
+    for marker, whitespace_units in signatures:
+        offset = 0
+        unit_size = len(whitespace_units[0])
+        while content[offset : offset + unit_size] in whitespace_units:
+            offset += unit_size
+        if content.startswith(marker, offset):
+            return True
+    return False
 
 
 def _preflight_svg_structure(content: bytes) -> None:
@@ -510,7 +574,11 @@ def _preflight_svg_structure(content: bytes) -> None:
     element_count = 0
     attribute_count = 0
     attribute_value_chars = 0
+    character_data_chars = 0
+    text_chars = 0
+    style_chars = 0
     depth = 0
+    element_stack: list[str] = []
     parser = expat.ParserCreate()
 
     def reject_declaration(*_args: object) -> None:
@@ -550,16 +618,50 @@ def _preflight_svg_structure(content: bytes) -> None:
                 character in _SVG_PATH_COMMANDS for character in path_data
             ) > PDF_SVG_MAX_PATH_COMMANDS:
                 raise PdfImageError("SVG path complexity limit exceeded")
+        element_name = _name.rsplit(":", 1)[-1].lower()
+        if element_name in {"polyline", "polygon"}:
+            points = next(
+                (
+                    value
+                    for name, value in attributes.items()
+                    if name.rsplit(":", 1)[-1].lower() == "points"
+                ),
+                "",
+            )
+            if (
+                sum(1 for _match in _SVG_NUMBER_RE.finditer(points))
+                > PDF_SVG_MAX_POINT_COORDINATES
+            ):
+                raise PdfImageError("SVG point complexity limit exceeded")
+        element_stack.append(element_name)
 
     def end_element(_name: str) -> None:
         nonlocal depth
+        element_stack.pop()
         depth -= 1
+
+    def character_data(data: str) -> None:
+        nonlocal character_data_chars, text_chars, style_chars
+        size = len(data)
+        character_data_chars += size
+        current_element = element_stack[-1] if element_stack else ""
+        if current_element in {"text", "textpath", "tspan"}:
+            text_chars += size
+        elif current_element == "style":
+            style_chars += size
+        if (
+            character_data_chars > PDF_SVG_MAX_CHARACTER_DATA_CHARS
+            or text_chars > PDF_SVG_MAX_TEXT_CHARS
+            or style_chars > PDF_SVG_MAX_STYLE_CHARS
+        ):
+            raise PdfImageError("SVG character data limit exceeded")
 
     parser.StartDoctypeDeclHandler = reject_declaration
     parser.EntityDeclHandler = reject_declaration
     parser.ExternalEntityRefHandler = reject_external_entity
     parser.StartElementHandler = start_element
     parser.EndElementHandler = end_element
+    parser.CharacterDataHandler = character_data
     try:
         parser.Parse(content, True)
     except PdfImageError:

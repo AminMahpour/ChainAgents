@@ -844,15 +844,24 @@ def _prepare_pdf_image_resources(
         if remaining_bytes <= 0:
             failures.add(url)
             continue
+        remaining_pixels = MAX_PDF_REMOTE_IMAGE_PIXELS - total_pixels
+        if remaining_pixels <= 0:
+            failures.update(urls[index:])
+            break
         try:
             previous_remaining = budget.remaining_bytes
             if url.lower().startswith("data:image/"):
-                resource = _decode_pdf_data_image(url, max_bytes=remaining_bytes)
+                resource = _decode_pdf_data_image(
+                    url,
+                    max_bytes=remaining_bytes,
+                    max_pixels=remaining_pixels,
+                )
             else:
                 resource = _download_pdf_image(
                     url,
                     deadline=deadline,
                     max_bytes=remaining_bytes,
+                    max_pixels=remaining_pixels,
                     budget=budget,
                 )
             transferred_bytes = previous_remaining - budget.remaining_bytes

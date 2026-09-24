@@ -541,7 +541,7 @@ def test_prepare_pdf_images_redacts_source_in_warning(monkeypatch, caplog) -> No
 
 
 def test_prepare_pdf_images_limits_aggregate_pixels(monkeypatch) -> None:
-    """Encoded byte limits must also cap aggregate decoded raster work."""
+    """Pixel exhaustion must stop later images before their pixels are decoded."""
     calls = 0
 
     def download(*_args: Any, **_kwargs: Any) -> Any:
@@ -561,7 +561,7 @@ def test_prepare_pdf_images_limits_aggregate_pixels(monkeypatch) -> None:
 
     rendered, resources = response_exports._prepare_pdf_image_resources(document)
 
-    assert calls == 3
+    assert calls == 2
     assert len(resources) == 2
     assert rendered.count("Image unavailable:") == 1
 
@@ -606,6 +606,18 @@ def test_pdf_image_validation_rejects_truncated_jpeg() -> None:
 
     with pytest.raises(pdf_images.PdfImageError, match="image content is invalid"):
         pdf_images._validate_pdf_image(output.getvalue()[:-2])
+
+
+def test_pdf_image_validation_normalizes_unsupported_raster_mode() -> None:
+    """Raster modes unsupported by WeasyPrint must become safe 8-bit PNGs."""
+    output = BytesIO()
+    Image.new("I;16", (10, 10), 32_768).save(output, format="PNG")
+
+    resource = pdf_images._validate_pdf_image(output.getvalue())
+
+    assert resource.mime_type == "image/png"
+    with Image.open(BytesIO(resource.content)) as image:
+        assert image.mode in {"L", "LA", "RGB", "RGBA"}
 
 
 def test_pdf_image_validation_rejects_svg_external_resource() -> None:
@@ -666,6 +678,17 @@ def test_pdf_image_validation_detects_utf16_svg() -> None:
     assert resource.mime_type == "image/svg+xml"
 
 
+def test_pdf_image_validation_detects_bomless_utf16_svg_after_whitespace() -> None:
+    """Encoded leading whitespace must not hide a BOM-less UTF-16 SVG."""
+    svg = (
+        ' \n<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" />'
+    ).encode("utf-16-le")
+
+    resource = pdf_images._validate_pdf_image(svg)
+
+    assert resource.mime_type == "image/svg+xml"
+
+
 def test_pdf_image_validation_rejects_utf16_doctype() -> None:
     """DTD detection must account for multibyte XML encodings."""
     svg = (
@@ -709,6 +732,45 @@ def test_pdf_image_validation_rejects_excessive_svg_path_complexity() -> None:
     ).encode()
 
     with pytest.raises(pdf_images.PdfImageError, match="path complexity limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_excessive_svg_point_complexity() -> None:
+    """Polyline point lists must have the same bounded rendering workload."""
+    points = "0,0 " * (pdf_images.PDF_SVG_MAX_POINT_COORDINATES // 2 + 1)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg"><polyline points="{points}" /></svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="point complexity limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_excessive_svg_text() -> None:
+    """Renderable SVG character data must be bounded before tree creation."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg"><text>'
+        + "a" * (pdf_images.PDF_SVG_MAX_TEXT_CHARS + 1)
+        + "</text></svg>"
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="character data limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_repeating_gradient() -> None:
+    """Repeating gradients must not create an unbounded renderer loop."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="100000000">'
+        b'<defs><linearGradient id="gradient" spreadMethod="repeat" '
+        b'gradientUnits="userSpaceOnUse" x1="0" x2="1">'
+        b'<stop offset="0" stop-color="red" />'
+        b'<stop offset="1" stop-color="blue" />'
+        b'</linearGradient></defs>'
+        b'<rect width="100000000" height="1" fill="url(#gradient)" /></svg>'
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="repeating gradient"):
         pdf_images._validate_pdf_image(svg)
 
 
@@ -758,9 +820,9 @@ def test_pdf_image_validation_handles_deep_acyclic_svg_use_chain() -> None:
     assert resource.mime_type == "image/svg+xml"
 
 
-def test_pdf_image_validation_handles_deeply_nested_svg_ids() -> None:
-    """Reference graph construction must stay linear for nested IDs."""
-    depth = 2_000
+def test_pdf_image_validation_rejects_renderer_unsafe_svg_depth() -> None:
+    """Accepted nesting must remain below WeasyPrint's recursion ceiling."""
+    depth = pdf_images.PDF_SVG_MAX_DEPTH + 1
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg">'
         + "".join(f'<g id="node-{index}">' for index in range(depth))
@@ -769,9 +831,8 @@ def test_pdf_image_validation_handles_deeply_nested_svg_ids() -> None:
         + "</svg>"
     ).encode()
 
-    resource = pdf_images._validate_pdf_image(svg)
-
-    assert resource.mime_type == "image/svg+xml"
+    with pytest.raises(pdf_images.PdfImageError, match="structure limit"):
+        pdf_images._validate_pdf_image(svg)
 
 
 def test_pdf_image_validation_preserves_svg_hyperlink() -> None:
