@@ -322,6 +322,7 @@ def build_langgraph_config(
     *,
     recursion_limit: int,
     runtime_config: RuntimeConfig | None = None,
+    langsmith_tracing: Any | None = None,
 ) -> dict[str, Any]:
     """Build the LangGraph run configuration for a Chainlit thread.
 
@@ -334,7 +335,11 @@ def build_langgraph_config(
         A LangGraph configuration dictionary for the thread.
     """
     if runtime_config is not None:
-        return build_langgraph_run_config(runtime_config, thread_id=settings.thread_id)
+        return build_langgraph_run_config(
+            runtime_config,
+            thread_id=settings.thread_id,
+            langsmith_tracing=langsmith_tracing,
+        )
     return {
         "configurable": {"thread_id": settings.thread_id},
         "recursion_limit": recursion_limit,
@@ -1923,6 +1928,7 @@ async def _run_agent_turn(
         settings,
         recursion_limit=runtime.config.recursion_limit,
         runtime_config=runtime.config,
+        langsmith_tracing=getattr(runtime, "langsmith_tracing", None),
     )
     payload = {
         "messages": [

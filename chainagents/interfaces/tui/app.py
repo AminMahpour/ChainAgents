@@ -459,6 +459,7 @@ class ChainAgentsTuiApp(App[int]):
         config = build_langgraph_run_config(
             self.runtime.config,
             thread_id=self.thread_id,
+            langsmith_tracing=getattr(self.runtime, "langsmith_tracing", None),
         )
         adapter = AgentStreamEventAdapter(prompt=prompt)
         reflection_collector = ReflectionCollector.from_runtime_config(

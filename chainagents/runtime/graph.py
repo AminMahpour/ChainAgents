@@ -18,6 +18,7 @@ import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
+import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
     WorkspaceDocsRAG,
     compose_rag_system_prompt,
@@ -45,6 +46,7 @@ _STATIC_BACKGROUND_TASK_MANAGERS: set[
 _STATIC_LARGE_TOOL_RESULT_ARTIFACTS = (
     runtime_artifacts.LargeToolResultArtifactRegistry()
 )
+_STATIC_LANGSMITH_TRACINGS: set[runtime_tracing.LangSmithTracing] = set()
 
 
 def static_background_task_managers() -> tuple[
@@ -71,6 +73,17 @@ async def close_static_background_tasks() -> None:
         await _STATIC_LARGE_TOOL_RESULT_ARTIFACTS.drain()
     except BaseException as exc:
         errors.append(exc)
+    if _STATIC_LANGSMITH_TRACINGS:
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(tracing.flush)
+                for tracing in tuple(_STATIC_LANGSMITH_TRACINGS)
+            ),
+            return_exceptions=True,
+        )
+        errors.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
     if len(errors) == 1:
         raise errors[0]
     if errors:
@@ -372,6 +385,7 @@ def build_static_sync_subagent_spec(
     background_manager: runtime_background_tasks.BackgroundTaskManager | None = None,
     artifact_registry: runtime_artifacts.LargeToolResultArtifactRegistry | None = None,
     agent_path: tuple[str, ...] = (),
+    langsmith_tracing: runtime_tracing.LangSmithTracing | None = None,
 ) -> dict[str, Any]:
     """Build a sync subagent spec for configured graph creation."""
     effective_model = runtime_models.resolve_runtime_model_profile(
@@ -443,6 +457,7 @@ def build_static_sync_subagent_spec(
             agent_path=(*agent_path, child.name),
             inherited_model=effective_model,
             project_root=project_root,
+            langsmith_tracing=langsmith_tracing,
         )
         for child in child_subagents
     ]
@@ -467,6 +482,7 @@ def build_static_sync_subagent_spec(
                 )
             ),
             existing_tools=effective_tools,
+            langsmith_tracing=langsmith_tracing,
         )
         if caller_background_enabled
         else []
@@ -508,6 +524,7 @@ def build_graph_subagent_specs(
     inherited_tools: list[Any] | None = None,
     background_manager: runtime_background_tasks.BackgroundTaskManager | None = None,
     artifact_registry: runtime_artifacts.LargeToolResultArtifactRegistry | None = None,
+    langsmith_tracing: runtime_tracing.LangSmithTracing | None = None,
 ) -> list[Any]:
     """Build graph subagent specs.
 
@@ -548,6 +565,7 @@ def build_graph_subagent_specs(
             background_manager=background_manager,
             artifact_registry=artifact_registry,
             agent_path=(subagent.name,),
+            langsmith_tracing=langsmith_tracing,
         )
         for subagent in config.extensions.subagents
     ]
@@ -590,6 +608,9 @@ def create_configured_graph(
         The created configured graph.
     """
     config = RuntimeConfig.from_env()
+    langsmith_tracing = runtime_tracing.build_langsmith_tracing(config.langsmith)
+    if langsmith_tracing is not None:
+        _STATIC_LANGSMITH_TRACINGS.add(langsmith_tracing)
     backend = runtime_backends.build_deepagent_backend(
         include_memories=config.agent_state == "stateful",
         memory_namespace=config.extensions.agent_memory_namespace,
@@ -628,6 +649,7 @@ def create_configured_graph(
         inherited_tools=main_tools,
         background_manager=background_manager,
         artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
+        langsmith_tracing=langsmith_tracing,
     )
     local_subagent_specs = [
         spec for spec in subagent_specs if "runnable" in spec
@@ -657,6 +679,7 @@ def create_configured_graph(
                 )
             ),
             existing_tools=main_tools,
+            langsmith_tracing=langsmith_tracing,
         )
         if background_manager is not None and background_subagents
         else []
@@ -705,4 +728,7 @@ def create_configured_graph(
             session_manager
         ),
         artifact_registry=_STATIC_LARGE_TOOL_RESULT_ARTIFACTS,
+        run_config_transform=(
+            langsmith_tracing.with_callback if langsmith_tracing is not None else None
+        ),
     )

@@ -1882,7 +1882,11 @@ async def run_agent_prompt(
     payload = {
         "messages": [{"role": "user", "content": user_message_content(prompt, photos)}]
     }
-    config = build_langgraph_run_config(runtime.config, thread_id=settings.thread_id)
+    config = build_langgraph_run_config(
+        runtime.config,
+        thread_id=settings.thread_id,
+        langsmith_tracing=getattr(runtime, "langsmith_tracing", None),
+    )
     renderer = CliEventRenderer(
         prompt=prompt,
         stdout=stdout,

@@ -265,6 +265,15 @@ class LangfuseConfig:
 
 
 @dataclass(frozen=True)
+class LangSmithConfig:
+    """Optional LangSmith tracing for foreground and local background runs."""
+
+    enabled: bool = False
+    project: str | None = None
+    background_trace_mode: Literal["linked", "separate"] = "linked"
+
+
+@dataclass(frozen=True)
 class ExtensionsConfig:
     """Store optional runtime extension settings parsed from configuration.
 
@@ -426,6 +435,7 @@ class FileConfig:
     extensions: ExtensionsConfig
     model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
     langfuse: LangfuseConfig = LangfuseConfig()
+    langsmith: LangSmithConfig = LangSmithConfig()
     rag: RagConfig = RagConfig()
 
 
