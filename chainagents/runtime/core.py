@@ -28,6 +28,7 @@ from chainagents.runtime.config import (
     load_extensions_config,
     load_file_config,
     parse_langfuse_config,
+    parse_langsmith_config,
 )
 from chainagents.runtime.constants import (
     AGENTS_MD_FILENAME,
@@ -169,7 +170,9 @@ from chainagents.runtime.providers import (
 from chainagents.runtime.tracing import (
     _import_langfuse_callback_handler as _import_langfuse_callback_handler,
     build_langfuse_callback_handler,
+    build_langsmith_tracing,
     build_langgraph_run_config,
+    LangSmithTracing,
     shutdown_langfuse_client,
 )
 from chainagents.runtime.types import (
@@ -184,6 +187,7 @@ from chainagents.runtime.types import (
     ExtensionsConfig,
     FileConfig,
     LangfuseConfig,
+    LangSmithConfig,
     ModelDefaults,
     RuntimeConfigOverrides,
     SkillCommandMetadata,
@@ -304,6 +308,8 @@ __all__ = [
     "GENERATIVE_UI_COMPONENT_NAME",
     "InMemoryStore",
     "LangfuseConfig",
+    "LangSmithConfig",
+    "LangSmithTracing",
     "Literal",
     "MemorySaver",
     "ModelDefaults",
@@ -358,6 +364,7 @@ __all__ = [
     "build_deepagent_backend",
     "build_graph_subagent_specs",
     "build_langfuse_callback_handler",
+    "build_langsmith_tracing",
     "build_langgraph_run_config",
     "build_model",
     "build_model_for_profile",
@@ -422,6 +429,7 @@ __all__ = [
     "parse_async_subagent_config",
     "parse_extensions_config",
     "parse_langfuse_config",
+    "parse_langsmith_config",
     "parse_model_defaults",
     "parse_model_disable_streaming",
     "parse_model_profile_defaults",

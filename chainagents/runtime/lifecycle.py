@@ -26,6 +26,7 @@ import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.graph as runtime_graph
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
+import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
     RagStatus,
     RagUploadResult,
@@ -125,6 +126,7 @@ class AgentRuntime:
             project_root: Project root used to resolve local paths.
         """
         self.config = config
+        self.langsmith_tracing = runtime_tracing.build_langsmith_tracing(config.langsmith)
         self.project_root = project_root or runtime_constants.PROJECT_ROOT
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
@@ -587,6 +589,7 @@ class AgentRuntime:
                     )
                 ),
                 existing_tools=effective_tools,
+                langsmith_tracing=self.langsmith_tracing,
             )
             if caller_background_enabled
             else []
@@ -753,6 +756,7 @@ class AgentRuntime:
                             )
                         ),
                         existing_tools=main_tools,
+                        langsmith_tracing=self.langsmith_tracing,
                     )
                     if (
                         self.config.extensions.background_subagents.enabled
@@ -1334,9 +1338,28 @@ class AgentRuntime:
                 try:
                     await self._exit_stack.aclose()
                 finally:
-                    self._checkpointer = None
-                    self._store = None
-                    self._mcp_client = None
+                    try:
+                        if self.langsmith_tracing is not None:
+                            flush = asyncio.create_task(
+                                asyncio.to_thread(self.langsmith_tracing.flush),
+                                name="chainagents-flush-langsmith",
+                            )
+                            try:
+                                await runtime_background_tasks.await_preserving_cancellation(
+                                    flush
+                                )
+                            finally:
+                                close = asyncio.create_task(
+                                    asyncio.to_thread(self.langsmith_tracing.close),
+                                    name="chainagents-close-langsmith",
+                                )
+                                await runtime_background_tasks.await_preserving_cancellation(
+                                    close
+                                )
+                    finally:
+                        self._checkpointer = None
+                        self._store = None
+                        self._mcp_client = None
 
     def _build_backend(self, runtime):
         """Build the Deep Agent backend for the current runtime settings.

@@ -526,6 +526,44 @@ When enabled, ChainAgents attaches Langfuse's LangChain callback handler to
 Chainlit, CLI, TUI, and API agent runs. The LangGraph thread ID is also passed
 as the Langfuse session ID.
 
+## Optional: Enable LangSmith Tracing
+
+Set a LangSmith API key in the environment, then enable the integration in
+`deepagent.toml`:
+
+```bash
+export LANGSMITH_API_KEY="lsv2_..."
+# For a non-default region, also set LANGSMITH_ENDPOINT without a trailing slash.
+# For an API key linked to multiple workspaces, set LANGSMITH_WORKSPACE_ID.
+```
+
+```toml
+[langsmith]
+enabled = true
+project = "chainagents"
+background_trace_mode = "linked" # or "separate"
+```
+
+The `project` setting takes precedence over `LANGSMITH_PROJECT`; when neither
+is set, ChainAgents uses `chainagents`. In `linked` mode, a local background
+subagent run belongs to its parent trace when a LangSmith parent is available.
+If the parent cannot be captured, it starts its own trace. In `separate` mode,
+each task starts its own trace and records parent run and trace IDs as metadata.
+Both modes identify runs by the conversation session ID and background task ID,
+including nested and batch tasks. Search for `background_task_id` in LangSmith
+to find a task, or filter by `session_id` to see a conversation's tasks. The
+`background_trace_link` metadata says `linked`, `separate`, or
+`parent_unavailable`; the last value marks a linked-mode fallback to a root
+trace. Each run also records the agent name and path, and nested runs record
+their parent task ID. Chainlit reasoning and tool step visibility settings do
+not change tracing. Langfuse can remain enabled at the same time.
+
+LangSmith records graph execution. The local task manager remains the source
+for final cancellation and cleanup status, which can differ from a graph run
+that already finished successfully. An enabled integration owns a client and
+flushes buffered traces when the runtime shuts down. Exported graphs flush at
+application teardown and remain usable in a later lifespan.
+
 ## Agent Runtime Config
 
 The `[agent]` table configures main-agent runtime behavior:

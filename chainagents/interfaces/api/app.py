@@ -1507,7 +1507,11 @@ async def _iter_agent_events(
             },
         ]
     }
-    config = build_langgraph_run_config(runtime.config, thread_id=context.thread_id)
+    config = build_langgraph_run_config(
+        runtime.config,
+        thread_id=context.thread_id,
+        langsmith_tracing=getattr(runtime, "langsmith_tracing", None),
+    )
     adapter = AgentStreamEventAdapter(prompt=context.prompt)
     stream = agent.astream_events(
         payload,

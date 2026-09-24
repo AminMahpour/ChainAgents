@@ -50,6 +50,15 @@ reasoning_effort = "medium"
 # Set true to attach Langfuse's LangChain callback handler to agent runs.
 enabled = false
 
+[langsmith]
+# Trace foreground and local background runs when enabled. Credentials stay in
+# LANGSMITH_API_KEY and optional LANGSMITH_ENDPOINT/LANGSMITH_WORKSPACE_ID.
+enabled = false
+project = "chainagents"
+# "linked" nests background runs under their parent trace when possible;
+# "separate" starts one root trace per background task.
+background_trace_mode = "linked"
+
 [mcp]
 tool_name_prefix = false
 stateful = true

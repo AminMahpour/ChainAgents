@@ -37,6 +37,7 @@ from chainagents.runtime.types import (
     ExtensionsConfig,
     FileConfig,
     LangfuseConfig,
+    LangSmithConfig,
     ModelDefaults,
     RuntimeConfigOverrides,
 )
@@ -64,6 +65,25 @@ def parse_langfuse_config(raw_config: dict[str, Any]) -> LangfuseConfig:
     return LangfuseConfig(enabled=raw_enabled)
 
 
+def parse_langsmith_config(raw_config: dict[str, Any]) -> LangSmithConfig:
+    """Parse optional LangSmith tracing settings from a top-level table."""
+    raw_langsmith = raw_config.get("langsmith", {})
+    if not isinstance(raw_langsmith, dict):
+        raise ValueError("The top-level 'langsmith' config must be a table/object.")
+    enabled = raw_langsmith.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("The top-level 'langsmith.enabled' config must be a boolean.")
+    project = raw_langsmith.get("project")
+    if project is not None:
+        if not isinstance(project, str) or not project.strip():
+            raise ValueError("The top-level 'langsmith.project' config must be a nonempty string.")
+        project = project.strip()
+    mode = raw_langsmith.get("background_trace_mode", "linked")
+    if mode not in ("linked", "separate"):
+        raise ValueError("The top-level 'langsmith.background_trace_mode' config must be 'linked' or 'separate'.")
+    return LangSmithConfig(enabled=enabled, project=project, background_trace_mode=mode)
+
+
 def load_file_config(config_path: str | Path | None = None) -> FileConfig:
     """Load file config.
 
@@ -88,6 +108,7 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
             extensions=ExtensionsConfig(config_path=None),
             model_profiles={},
             langfuse=LangfuseConfig(),
+            langsmith=LangSmithConfig(),
             rag=RagConfig(),
         )
 
@@ -101,6 +122,7 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
         extensions=runtime_extension_config.parse_extensions_config(raw_config, resolved_config_path),
         model_profiles=runtime_model_config.parse_model_profiles(raw_model, base=model_defaults),
         langfuse=parse_langfuse_config(raw_config),
+        langsmith=parse_langsmith_config(raw_config),
         rag=parse_rag_config(raw_config, resolved_config_path),
     )
 
@@ -174,6 +196,7 @@ class RuntimeConfig:
     extensions: ExtensionsConfig
     model_max_tokens: int | None = None
     langfuse: LangfuseConfig = LangfuseConfig()
+    langsmith: LangSmithConfig = LangSmithConfig()
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     model_repeat_penalty: float | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
@@ -725,6 +748,7 @@ class RuntimeConfig:
             agent_state=file_config.extensions.agent_state,
             extensions=file_config.extensions,
             langfuse=file_config.langfuse,
+            langsmith=file_config.langsmith,
             recursion_limit=recursion_limit,
             rag_requested=rag_requested,
             rag=rag,

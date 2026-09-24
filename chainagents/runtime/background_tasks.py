@@ -19,9 +19,9 @@ from collections.abc import (
     Iterator,
     Sequence,
 )
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
@@ -41,6 +41,9 @@ from chainagents.runtime.artifacts import (
     LargeToolResultArtifactRegistry,
 )
 from chainagents.runtime.types import BackgroundSubagentConfig
+
+if TYPE_CHECKING:
+    from chainagents.runtime.tracing import LangSmithTracing
 
 
 BackgroundTaskStatus = Literal[
@@ -210,12 +213,19 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         on_session_open: Callable[[str], None] | None = None,
         artifact_registry: LargeToolResultArtifactRegistry | None = None,
         fixed_session_id: str | None = None,
+        run_config_transform: Callable[[RunnableConfig | None], RunnableConfig] | None = None,
     ) -> None:
         self.runnable = runnable
         self.manager = manager
         self.on_session_open = on_session_open
         self.artifact_registry = artifact_registry
         self.fixed_session_id = fixed_session_id
+        self.run_config_transform = run_config_transform
+
+    def _prepare_config(self, config: RunnableConfig | None) -> RunnableConfig | None:
+        if self.run_config_transform is None:
+            return config
+        return self.run_config_transform(config)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.runnable, name)
@@ -292,6 +302,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ) -> Any:
+        config = self._prepare_config(config)
         token = self._set_generation(config)
         try:
             return self.runnable.invoke(input, config, **kwargs)  # type: ignore[attr-defined]
@@ -304,6 +315,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ) -> Any:
+        config = self._prepare_config(config)
         token = self._set_generation(config)
         try:
             return await self.runnable.ainvoke(  # type: ignore[attr-defined]
@@ -320,6 +332,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ) -> Iterator[Any]:
+        config = self._prepare_config(config)
         token = self._set_generation(config)
         try:
             yield from self.runnable.stream(  # type: ignore[attr-defined]
@@ -336,6 +349,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
+        config = self._prepare_config(config)
         token = self._set_generation(config)
         try:
             async for chunk in self.runnable.astream(  # type: ignore[attr-defined]
@@ -387,6 +401,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         exclude_tags: Sequence[str] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[Any] | Awaitable[Any]:
+        config = self._prepare_config(config)
         configurable = (config or {}).get("configurable", {})
         session_id = str(
             self.fixed_session_id or configurable.get("thread_id") or ""
@@ -524,6 +539,7 @@ def scope_background_session_invocation(
     on_session_open: Callable[[str], None] | None = None,
     artifact_registry: LargeToolResultArtifactRegistry | None = None,
     fixed_session_id: str | None = None,
+    run_config_transform: Callable[[RunnableConfig | None], RunnableConfig] | None = None,
 ) -> Runnable[Any, Any]:
     """Wrap an exported graph with invocation-scoped session invalidation."""
     return _BackgroundSessionScopedRunnable(
@@ -532,6 +548,7 @@ def scope_background_session_invocation(
         on_session_open=on_session_open,
         artifact_registry=artifact_registry,
         fixed_session_id=fixed_session_id,
+        run_config_transform=run_config_transform,
     )
 
 
@@ -895,6 +912,7 @@ def create_background_task_tools(
     session_generation: BackgroundSessionGeneration | None = None,
     batch_output_store: BatchResultOutputStore | None = None,
     existing_tools: Iterable[object] = (),
+    langsmith_tracing: LangSmithTracing | None = None,
 ) -> list[object]:
     """Create task tools scoped to the direct children of one agent."""
     collisions = sorted(
@@ -931,6 +949,12 @@ def create_background_task_tools(
         if child is None:
             raise ValueError(f"Allowed subagents for background work: {allowed_text}.")
         parent_configurable = runtime.config.get("configurable", {})
+        parent_task_id = current_background_task_id()
+        parent_trace = (
+            langsmith_tracing.capture_parent(runtime.config)
+            if langsmith_tracing is not None
+            else None
+        )
         shared_checkpointer = parent_configurable.get(_LANGGRAPH_CHECKPOINTER_KEY)
         shared_store = runtime.store
         delete_checkpoint_thread = getattr(
@@ -954,34 +978,62 @@ def create_background_task_tools(
                 "configurable": configurable,
                 "recursion_limit": recursion_limit,
             }
-            if manager.config.stream_activity:
-                adapter = AgentStreamEventAdapter(prompt=description)
-                final_values: object = None
-                async for chunk in child.astream(  # type: ignore[attr-defined]
-                    state,
-                    config,
-                    stream_mode=["values", "messages", "updates"],
-                    subgraphs=True,
-                ):
-                    part = langgraph_part_from_event_chunk(chunk)
-                    if part is None:
-                        continue
-                    namespace = tuple(part.get("ns", ()))
-                    if part.get("type") == "values" and not namespace:
-                        final_values = part.get("data")
-                    for event in adapter.events_from_part(part):
-                        source = (
-                            subagent_type
-                            if not namespace
-                            else f"{subagent_type} / {event.source}"
-                        )
-                        await manager.publish_activity(
-                            task_id,
-                            dataclasses.replace(event, source=source),
-                        )
-                return _result_text(final_values)
-            result = await child.ainvoke(state, config)  # type: ignore[attr-defined]
-            return _result_text(result)
+            scope = nullcontext()
+            if langsmith_tracing is not None:
+                mode = langsmith_tracing.config.background_trace_mode
+                if mode == "separate":
+                    link = "separate"
+                elif parent_trace is None:
+                    link = "parent_unavailable"
+                else:
+                    link = "linked"
+                metadata: dict[str, object] = {
+                    "session_id": session_id,
+                    "background_task_id": task_id,
+                    "background_agent": subagent_type,
+                    "background_agent_path": [*agent_path, subagent_type],
+                    "background_trace_mode": mode,
+                    "background_trace_link": link,
+                }
+                if parent_task_id is not None:
+                    metadata["background_parent_task_id"] = parent_task_id
+                if parent_trace is not None:
+                    metadata["originating_parent_run_id"] = parent_trace.run_id
+                    metadata["originating_parent_trace_id"] = parent_trace.trace_id
+                config["metadata"] = metadata
+                config["run_name"] = f"background/{subagent_type}/{task_id}"
+                config["run_id"] = uuid.uuid4()
+                config["tags"] = ["chainagents", "background-subagent"]
+                scope = langsmith_tracing.background_scope(parent_trace, mode=mode)
+            with scope:
+                if manager.config.stream_activity:
+                    adapter = AgentStreamEventAdapter(prompt=description)
+                    final_values: object = None
+                    async for chunk in child.astream(  # type: ignore[attr-defined]
+                        state,
+                        config,
+                        stream_mode=["values", "messages", "updates"],
+                        subgraphs=True,
+                    ):
+                        part = langgraph_part_from_event_chunk(chunk)
+                        if part is None:
+                            continue
+                        namespace = tuple(part.get("ns", ()))
+                        if part.get("type") == "values" and not namespace:
+                            final_values = part.get("data")
+                        for event in adapter.events_from_part(part):
+                            source = (
+                                subagent_type
+                                if not namespace
+                                else f"{subagent_type} / {event.source}"
+                            )
+                            await manager.publish_activity(
+                                task_id,
+                                dataclasses.replace(event, source=source),
+                            )
+                    return _result_text(final_values)
+                result = await child.ainvoke(state, config)  # type: ignore[attr-defined]
+                return _result_text(result)
 
         cleanup: BackgroundCleanup | None = None
         if callable(delete_checkpoint_thread):
