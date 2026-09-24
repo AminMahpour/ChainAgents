@@ -57,6 +57,7 @@ class _LocalTaskActivityState:
     reasoning_steps: dict[str, cl.Step] = field(default_factory=dict)
     tool_steps: dict[str, _LocalToolActivityState] = field(default_factory=dict)
     suppressed_tool_call_ids: set[str] = field(default_factory=set)
+    pending_hidden_tool_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 class LocalBackgroundTaskNotifier:
@@ -234,13 +235,23 @@ class LocalBackgroundTaskNotifier:
                 if previous is not None:
                     previous.call_id = event.tool_call_id
                     state.tool_steps[event.tool_call_id] = previous
-            if not self.tool_steps_enabled:
-                if event.tool_call_id in state.tool_steps:
-                    return
-                if event.tool_call_id:
+                hidden = state.pending_hidden_tool_calls.pop(
+                    event.previous_tool_call_id, None
+                )
+                if hidden is not None:
+                    state.pending_hidden_tool_calls[event.tool_call_id] = hidden
                     state.suppressed_tool_call_ids.add(event.tool_call_id)
-                return
+            if not self.tool_steps_enabled:
+                if event.tool_call_id not in state.tool_steps:
+                    if event.tool_call_id:
+                        state.suppressed_tool_call_ids.add(event.tool_call_id)
+                        state.pending_hidden_tool_calls[event.tool_call_id] = (
+                            event.source,
+                            event.tool_name,
+                        )
+                    return
             state.suppressed_tool_call_ids.discard(event.tool_call_id)
+            state.pending_hidden_tool_calls.pop(event.tool_call_id, None)
             call_id = event.tool_call_id or event.source
             tool_state = state.tool_steps.get(call_id)
             if tool_state is None:
@@ -286,6 +297,20 @@ class LocalBackgroundTaskNotifier:
                     if (
                         event.tool_call_id in state.suppressed_tool_call_ids
                         or event.previous_tool_call_id in state.suppressed_tool_call_ids
+                    ):
+                        state.pending_hidden_tool_calls.pop(event.tool_call_id, None)
+                        state.pending_hidden_tool_calls.pop(
+                            event.previous_tool_call_id, None
+                        )
+                        return
+                    # An unseen ID could belong to a pending hidden synthetic call.
+                    if any(
+                        hidden_source == event.source
+                        and (
+                            hidden_name in {"", "tool"}
+                            or event.tool_name in {"", "tool", hidden_name}
+                        )
+                        for hidden_source, hidden_name in state.pending_hidden_tool_calls.values()
                     ):
                         return
                     visible = self._resolve_tool_state(
