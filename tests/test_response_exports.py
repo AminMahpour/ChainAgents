@@ -758,6 +758,19 @@ def test_pdf_image_validation_rejects_excessive_svg_text() -> None:
         pdf_images._validate_pdf_image(svg)
 
 
+def test_pdf_image_validation_rejects_excessive_svg_css_cascade() -> None:
+    """Stylesheet rule matching work must be bounded across SVG elements."""
+    rules = "*{fill:red}" * 501
+    rectangles = '<rect width="1" height="1" />' * 2_001
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg"><style>{rules}</style>'
+        f"{rectangles}</svg>"
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="stylesheet complexity"):
+        pdf_images._validate_pdf_image(svg)
+
+
 def test_pdf_image_validation_rejects_repeating_gradient() -> None:
     """Repeating gradients must not create an unbounded renderer loop."""
     svg = (
@@ -801,6 +814,48 @@ def test_pdf_image_validation_rejects_excessive_svg_use_expansion() -> None:
     ).encode()
 
     with pytest.raises(pdf_images.PdfImageError, match="expansion limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_aggregate_root_svg_use_expansion() -> None:
+    """Duplicate document-level references must share one expansion budget."""
+    children = '<rect width="1" height="1" />' * 500
+    references = '<use href="#shape" />' * 500
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        f'<defs><g id="shape">{children}</g></defs>{references}</svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="expansion limit"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_deep_svg_inheritance_chain() -> None:
+    """Gradient and pattern inheritance must stay below renderer recursion."""
+    definitions = "".join(
+        f'<linearGradient id="gradient-{index}" href="#gradient-{index + 1}" />'
+        for index in range(pdf_images.PDF_SVG_MAX_INHERITANCE_DEPTH + 1)
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        + definitions
+        + '<linearGradient id="gradient-end" /></defs></svg>'
+    ).encode()
+
+    with pytest.raises(pdf_images.PdfImageError, match="inheritance depth"):
+        pdf_images._validate_pdf_image(svg)
+
+
+def test_pdf_image_validation_rejects_circular_svg_inheritance() -> None:
+    """Local non-use resource inheritance must reject cycles."""
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        b'<linearGradient id="first" href="#second" />'
+        b'<linearGradient id="second" href="#first" />'
+        b"</defs></svg>"
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="circular inheritance"):
         pdf_images._validate_pdf_image(svg)
 
 

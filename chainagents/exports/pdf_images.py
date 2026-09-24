@@ -36,7 +36,12 @@ PDF_SVG_MAX_POINT_COORDINATES = 50_000
 PDF_SVG_MAX_CHARACTER_DATA_CHARS = 1_000_000
 PDF_SVG_MAX_TEXT_CHARS = 250_000
 PDF_SVG_MAX_STYLE_CHARS = 100_000
+PDF_SVG_MAX_STYLE_RULES = 1_000
+PDF_SVG_MAX_STYLE_DECLARATIONS = 10_000
+PDF_SVG_MAX_STYLE_MATCH_WORK = 1_000_000
 PDF_SVG_MAX_USE_EXPANSION = 4_096
+PDF_SVG_MAX_TOTAL_EXPANSION = 25_000
+PDF_SVG_MAX_INHERITANCE_DEPTH = 128
 PDF_IMAGE_MAX_REDIRECTS = 3
 PDF_IMAGE_TIMEOUT_SECONDS = 5.0
 PDF_IMAGE_USER_AGENT = "ChainAgents-PDF/1.0"
@@ -533,15 +538,24 @@ def _validate_svg_image(content: bytes) -> PdfImageResource:
             or _svg_css_has_external_resource(element.text or "")
         ):
             raise PdfImageError("SVG contains an external resource")
-    use_graph, use_base_costs, referenced_ids = _svg_use_graph(root)
+    (
+        use_graph,
+        use_base_costs,
+        referenced_ids,
+        document_references,
+        document_element_count,
+    ) = _svg_use_graph(root)
     if _svg_graph_has_cycle(use_graph):
         raise PdfImageError("SVG contains a circular local reference")
     if _svg_graph_exceeds_expansion_limit(
         use_graph,
         use_base_costs,
         referenced_ids,
+        document_references,
+        document_element_count,
     ):
         raise PdfImageError("SVG local reference expansion limit exceeded")
+    _validate_svg_inheritance(root)
     return PdfImageResource(content, "image/svg+xml")
 
 
@@ -577,6 +591,8 @@ def _preflight_svg_structure(content: bytes) -> None:
     character_data_chars = 0
     text_chars = 0
     style_chars = 0
+    style_rules = 0
+    style_declarations = 0
     depth = 0
     element_stack: list[str] = []
     parser = expat.ParserCreate()
@@ -641,7 +657,8 @@ def _preflight_svg_structure(content: bytes) -> None:
         depth -= 1
 
     def character_data(data: str) -> None:
-        nonlocal character_data_chars, text_chars, style_chars
+        nonlocal character_data_chars, style_chars, style_declarations
+        nonlocal style_rules, text_chars
         size = len(data)
         character_data_chars += size
         current_element = element_stack[-1] if element_stack else ""
@@ -649,10 +666,14 @@ def _preflight_svg_structure(content: bytes) -> None:
             text_chars += size
         elif current_element == "style":
             style_chars += size
+            style_rules += data.count("{")
+            style_declarations += data.count(":")
         if (
             character_data_chars > PDF_SVG_MAX_CHARACTER_DATA_CHARS
             or text_chars > PDF_SVG_MAX_TEXT_CHARS
             or style_chars > PDF_SVG_MAX_STYLE_CHARS
+            or style_rules > PDF_SVG_MAX_STYLE_RULES
+            or style_declarations > PDF_SVG_MAX_STYLE_DECLARATIONS
         ):
             raise PdfImageError("SVG character data limit exceeded")
 
@@ -668,11 +689,13 @@ def _preflight_svg_structure(content: bytes) -> None:
         raise
     except (expat.ExpatError, LookupError, ValueError) as exc:
         raise PdfImageError("SVG content is invalid") from exc
+    if style_rules * element_count > PDF_SVG_MAX_STYLE_MATCH_WORK:
+        raise PdfImageError("SVG stylesheet complexity limit exceeded")
 
 
 def _svg_use_graph(
     root: ElementTree.Element,
-) -> tuple[dict[str, list[str]], dict[str, int], set[str]]:
+) -> tuple[dict[str, list[str]], dict[str, int], set[str], list[str], int]:
     """Build a local-reference graph and direct element costs for SVG IDs."""
     elements_by_id = {
         identifier: element
@@ -682,9 +705,12 @@ def _svg_use_graph(
     graph: dict[str, list[str]] = {identifier: [] for identifier in elements_by_id}
     base_costs = dict.fromkeys(elements_by_id, 0)
     referenced_ids: set[str] = set()
+    document_references: list[str] = []
+    document_element_count = 0
     pending: list[tuple[ElementTree.Element, str | None]] = [(root, None)]
     while pending:
         element, owner = pending.pop()
+        document_element_count += 1
         identifier = element.attrib.get("id", "").strip()
         if identifier:
             if owner is not None:
@@ -701,8 +727,16 @@ def _svg_use_graph(
                         referenced_ids.add(target)
                         if owner is not None:
                             graph[owner].append(target)
+                        else:
+                            document_references.append(target)
         pending.extend((child, owner) for child in element)
-    return graph, base_costs, referenced_ids
+    return (
+        graph,
+        base_costs,
+        referenced_ids,
+        document_references,
+        document_element_count,
+    )
 
 
 def _svg_graph_has_cycle(graph: dict[str, list[str]]) -> bool:
@@ -735,6 +769,8 @@ def _svg_graph_exceeds_expansion_limit(
     graph: dict[str, list[str]],
     base_costs: dict[str, int],
     referenced_ids: set[str],
+    document_references: list[str],
+    document_element_count: int,
 ) -> bool:
     """Return whether expanding any local SVG reference exceeds the limit."""
     expanded_costs: dict[str, int] = {}
@@ -760,7 +796,49 @@ def _svg_graph_exceeds_expansion_limit(
                 if cost > PDF_SVG_MAX_USE_EXPANSION:
                     return True
             expanded_costs[identifier] = cost
+    total_expansion = document_element_count
+    for target in document_references:
+        total_expansion += expanded_costs[target]
+        if total_expansion > PDF_SVG_MAX_TOTAL_EXPANSION:
+            return True
     return False
+
+
+def _validate_svg_inheritance(root: ElementTree.Element) -> None:
+    """Reject cyclic or renderer-unsafe local gradient and pattern chains."""
+    graph: dict[str, str] = {}
+    inheritable_elements = {"lineargradient", "radialgradient", "pattern"}
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].lower() not in inheritable_elements:
+            continue
+        identifier = element.attrib.get("id", "").strip()
+        if not identifier:
+            continue
+        for name, value in element.attrib.items():
+            reference = value.strip()
+            if name.lower().endswith("href") and reference.startswith("#"):
+                graph[identifier] = reference[1:]
+                break
+
+    depths: dict[str, int] = {}
+    for start in graph:
+        if start in depths:
+            continue
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current = start
+        while current in graph and current not in depths:
+            if current in positions:
+                raise PdfImageError("SVG contains circular inheritance")
+            positions[current] = len(path)
+            path.append(current)
+            current = graph[current]
+        depth = depths.get(current, 0)
+        for identifier in reversed(path):
+            depth += 1
+            if depth > PDF_SVG_MAX_INHERITANCE_DEPTH:
+                raise PdfImageError("SVG inheritance depth limit exceeded")
+            depths[identifier] = depth
 
 
 def _svg_css_has_external_resource(value: str) -> bool:
