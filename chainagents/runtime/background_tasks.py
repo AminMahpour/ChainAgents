@@ -1404,18 +1404,11 @@ class BackgroundTaskManager:
                     "Background running limit reached for this process "
                     f"({self.config.max_running_total})."
                 )
-            overflow = (
-                len(session_ids) + batch_size - self.config.max_tasks_per_session
-            )
-            if overflow > 0:
-                evictable = self._evictable_record_ids(normalized_session, overflow)
-                if len(evictable) < overflow:
-                    raise RuntimeError(
-                        "Background retained task limit reached for this session "
-                        f"({self.config.max_tasks_per_session})."
-                    )
-                self._forget_records(normalized_session, evictable)
-                session_ids = self._session_task_ids.get(normalized_session, [])
+            # Validate the requested parent before eviction, and spare it: the new
+            # children are not retained yet, so nothing else would stop eviction
+            # from removing the very parent this spawn needs. Its own ancestors are
+            # already spared as parents of a retained record.
+            protected: set[str] | None = None
             if parent_task_id is not None:
                 parent = self._records.get(parent_task_id)
                 if parent is None or parent.session_id != normalized_session:
@@ -1424,6 +1417,23 @@ class BackgroundTaskManager:
                     )
                 if parent.cancelling:
                     raise RuntimeError("Background parent task is cancelling.")
+                protected = {parent.task_id}
+            overflow = (
+                len(session_ids) + batch_size - self.config.max_tasks_per_session
+            )
+            if overflow > 0:
+                evictable = self._evictable_record_ids(
+                    normalized_session,
+                    overflow,
+                    protected=protected,
+                )
+                if len(evictable) < overflow:
+                    raise RuntimeError(
+                        "Background retained task limit reached for this session "
+                        f"({self.config.max_tasks_per_session})."
+                    )
+                self._forget_records(normalized_session, evictable)
+                session_ids = self._session_task_ids.get(normalized_session, [])
 
             retained_ids = self._session_task_ids.setdefault(normalized_session, [])
             records: list[_BackgroundTaskRecord] = []
@@ -1460,18 +1470,27 @@ class BackgroundTaskManager:
                 )
             return [record.snapshot() for record in records]
 
-    def _evictable_record_ids(self, session_id: str, count: int) -> set[str]:
+    def _evictable_record_ids(
+        self,
+        session_id: str,
+        count: int,
+        *,
+        protected: set[str] | None = None,
+    ) -> set[str]:
         """Select up to ``count`` of the oldest settled records in a session.
 
         Only terminal records that no waiter is blocked on, whose cleanup has
         completed, and that no retained record names as its parent are eligible,
-        so ancestry, pending cleanup and in-flight waits stay intact. This only
+        so ancestry, pending cleanup and in-flight waits stay intact. ``protected``
+        additionally spares records the caller still needs, such as the parent a
+        pending spawn names, which nothing retained points at yet. This only
         selects; ``_forget_records`` performs the removal once the caller knows
         the batch is admissible. Callers must hold ``self._lock``.
         """
         session_ids = self._session_task_ids.get(session_id)
         if not session_ids:
             return set()
+        spared = protected or set()
         evicted: set[str] = set()
         while len(evicted) < count:
             parent_ids = {
@@ -1484,6 +1503,7 @@ class BackgroundTaskManager:
                     task_id
                     for task_id in session_ids
                     if task_id not in evicted
+                    and task_id not in spared
                     and task_id not in parent_ids
                     and self._is_evictable(self._records[task_id])
                 ),
@@ -1763,8 +1783,13 @@ class BackgroundTaskManager:
                 await asyncio.wait_for(completion.wait(), timeout=wait_seconds)
             except TimeoutError:
                 pass
-            async with self._lock:
+            finally:
+                # Release the pin even when this caller is cancelled. A bare
+                # decrement needs no lock: without a suspension point the loop
+                # cannot interleave a reader, and awaiting the lock here could
+                # itself be cancelled and leak the pin.
                 record.waiters -= 1
+            async with self._lock:
                 self._validate_session_generation(
                     session_id,
                     expected_session_generation,

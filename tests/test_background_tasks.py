@@ -731,6 +731,109 @@ def test_waiting_caller_still_sees_its_completed_task() -> None:
     asyncio.run(exercise())
 
 
+def test_cancelled_wait_releases_its_eviction_pin() -> None:
+    """A cancelled get() must not pin its record against eviction forever."""
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=2, max_tasks_per_session=1)
+        release = asyncio.Event()
+
+        async def slow(task_id: str) -> str:
+            await release.wait()
+            return task_id
+
+        async def quick(task_id: str) -> str:
+            return task_id
+
+        awaited = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="awaited",
+            agent_path=("worker",),
+            runner=slow,
+        )
+        getter = asyncio.create_task(
+            manager.get("session-a", awaited.task_id, wait_seconds=5)
+        )
+        await asyncio.sleep(0)
+        assert manager._records[awaited.task_id].waiters == 1
+
+        getter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await getter
+        assert manager._records[awaited.task_id].waiters == 0
+
+        release.set()
+        await manager.wait_session("session-a")
+        replacement = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="replacement",
+            agent_path=("worker",),
+            runner=quick,
+        )
+        assert set(manager._records) == {replacement.task_id}
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_spawn_never_evicts_the_parent_it_requests() -> None:
+    """The oldest finished record is spared when the new batch names it as parent."""
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=2, max_tasks_per_session=2)
+
+        async def quick(task_id: str) -> str:
+            return f"result:{task_id}"
+
+        # The parent is the oldest record, so it would be the first eviction
+        # candidate if the spawn did not spare it.
+        parent = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="parent",
+            agent_path=("worker",),
+            runner=quick,
+        )
+        await manager.wait_session("session-a")
+        unrelated = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="unrelated",
+            agent_path=("worker",),
+            runner=quick,
+        )
+        await manager.wait_session("session-a")
+
+        child = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="child",
+            agent_path=("worker",),
+            runner=quick,
+            parent_task_id=parent.task_id,
+        )
+        kept = await manager.get("session-a", parent.task_id)
+        assert kept.result == f"result:{parent.task_id}"
+        assert set(manager._records) == {parent.task_id, child.task_id}
+        assert unrelated.task_id not in manager._records
+
+        # A parent that is already gone is still rejected, and the rejection leaves
+        # the remaining records in place.
+        with pytest.raises(ValueError, match="parent task does not exist"):
+            await manager.spawn(
+                session_id="session-a",
+                agent_name="worker",
+                description="orphan",
+                agent_path=("worker",),
+                runner=quick,
+                parent_task_id=unrelated.task_id,
+            )
+        assert set(manager._records) == {parent.task_id, child.task_id}
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_full_activity_queue_drops_live_events_before_terminal_notices() -> None:
     """A finished task's notice must survive another task flooding live events."""
     async def exercise() -> None:
