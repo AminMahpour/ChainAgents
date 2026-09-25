@@ -478,7 +478,7 @@ def test_nested_background_agent_sees_only_its_own_task_instance_descendants() -
 
 def test_running_and_retained_task_limits_reject_without_queueing() -> None:
     async def exercise() -> None:
-        manager = make_manager(max_running_per_session=1, max_tasks_per_session=1)
+        manager = make_manager(max_running_per_session=2, max_tasks_per_session=1)
         release = asyncio.Event()
 
         async def runner(task_id: str) -> str:
@@ -492,7 +492,7 @@ def test_running_and_retained_task_limits_reject_without_queueing() -> None:
             agent_path=("worker",),
             runner=runner,
         )
-        with pytest.raises(RuntimeError, match="running limit"):
+        with pytest.raises(RuntimeError, match="retained task limit"):
             await manager.spawn(
                 session_id="session-a",
                 agent_name="worker",
@@ -501,17 +501,189 @@ def test_running_and_retained_task_limits_reject_without_queueing() -> None:
                 runner=runner,
             )
 
+        running_manager = make_manager(max_running_per_session=1)
+        await running_manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="first",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        with pytest.raises(RuntimeError, match="running limit"):
+            await running_manager.spawn(
+                session_id="session-a",
+                agent_name="worker",
+                description="second",
+                agent_path=("worker",),
+                runner=runner,
+            )
+
         release.set()
+        await manager.close()
+        await running_manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_retained_task_limit_evicts_oldest_finished_records() -> None:
+    """A long conversation keeps spawning by forgetting its oldest finished tasks."""
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=1, max_tasks_per_session=2)
+
+        async def runner(task_id: str) -> str:
+            return task_id
+
+        spawned_ids: list[str] = []
+        for index in range(5):
+            spawned = await manager.spawn(
+                session_id="session-a",
+                agent_name="worker",
+                description=f"task {index}",
+                agent_path=("worker",),
+                runner=runner,
+            )
+            spawned_ids.append(spawned.task_id)
+            await manager.wait_session("session-a")
+
+        retained = await manager.list("session-a")
+        assert [task.task_id for task in retained] == spawned_ids[-2:]
+        assert set(manager._records) == set(spawned_ids[-2:])
+        with pytest.raises(KeyError):
+            await manager.get("session-a", spawned_ids[0])
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_retained_task_eviction_keeps_parents_and_failed_cleanup() -> None:
+    """Parents of retained tasks and records with pending cleanup are never evicted."""
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=2, max_tasks_per_session=3)
+        release_child = asyncio.Event()
+
+        async def quick(task_id: str) -> str:
+            return task_id
+
+        async def slow(task_id: str) -> str:
+            await release_child.wait()
+            return task_id
+
+        async def failing_cleanup(task_id: str) -> None:
+            raise RuntimeError("cleanup unavailable")
+
+        parent = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="parent",
+            agent_path=("worker",),
+            runner=quick,
+        )
         await manager.wait_session("session-a")
+        child = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="child",
+            agent_path=("worker",),
+            runner=slow,
+            parent_task_id=parent.task_id,
+        )
+        dirty = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="dirty",
+            agent_path=("worker",),
+            runner=quick,
+            cleanup=failing_cleanup,
+        )
+        await manager.get("session-a", dirty.task_id, wait_seconds=1)
+
         with pytest.raises(RuntimeError, match="retained task limit"):
             await manager.spawn(
                 session_id="session-a",
                 agent_name="worker",
-                description="third",
+                description="overflow",
                 agent_path=("worker",),
-                runner=runner,
+                runner=quick,
             )
+        assert {parent.task_id, child.task_id, dirty.task_id} <= set(manager._records)
+
+        release_child.set()
+        await manager.wait_session("session-a")
+        replacement = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="replacement",
+            agent_path=("worker",),
+            runner=quick,
+        )
+        # The finished child is evicted first; its parent then remains as the oldest.
+        assert child.task_id not in manager._records
+        assert {parent.task_id, dirty.task_id, replacement.task_id} == set(
+            manager._records
+        )
         await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_subscriber_queues_are_bounded_and_keep_terminal_notices() -> None:
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True)
+        activity_queue = manager.subscribe_activity("session-a")
+        completion_queue = manager.subscribe("session-a")
+        assert activity_queue.maxsize == background_tasks.SUBSCRIBER_QUEUE_MAXSIZE
+        assert completion_queue.maxsize == background_tasks.SUBSCRIBER_QUEUE_MAXSIZE
+
+        async def runner(task_id: str) -> str:
+            for _ in range(background_tasks.SUBSCRIBER_QUEUE_MAXSIZE + 10):
+                await manager.publish_activity(
+                    task_id,
+                    AgentStreamEvent(kind="response_delta", source="worker", text="x"),
+                )
+            return "done"
+
+        spawned = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="chatty",
+            agent_path=("worker",),
+            runner=runner,
+        )
+        await manager.wait_session("session-a")
+
+        assert activity_queue.qsize() == background_tasks.SUBSCRIBER_QUEUE_MAXSIZE
+        drained = [
+            activity_queue.get_nowait() for _ in range(activity_queue.qsize())
+        ]
+        assert drained[-1].snapshot is not None
+        assert drained[-1].snapshot.task_id == spawned.task_id
+        assert completion_queue.get_nowait().task_id == spawned.task_id
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_close_all_sessions_releases_subscribers_when_one_session_fails() -> None:
+    async def exercise() -> None:
+        manager = make_manager()
+        manager._session_task_ids = {"session-a": [], "session-b": []}
+        manager.subscribe("session-a")
+        manager.subscribe_activity("session-b")
+        closed: list[str] = []
+
+        async def close_session(session_id: str) -> None:
+            if session_id == "session-a":
+                raise RuntimeError("close failed")
+            await asyncio.sleep(0)
+            closed.append(session_id)
+
+        manager.close_session = close_session  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="close failed"):
+            await manager.close()
+
+        assert closed == ["session-b"]
+        assert manager._subscribers == {}
+        assert manager._activity_subscribers == {}
 
     asyncio.run(exercise())
 

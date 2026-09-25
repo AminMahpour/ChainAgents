@@ -63,6 +63,8 @@ BACKGROUND_TASK_TOOL_NAMES = frozenset(
         "cancel_background_task",
     }
 )
+# Bound per-subscriber buffers so a stalled consumer cannot grow memory without limit.
+SUBSCRIBER_QUEUE_MAXSIZE = 1000
 _LANGGRAPH_CHECKPOINTER_KEY = "__pregel_checkpointer"
 _LANGGRAPH_RUNTIME_KEY = "__pregel_runtime"
 _T = TypeVar("_T")
@@ -122,6 +124,16 @@ def current_background_invocation_path() -> tuple[str, ...]:
 def current_background_session_generation() -> BackgroundSessionGeneration | None:
     """Return the lifecycle capability attached to the current graph run."""
     return _CURRENT_BACKGROUND_SESSION_GENERATION.get()
+
+
+def _put_evicting_oldest(queue: asyncio.Queue[_T], item: _T) -> None:
+    """Enqueue a must-deliver item, discarding the oldest entry when full."""
+    while queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    queue.put_nowait(item)
 
 
 async def await_preserving_cancellation(task: asyncio.Task[_T]) -> _T:
@@ -1359,6 +1371,12 @@ class BackgroundTaskManager:
                     "Background running limit reached for this process "
                     f"({self.config.max_running_total})."
                 )
+            overflow = (
+                len(session_ids) + batch_size - self.config.max_tasks_per_session
+            )
+            if overflow > 0:
+                self._evict_finished_records(normalized_session, overflow)
+                session_ids = self._session_task_ids.get(normalized_session, [])
             if len(session_ids) + batch_size > self.config.max_tasks_per_session:
                 raise RuntimeError(
                     "Background retained task limit reached for this session "
@@ -1407,6 +1425,51 @@ class BackgroundTaskManager:
                     context=contextvars.Context(),
                 )
             return [record.snapshot() for record in records]
+
+    def _evict_finished_records(self, session_id: str, count: int) -> None:
+        """Forget up to ``count`` of the oldest settled records in a session.
+
+        Only terminal records whose cleanup has completed and that no retained
+        record names as its parent are evicted, so ancestry and pending cleanup
+        stay intact. Callers must hold ``self._lock``.
+        """
+        session_ids = self._session_task_ids.get(session_id)
+        if not session_ids:
+            return
+        evicted: set[str] = set()
+        while len(evicted) < count:
+            parent_ids = {
+                self._records[task_id].parent_task_id
+                for task_id in session_ids
+                if task_id not in evicted
+            }
+            candidate = next(
+                (
+                    task_id
+                    for task_id in session_ids
+                    if task_id not in evicted
+                    and task_id not in parent_ids
+                    and self._is_evictable(self._records[task_id])
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            evicted.add(candidate)
+        if not evicted:
+            return
+        session_ids[:] = [task_id for task_id in session_ids if task_id not in evicted]
+        for task_id in evicted:
+            self._records.pop(task_id, None)
+
+    @staticmethod
+    def _is_evictable(record: _BackgroundTaskRecord) -> bool:
+        return (
+            record.status in TERMINAL_BACKGROUND_TASK_STATUSES
+            and record.cleanup is None
+            and record.cleanup_task is None
+            and (record.cancel_task is None or record.cancel_task.done())
+        )
 
     async def _execute(
         self,
@@ -1530,7 +1593,7 @@ class BackgroundTaskManager:
                 self._activity_subscribers.get(record.session_id, ())
             )
         for completion_queue in subscribers:
-            completion_queue.put_nowait(snapshot)
+            _put_evicting_oldest(completion_queue, snapshot)
         terminal_activity = BackgroundTaskActivity(
             task_id=record.task_id,
             session_id=record.session_id,
@@ -1539,7 +1602,7 @@ class BackgroundTaskManager:
             snapshot=snapshot,
         )
         for activity_queue in activity_subscribers:
-            activity_queue.put_nowait(terminal_activity)
+            _put_evicting_oldest(activity_queue, terminal_activity)
 
     async def publish_activity(
         self,
@@ -1560,7 +1623,9 @@ class BackgroundTaskManager:
                 event=event,
             )
         for queue in subscribers:
-            queue.put_nowait(activity)
+            # Live events are best effort; drop new ones while a consumer lags.
+            if not queue.full():
+                queue.put_nowait(activity)
 
     def _is_visible(
         self,
@@ -1910,7 +1975,9 @@ class BackgroundTaskManager:
 
     def subscribe(self, session_id: str) -> asyncio.Queue[BackgroundTaskSnapshot]:
         """Subscribe to terminal task snapshots for one conversation."""
-        queue: asyncio.Queue[BackgroundTaskSnapshot] = asyncio.Queue()
+        queue: asyncio.Queue[BackgroundTaskSnapshot] = asyncio.Queue(
+            maxsize=SUBSCRIBER_QUEUE_MAXSIZE
+        )
         self._subscribers.setdefault(session_id, set()).add(queue)
         return queue
 
@@ -1932,7 +1999,9 @@ class BackgroundTaskManager:
         session_id: str,
     ) -> asyncio.Queue[BackgroundTaskActivity]:
         """Subscribe to ordered live and terminal task activity."""
-        queue: asyncio.Queue[BackgroundTaskActivity] = asyncio.Queue()
+        queue: asyncio.Queue[BackgroundTaskActivity] = asyncio.Queue(
+            maxsize=SUBSCRIBER_QUEUE_MAXSIZE
+        )
         self._activity_subscribers.setdefault(session_id, set()).add(queue)
         return queue
 
@@ -1987,9 +2056,14 @@ class BackgroundTaskManager:
         session_ids: builtins.list[str],
     ) -> None:
         """Close the manager's sessions and release completion subscribers."""
-        await asyncio.gather(
-            *(self.close_session(session_id) for session_id in session_ids),
-            return_exceptions=False,
-        )
-        self._subscribers.clear()
-        self._activity_subscribers.clear()
+        try:
+            results = await asyncio.gather(
+                *(self.close_session(session_id) for session_id in session_ids),
+                return_exceptions=True,
+            )
+        finally:
+            self._subscribers.clear()
+            self._activity_subscribers.clear()
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result

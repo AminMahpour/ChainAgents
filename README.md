@@ -892,7 +892,7 @@ Main `[agent]` additions:
 - `memory_files`: optional list of absolute `/memories/` file paths loaded into the DeepAgents startup memory prompt. Defaults to `["/memories/AGENTS.md"]`; use `[]` to disable startup memory loading.
 - `delete_tool_enabled`: optional boolean controlling DeepAgents 0.7's recursive `delete` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
-- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. `stream_activity = true` exposes live reasoning and tool activity as nested Chainlit steps while leaving other interfaces completion-only. `batch_result_format` selects `run_subagent_batch` results from `json`, `markdown`, or `markdown_files` and defaults to `markdown`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation.
+- `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. `stream_activity = true` exposes live reasoning and tool activity as nested Chainlit steps while leaving other interfaces completion-only. `batch_result_format` selects `run_subagent_batch` results from `json`, `markdown`, or `markdown_files` and defaults to `markdown`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation. When the retained limit is reached, the oldest finished tasks are forgotten to make room; unfinished tasks, parents of retained tasks, and tasks whose cleanup has not completed are kept.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
 - `[agent.reflection]`: optional correction-learning workflow. `enabled = true` requires `state = "stateful"` and a `memory_file` under `/memories/`; `max_lesson_chars` limits proposal size; `tool_failure_mode = "unrecovered"` only proposes lessons for failed tool calls that do not produce a later final response.
 - `AGENTS.md`: optional repo-root file that is automatically appended to the **main/supervisor** agent system prompt when present. It is not applied to separately configured async graph prompts.
@@ -1082,7 +1082,8 @@ curl -X DELETE "http://127.0.0.1:8000/api/background-tasks/bg-123?thread_id=$THR
 curl -X DELETE "http://127.0.0.1:8000/api/background-tasks?thread_id=$THREAD_ID"
 ```
 
-Tasks are retained until the conversation closes and are cancelled before its
+Tasks are retained until the conversation closes (or until the oldest finished
+tasks are evicted to stay within `max_tasks_per_session`) and are cancelled before its
 offloaded large tool results and MCP resources are released. Cleanup is scoped
 by thread ID, so closing one conversation does not remove another conversation's
 artifacts; workspace files, generated downloads, memories, and uploads are not
