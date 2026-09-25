@@ -626,6 +626,162 @@ def test_retained_task_eviction_keeps_parents_and_failed_cleanup() -> None:
     asyncio.run(exercise())
 
 
+def test_rejected_spawn_keeps_evictable_records() -> None:
+    """A spawn that cannot be admitted must not discard finished task results."""
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=3, max_tasks_per_session=2)
+        release = asyncio.Event()
+
+        async def quick(task_id: str) -> str:
+            return task_id
+
+        async def slow(task_id: str) -> str:
+            await release.wait()
+            return task_id
+
+        finished = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="finished",
+            agent_path=("worker",),
+            runner=quick,
+        )
+        await manager.get("session-a", finished.task_id, wait_seconds=1)
+        await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="running",
+            agent_path=("worker",),
+            runner=slow,
+        )
+
+        # Two new tasks need two free slots, but only one record is evictable.
+        with pytest.raises(RuntimeError, match="retained task limit"):
+            await manager.spawn_batch(
+                session_id="session-a",
+                submissions=[
+                    background_tasks._BackgroundTaskSubmission(
+                        agent_name="worker",
+                        description=f"overflow {index}",
+                        agent_path=("worker",),
+                        runner=quick,
+                    )
+                    for index in range(2)
+                ],
+            )
+        kept = await manager.get("session-a", finished.task_id)
+        assert kept.result == finished.task_id
+
+        release.set()
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_waiting_caller_still_sees_its_completed_task() -> None:
+    """A record a caller waits on survives eviction pressure from a later spawn."""
+    async def exercise() -> None:
+        manager = make_manager(max_running_per_session=2, max_tasks_per_session=1)
+        release = asyncio.Event()
+
+        async def slow(task_id: str) -> str:
+            await release.wait()
+            return f"result:{task_id}"
+
+        async def quick(task_id: str) -> str:
+            return task_id
+
+        awaited = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="awaited",
+            agent_path=("worker",),
+            runner=slow,
+        )
+        getter = asyncio.create_task(
+            manager.get("session-a", awaited.task_id, wait_seconds=5)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        # The record is terminal but pinned, so this spawn cannot evict it.
+        with pytest.raises(RuntimeError, match="retained task limit"):
+            await manager.spawn(
+                session_id="session-a",
+                agent_name="worker",
+                description="replacement",
+                agent_path=("worker",),
+                runner=quick,
+            )
+
+        finished = await asyncio.wait_for(getter, timeout=1)
+        assert finished.result == f"result:{awaited.task_id}"
+        assert manager._records[awaited.task_id].waiters == 0
+
+        # Once nobody waits on it, the record is evictable again.
+        replacement = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="replacement",
+            agent_path=("worker",),
+            runner=quick,
+        )
+        assert set(manager._records) == {replacement.task_id}
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_full_activity_queue_drops_live_events_before_terminal_notices() -> None:
+    """A finished task's notice must survive another task flooding live events."""
+    async def exercise() -> None:
+        manager = make_manager(stream_activity=True, max_running_per_session=2)
+        queue = manager.subscribe_activity("session-a")
+        flood = asyncio.Event()
+
+        async def quiet(task_id: str) -> str:
+            return "quiet result"
+
+        async def chatty(task_id: str) -> str:
+            await flood.wait()
+            for _ in range(background_tasks.SUBSCRIBER_QUEUE_MAXSIZE + 50):
+                await manager.publish_activity(
+                    task_id,
+                    AgentStreamEvent(kind="response_delta", source="worker", text="x"),
+                )
+            return "chatty result"
+
+        quiet_task = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="quiet",
+            agent_path=("worker",),
+            runner=quiet,
+        )
+        chatty_task = await manager.spawn(
+            session_id="session-a",
+            agent_name="worker",
+            description="chatty",
+            agent_path=("worker",),
+            runner=chatty,
+        )
+        await manager.get("session-a", quiet_task.task_id, wait_seconds=1)
+        flood.set()
+        await manager.wait_session("session-a")
+
+        drained = [queue.get_nowait() for _ in range(queue.qsize())]
+        terminal = {
+            activity.task_id: activity.snapshot
+            for activity in drained
+            if activity.snapshot is not None
+        }
+        assert set(terminal) == {quiet_task.task_id, chatty_task.task_id}
+        assert terminal[quiet_task.task_id].result == "quiet result"
+        assert terminal[chatty_task.task_id].result == "chatty result"
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
 def test_subscriber_queues_are_bounded_and_keep_terminal_notices() -> None:
     async def exercise() -> None:
         manager = make_manager(stream_activity=True)
