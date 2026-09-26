@@ -6,7 +6,7 @@ import ast
 import json
 import mimetypes
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -39,10 +39,17 @@ class GeneratedFileDescriptor:
     mime_type: str
     size_bytes: int
     download_url: str
+    # Local resolved path for in-process renderers; never part of the wire shape.
+    path: Path | None = field(default=None, compare=False)
 
     def to_payload(self) -> dict[str, str | int]:
         """Return this descriptor in its stable API wire shape."""
-        return asdict(self)
+        return {
+            "name": self.name,
+            "mime_type": self.mime_type,
+            "size_bytes": self.size_bytes,
+            "download_url": self.download_url,
+        }
 
 
 def generated_file_paths_from_tool_args(
@@ -132,6 +139,7 @@ def generated_file_descriptors(
                     "/api/generated-files/"
                     + "/".join(quote(part, safe="") for part in relative_path.parts)
                 ),
+                path=resolved,
             )
         )
         if len(descriptors) >= MAX_GENERATED_FILES:

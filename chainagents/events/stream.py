@@ -27,6 +27,8 @@ LANGGRAPH_STREAM_MODES = {
     "tasks",
     "debug",
 }
+# Stream modes every front end requests from ``agent.astream_events``.
+AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 SUMMARIZATION_STATUS_KIND = "summarization_status"
 ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 TOKEN_LIMIT_RETRY_MARKER = "chainagents_token_limit_retry"

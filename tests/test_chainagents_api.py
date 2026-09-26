@@ -2119,3 +2119,36 @@ def test_reflection_confirmation_is_retryable_after_cancellation(after_write) ->
                 assert item.value["content"].count(proposal["lesson"]) == 1
 
     asyncio.run(exercise())
+
+
+def test_stream_lines_closing_early_cancels_turn_and_closes_agent_stream() -> None:
+    """Verify an abandoned NDJSON stream cancels the runner task and its agent stream."""
+    closed = asyncio.Event()
+
+    class _EndlessAgent(_FakeAgent):
+        def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+            async def events():
+                try:
+                    while True:
+                        yield _raw_event(((), "messages", (_Token("tick"), {})))
+                finally:
+                    closed.set()
+
+            return events()
+
+    runtime = _FakeRuntime(_EndlessAgent([]))
+    context = chainagents_api._run_context(
+        runtime,
+        chainagents_api.AgentRunRequest(prompt="hi", thread_id="thread-1"),
+    )
+
+    async def exercise() -> None:
+        lines = chainagents_api._agent_stream_lines(
+            runtime, context, issue_reflection_token=lambda *_args: "token"
+        )
+        first = await anext(lines)
+        assert json.loads(first)["text"] == "tick"
+        await lines.aclose()
+        await asyncio.wait_for(closed.wait(), timeout=2)
+
+    asyncio.run(exercise())

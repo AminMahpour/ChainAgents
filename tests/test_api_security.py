@@ -487,7 +487,9 @@ def test_reflection_fallback_does_not_echo_backend_exception(monkeypatch):
         yield event
         raise RuntimeError("credential=supersecret")
 
-    monkeypatch.setattr(api, "_iter_agent_events", failed_events)
+    from chainagents.turns.runner import TurnRunner
+
+    monkeypatch.setattr(TurnRunner, "_agent_events", failed_events)
     with make_client(monkeypatch) as client:
         client.app.state.runtime.config.extensions.agent_reflection = ReflectionConfig(
             enabled=True

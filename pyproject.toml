@@ -87,4 +87,5 @@ files = [
     "chainagents/interfaces/api/security.py",
     "chainagents/interfaces/uploads.py",
     "chainagents/runtime/reflection.py",
+    "chainagents/turns",
 ]
