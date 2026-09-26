@@ -28,8 +28,9 @@ them with `brew install weasyprint`; on Linux, see the
 - **Ollama (local, free):** `ollama pull gpt-oss:20b`
 - **LM Studio / OpenAI-compatible:** load a model, start the local server
   (usually `http://localhost:1234`), and set
-  `[model].provider = "openai_compatible"` with the server's `base_url` in
-  `deepagent.toml`.
+  `[model].provider = "openai_compatible"` with the server's `base_url`
+  *and* a `[model].name` matching the model ID your server exposes (the
+  default name targets Ollama and will otherwise 404).
 - **OpenAI:** the checked-in default points at Ollama, so switch providers
   explicitly: set `[model].provider = "openai_compatible"`, a
   `[model].base_url` (or `endpoint_url`) targeting OpenAI, and an OpenAI
@@ -75,7 +76,10 @@ The Chainlit app is then available at `http://localhost:8000` by default.
 `DATABASE_URL` is optional:
 
 - **When set**, LangGraph checkpoints and `/memories/` are persisted in
-  Postgres. A local Postgres is available via `compose.yaml`:
+  Postgres — but only in stateful mode. With `[agent].state = "stateless"`
+  in `deepagent.toml`, no checkpoint or store handles are opened at all and
+  nothing is persisted, even with `DATABASE_URL` set. A local Postgres is
+  available via `compose.yaml`:
 
   ```bash
   docker compose up -d

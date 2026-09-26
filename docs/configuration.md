@@ -69,7 +69,16 @@ transport = "streamable_http"
 url = "http://127.0.0.1:9000/mcp"
 ```
 
-They expose their tools to the agent; MCP sessions are managed by
+Declaring a server only registers it — its tools are not exposed until you
+attach it to an agent by name via `[agent].mcp_servers` (default `[]`):
+
+```toml
+[agent]
+mcp_servers = ["docs"]
+```
+
+Individual subagents can instead attach servers through their own
+`mcp_servers` list. MCP sessions are managed by
 `chainagents.runtime.mcp_sessions`.
 
 ## Subagents
@@ -111,10 +120,11 @@ enable switch and credentials:
 - **Langfuse** — set `[langfuse].enabled = true` in `deepagent.toml`, then
   `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optionally
   `LANGFUSE_BASE_URL`.
-- **LangSmith** — set `[langsmith].enabled = true`, then the standard
-  `LANGSMITH_*` environment variables (`LANGSMITH_PROJECT`, and optionally
-  `LANGSMITH_ENDPOINT` and `LANGSMITH_WORKSPACE_ID` for non-default
-  regions/workspaces).
+- **LangSmith** — set `[langsmith].enabled = true`, then provide
+  `LANGSMITH_API_KEY` (the authentication credential the SDK client is
+  built from) plus `LANGSMITH_PROJECT`; `LANGSMITH_ENDPOINT` and
+  `LANGSMITH_WORKSPACE_ID` are optional routing settings for non-default
+  regions/workspaces.
 
 Setting only the environment variables leaves tracing off; no traces are
 exported until the matching table is enabled.

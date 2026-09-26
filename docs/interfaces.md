@@ -1,9 +1,13 @@
 # Interfaces
 
 Every interface shares the same runtime and the same `deepagent.toml`
-configuration. Each drives one agent turn through the shared
-{py:mod}`chainagents.turns.runner` pipeline: slash commands, uploads,
-streaming events, and generated files.
+configuration. The Chainlit, CLI, TUI, and FastAPI interfaces each drive one
+agent turn through the shared {py:mod}`chainagents.turns.runner` pipeline:
+slash commands, uploads, streaming events, and generated files. (The
+LangGraph Agent Server path is different — it exports graphs built directly
+by `create_configured_graph` and does not use the turn runner, so
+slash-command dispatch, upload ingestion, and generated-file collection are
+not provided there.)
 
 ## Chainlit web UI
 
