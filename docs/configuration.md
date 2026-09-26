@@ -53,7 +53,10 @@ The `[agent]` table controls the Deep Agent runtime:
 - `execute_tool_enabled` — command execution is **disabled** unless this is
   `true`.
 - `custom_instruction` / `custom_instruction_file` — extra system
-  instructions, inline or from a file under `prompts/`.
+  instructions, inline or from a file (typically under `prompts/`).
+  Relative `custom_instruction_file` paths resolve from the directory of
+  the active config file, not the repository root, so use an absolute path
+  when `DEEPAGENT_CONFIG` points outside the repo.
 
 ## Skills
 
@@ -98,8 +101,9 @@ Subagents delegate tasks with isolated context windows and are configured as
   (or as a `[[subagents]]` entry carrying a `graph_id`).
 
 Subagents can also be **nested** — a subagent can declare its own children,
-either private inline definitions or reuse of a top-level subagent — and each
-subagent may pin its own `model`.
+either private inline definitions or reuse of a top-level subagent.
+Synchronous subagents may pin their own `model`; remote async subagents
+reject it, since their model is configured on the remote graph.
 
 ## RAG
 
@@ -111,11 +115,16 @@ until explicitly enabled in the `[rag]` table:
 enabled = true
 
 [rag.embedding]
-provider = "auto"
+provider = "ollama"
 ```
 
 With Ollama embeddings, pull an embedding model such as `nomic-embed-text`
-first.
+first. `provider = "auto"` follows the active chat-model provider and is only
+valid for Ollama and OpenAI-compatible chat models — it is rejected for
+Anthropic and Snowflake Cortex, which must set `ollama` or
+`openai_compatible` explicitly with an appropriate `model` and `base_url`
+(and `api_key` when needed). OpenAI-compatible embeddings also require an
+explicit `[rag.embedding].model`.
 
 ## Chainlit app behavior
 

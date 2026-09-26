@@ -26,9 +26,9 @@ them with `brew install weasyprint`; on Linux, see the
 ## Pick a model provider
 
 - **Ollama (local, free):** `ollama pull gpt-oss:20b`
-- **LM Studio / OpenAI-compatible:** load a model, start the local server
-  (usually `http://localhost:1234`), and set
-  `[model].provider = "openai_compatible"` with the server's `base_url`
+- **LM Studio / OpenAI-compatible:** load a model, start the local server,
+  and set `[model].provider = "openai_compatible"` with the server's
+  `base_url` *including* the API prefix (e.g. `http://127.0.0.1:1234/v1`)
   *and* a `[model].name` matching the model ID your server exposes (the
   default name targets Ollama and will otherwise 404).
 - **OpenAI:** the checked-in default points at Ollama, so switch providers
@@ -87,7 +87,8 @@ The Chainlit app is then available at `http://localhost:8000` by default.
   ```
 
 - **When unset**, the app falls back to in-memory persistence for the current
-  process only.
+  process only. In stateless mode there is no persistence at all — with or
+  without `DATABASE_URL` — because no store or checkpointer is created.
 
 ## Environment variables
 
