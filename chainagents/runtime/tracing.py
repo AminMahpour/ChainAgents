@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
-from collections.abc import Iterator
 
 from langchain_core.runnables import RunnableConfig
 

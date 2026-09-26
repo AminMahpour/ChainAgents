@@ -629,7 +629,6 @@ async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> 
     bridge = ChainlitEventBridge(prompt="hello")
     bridge.response_message = response_message  # type: ignore[assignment]
 
-    monkeypatch.setattr(chainlit_bridge.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(
         chainlit_bridge,
         "attach_response_export_actions",

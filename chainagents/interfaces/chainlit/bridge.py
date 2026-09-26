@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
-import time
 import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
@@ -33,8 +32,6 @@ from chainagents.exports.response import attach_response_export_actions
 from chainagents.runtime.types import ChainlitResponseActionConfig
 
 DEFAULT_AUTO_COLLAPSE_DELAY_SECONDS = 3.0
-RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS = 0.05
-RESPONSE_STREAM_FLUSH_CHARS = 1024
 CHAINLIT_APP_CONFIG_PATH = Path(__file__).resolve().parents[3] / "chainlit.toml"
 
 
@@ -692,7 +689,6 @@ class ChainlitEventBridge:
         self.response_buffer = ""
         self.pending_response_stream = ""
         self.response_task_started = False
-        self.last_response_flush_at = 0.0
         self.reasoning_steps: dict[str, cl.Step] = {}
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
@@ -1067,21 +1063,6 @@ class ChainlitEventBridge:
         )
         await self.response_message.update()
 
-    def _should_flush_response_stream(self) -> bool:
-        """Return whether buffered response text should be flushed now.
-
-        Returns:
-            Whether buffered response text should be flushed now.
-        """
-        if len(self.pending_response_stream) >= RESPONSE_STREAM_FLUSH_CHARS:
-            return True
-        if not self.last_response_flush_at:
-            return True
-        return (
-            time.monotonic() - self.last_response_flush_at
-            >= RESPONSE_STREAM_FLUSH_INTERVAL_SECONDS
-        )
-
     async def _flush_response_stream(self) -> None:
         """Flush buffered response text to the Chainlit message."""
         if not self.pending_response_stream:
@@ -1090,7 +1071,6 @@ class ChainlitEventBridge:
         if self.response_message is not None:
             await self.response_message.stream_token(pending)
         self.pending_response_stream = ""
-        self.last_response_flush_at = time.monotonic()
 
     async def _close_reasoning_step(self, source: str) -> None:
         """Close one active Chainlit reasoning step.
@@ -1110,7 +1090,6 @@ class ChainlitEventBridge:
         """Close all active Chainlit reasoning steps."""
         for source in list(self.reasoning_steps):
             await self._close_reasoning_step(source)
-
 
     def _resolve_tool_step_from_event(
         self,

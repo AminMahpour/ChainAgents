@@ -7,11 +7,11 @@ import json
 import math
 import shutil
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
-from collections.abc import Sequence
 
 from langchain_core.documents import Document
 from langchain_core.tools import BaseTool, tool

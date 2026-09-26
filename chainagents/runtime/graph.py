@@ -393,6 +393,38 @@ class _SubagentBuildContext:
     session_id: str | None
     langsmith_tracing: runtime_tracing.LangSmithTracing | None
 
+    @classmethod
+    def create(
+        cls,
+        config: RuntimeConfig,
+        *,
+        backend: Any,
+        project_root: Path | None,
+        reasoning_level_is_explicit: bool,
+        build_model: ModelBuilder | None,
+        subagent_mcp_tools: Mapping[tuple[str, ...], list[Any]] | None,
+        store: Any | None,
+        checkpointer: Any | None,
+        background_manager: runtime_background_tasks.BackgroundTaskManager | None,
+        session_id: str | None,
+        langsmith_tracing: runtime_tracing.LangSmithTracing | None,
+    ) -> _SubagentBuildContext:
+        """Build a context with the configured subagent registry and model builder."""
+        return cls(
+            config=config,
+            registry={subagent.name: subagent for subagent in config.extensions.subagents},
+            backend=backend,
+            project_root=project_root,
+            reasoning_level_is_explicit=reasoning_level_is_explicit,
+            build_model=build_model or _default_model_builder(config),
+            subagent_mcp_tools=subagent_mcp_tools,
+            store=store,
+            checkpointer=checkpointer,
+            background_manager=background_manager,
+            session_id=session_id,
+            langsmith_tracing=langsmith_tracing,
+        )
+
     def background_task_tools(
         self,
         *,
@@ -647,13 +679,12 @@ def build_subagent_specs(
     Returns:
         The constructed subagent specs.
     """
-    context = _SubagentBuildContext(
-        config=config,
-        registry={subagent.name: subagent for subagent in config.extensions.subagents},
+    context = _SubagentBuildContext.create(
+        config,
         backend=backend,
         project_root=project_root,
         reasoning_level_is_explicit=reasoning_level_is_explicit,
-        build_model=build_model or _default_model_builder(config),
+        build_model=build_model,
         subagent_mcp_tools=subagent_mcp_tools,
         store=store,
         checkpointer=checkpointer,
@@ -691,6 +722,10 @@ def build_graph_subagent_specs(
         backend: DeepAgents backend shared with compiled nested subgraphs.
         project_root: Project root used to resolve runtime middleware context.
         inherited_tools: Tools inherited from the graph that owns these subagents.
+        background_manager: Background task manager, or None when disabled.
+        artifact_registry: Registry for large tool result artifacts, used when
+            ``backend`` is not supplied and a backend is built here.
+        langsmith_tracing: LangSmith tracing for background task runs.
 
     Returns:
         The constructed graph subagent specs.
@@ -833,9 +868,8 @@ def build_agent_kwargs(
         source="main-agent",
         project_root=project_root,
     )
-    context = _SubagentBuildContext(
-        config=config,
-        registry={subagent.name: subagent for subagent in config.extensions.subagents},
+    context = _SubagentBuildContext.create(
+        config,
         backend=backend,
         project_root=project_root,
         reasoning_level_is_explicit=reasoning_level_is_explicit,

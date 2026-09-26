@@ -22,7 +22,6 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
-import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
@@ -645,29 +644,6 @@ class AgentRuntime:
                 ) from None
         return await selected_tool.ainvoke(parsed_args)
 
-    def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
-        """Sanitize tools for the active model provider.
-
-        Args:
-            tools: The tools value.
-
-        Returns:
-            The sanitized value.
-        """
-        return runtime_graph.sanitize_tools_for_model(self.config.model_provider, tools)
-
-    @staticmethod
-    def _tool_supports_openai_compatible_schema(tool: Any) -> bool:
-        """Return whether a tool supports OpenAI-compatible schemas.
-
-        Args:
-            tool: The tool value.
-
-        Returns:
-            Whether a tool supports OpenAI-compatible schemas.
-        """
-        return runtime_graph.tool_supports_openai_compatible_schema(tool)
-
     def _build_model(
         self,
         reasoning_level: ReasoningLevel,
@@ -865,19 +841,3 @@ class AgentRuntime:
                         self._checkpointer = None
                         self._store = None
                         self._mcp_pool.client = None
-
-    def _build_backend(self, runtime):
-        """Build the Deep Agent backend for the current runtime settings.
-
-        Args:
-            runtime: Agent runtime used by the operation.
-
-        Returns:
-            The constructed the deep agent backend for the current runtime settings.
-        """
-        return runtime_backends.build_deepagent_backend(
-            project_root=self.project_root,
-            include_memories=runtime.config.agent_state == "stateful",
-            memory_namespace=runtime.config.extensions.agent_memory_namespace,
-            artifact_registry=self.large_tool_result_artifacts,
-        )
