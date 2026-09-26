@@ -9,7 +9,7 @@ import threading
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 
 from deepagents.backends import BackendProtocol, CompositeBackend
 from deepagents.backends.protocol import (
@@ -27,11 +27,10 @@ from deepagents.backends.protocol import (
 )
 
 
-_T = TypeVar("_T")
 _HIDDEN_ARTIFACT_ERROR = "Internal artifact storage is not accessible."
 
 
-async def _await_preserving_cancellation(task: asyncio.Task[_T]) -> _T:
+async def _await_preserving_cancellation[T](task: asyncio.Task[T]) -> T:
     """Finish one backend mutation before propagating caller cancellation."""
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
@@ -355,7 +354,7 @@ class ArtifactTrackingBackend(CompositeBackend):
             logical_root = self._normalize_path(
                 f"{artifact_root}/large_tool_results"
             )
-            if normalized == hidden_root or normalized == active_root:
+            if normalized in (hidden_root, active_root):
                 restored = logical_root
             elif normalized.startswith(f"{active_root}/"):
                 restored = f"{logical_root}{normalized.removeprefix(active_root)}"
@@ -704,7 +703,7 @@ class ArtifactTrackingBackend(CompositeBackend):
         results = self.backend.upload_files(
             [(mapped, content) for _, _, mapped, content, _ in allowed]
         )
-        for (index, path, mapped, _content, handle), result in zip(
+        for (index, path, _mapped, _content, handle), result in zip(
             allowed,
             results,
             strict=True,
@@ -737,7 +736,7 @@ class ArtifactTrackingBackend(CompositeBackend):
             results = await self.backend.aupload_files(
                 [(mapped, content) for _, _, mapped, content, _ in allowed]
             )
-            for (index, path, mapped, _content, handle), result in zip(
+            for (index, path, _mapped, _content, handle), result in zip(
                 allowed,
                 results,
                 strict=True,

@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TypeVar
 
 from chainagents.runtime.background_tasks.models import BackgroundTaskActivity
 
 # Bound per-subscriber buffers so a stalled consumer cannot grow memory without limit.
 SUBSCRIBER_QUEUE_MAXSIZE = 1000
-_T = TypeVar("_T")
 
 
-def _put_evicting_oldest(queue: asyncio.Queue[_T], item: _T) -> None:
+def _put_evicting_oldest[T](queue: asyncio.Queue[T], item: T) -> None:
     """Enqueue a must-deliver item, discarding the oldest entry when full."""
     while queue.full():
         try:
@@ -53,7 +51,7 @@ def _put_activity_evicting_live(
     queue.put_nowait(item)
 
 
-async def await_preserving_cancellation(task: asyncio.Task[_T]) -> _T:
+async def await_preserving_cancellation[T](task: asyncio.Task[T]) -> T:
     """Delay caller cancellation until a lifecycle task has finished."""
     cancellation: asyncio.CancelledError | None = None
     while not task.done():

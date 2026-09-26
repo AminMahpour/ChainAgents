@@ -270,10 +270,10 @@ def normalize_anthropic_tool_schema(tool: Any) -> Any:
 
     try:
         cloned = copy.copy(tool)
-        setattr(cloned, "args_schema", normalized_schema)
+        cloned.args_schema = normalized_schema
         return cloned
     except Exception:
-        setattr(tool, "args_schema", normalized_schema)
+        tool.args_schema = normalized_schema
         return tool
 
 

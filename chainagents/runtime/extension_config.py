@@ -292,7 +292,7 @@ def normalize_mcp_server_config(raw_server: dict[str, Any], base_dir: Path) -> d
         server["command"] = str(server["command"]).strip()
     if "args" in server:
         server["args"] = [str(arg) for arg in server.get("args", [])]
-    if "cwd" in server and server["cwd"]:
+    if server.get("cwd"):
         server["cwd"] = str(resolve_local_path(str(server["cwd"]), base_dir))
     if "headers" in server and server["headers"] is not None:
         server["headers"] = {str(k): str(v) for k, v in server["headers"].items()}

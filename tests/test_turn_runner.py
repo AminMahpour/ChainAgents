@@ -6,7 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -18,8 +18,8 @@ class _Token:
     """Minimal streamed AI message chunk."""
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         self.content = content
@@ -68,7 +68,7 @@ class _FakeStream:
         self.closed = False
         self.started = asyncio.Event()
 
-    def __aiter__(self) -> "_FakeStream":
+    def __aiter__(self) -> _FakeStream:
         return self
 
     async def __anext__(self) -> dict[str, object]:
@@ -560,7 +560,7 @@ def test_agent_start_follows_mcp_status_with_final_prompt(tmp_path: Path) -> Non
 def test_resolve_commands_off_sends_slash_text_as_prompt(tmp_path: Path) -> None:
     runtime = _make_runtime(tmp_path, [_token("Done")])
 
-    result, renderer = _run(
+    result, _renderer = _run(
         runtime, _request("/lookup keep this literal", resolve_commands=False)
     )
 

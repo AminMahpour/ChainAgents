@@ -7,7 +7,7 @@ import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from textual.containers import VerticalScroll
@@ -31,8 +31,8 @@ from chainagents_tui import (
 
 class _Token:
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         self.content = content
@@ -41,7 +41,7 @@ class _Token:
 class _ReasoningToken:
     type = "AIMessageChunk"
     content = ""
-    tool_call_chunks: list[dict[str, str]] = []
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, reasoning: str) -> None:
         self.additional_kwargs = {"reasoning_content": reasoning}
@@ -50,7 +50,7 @@ class _ReasoningToken:
 class _ToolCallChunkToken:
     type = "AIMessageChunk"
     content = ""
-    additional_kwargs: dict[str, str] = {}
+    additional_kwargs: ClassVar[dict[str, str]] = {}
 
     def __init__(self, chunk: dict[str, str]) -> None:
         self.tool_call_chunks = [chunk]

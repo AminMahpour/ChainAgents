@@ -147,10 +147,12 @@ class AutoMigratingChainlitDataLayer(ChainlitDataLayer):
                 return
             if not self.pool:
                 raise RuntimeError("Chainlit data layer pool is not initialized")
-            async with self.pool.acquire() as connection:  # type: ignore[union-attr]
-                async with connection.transaction():
-                    for statement in CHAINLIT_SCHEMA_STATEMENTS:
-                        await connection.execute(statement)
+            async with (
+                self.pool.acquire() as connection,  # type: ignore[union-attr]
+                connection.transaction(),
+            ):
+                for statement in CHAINLIT_SCHEMA_STATEMENTS:
+                    await connection.execute(statement)
             self._schema_ready = True
             logger.info("Chainlit Postgres schema is ready")
 

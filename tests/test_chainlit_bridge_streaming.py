@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import weakref
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -15,7 +15,7 @@ from chainagents.events.stream import AgentStreamEventAdapter
 from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
 
-_FEEDS: "weakref.WeakKeyDictionary[ChainlitEventBridge, tuple[AgentStreamEventAdapter, ChainlitTurnRenderer]]" = (
+_FEEDS: weakref.WeakKeyDictionary[ChainlitEventBridge, tuple[AgentStreamEventAdapter, ChainlitTurnRenderer]] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -40,8 +40,8 @@ class _AnthropicThinkingToken:
     """Provide an internal helper for Anthropic thinking token."""
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, thinking: str) -> None:
         """Initialize the Anthropic thinking token instance.
@@ -145,7 +145,7 @@ class _Message:
         instances: The instances value.
     """
 
-    instances: list["_Message"] = []
+    instances: ClassVar[list[_Message]] = []
 
     def __init__(self, content: str = "", author: str | None = None, **_kwargs: Any) -> None:
         """Initialize the message instance.
@@ -165,7 +165,7 @@ class _Message:
         self.update_count = 0
         self.instances.append(self)
 
-    async def send(self) -> "_Message":
+    async def send(self) -> _Message:
         """Record send calls on the test double.
 
         Returns:
@@ -194,7 +194,7 @@ class _Step:
         instances: The instances value.
     """
 
-    instances: list["_Step"] = []
+    instances: ClassVar[list[_Step]] = []
 
     def __init__(
         self,
@@ -244,7 +244,7 @@ class _Step:
 class _CustomElement:
     """Provide an internal helper for Chainlit custom elements."""
 
-    instances: list["_CustomElement"] = []
+    instances: ClassVar[list[_CustomElement]] = []
 
     def __init__(self, name: str, props: dict[str, Any], display: str = "inline", **_kwargs: Any) -> None:
         """Initialize the custom element test double."""
@@ -289,7 +289,7 @@ class _ToolCallChunkToken:
 
     type = "AIMessageChunk"
     content = ""
-    additional_kwargs: dict[str, str] = {}
+    additional_kwargs: ClassVar[dict[str, str]] = {}
 
     def __init__(self, chunk: dict[str, Any]) -> None:
         """Initialize the token with one tool-call chunk."""

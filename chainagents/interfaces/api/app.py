@@ -146,7 +146,7 @@ class AgentHistoryMessage(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_content(self) -> "AgentHistoryMessage":
+    def validate_content(self) -> AgentHistoryMessage:
         """Reject blank text and empty multipart messages."""
         if isinstance(self.content, str):
             if not self.content.strip():
@@ -177,7 +177,7 @@ class AgentRunRequest(BaseModel):
     source_thread_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
 
     @model_validator(mode="after")
-    def validate_history_image_count(self) -> "AgentRunRequest":
+    def validate_history_image_count(self) -> AgentRunRequest:
         """Bound replay images to the same aggregate limit as uploads."""
         text_length = sum(
             len(message.content)
@@ -225,12 +225,12 @@ class RuntimeStatusResponse(BaseModel):
     recursion_limit: int
     persistence_mode: str
     ui_api_version: int = 1
-    models: list["RuntimeModelOption"]
+    models: list[RuntimeModelOption]
     reasoning_levels: list[ReasoningLevel]
-    features: "RuntimeFeatureFlags"
-    starters: list["RuntimeStarter"]
-    commands: list["RuntimeCommand"]
-    uploads: "RuntimeUploadCapabilities"
+    features: RuntimeFeatureFlags
+    starters: list[RuntimeStarter]
+    commands: list[RuntimeCommand]
+    uploads: RuntimeUploadCapabilities
 
 
 class RuntimeModelOption(BaseModel):
@@ -709,7 +709,7 @@ def create_app(
         history: str | None = Form(None),
         async_subagent_url: str | None = Form(None),
         mcp_session_id: str | None = Form(None),
-        files: list[UploadFile] | None = File(None),
+        files: list[UploadFile] | None = File(None),  # noqa: B008 -- FastAPI requires File() as a parameter default
     ) -> StreamingResponse:
         active_runtime = _runtime_from_request(request)
         normalized_uploads = await _read_multipart_uploads(files or [])

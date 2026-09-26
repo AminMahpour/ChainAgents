@@ -91,17 +91,23 @@ async def ingest_uploads(
     if not paths:
         return None
 
-    uploads: list[UploadedRagFile] = []
-    for raw_path in paths:
-        path = Path(raw_path).expanduser().resolve()
-        if not path.exists() or not path.is_file():
-            print(f"upload-rag: file does not exist: {path}", file=stderr)
-            return RagUploadResult(
-                thread_id=thread_id,
-                success=False,
-                reason=f"file does not exist: {path}",
-            )
-        uploads.append(UploadedRagFile(path=path, name=path.name))
+    def _resolve_uploads() -> tuple[list[UploadedRagFile], Path | None]:
+        resolved: list[UploadedRagFile] = []
+        for raw_path in paths:
+            path = Path(raw_path).expanduser().resolve()
+            if not path.exists() or not path.is_file():
+                return resolved, path
+            resolved.append(UploadedRagFile(path=path, name=path.name))
+        return resolved, None
+
+    uploads, missing_path = await asyncio.to_thread(_resolve_uploads)
+    if missing_path is not None:
+        print(f"upload-rag: file does not exist: {missing_path}", file=stderr)
+        return RagUploadResult(
+            thread_id=thread_id,
+            success=False,
+            reason=f"file does not exist: {missing_path}",
+        )
 
     result = await runtime.ingest_rag_uploads(thread_id=thread_id, uploads=uploads)
     if emit_output:

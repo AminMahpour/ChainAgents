@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 from deepagents.backends import CompositeBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
@@ -644,7 +645,7 @@ max_tokens = {max_tokens}
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="max_tokens.*positive integer"):
+    with pytest.raises(ValueError, match=r"max_tokens.*positive integer"):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -2303,7 +2304,7 @@ api_key = "profile-key"
     monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "https://openai.example/v1")
     monkeypatch.setenv("DEEPAGENT_MODEL_API_KEY", "openai-key")
 
-    with pytest.raises(ValueError, match="provider.*claude-reviewer"):
+    with pytest.raises(ValueError, match=r"provider.*claude-reviewer"):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -2436,7 +2437,7 @@ enabled = "yes"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="langfuse.enabled"):
+    with pytest.raises(ValueError, match=re.escape("langfuse.enabled")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -2836,7 +2837,7 @@ thinking = "manual"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="model.thinking"):
+    with pytest.raises(ValueError, match=re.escape("model.thinking")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -3389,7 +3390,7 @@ enabled = true
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="agent.reflection.enabled"):
+    with pytest.raises(ValueError, match=re.escape("agent.reflection.enabled")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -3443,7 +3444,7 @@ state = "sometimes"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="agent.state"):
+    with pytest.raises(ValueError, match=re.escape("agent.state")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -3706,7 +3707,7 @@ def test_build_deepagent_backend_uses_explicit_agent_memory_namespace(
 
     memory_backend = backend.routes["/memories/"]
 
-    assert memory_backend._namespace(None) == ("repo-agent",)  # noqa: SLF001
+    assert memory_backend._namespace(None) == ("repo-agent",)
 
 
 def test_tool_execution_resilience_middleware_returns_error_tool_message() -> None:
@@ -4901,7 +4902,7 @@ def test_get_agent_rejects_configured_background_tool_name_collision(
         try:
             with pytest.raises(
                 ValueError,
-                match="reserved background task tool name.*spawn_background_task",
+                match=r"reserved background task tool name.*spawn_background_task",
             ):
                 await runtime.get_agent("medium", thread_id="thread-1")
         finally:
@@ -6348,7 +6349,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         """
 
         callbacks = object()
-        tool_interceptors: list[object] = []
+        tool_interceptors: ClassVar[list[object]] = []
 
         @asynccontextmanager
         async def session(self, server_name: str, *, auto_initialize: bool = True):
@@ -7312,7 +7313,7 @@ background = "yes"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="subagent 'researcher'.*background"):
+    with pytest.raises(ValueError, match=r"subagent 'researcher'.*background"):
         deepagent_runtime.load_extensions_config()
 
 

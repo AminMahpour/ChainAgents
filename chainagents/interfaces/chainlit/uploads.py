@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -236,8 +237,12 @@ async def ask_for_rag_upload() -> list[UploadedRagFile]:
     ).send()
     if not files:
         return []
-    return [
-        UploadedRagFile(path=Path(file.path), name=file.name)
-        for file in files
-        if Path(file.path).exists()
-    ]
+
+    def _existing_uploads() -> list[UploadedRagFile]:
+        return [
+            UploadedRagFile(path=Path(file.path), name=file.name)
+            for file in files
+            if Path(file.path).exists()
+        ]
+
+    return await asyncio.to_thread(_existing_uploads)

@@ -6,7 +6,8 @@ import logging
 import os
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
+from collections.abc import Iterator
 
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.types import LangfuseConfig, LangSmithConfig

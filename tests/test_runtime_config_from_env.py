@@ -118,7 +118,7 @@ def test_provider_switch_error_precedes_missing_model_name_error(
     write_config('[model]\nprovider = "ollama"\nname = "local"')
     monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "openai_compatible")
 
-    with pytest.raises(ValueError, match="^Switching model providers via"):
+    with pytest.raises(ValueError, match=r"^Switching model providers via"):
         RuntimeConfig.from_env()
 
 
@@ -321,7 +321,7 @@ name = "claude-sonnet-4-6"
 model = "claude"
 """
     )
-    with pytest.raises(ValueError, match="^Anthropic runtime requires"):
+    with pytest.raises(ValueError, match=r"^Anthropic runtime requires"):
         RuntimeConfig.from_env()
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")

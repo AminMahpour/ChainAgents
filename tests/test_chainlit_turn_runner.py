@@ -6,7 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -16,8 +16,8 @@ from chainagents.runtime.reflection import ReflectionConfig
 
 class _Token:
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         self.content = content
@@ -64,7 +64,7 @@ class _Stream:
         self.closed = False
         self.started = asyncio.Event()
 
-    def __aiter__(self) -> "_Stream":
+    def __aiter__(self) -> _Stream:
         return self
 
     async def __anext__(self) -> dict[str, object]:
@@ -140,7 +140,7 @@ class _Session:
 
 
 class _Message:
-    sent: list["_Message"] = []
+    sent: ClassVar[list[_Message]] = []
 
     def __init__(self, content: str = "", author: str = "Assistant", **kwargs: Any) -> None:
         self.id = f"message-{len(self.sent)}"
@@ -150,7 +150,7 @@ class _Message:
         self.actions: list[Any] = []
         self.metadata: dict[str, Any] = {}
 
-    async def send(self) -> "_Message":
+    async def send(self) -> _Message:
         self.sent.append(self)
         return self
 
@@ -164,7 +164,7 @@ class _Step:
         self.input = ""
         self.output = ""
 
-    async def __aenter__(self) -> "_Step":
+    async def __aenter__(self) -> _Step:
         return self
 
     async def __aexit__(self, *_exc: object) -> None:

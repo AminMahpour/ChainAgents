@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -506,15 +507,11 @@ def run_configure_command(
                 return 1
             normalized_current_value = None
             if current_value is not None:
-                try:
-                    normalized_current_value, _ = (
-                        normalize_snowflake_cortex_endpoint_url(
-                            current_value,
-                            full_endpoint=False,
-                        )
+                with contextlib.suppress(ValueError):
+                    normalized_current_value, _ = normalize_snowflake_cortex_endpoint_url(
+                        current_value,
+                        full_endpoint=False,
                     )
-                except ValueError:
-                    pass
             if (
                 current_model_endpoint_url is not None
                 and value != normalized_current_value

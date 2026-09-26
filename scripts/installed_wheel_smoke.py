@@ -58,7 +58,7 @@ enabled = false
     config = RuntimeConfig.from_env()
     runtime_requirements = importlib.metadata.requires("ChainAgents") or []
 
-    assert runtime_core.PROJECT_ROOT == working_directory
+    assert working_directory == runtime_core.PROJECT_ROOT
     assert runtime_core.PROJECT_ROOT.name != "site-packages"
     assert not any(
         requirement.lower().startswith("pytest")

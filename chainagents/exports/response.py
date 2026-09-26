@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
 import os
@@ -176,7 +177,9 @@ _CHAINLIT_PDF_RENDER_SEMAPHORES: weakref.WeakKeyDictionary[
 ] = weakref.WeakKeyDictionary()
 MOJIBAKE_MARKERS = ("Â", "Ã", "â", "ð", "�")
 PDF_SUBSCRIPT_CHARS = {
-    **dict(zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789")),
+    **dict(
+        zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789", strict=True)
+    ),
     "\u208a": "+",
     "\u208b": "-",
     "\u208c": "=",
@@ -1021,10 +1024,8 @@ async def _build_chainlit_pdf_bytes(text: str) -> bytes:
         try:
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
-            try:
+            with contextlib.suppress(Exception):
                 await worker
-            except Exception:
-                pass
             raise
 
 

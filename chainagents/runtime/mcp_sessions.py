@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextvars import ContextVar
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -272,9 +273,11 @@ class MCPSessionPool:
         )
         async with self._lock:
             for (key, owner), result in zip(owners, results, strict=True):
-                if not isinstance(result, BaseException) or getattr(owner, "terminal", False):
-                    if self._session_owners.get(key) is owner:
-                        self._session_owners.pop(key, None)
+                should_release = not isinstance(result, BaseException) or getattr(
+                    owner, "terminal", False
+                )
+                if should_release and self._session_owners.get(key) is owner:
+                    self._session_owners.pop(key, None)
         for result in results:
             if isinstance(result, BaseException):
                 raise result

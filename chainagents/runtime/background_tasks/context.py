@@ -8,7 +8,7 @@ import contextvars
 class BackgroundSessionGeneration:
     """Weakly tracked capability for one open background-task session."""
 
-    __slots__ = ("active", "session_id", "__weakref__")
+    __slots__ = ("__weakref__", "active", "session_id")
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id

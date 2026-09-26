@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 from fastapi.testclient import TestClient
 import pytest
@@ -25,8 +26,8 @@ class _Token:
     """Provide a minimal streamed AI token for API tests."""
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         """Initialize the token instance."""
@@ -965,13 +966,15 @@ def test_stream_returns_ndjson_agent_events() -> None:
     runtime = _FakeRuntime(agent)
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
-        with client.stream(
+    with (
+        TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client,
+        client.stream(
             "POST",
             "/api/agent/stream",
             json={"prompt": "hello", "thread_id": "thread-1"},
-        ) as response:
-            lines = [json.loads(line) for line in response.iter_lines()]
+        ) as response,
+    ):
+        lines = [json.loads(line) for line in response.iter_lines()]
 
     assert response.status_code == 200
     assert lines == [
@@ -2048,7 +2051,7 @@ def test_ui_directory_env_and_invalid_paths_fail_clearly(
     assert response.status_code == 200
     assert response.text == "SparxUI"
 
-    with pytest.raises(ValueError, match="index.html"):
+    with pytest.raises(ValueError, match=re.escape("index.html")):
         chainagents_api.create_app(
             runtime=_FakeRuntime(_FakeAgent([])),
             ui_dir=tmp_path / "missing",
@@ -2087,36 +2090,35 @@ def test_reflection_confirmation_is_retryable_after_cancellation(after_write) ->
         _enable_reflection_storage(runtime)
         runtime.store = _BlockingStore()
         app = chainagents_api.create_app(runtime=runtime)
-        async with app.router.lifespan_context(app):
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-            ) as client:
-                response = await client.post(
-                    "/api/agent/stream",
-                    json={"prompt": "That was wrong", "thread_id": "thread-1"},
-                )
-                proposal = next(
-                    json.loads(line)["proposal"]
-                    for line in response.iter_lines()
-                    if json.loads(line)["kind"] == "reflection_proposal"
-                )
-                runtime.requests.clear()
-                payload = {"thread_id": "thread-1", "proposal": proposal}
-                task = asyncio.create_task(
-                    client.post("/api/reflections/save", json=payload)
-                )
-                await asyncio.wait_for(reached_save.wait(), timeout=2)
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-                runtime.store.block = False
-                retry = await client.post("/api/reflections/save", json=payload)
-                replay = await client.post("/api/reflections/save", json=payload)
-                assert retry.status_code == 200
-                assert replay.status_code == 409
-                assert runtime.requests == []
-                item = await runtime.store.aget(("api-reflections",), "/AGENTS.md")
-                assert item.value["content"].count(proposal["lesson"]) == 1
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            response = await client.post(
+                "/api/agent/stream",
+                json={"prompt": "That was wrong", "thread_id": "thread-1"},
+            )
+            proposal = next(
+                json.loads(line)["proposal"]
+                for line in response.iter_lines()
+                if json.loads(line)["kind"] == "reflection_proposal"
+            )
+            runtime.requests.clear()
+            payload = {"thread_id": "thread-1", "proposal": proposal}
+            task = asyncio.create_task(
+                client.post("/api/reflections/save", json=payload)
+            )
+            await asyncio.wait_for(reached_save.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            runtime.store.block = False
+            retry = await client.post("/api/reflections/save", json=payload)
+            replay = await client.post("/api/reflections/save", json=payload)
+            assert retry.status_code == 200
+            assert replay.status_code == 409
+            assert runtime.requests == []
+            item = await runtime.store.aget(("api-reflections",), "/AGENTS.md")
+            assert item.value["content"].count(proposal["lesson"]) == 1
 
     asyncio.run(exercise())
 

@@ -338,7 +338,7 @@ class BackgroundTaskManager:
             await self._cancel_descendants(record.session_id, record.task_id)
             await self._finish(record, status="cancelled", error=cleanup_error)
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             detail = " ".join(str(exc).split()).strip()
             error = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
             cleanup_error = await self._cleanup_record(record)
@@ -393,7 +393,7 @@ class BackgroundTaskManager:
                     if record.cleanup_task is cleanup_task:
                         record.cleanup_task = None
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             async with self._lock:
                 if record.cleanup_task is cleanup_task:
                     record.cleanup_task = None

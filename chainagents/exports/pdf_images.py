@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import http.client
 import ipaddress
 import math
@@ -387,10 +388,8 @@ def _close_expired_connection(connection: http.client.HTTPConnection) -> None:
     """Interrupt a request that remains active past the export deadline."""
     sock = connection.sock
     if sock is not None:
-        try:
+        with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
     connection.close()
 
 

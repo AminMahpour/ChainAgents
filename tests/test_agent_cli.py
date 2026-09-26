@@ -18,6 +18,7 @@ import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -1232,6 +1233,7 @@ class _ScriptedStream:
         self.error = error
         self.block = block
         self.started = asyncio.Event()
+        self.blocked = asyncio.Event()
         self.closed = False
 
     def __aiter__(self):
@@ -1244,6 +1246,7 @@ class _ScriptedStream:
         if self.error is not None:
             raise self.error
         if self.block:
+            self.blocked.set()
             await asyncio.Event().wait()
         raise StopAsyncIteration
 
@@ -1517,8 +1520,7 @@ async def test_cli_cancelled_turn_propagates_and_closes_stream(tmp_path: Path) -
             stderr=stderr,
         )
     )
-    while not (stream.started.is_set() and not stream.events):
-        await asyncio.sleep(0)
+    await stream.blocked.wait()
     await asyncio.sleep(0)
 
     task.cancel()
@@ -1934,8 +1936,8 @@ class _Token:
     """
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str) -> None:
         """Initialize the token instance.
@@ -1950,8 +1952,8 @@ class _AnthropicThinkingToken:
     """Provide an internal helper for Anthropic thinking token."""
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, thinking: str) -> None:
         """Initialize the Anthropic thinking token instance.
@@ -1993,7 +1995,7 @@ class _ReasoningToken:
 
     type = "AIMessageChunk"
     content = ""
-    tool_call_chunks: list[dict[str, str]] = []
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, reasoning: str = "thinking") -> None:
         """Initialize the reasoning token instance.
@@ -2016,8 +2018,8 @@ class _ToolCallToken:
 
     type = "AIMessageChunk"
     content = ""
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks = [
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = [
         {
             "id": "call-1",
             "name": "read_file",
@@ -2037,7 +2039,7 @@ class _ToolCallChunkToken:
 
     type = "AIMessageChunk"
     content = ""
-    additional_kwargs: dict[str, str] = {}
+    additional_kwargs: ClassVar[dict[str, str]] = {}
 
     def __init__(self, chunk: dict[str, str]) -> None:
         """Initialize the tool call chunk token instance.

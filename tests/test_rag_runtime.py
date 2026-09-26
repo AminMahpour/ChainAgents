@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -334,7 +335,7 @@ def test_resolve_rag_config_requires_model_for_openai_compatible(tmp_path: Path)
         embedding=RagEmbeddingConfig(provider="auto"),
     )
 
-    with pytest.raises(ValueError, match="rag.embedding.model"):
+    with pytest.raises(ValueError, match=re.escape("rag.embedding.model")):
         resolve_rag_config(
             config,
             model_provider="openai_compatible",
@@ -354,7 +355,7 @@ def test_resolve_rag_config_rejects_auto_for_anthropic(tmp_path: Path) -> None:
         embedding=RagEmbeddingConfig(provider="auto"),
     )
 
-    with pytest.raises(ValueError, match="rag.embedding.provider"):
+    with pytest.raises(ValueError, match=re.escape("rag.embedding.provider")):
         resolve_rag_config(
             config,
             model_provider="anthropic",

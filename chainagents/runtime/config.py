@@ -855,10 +855,7 @@ def _resolve_rag(
     if not (rag_config.enabled and not disable_rag):
         return _RagResolution(requested=False)
     rag_embedding_provider = rag_config.embedding.provider
-    if rag_embedding_provider == "auto":
-        rag_model_provider = active_runtime_model.provider
-        rag_model_base_url = active_runtime_model.base_url
-    elif rag_embedding_provider == active_runtime_model.provider:
+    if rag_embedding_provider == "auto" or rag_embedding_provider == active_runtime_model.provider:
         rag_model_provider = active_runtime_model.provider
         rag_model_base_url = active_runtime_model.base_url
     elif rag_embedding_provider == runtime_default_model.provider:
@@ -936,8 +933,8 @@ class RuntimeConfig:
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
     model_max_tokens: int | None = None
-    langfuse: LangfuseConfig = LangfuseConfig()
-    langsmith: LangSmithConfig = LangSmithConfig()
+    langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+    langsmith: LangSmithConfig = field(default_factory=LangSmithConfig)
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
     model_repeat_penalty: float | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
@@ -965,7 +962,7 @@ class RuntimeConfig:
     def from_env(
         cls,
         overrides: RuntimeConfigOverrides | None = None,
-    ) -> "RuntimeConfig":
+    ) -> RuntimeConfig:
         """Create this object from environment.
 
         Args:

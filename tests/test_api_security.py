@@ -521,7 +521,9 @@ def test_oversize_multipart_closes_parser_files(monkeypatch):
     opened = []
 
     def recording_file(*args, **kwargs):
-        file = tempfile.SpooledTemporaryFile(*args, **kwargs)
+        # The file's lifecycle belongs to starlette's parser (closed there, asserted
+        # below), so it cannot be opened as a context manager here.
+        file = tempfile.SpooledTemporaryFile(*args, **kwargs)  # noqa: SIM115
         opened.append(file)
         return file
 

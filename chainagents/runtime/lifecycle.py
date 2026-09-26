@@ -68,7 +68,7 @@ async def agent_with_mcp_status(
 class AgentRuntime:
     """Own configured agents, MCP sessions, persistence handles, and RAG state."""
 
-    _instance: "AgentRuntime | None" = None
+    _instance: AgentRuntime | None = None
     _instance_lock = asyncio.Lock()
 
     def __init__(self, config: RuntimeConfig, *, project_root: Path | None = None) -> None:
@@ -195,7 +195,7 @@ class AgentRuntime:
                 raise RuntimeError("Reflection persistence failed.") from exc
 
     @classmethod
-    async def get(cls) -> "AgentRuntime":
+    async def get(cls) -> AgentRuntime:
         """Get the agent runtime.
 
         Returns:
@@ -218,7 +218,7 @@ class AgentRuntime:
         config: RuntimeConfig | None = None,
         *,
         project_root: Path | None = None,
-    ) -> "AgentRuntime":
+    ) -> AgentRuntime:
         """Create the agent runtime.
 
         Args:
@@ -237,7 +237,7 @@ class AgentRuntime:
         return instance
 
     @classmethod
-    def current(cls) -> "AgentRuntime | None":
+    def current(cls) -> AgentRuntime | None:
         """Return the current.
 
         Returns:

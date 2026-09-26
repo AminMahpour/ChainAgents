@@ -40,7 +40,7 @@ jobs:
         run: uv run python -m compileall chainagents main.py langgraph_app.py deepagent_runtime.py chainlit_bridge.py rag_runtime.py
 
       - name: Lint Python sources
-        run: uv run ruff check chainagents *.py scripts/*.py
+        run: uv run ruff check chainagents *.py scripts/*.py tests
 
       - name: Type-check maintained modules
         run: uv run mypy

@@ -212,11 +212,11 @@ async def _write_batch_markdown_files(
                 raise BaseExceptionGroup(
                     "Batch result write and cleanup failed.",
                     grouped,
-                )
+                ) from primary
             raise ExceptionGroup(
                 "Batch result write and cleanup failed.",
                 cast(list[Exception], grouped),
-            )
+            ) from primary
         raise
 
     return {"files": manifest}

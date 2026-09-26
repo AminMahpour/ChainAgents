@@ -143,7 +143,7 @@ def test_failed_storage_never_reports_success_and_can_retry(
                     )
 
                 patch.setattr(StoreBackend, "awrite", fail_write)
-            with pytest.raises(RuntimeError, match="[Rr]eflection"):
+            with pytest.raises(RuntimeError, match=r"[Rr]eflection"):
                 await runtime.save_reflection(proposal())
         item = await runtime.store.aget(("reflection-tests",), "/AGENTS.md")
         assert item.value["content"] == "# Preserve me\n"

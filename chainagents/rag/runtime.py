@@ -8,9 +8,10 @@ import math
 import shutil
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
+from collections.abc import Sequence
 
 from langchain_core.documents import Document
 from langchain_core.tools import BaseTool, tool
@@ -114,7 +115,7 @@ class JsonVectorStore:
         documents: list[Document],
         embedding: Any,
         persist_directory: str | Path,
-    ) -> "JsonVectorStore":
+    ) -> JsonVectorStore:
         """Build and persist a vector store from documents.
 
         Args:
@@ -152,7 +153,7 @@ class JsonVectorStore:
         *,
         embedding_function: Any,
         persist_directory: str | Path,
-    ) -> "JsonVectorStore":
+    ) -> JsonVectorStore:
         """Load a vector store from a JSON index.
 
         Args:
@@ -236,7 +237,7 @@ class JsonVectorStore:
 
         dot_product = sum(
             left_value * right_value
-            for left_value, right_value in zip(left, right)
+            for left_value, right_value in zip(left, right, strict=True)
         )
         left_norm = math.sqrt(sum(value * value for value in left))
         right_norm = math.sqrt(sum(value * value for value in right))
@@ -478,7 +479,7 @@ class RagStatus:
     persist_directory: Path | None = None
 
     @classmethod
-    def disabled(cls) -> "RagStatus":
+    def disabled(cls) -> RagStatus:
         """Create a disabled RAG status.
 
         Returns:
@@ -492,7 +493,7 @@ class RagStatus:
         *,
         reason: str,
         persist_directory: Path | None = None,
-    ) -> "RagStatus":
+    ) -> RagStatus:
         """Create an unavailable RAG status with a reason.
 
         Args:
@@ -516,7 +517,7 @@ class RagStatus:
         file_count: int,
         chunk_count: int,
         persist_directory: Path,
-    ) -> "RagStatus":
+    ) -> RagStatus:
         """Create a ready RAG status.
 
         Args:
@@ -744,7 +745,7 @@ class SearchWorkspaceKnowledgeInput(BaseModel):
 
 
 def create_search_workspace_knowledge_tool(
-    rag: "WorkspaceDocsRAG",
+    rag: WorkspaceDocsRAG,
     *,
     thread_id: str | None = None,
 ) -> BaseTool:
@@ -1213,7 +1214,7 @@ class WorkspaceDocsRAG:
             The constructed manifest.
         """
         return {
-            "built_at": datetime.now(timezone.utc).isoformat(),
+            "built_at": datetime.now(UTC).isoformat(),
             "chunk_count": chunk_count,
             "file_count": file_count,
             "signature": self._signature_for_paths(

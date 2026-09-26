@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from langchain_mcp_adapters import sessions as mcp_sessions
 from rich.panel import Panel
@@ -71,7 +71,7 @@ def capture_mcp_stdio_stderr(log_path: Path):
 class PromptTextArea(TextArea):
     """Multiline prompt editor that preserves Enter as the send shortcut."""
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Any]] = [
         Binding("enter", "submit", "Send", priority=True),
         Binding("shift+enter", "insert_newline", "New line", priority=True),
     ]
@@ -177,7 +177,7 @@ class ChainAgentsTuiApp(App[int]):
     }
     """.replace("__SIDE_PANEL_WIDTH__", str(TUI_SIDE_PANEL_WIDTH))
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Any]] = [
         ("ctrl+c", "cancel_or_quit", "Cancel/Quit"),
         ("ctrl+l", "clear_conversation", "Clear"),
         ("tab", "complete_slash_command", "Complete command"),

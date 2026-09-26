@@ -989,10 +989,10 @@ def test_pdf_image_validation_rejects_circular_svg_presentation_reference() -> N
 def test_pdf_image_validation_decodes_css_escaped_presentation_reference() -> None:
     """CSS escapes must not hide a circular local presentation reference."""
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg"><defs>'
-        '<mask id="loop" style="mask:u\\72l(#loop)">'
-        '<rect width="1" height="1" /></mask></defs></svg>'
-    ).encode()
+        b'<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        b'<mask id="loop" style="mask:u\\72l(#loop)">'
+        b'<rect width="1" height="1" /></mask></defs></svg>'
+    )
 
     with pytest.raises(pdf_images.PdfImageError, match="circular"):
         pdf_images._validate_pdf_image(svg)
@@ -1173,7 +1173,7 @@ def test_build_pdf_html_document_removes_pdf_hostile_unicode() -> None:
 
 def test_build_pdf_html_document_repairs_common_mojibake() -> None:
     """Verify common UTF-8-as-Windows-1252 artifacts are repaired for PDFs."""
-    html = response_exports.build_pdf_html_document("Hâ‚‚O and xÂ²")
+    html = response_exports.build_pdf_html_document("Hâ‚‚O and xÂ²")  # noqa: RUF001 -- intentional mojibake fixture
 
     assert "H<sub>2</sub>O" in html
     assert "x<sup>2</sup>" in html
@@ -1183,7 +1183,7 @@ def test_build_pdf_html_document_repairs_common_mojibake() -> None:
 
 def test_build_pdf_html_document_repairs_mojibake_with_unicode_text() -> None:
     """Verify mojibake repair still works when surrounding text is Unicode."""
-    html = response_exports.build_pdf_html_document("Δ sample: Hâ‚‚O and xÂ²")
+    html = response_exports.build_pdf_html_document("Δ sample: Hâ‚‚O and xÂ²")  # noqa: RUF001 -- intentional mojibake fixture
 
     assert "Δ sample: H<sub>2</sub>O" in html
     assert "x<sup>2</sup>" in html

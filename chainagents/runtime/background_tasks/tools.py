@@ -91,14 +91,14 @@ def _result_text(result: object) -> str:
 
 def create_background_task_tools(
     *,
-    manager: "BackgroundTaskManager",
+    manager: BackgroundTaskManager,
     subagents: dict[str, object],
     agent_path: tuple[str, ...],
     recursion_limit: int,
     session_generation: BackgroundSessionGeneration | None = None,
     batch_output_store: BatchResultOutputStore | None = None,
     existing_tools: Iterable[object] = (),
-    langsmith_tracing: "LangSmithTracing | None" = None,
+    langsmith_tracing: LangSmithTracing | None = None,
 ) -> list[object]:
     """Create task tools scoped to the direct children of one agent."""
     collisions = sorted(

@@ -93,7 +93,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
     def __init__(
         self,
         runnable: object,
-        manager: "BackgroundTaskManager",
+        manager: BackgroundTaskManager,
         on_session_open: Callable[[str], None] | None = None,
         artifact_registry: LargeToolResultArtifactRegistry | None = None,
         fixed_session_id: str | None = None,
@@ -115,11 +115,11 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
         return getattr(self.runnable, name)
 
     @property
-    def InputType(self) -> Any:  # noqa: N802
+    def InputType(self) -> Any:
         return self.runnable.InputType  # type: ignore[attr-defined]
 
     @property
-    def OutputType(self) -> Any:  # noqa: N802
+    def OutputType(self) -> Any:
         return self.runnable.OutputType  # type: ignore[attr-defined]
 
     @property
@@ -316,7 +316,7 @@ class _BackgroundSessionScopedRunnable(Runnable[Any, Any]):
                     stream = await cast(Awaitable[Any], result)
                     graph_iterator = getattr(stream, "_graph_aiter", None)
                     if graph_iterator is not None:
-                        stream._graph_aiter = (  # noqa: SLF001
+                        stream._graph_aiter = (
                             _BackgroundSessionScopedAsyncIterator(
                                 graph_iterator,
                                 generation,
@@ -381,7 +381,7 @@ class _BackgroundSessionScopedAsyncIterator:
         self.artifact_registry = artifact_registry
         self.artifact_handle = artifact_handle
 
-    def __aiter__(self) -> "_BackgroundSessionScopedAsyncIterator":
+    def __aiter__(self) -> _BackgroundSessionScopedAsyncIterator:
         return self
 
     async def __anext__(self) -> Any:
@@ -418,7 +418,7 @@ class _BackgroundSessionScopedAsyncIterator:
 
 def scope_background_session_invocation(
     runnable: object,
-    manager: "BackgroundTaskManager",
+    manager: BackgroundTaskManager,
     *,
     on_session_open: Callable[[str], None] | None = None,
     artifact_registry: LargeToolResultArtifactRegistry | None = None,

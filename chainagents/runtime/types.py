@@ -55,7 +55,7 @@ class SubagentConfig:
     model: str | None = None
     background: bool = False
     nested_subagent_names: tuple[str, ...] = ()
-    subagents: tuple["SubagentConfig", ...] = ()
+    subagents: tuple[SubagentConfig, ...] = ()
 
     def to_deepagents_spec(
         self,
@@ -317,7 +317,7 @@ class ExtensionsConfig:
     agent_memory_files: tuple[str, ...] = DEFAULT_AGENT_MEMORY_FILES
     delete_tool_enabled: bool = False
     execute_tool_enabled: bool = False
-    agent_reflection: ReflectionConfig = ReflectionConfig()
+    agent_reflection: ReflectionConfig = field(default_factory=ReflectionConfig)
     agent_model: str | None = None
     recursion_limit: int = DEFAULT_RECURSION_LIMIT
     mcp_servers: dict[str, dict[str, Any]] | None = None
@@ -436,7 +436,7 @@ class FileConfig:
     model_profiles: dict[str, ModelDefaults] = field(default_factory=dict)
     langfuse: LangfuseConfig = LangfuseConfig()
     langsmith: LangSmithConfig = LangSmithConfig()
-    rag: RagConfig = RagConfig()
+    rag: RagConfig = field(default_factory=RagConfig)
 
 
 @dataclass(frozen=True)

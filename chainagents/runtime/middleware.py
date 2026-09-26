@@ -319,9 +319,9 @@ class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
             ensure_ids = getattr(self.inner, "_ensure_message_ids", None)
             if callable(ensure_ids):
                 ensure_ids(messages)
-            token_counter = getattr(self.inner, "token_counter")
-            should_summarize = getattr(self.inner, "_should_summarize")
-            determine_cutoff = getattr(self.inner, "_determine_cutoff_index")
+            token_counter = self.inner.token_counter
+            should_summarize = self.inner._should_summarize
+            determine_cutoff = self.inner._determine_cutoff_index
             total_tokens = token_counter(messages)
             return bool(
                 should_summarize(messages, total_tokens)
