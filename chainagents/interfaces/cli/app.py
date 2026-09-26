@@ -27,7 +27,6 @@ from rich.text import Text
 
 from chainagents.events.stream import (
     AgentStreamEvent,
-    AgentStreamEventAdapter,
     anthropic_thinking_text,  # noqa: F401
     assistant_messages_for_current_prompt,  # noqa: F401
     is_assistant_message,  # noqa: F401
@@ -39,28 +38,19 @@ from chainagents.events.stream import (
     reasoning_text_from_token,  # noqa: F401
     stringify_content,
 )
-from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.runtime.reflection import (
-    ReflectionCollector,
     ReflectionProposal,
     format_reflection_proposal,
 )
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
-from chainagents.commands.native import (
-    dumps_tool_result,
-    parse_native_command,
-    resolve_native_command,
-    resolve_runtime_command,
-)
+from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
 from chainagents.runtime import (
     AgentRuntime,
-    AppSettings,
     DEFAULT_EXTENSIONS_CONFIG,
     PROJECT_ROOT,
     ReasoningLevel,
     RuntimeConfig,
     RuntimeConfigOverrides,
-    build_langgraph_run_config,
     shutdown_langfuse_client,
     format_model_provider,
     normalize_model_provider,
@@ -68,6 +58,13 @@ from chainagents.runtime import (
     normalize_snowflake_cortex_endpoint_url,
     resolve_runtime_model_profile,
     resolve_local_path,
+)
+from chainagents.turns import (
+    BaseTurnRenderer,
+    TurnCommandError,
+    TurnRequest,
+    TurnResult,
+    TurnRunner,
 )
 from chainagents.rag.runtime import RagStatus, RagUploadResult, UploadedRagFile
 
@@ -870,21 +867,6 @@ def photo_content_parts(paths: list[str], *, stderr: TextIO) -> list[dict[str, A
     return parts
 
 
-def user_message_content(prompt: str, photos: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
-    """Build the user message payload sent from the CLI.
-
-    Args:
-        prompt: The prompt value.
-        photos: The photos value.
-
-    Returns:
-        The constructed the user message payload sent from the cli.
-    """
-    if not photos:
-        return prompt
-    return [{"type": "text", "text": prompt}, *photos]
-
-
 def truncate_tool_result_content(value: Any) -> str:
     """Truncate tool result content.
 
@@ -968,34 +950,45 @@ def cli_kv_table() -> Table:
     return table
 
 
-class CliEventRenderer:
-    """Represent CLI event renderer."""
+def is_command_output(result: TurnResult) -> bool:
+    """Return whether ``result`` is MCP-tool command output, not an agent run."""
+    return (
+        result.command_result is not None
+        and result.command_result.target == "mcp_tool"
+    )
+
+
+def generated_file_paths(result: TurnResult) -> list[str]:
+    """Return the local paths of the turn's validated generated files."""
+    return [
+        str(descriptor.path) if descriptor.path is not None else descriptor.name
+        for descriptor in result.generated_files
+    ]
+
+
+class CliEventRenderer(BaseTurnRenderer):
+    """Render one shared-runner agent turn to the CLI's stdout and stderr."""
 
     def __init__(
         self,
         *,
-        prompt: str,
         stdout: TextIO,
         stderr: TextIO,
         stream: bool,
         json_output: bool,
         show_reasoning: bool,
         show_tools: bool,
-        reflection_collector: ReflectionCollector | None = None,
     ) -> None:
         """Initialize the CLI event renderer instance.
 
         Args:
-            prompt: The prompt value.
             stdout: The stdout value.
             stderr: The stderr value.
             stream: The stream value.
             json_output: The JSON output value.
             show_reasoning: The show reasoning value.
             show_tools: The show tools value.
-            reflection_collector: Optional collector for memory proposals.
         """
-        self.prompt = prompt
         self.stdout = stdout
         self.stderr = stderr
         self.stream = stream
@@ -1003,26 +996,15 @@ class CliEventRenderer:
         self.show_reasoning = show_reasoning
         self.show_tools = show_tools
         self.response_buffer = ""
-        self.stream_adapter = AgentStreamEventAdapter(prompt=prompt)
-        self.reflection_collector = reflection_collector
         self.reasoning_line_source: str | None = None
         self.stdout_console = cli_console(stdout)
         self.stderr_console = cli_console(stderr)
 
-    async def handle_event(self, event: dict[str, Any]) -> None:
-        """Handle one raw LangGraph stream event.
-
-        Args:
-            event: LangGraph stream event to process.
-        """
-        for stream_event in self.stream_adapter.events_from_raw_event(event):
-            self._handle_stream_event(stream_event)
-
-    def _handle_stream_event(self, event: AgentStreamEvent) -> None:
+    async def on_event(self, event: AgentStreamEvent) -> None:
         """Render one normalized agent stream event."""
-        if self.reflection_collector is not None:
-            self.reflection_collector.record_event(event)
-        if event.kind == "response_delta":
+        if event.kind == "mcp_status":
+            print(event.text, file=self.stderr)
+        elif event.kind == "response_delta":
             self._stream_response_delta(event.text)
         elif event.kind == "reasoning_delta":
             self._stream_reasoning_delta(event.source, event.text)
@@ -1033,33 +1015,59 @@ class CliEventRenderer:
         elif event.kind == "summarization_status":
             self._stream_summarization_status(event)
 
-    def finish(self) -> str:
-        """Finish the CLI event renderer.
+    async def on_command_result(self, result: RuntimeCommandResult) -> None:
+        """Print MCP-tool command output as raw JSON on stdout."""
+        print(dumps_tool_result(result.tool_result), file=self.stdout)
 
-        Returns:
-            The finish result.
-        """
+    async def on_command_error(self, exc: TurnCommandError, status: int) -> None:
+        """Print a failed or unknown native command to stderr."""
+        if exc.unknown:
+            print(f"Unknown command /{exc.command_name}.", file=self.stderr)
+        else:
+            print(f"Command /{exc.command_name} failed: {exc.message}", file=self.stderr)
+
+    async def on_complete(self, result: TurnResult) -> None:
+        """Print the response, generated files, reflection and failure, in order."""
+        if result.status == "command_error":
+            return
+        command_output = is_command_output(result)
+        if result.status == "completed" and not command_output:
+            self._finish_response()
+        else:
+            self._close_reasoning_line()
+        # A successful JSON agent turn carries the files in its payload instead.
+        if result.generated_files and not (
+            self.json_output and result.status == "completed" and not command_output
+        ):
+            self._print_generated_files(result)
+        if result.reflection is not None:
+            self.print_reflection_proposal(result.reflection)
+        if result.error is not None:
+            exc = result.error
+            print(f"{type(exc).__name__}: {exc}", file=self.stderr)
+            if self.show_tools or self.show_reasoning:
+                print(
+                    "".join(traceback.format_exception(exc, limit=10)),
+                    file=self.stderr,
+                )
+
+    def _finish_response(self) -> None:
+        """Close streamed output, or print the buffered response when not streaming."""
         self._close_reasoning_line()
         if self.json_output:
-            return self.response_buffer
+            return
         if self.stream:
             if self.response_buffer and not self.response_buffer.endswith("\n"):
                 self.stdout_console.print()
-            return self.response_buffer
+            return
         if self.response_buffer:
             self.stdout_console.print(Text(self.response_buffer, style="bright_white"))
-        return self.response_buffer
 
-    def mark_run_failed(self, exc: BaseException) -> None:
-        """Record that the streamed run failed."""
-        if self.reflection_collector is not None:
-            self.reflection_collector.mark_run_failed(exc)
-
-    def reflection_proposal(self) -> ReflectionProposal | None:
-        """Return a reflection proposal after the run completes."""
-        if self.reflection_collector is None:
-            return None
-        return self.reflection_collector.build_proposal()
+    def _print_generated_files(self, result: TurnResult) -> None:
+        """List the turn's generated file paths on stderr."""
+        print("Generated files:", file=self.stderr)
+        for path in generated_file_paths(result):
+            print(f"  {path}", file=self.stderr)
 
     def print_reflection_proposal(self, proposal: ReflectionProposal) -> None:
         """Print a reflection proposal to stderr for human CLI users."""
@@ -1547,7 +1555,7 @@ async def run_agent_prompt(
     stderr: TextIO,
     emit_json: bool = True,
 ) -> int | dict[str, Any]:
-    """Stream one CLI prompt through the configured agent.
+    """Run one CLI prompt through the shared turn runner.
 
     Args:
         runtime: Agent runtime used by the operation.
@@ -1565,134 +1573,54 @@ async def run_agent_prompt(
         args.reasoning,
         default=runtime.config.default_reasoning,
     )
-    settings = AppSettings(
-        model_name=args.model or runtime.config.model_name,
-        reasoning_level=reasoning_level,
-        thread_id=thread_id,
-    )
-
-    parsed_command = resolve_native_command(
-        raw_text=prompt,
-        selected_command=args.command,
-    )
-    slash_command_from_text = parse_native_command(prompt)
-    if parsed_command is not None:
-        try:
-            command_result = await resolve_runtime_command(
-                runtime=runtime,
-                parsed=parsed_command,
-                thread_id=settings.thread_id,
-                mcp_session_id=args.mcp_session_id,
-            )
-        except Exception as exc:
-            print(
-                f"Command /{parsed_command.command_name} failed: {exc}",
-                file=stderr,
-            )
-            return 1
-
-        if command_result.target == "unknown":
-            if slash_command_from_text is not None or args.command:
-                print(
-                    f"Unknown command /{parsed_command.command_name}.",
-                    file=stderr,
-                )
-                return 2
-        elif command_result.target == "mcp_tool":
-            print(dumps_tool_result(command_result.tool_result), file=stdout)
-            return 0
-        elif command_result.prompt is not None:
-            prompt = command_result.prompt
-            if not prompt.strip():
-                return 0
-
+    model_name = args.model or runtime.config.model_name
     photos = photo_content_parts(args.photo, stderr=stderr)
     if photos is None:
         return 1
 
-    agent, mcp_failures = await agent_with_mcp_status(
-        runtime,
-        settings.reasoning_level,
-        model_name=settings.model_name,
-        thread_id=settings.thread_id,
-        async_subagent_url_override=args.async_subagent_url,
-        mcp_session_id=args.mcp_session_id,
-    )
-    if mcp_failures:
-        print(mcp_outage_warning(mcp_failures), file=stderr)
-    payload = {
-        "messages": [{"role": "user", "content": user_message_content(prompt, photos)}]
-    }
-    config = build_langgraph_run_config(
-        runtime.config,
-        thread_id=settings.thread_id,
-        langsmith_tracing=getattr(runtime, "langsmith_tracing", None),
-    )
     renderer = CliEventRenderer(
-        prompt=prompt,
         stdout=stdout,
         stderr=stderr,
         stream=args.stream,
         json_output=args.json_output,
         show_reasoning=args.show_reasoning,
         show_tools=args.show_tools,
-        reflection_collector=ReflectionCollector.from_runtime_config(
-            runtime.config,
+    )
+    result = await TurnRunner(runtime, sanitize_errors=False).run(
+        TurnRequest(
             prompt=prompt,
+            thread_id=thread_id,
+            model_name=model_name,
+            reasoning_level=reasoning_level,
+            selected_command=args.command,
+            reasoning_level_is_explicit=args.reasoning is not None,
+            content_parts=tuple(photos),
+            async_subagent_url=args.async_subagent_url,
+            mcp_session_id=args.mcp_session_id,
         ),
+        renderer,
     )
-    stream = agent.astream_events(
-        payload,
-        config=config,
-        version="v2",
-        stream_mode=["messages", "updates", "custom"],
-        subgraphs=True,
-    )
-
-    try:
-        while True:
-            try:
-                event = await anext(stream)
-            except StopAsyncIteration:
-                break
-            await renderer.handle_event(event)
-    except asyncio.CancelledError:
-        with suppress(Exception):
-            await stream.aclose()
-        raise
-    except Exception as exc:
-        with suppress(Exception):
-            await stream.aclose()
-        renderer.mark_run_failed(exc)
-        proposal = renderer.reflection_proposal()
-        if proposal is not None:
-            renderer.print_reflection_proposal(proposal)
-        print(f"{type(exc).__name__}: {exc}", file=stderr)
-        if args.show_tools or args.show_reasoning:
-            print(traceback.format_exc(limit=10), file=stderr)
+    if result.command_error is not None:
+        return 2 if result.command_error.unknown else 1
+    if result.status == "failed":
         return 1
-    finally:
-        with suppress(Exception):
-            await stream.aclose()
+    if result.status == "skipped" or is_command_output(result) or not args.json_output:
+        return 0
 
-    response = renderer.finish()
-    proposal = renderer.reflection_proposal()
-    if proposal is not None:
-        renderer.print_reflection_proposal(proposal)
-    if args.json_output:
-        payload = {
-            "response": response,
-            "thread_id": settings.thread_id,
-            "model": settings.model_name,
-            "reasoning": settings.reasoning_level,
-        }
-        if proposal is not None:
-            payload["reflection_proposal"] = proposal.to_payload()
-        if emit_json:
-            print(json.dumps(payload, indent=2, sort_keys=True), file=stdout)
-            return 0
-        return {"prompt": payload}
-    return 0
+    payload: dict[str, Any] = {
+        "response": result.response,
+        "thread_id": thread_id,
+        "model": model_name,
+        "reasoning": reasoning_level,
+    }
+    if result.reflection is not None:
+        payload["reflection_proposal"] = result.reflection.to_payload()
+    if result.generated_files:
+        payload["generated_files"] = generated_file_paths(result)
+    if emit_json:
+        print(json.dumps(payload, indent=2, sort_keys=True), file=stdout)
+        return 0
+    return {"prompt": payload}
 
 
 async def _read_terminal_line(

@@ -22,6 +22,8 @@ from types import SimpleNamespace
 import pytest
 
 import chainagents_cli
+from chainagents.events.stream import AgentStreamEventAdapter
+from chainagents.turns import TurnResult
 from deepagent_runtime import RuntimeConfig
 from chainagents.runtime.background_tasks import (
     BackgroundTaskManager,
@@ -1213,6 +1215,320 @@ async def test_cli_reports_mcp_outage_and_keeps_response() -> None:
     assert "MCP server unavailable: docs" in stderr.getvalue()
 
 
+def _token_event(text: str) -> dict[str, object]:
+    """Return one raw LangGraph message chunk carrying response text."""
+    return {
+        "event": "on_chain_stream",
+        "data": {"chunk": ((), "messages", (_Token(text), {}))},
+    }
+
+
+class _ScriptedStream:
+    """Replay raw events, then optionally fail or block, recording ``aclose``."""
+
+    def __init__(self, events, *, error: Exception | None = None, block: bool = False):
+        self.events = list(events)
+        self.error = error
+        self.block = block
+        self.started = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.started.set()
+        if self.events:
+            return self.events.pop(0)
+        if self.error is not None:
+            raise self.error
+        if self.block:
+            await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _ScriptedAgent:
+    """Return one scripted stream per run and keep the last payload."""
+
+    def __init__(self, stream: _ScriptedStream) -> None:
+        self.stream = stream
+        self.payload = None
+
+    def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+        self.payload = payload
+        return self.stream
+
+
+class _ScriptedRuntime(_FakePromptRuntime):
+    """Serve a scripted agent from ``project_root`` and record agent kwargs."""
+
+    def __init__(self, stream: _ScriptedStream, project_root: Path) -> None:
+        super().__init__()
+        self.agent = _ScriptedAgent(stream)  # type: ignore[assignment]
+        self.project_root = project_root
+        self.agent_calls: list[tuple[tuple, dict]] = []
+
+    async def get_agent(self, *args, **kwargs):
+        self.agent_calls.append((args, kwargs))
+        return self.agent
+
+
+def _generated_output(project_root: Path, name: str) -> Path:
+    """Create one generated output file under ``project_root``."""
+    output = project_root / ".files" / "outputs" / name
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("data\n", encoding="utf-8")
+    return output.resolve()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("argv", "explicit", "level"),
+    [
+        (["--prompt", "hello"], False, "medium"),
+        (["--prompt", "hello", "--reasoning", "high"], True, "high"),
+    ],
+)
+async def test_cli_passes_reasoning_level_is_explicit(
+    tmp_path: Path, argv: list[str], explicit: bool, level: str
+) -> None:
+    """Only an explicit --reasoning flag marks the reasoning level explicit."""
+    runtime = _ScriptedRuntime(_ScriptedStream([]), tmp_path)
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        chainagents_cli.parse_args(argv),
+        prompt="hello",
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    [(args, kwargs)] = runtime.agent_calls
+    assert args == (level,)
+    assert kwargs["reasoning_level_is_explicit"] is explicit
+
+
+@pytest.mark.anyio
+async def test_cli_prints_generated_files_after_the_response(tmp_path: Path) -> None:
+    """Generated output paths are listed on stderr after the printed response."""
+    output = _generated_output(tmp_path, "report.md")
+    runtime = _ScriptedRuntime(
+        _ScriptedStream([_token_event("Wrote /workspace/.files/outputs/report.md")]),
+        tmp_path,
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        chainagents_cli.parse_args(["--prompt", "hello", "--no-stream"]),
+        prompt="hello",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert code == 0
+    assert stdout.getvalue() == "Wrote /workspace/.files/outputs/report.md\n"
+    assert stderr.getvalue() == f"Generated files:\n  {output}\n"
+    assert runtime.agent.stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_cli_prints_generated_files_and_error_on_failure(tmp_path: Path) -> None:
+    """A failed run still lists generated files, then reports the error."""
+    output = _generated_output(tmp_path, "partial.csv")
+    runtime = _ScriptedRuntime(
+        _ScriptedStream(
+            [_token_event("Saved /workspace/.files/outputs/partial.csv")],
+            error=RuntimeError("model went away"),
+        ),
+        tmp_path,
+    )
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        chainagents_cli.parse_args(["--prompt", "hello", "--no-stream"]),
+        prompt="hello",
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 1
+    assert stderr.getvalue() == (
+        f"Generated files:\n  {output}\nRuntimeError: model went away\n"
+    )
+    assert runtime.agent.stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_cli_failure_traceback_only_with_show_flags(tmp_path: Path) -> None:
+    """The failure traceback is printed only with --show-tools/--show-reasoning."""
+    runtime = _ScriptedRuntime(
+        _ScriptedStream([], error=RuntimeError("model went away")), tmp_path
+    )
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        chainagents_cli.parse_args(["--prompt", "hello", "--show-tools"]),
+        prompt="hello",
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 1
+    assert stderr.getvalue().startswith("RuntimeError: model went away\n")
+    assert "Traceback (most recent call last)" in stderr.getvalue()
+
+
+@pytest.mark.anyio
+async def test_cli_json_payload_lists_generated_files(tmp_path: Path) -> None:
+    """JSON output carries generated paths in the payload, not on stderr."""
+    output = _generated_output(tmp_path, "report.md")
+    runtime = _ScriptedRuntime(
+        _ScriptedStream([_token_event("See /workspace/.files/outputs/report.md")]),
+        tmp_path,
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        chainagents_cli.parse_args(["--prompt", "hello", "--json"]),
+        prompt="hello",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert code == 0
+    payload = json.loads(stdout.getvalue())
+    assert payload["response"] == "See /workspace/.files/outputs/report.md"
+    assert payload["generated_files"] == [str(output)]
+    assert stderr.getvalue() == ""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("json_flag", [[], ["--json"]])
+async def test_cli_mcp_command_keeps_stdout_pure_json(
+    tmp_path: Path, json_flag: list[str]
+) -> None:
+    """MCP-tool output stays raw JSON on stdout; generated files go to stderr."""
+    output = _generated_output(tmp_path, "a.txt")
+
+    class Runtime(_FakeMcpRuntime):
+        project_root = tmp_path
+
+        async def invoke_mcp_tool_command(self, **kwargs):
+            await super().invoke_mcp_tool_command(**kwargs)
+            return {"path": "/workspace/.files/outputs/a.txt"}
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        Runtime(),  # type: ignore[arg-type]
+        chainagents_cli.parse_args(
+            ["--prompt", "ignored", "--command", "repo-readme", *json_flag]
+        ),
+        prompt="ignored",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert code == 0
+    assert json.loads(stdout.getvalue()) == {"path": "/workspace/.files/outputs/a.txt"}
+    assert stderr.getvalue() == f"Generated files:\n  {output}\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("argv", "prompt"),
+    [
+        (["--prompt", "/nope now"], "/nope now"),
+        (["--prompt", "hi", "--command", "nope"], "hi"),
+    ],
+)
+async def test_cli_unknown_command_exits_2(
+    tmp_path: Path, argv: list[str], prompt: str
+) -> None:
+    """Unknown typed or selected commands exit 2 without running the agent."""
+
+    class Runtime(_ScriptedRuntime):
+        def resolve_chainlit_command(self, name: str):
+            return None
+
+    runtime = Runtime(_ScriptedStream([]), tmp_path)
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        runtime,  # type: ignore[arg-type]
+        chainagents_cli.parse_args(argv),
+        prompt=prompt,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 2
+    assert stderr.getvalue() == "Unknown command /nope.\n"
+    assert runtime.agent_calls == []
+
+
+@pytest.mark.anyio
+async def test_cli_command_error_exits_1_with_real_message() -> None:
+    """A failing command prints its real error text and exits 1."""
+
+    class Runtime(_FakeMcpRuntime):
+        async def invoke_mcp_tool_command(self, **kwargs):
+            raise RuntimeError("repo server exploded")
+
+    stderr = io.StringIO()
+
+    code = await chainagents_cli.run_agent_prompt(
+        Runtime(),  # type: ignore[arg-type]
+        chainagents_cli.parse_args(["--prompt", "x", "--command", "repo-readme"]),
+        prompt="x",
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 1
+    assert stderr.getvalue() == "Command /repo-readme failed: repo server exploded\n"
+
+
+@pytest.mark.anyio
+async def test_cli_cancelled_turn_propagates_and_closes_stream(tmp_path: Path) -> None:
+    """Cancelling a running prompt re-raises CancelledError and closes the stream."""
+    stream = _ScriptedStream([_token_event("partial")], block=True)
+    runtime = _ScriptedRuntime(stream, tmp_path)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    task = asyncio.create_task(
+        chainagents_cli.run_agent_prompt(
+            runtime,  # type: ignore[arg-type]
+            chainagents_cli.parse_args(["--prompt", "hello"]),
+            prompt="hello",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    )
+    while not (stream.started.is_set() and not stream.events):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stream.closed is True
+    assert stdout.getvalue() == "partial"
+    assert stderr.getvalue() == ""
+
+
 @pytest.mark.anyio
 async def test_one_shot_json_waits_for_background_tasks(monkeypatch) -> None:
     """One-shot JSON must contain terminal local background task results."""
@@ -1755,12 +2071,32 @@ class _ToolMessage:
         self.content = content
 
 
+def _event_feeder(renderer):
+    """Return a coroutine that renders raw chunks the way the turn runner does.
+
+    One adapter per renderer mirrors one ``TurnRunner`` turn.
+    """
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    async def feed(raw_event) -> None:
+        for event in adapter.events_from_raw_event(raw_event):
+            await renderer.on_event(event)
+
+    return feed
+
+
+async def _complete(renderer, **kwargs) -> None:
+    """Finish a renderer turn with a completed agent-run result."""
+    await renderer.on_complete(
+        TurnResult(status="completed", prompt="hello", **kwargs)
+    )
+
+
 @pytest.mark.anyio
 async def test_cli_event_renderer_streams_final_response() -> None:
     """Verify that CLI event renderer streams final response."""
     stdout = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=stdout,
         stderr=io.StringIO(),
         stream=True,
@@ -1768,8 +2104,9 @@ async def test_cli_event_renderer_streams_final_response() -> None:
         show_reasoning=False,
         show_tools=False,
     )
+    feed = _event_feeder(renderer)
 
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
@@ -1781,7 +2118,7 @@ async def test_cli_event_renderer_streams_final_response() -> None:
             },
         }
     )
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
@@ -1794,9 +2131,9 @@ async def test_cli_event_renderer_streams_final_response() -> None:
         }
     )
 
-    response = renderer.finish()
+    await _complete(renderer)
 
-    assert response == "Hello world"
+    assert renderer.response_buffer == "Hello world"
     assert stdout.getvalue() == "Hello world\n"
 
 
@@ -1805,7 +2142,6 @@ async def test_cli_event_renderer_formats_reasoning_trace() -> None:
     """Verify that CLI event renderer formats reasoning trace."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=io.StringIO(),
         stderr=stderr,
         stream=True,
@@ -1813,8 +2149,9 @@ async def test_cli_event_renderer_formats_reasoning_trace() -> None:
         show_reasoning=True,
         show_tools=False,
     )
+    feed = _event_feeder(renderer)
 
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
@@ -1835,7 +2172,6 @@ async def test_cli_event_renderer_appends_reasoning_chunks_inline() -> None:
     """Verify that CLI event renderer appends reasoning chunks inline."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=io.StringIO(),
         stderr=stderr,
         stream=True,
@@ -1843,9 +2179,10 @@ async def test_cli_event_renderer_appends_reasoning_chunks_inline() -> None:
         show_reasoning=True,
         show_tools=False,
     )
+    feed = _event_feeder(renderer)
 
     for reasoning in ("thinking", "thinking through", "thinking through details"):
-        await renderer.handle_event(
+        await feed(
             {
                 "event": "on_chain_stream",
                 "data": {
@@ -1857,7 +2194,7 @@ async def test_cli_event_renderer_appends_reasoning_chunks_inline() -> None:
                 },
             }
         )
-    renderer.finish()
+    await _complete(renderer)
 
     output = stderr.getvalue()
     assert output.count("[reasoning:main-agent]") == 1
@@ -1869,7 +2206,6 @@ async def test_cli_event_renderer_uses_block_panel_for_tool_call_start() -> None
     """Verify that CLI event renderer uses block panel for tool call start."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=io.StringIO(),
         stderr=stderr,
         stream=True,
@@ -1877,8 +2213,9 @@ async def test_cli_event_renderer_uses_block_panel_for_tool_call_start() -> None
         show_reasoning=False,
         show_tools=True,
     )
+    feed = _event_feeder(renderer)
 
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
@@ -1909,7 +2246,6 @@ async def test_cli_event_renderer_shows_summarization_status() -> None:
     """Verify that CLI event renderer shows summarization status."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=io.StringIO(),
         stderr=stderr,
         stream=True,
@@ -1917,8 +2253,9 @@ async def test_cli_event_renderer_shows_summarization_status() -> None:
         show_reasoning=False,
         show_tools=False,
     )
+    feed = _event_feeder(renderer)
 
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
@@ -1947,7 +2284,6 @@ async def test_cli_event_renderer_accumulates_tool_args_across_chunks() -> None:
     """Verify that CLI event renderer accumulates tool args across chunks."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=io.StringIO(),
         stderr=stderr,
         stream=True,
@@ -1955,14 +2291,15 @@ async def test_cli_event_renderer_accumulates_tool_args_across_chunks() -> None:
         show_reasoning=False,
         show_tools=True,
     )
+    feed = _event_feeder(renderer)
 
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {"chunk": ((), "messages", (_ToolCallChunkToken({"id": "call-9", "name": "read_file", "args": '{"path":"REA'}), {}))},
         }
     )
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {"chunk": ((), "messages", (_ToolCallChunkToken({"id": "call-9", "args": 'DME.md"}'}), {}))},
@@ -1981,7 +2318,6 @@ async def test_cli_event_renderer_truncates_tool_results_to_200_characters() -> 
     """Verify that CLI event renderer truncates tool results to 200 characters."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=io.StringIO(),
         stderr=stderr,
         stream=True,
@@ -1989,11 +2325,12 @@ async def test_cli_event_renderer_truncates_tool_results_to_200_characters() -> 
         show_reasoning=False,
         show_tools=True,
     )
+    feed = _event_feeder(renderer)
     long_result = ("abcdefghijklmnopqrstuvwxyz" * 8) + "TAIL"
 
     assert chainagents_cli.truncate_tool_result_content(long_result) == long_result[:200]
 
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
@@ -2024,7 +2361,6 @@ async def test_cli_event_renderer_deduplicates_tool_results_from_stream_modes() 
     """Verify that CLI event renderer deduplicates tool results from stream modes."""
     stderr = io.StringIO()
     renderer = chainagents_cli.CliEventRenderer(
-        prompt="hello",
         stdout=io.StringIO(),
         stderr=stderr,
         stream=True,
@@ -2032,9 +2368,10 @@ async def test_cli_event_renderer_deduplicates_tool_results_from_stream_modes() 
         show_reasoning=False,
         show_tools=True,
     )
+    feed = _event_feeder(renderer)
     tool_message = _ToolMessage("same result")
 
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
@@ -2046,7 +2383,7 @@ async def test_cli_event_renderer_deduplicates_tool_results_from_stream_modes() 
             },
         }
     )
-    await renderer.handle_event(
+    await feed(
         {
             "event": "on_chain_stream",
             "data": {
