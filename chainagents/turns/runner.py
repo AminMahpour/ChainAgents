@@ -13,7 +13,6 @@ from typing import Any, Literal
 from chainagents.commands.native import (
     RuntimeCommandResult,
     dumps_tool_result,
-    parse_native_command,
     resolve_native_command,
     resolve_runtime_command,
 )
@@ -50,7 +49,9 @@ class TurnRequest:
     ``prompt`` is the raw user text used for native command resolution. After
     resolution the agent prompt is decorated with ``image_names`` and
     ``prompt_note`` (see ``prompt_with_images``) and sent with
-    ``content_parts`` (image parts) after ``history``.
+    ``content_parts`` (image parts) after ``history``. ``run_config_extras``
+    keys shallowly override the keys of ``build_langgraph_run_config`` (for
+    example a ``callbacks`` or ``metadata`` entry replaces the tracing value).
     """
 
     prompt: str
@@ -69,7 +70,11 @@ class TurnRequest:
 
 
 class TurnCommandError(Exception):
-    """A failed or unknown native command with a user-safe message."""
+    """A failed or unknown native command.
+
+    ``message`` is user-safe when the runner sanitises errors, otherwise it is
+    the real exception text; the original exception is ``__cause__``.
+    """
 
     def __init__(
         self,
@@ -114,21 +119,34 @@ class TurnResult:
 class TurnRunner:
     """Own the canonical flow of one agent turn for every front end."""
 
-    def __init__(self, runtime: Any) -> None:
+    def __init__(self, runtime: Any, *, sanitize_errors: bool = True) -> None:
+        """Bind the runner to ``runtime``.
+
+        ``sanitize_errors`` replaces command-error messages and the
+        reflection-proposal failure text with fixed messages (logging the real
+        exception). Keep it on wherever errors cross the network (the API);
+        local front ends pass False to show the real exception text.
+        """
         self.runtime = runtime
+        self.sanitize_errors = sanitize_errors
 
     async def run(self, request: TurnRequest, renderer: TurnRenderer) -> TurnResult:
         """Run one turn, reporting output to ``renderer``.
 
         Command and agent failures are reported to the renderer and returned in
-        the result; they are not raised. ``CancelledError`` is re-raised after
-        ``renderer.on_cancelled()``.
+        the result; they are not raised. A renderer callback that raises while
+        events stream counts as an agent failure, but one that raises during
+        the finish steps (``on_generated_files``, ``on_reflection``,
+        ``on_error``, ``on_complete``) or a command outcome propagates out of
+        ``run``. ``CancelledError`` is re-raised after ``renderer.on_cancelled()``.
         """
         try:
             return await self._run(request, renderer)
         except asyncio.CancelledError:
-            with suppress(Exception):
+            try:
                 await renderer.on_cancelled()
+            except Exception:
+                logger.exception("Turn renderer failed while handling cancellation.")
             raise
 
     async def _run(self, request: TurnRequest, renderer: TurnRenderer) -> TurnResult:
@@ -149,7 +167,11 @@ class TurnRunner:
                 )
             except ValueError as exc:
                 command_error = TurnCommandError(
-                    safe_command_validation_error(exc),
+                    (
+                        safe_command_validation_error(exc)
+                        if self.sanitize_errors
+                        else str(exc)
+                    ),
                     command_name=parsed.command_name,
                     status=422,
                 )
@@ -158,21 +180,20 @@ class TurnRunner:
                 raise
             except Exception as exc:
                 command_error = TurnCommandError(
-                    safe_backend_error(exc),
+                    safe_backend_error(exc) if self.sanitize_errors else str(exc),
                     command_name=parsed.command_name,
                     status=500,
                 )
                 command_error.__cause__ = exc
+            # resolve_native_command only parses a selected command or typed
+            # ``/name`` text, so an unknown parsed command is always an error.
             if command_result is not None and command_result.target == "unknown":
-                if _unknown_command_is_error(request):
-                    command_error = TurnCommandError(
-                        f"Unknown command `/{command_result.command_name}`.",
-                        command_name=command_result.command_name,
-                        status=422,
-                        unknown=True,
-                    )
-                else:
-                    command_result = None
+                command_error = TurnCommandError(
+                    f"Unknown command `/{command_result.command_name}`.",
+                    command_name=command_result.command_name,
+                    status=422,
+                    unknown=True,
+                )
             if command_error is not None:
                 await renderer.on_command_error(command_error, command_error.status)
                 result = TurnResult(
@@ -272,8 +293,10 @@ class TurnRunner:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # The proposal may be shown to users, so never embed backend text.
-            collector.mark_run_failed(RuntimeError("Agent operation failed."))
+            # A sanitised proposal may cross the network, so omit backend text.
+            collector.mark_run_failed(
+                RuntimeError("Agent operation failed.") if self.sanitize_errors else exc
+            )
             result.status = "failed"
             result.error = exc
         result.response = "".join(response_parts)
@@ -377,12 +400,6 @@ class _GeneratedPathTracker:
                 self.paths.extend(
                     generated_file_paths_from_tool_result(tool_name, event.tool_result)
                 )
-
-
-def _unknown_command_is_error(request: TurnRequest) -> bool:
-    """Unknown commands fail only when explicitly selected or typed as ``/name``."""
-    selected = str(request.selected_command or "").strip().lstrip("/")
-    return bool(selected) or parse_native_command(request.prompt) is not None
 
 
 def safe_backend_error(exc: Exception, message: str = DEFAULT_BACKEND_ERROR) -> str:

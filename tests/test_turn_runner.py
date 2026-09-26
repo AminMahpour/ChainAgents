@@ -440,3 +440,99 @@ def test_cancellation_notifies_renderer_reraises_and_closes_stream(
 
     assert renderer.kinds() == ["event", "cancelled"]
     assert runtime.agent.stream.closed
+
+
+def test_unsanitised_runner_keeps_real_error_text(tmp_path: Path) -> None:
+    runtime = _make_runtime(tmp_path)
+    runtime.command_error = RuntimeError("backend exploded")
+    renderer = _RecordingRenderer()
+
+    result = asyncio.run(
+        TurnRunner(runtime, sanitize_errors=False).run(
+            _request("/lookup q"), renderer
+        )
+    )
+
+    assert result.command_error is not None
+    assert result.command_error.message == "backend exploded"
+    assert result.command_error.status == 500
+
+    runtime.command_error = ValueError("bad args")
+    result = asyncio.run(
+        TurnRunner(runtime, sanitize_errors=False).run(
+            _request("/lookup q"), _RecordingRenderer()
+        )
+    )
+    assert result.command_error is not None
+    assert result.command_error.message == "bad args"
+    assert result.command_error.status == 422
+
+
+@pytest.mark.parametrize(
+    ("sanitize", "expected", "hidden"),
+    [
+        (True, "Agent operation failed.", "credential=supersecret"),
+        (False, "credential=supersecret", None),
+    ],
+)
+def test_failure_reflection_text_follows_sanitize_mode(
+    tmp_path: Path, sanitize: bool, expected: str, hidden: str | None
+) -> None:
+    error = RuntimeError("credential=supersecret")
+    call = _Token()
+    call.tool_call_chunks = [{"id": "call-1", "name": "read_file", "args": "{}"}]
+    failed = SimpleNamespace(
+        type="tool",
+        name="read_file",
+        status="error",
+        tool_call_id="call-1",
+        content="",
+    )
+    runtime = _make_runtime(
+        tmp_path,
+        [_raw(((), "messages", (call, {}))), _raw(((), "messages", (failed, {})))],
+        error=error,
+    )
+
+    result = asyncio.run(
+        TurnRunner(runtime, sanitize_errors=sanitize).run(
+            _request("hi"), _RecordingRenderer()
+        )
+    )
+
+    assert result.error is error
+    assert result.reflection is not None
+    payload = json.dumps(result.reflection.to_payload())
+    assert expected in payload
+    if hidden is not None:
+        assert hidden not in payload
+
+
+def test_mcp_outage_is_reported_as_mcp_status_event(tmp_path: Path) -> None:
+    class _DegradedRuntime(_FakeRuntime):
+        async def get_agent_with_status(self, *args, **kwargs):
+            self.agent_requests.append({"args": args, "kwargs": kwargs})
+            return self.agent, ("docs",)
+
+    runtime = _DegradedRuntime(_FakeAgent(_FakeStream([_token("Ready")])), tmp_path)
+
+    result, renderer = _run(runtime, _request("hello"))
+
+    events = [value for name, value in renderer.calls if name == "event"]
+    assert events[0].kind == "mcp_status"
+    assert events[0].status == "warning"
+    assert events[0].text == (
+        "MCP server unavailable: docs. Continuing with available tools."
+    )
+    assert result.response == "Ready"
+
+
+def test_mcp_command_can_emit_reflection_from_user_text(tmp_path: Path) -> None:
+    runtime = _make_runtime(tmp_path)
+
+    result, renderer = _run(runtime, _request("/lookup That was wrong, fix it"))
+
+    assert renderer.kinds() == ["command_result", "reflection", "complete"]
+    assert result.reflection is not None
+    assert result.reflection.reason == "correction"
+    assert runtime.agent_requests == []

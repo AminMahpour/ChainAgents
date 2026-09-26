@@ -36,7 +36,7 @@ class TurnRenderer(Protocol):
         ...
 
     async def on_command_error(self, exc: TurnCommandError, status: int) -> None:
-        """Render a failed or unknown native command (message already sanitised)."""
+        """Render a failed or unknown native command (see ``TurnCommandError``)."""
         ...
 
     async def on_generated_files(self, files: list[GeneratedFileDescriptor]) -> None:
