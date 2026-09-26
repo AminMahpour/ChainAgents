@@ -27,12 +27,15 @@ Example:
 provider = "ollama"
 base_url = "http://127.0.0.1:11434"
 name = "gpt-oss:20b"
-reasoning = "medium"
+reasoning_effort = "medium"
 ```
 
-Every `[model]` value can be overridden at launch with the matching
-`DEEPAGENT_MODEL_*` environment variable (see
-[Getting Started](getting_started.md#environment-variables)).
+At launch, the supported `DEEPAGENT_MODEL_*` environment overrides
+(`DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`,
+`DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`,
+`DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_API_KEY`) replace the matching
+`[model]` values. Other model settings (such as `temperature`, `max_tokens`,
+`models`, `modalities`, or `thinking`) are only set in the file.
 
 ## Agent runtime
 
@@ -57,20 +60,33 @@ directory layout.
 
 ## MCP servers
 
-MCP (Model Context Protocol) servers are configured as `[[mcp.servers]]`
-entries and expose their tools to the agent. MCP sessions are managed by
+MCP (Model Context Protocol) servers are configured as **named tables** under
+`[mcp.servers]`, one table per server:
+
+```toml
+[mcp.servers.docs]
+transport = "streamable_http"
+url = "http://127.0.0.1:9000/mcp"
+```
+
+They expose their tools to the agent; MCP sessions are managed by
 `chainagents.runtime.mcp_sessions`.
 
 ## Subagents
 
 Subagents delegate tasks with isolated context windows and are configured as
-`[[subagent]]` entries. They can be:
+`[[subagents]]` entries. Their execution modes:
 
-- **Synchronous or asynchronous** — async subagents run as local background
-  tasks with completion notifications in the UI.
-- **Nested** — a subagent can declare its own children, either private inline
-  definitions or reuse of a top-level subagent.
-- **Model-specific** — each subagent may pin its own `model`.
+- **Synchronous** (default) — the parent agent waits for the result.
+- **Local background** — additionally requires `background = true` on the
+  entry *and* `[agent.background_subagents].enabled = true`; these run as
+  process-local background tasks with completion notifications in the UI.
+- **Remote async** — Agent Protocol jobs declared under `[[async_subagents]]`
+  (or as a `[[subagents]]` entry carrying a `graph_id`).
+
+Subagents can also be **nested** — a subagent can declare its own children,
+either private inline definitions or reuse of a top-level subagent — and each
+subagent may pin its own `model`.
 
 ## RAG
 
@@ -80,20 +96,28 @@ embedding model such as `nomic-embed-text` first.
 
 ## Chainlit app behavior
 
-Chainlit UI behavior is configured in `chainlit.toml` (app-specific options
-such as model selection visibility, per-message reasoning overrides, and
-reasoning panel display) and `.chainlit/config.toml` (native Chainlit
-config).
+App-specific Chainlit switches — model selection visibility, per-message
+reasoning overrides (`reasoning_mode_enabled`), and reasoning panel display
+(`reasoning_steps_enabled`) — live in the top-level `[chainlit]` table of
+`deepagent.toml`. The root `chainlit.toml` holds only native Chainlit
+settings (currently the `[steps]` table), and `.chainlit/config.toml` is the
+native Chainlit config.
 
 ## Tracing
 
-Optional tracing integrations:
+Optional tracing integrations are **disabled by default** and need both an
+enable switch and credentials:
 
-- **Langfuse** — set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and
-  optionally `LANGFUSE_BASE_URL`.
-- **LangSmith** — set the standard `LANGSMITH_*` environment variables
-  (`LANGSMITH_PROJECT`, and optionally `LANGSMITH_ENDPOINT` and
-  `LANGSMITH_WORKSPACE_ID` for non-default regions/workspaces).
+- **Langfuse** — set `[langfuse].enabled = true` in `deepagent.toml`, then
+  `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optionally
+  `LANGFUSE_BASE_URL`.
+- **LangSmith** — set `[langsmith].enabled = true`, then the standard
+  `LANGSMITH_*` environment variables (`LANGSMITH_PROJECT`, and optionally
+  `LANGSMITH_ENDPOINT` and `LANGSMITH_WORKSPACE_ID` for non-default
+  regions/workspaces).
+
+Setting only the environment variables leaves tracing off; no traces are
+exported until the matching table is enabled.
 
 ## Security
 

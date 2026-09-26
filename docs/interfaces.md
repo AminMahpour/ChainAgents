@@ -29,10 +29,12 @@ Notable UI features:
 - Notifications when asynchronous background subagents finish.
 - Optional authentication via `CHAINLIT_AUTH_SECRET` and
   `CHAINLIT_AUTH_USERS`.
-- Optional native Chainlit history backed by Postgres when `DATABASE_URL`
-  is set.
+- Optional native Chainlit history, which needs all three: `DATABASE_URL`
+  set, plus both `CHAINLIT_AUTH_SECRET` and `CHAINLIT_AUTH_USERS` — the
+  history bar stays hidden when authentication is off.
 
-UI behavior is tuned in `chainlit.toml` and `.chainlit/config.toml`; see
+App-specific UI switches live in the `[chainlit]` table of
+`deepagent.toml`; see
 [Configuration](configuration.md#chainlit-app-behavior).
 
 ## CLI
@@ -42,14 +44,13 @@ uv run chainagents "summarize the notes in /workspace"
 ```
 
 The CLI exposes the agent without a UI: status output, slash-command
-execution, upload handling, and rendered streaming events. Useful
-subcommands:
+execution, upload handling, and rendered streaming events. Useful flags:
 
 ```bash
-uv run chainagents tui         # full-screen terminal UI
-uv run chainagents status      # check agent status
-uv run chainagents configure   # interactively write deepagent.toml
-uv run chainagents commands    # list available commands
+uv run chainagents --tui             # full-screen terminal UI
+uv run chainagents --status          # print resolved runtime status
+uv run chainagents --configure       # interactively write deepagent.toml
+uv run chainagents --list-commands   # list configured commands
 ```
 
 ## TUI
@@ -65,9 +66,10 @@ uv run chainagents-api --host 127.0.0.1 --port 8000
 ```
 
 A FastAPI application with a streaming endpoint. It uses the same
-`deepagent.toml` and environment settings as the Chainlit app. Authentication,
-rate limiting, and deployment guidance are covered in
-[API_SECURITY.md](API_SECURITY.md).
+`deepagent.toml` and environment settings as the Chainlit app.
+[API_SECURITY.md](API_SECURITY.md) covers authentication and the
+request-size/resource limits — note these are not rate limits, so an
+external rate limiter is required in front of a public deployment.
 
 ## LangGraph Agent Server
 

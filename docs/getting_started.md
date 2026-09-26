@@ -30,11 +30,18 @@ them with `brew install weasyprint`; on Linux, see the
   (usually `http://localhost:1234`), and set
   `[model].provider = "openai_compatible"` with the server's `base_url` in
   `deepagent.toml`.
-- **OpenAI:** set `DEEPAGENT_MODEL_API_KEY`.
-- **Anthropic:** set `[model].provider = "anthropic"` and provide
-  `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY`.
-- **Snowflake Cortex:** use the dedicated `snowflake_cortex` provider and a
-  Snowflake PAT (`SNOWFLAKE_PAT`).
+- **OpenAI:** the checked-in default points at Ollama, so switch providers
+  explicitly: set `[model].provider = "openai_compatible"`, a
+  `[model].base_url` (or `endpoint_url`) targeting OpenAI, and an OpenAI
+  `[model].name` in `deepagent.toml` (or the matching `DEEPAGENT_MODEL_*`
+  overrides), and provide your key via `DEEPAGENT_MODEL_API_KEY` or
+  `[model].api_key`.
+- **Anthropic:** set `[model].provider = "anthropic"` and a `[model].name`,
+  and provide your key via `ANTHROPIC_API_KEY`,
+  `DEEPAGENT_MODEL_API_KEY`, or `[model].api_key`.
+- **Snowflake Cortex:** set `[model].provider = "snowflake_cortex"` with the
+  Cortex `endpoint_url` and `[model].name`, and provide a Snowflake PAT via
+  `SNOWFLAKE_PAT`, `DEEPAGENT_MODEL_API_KEY`, or `[model].api_key`.
 
 See [Configuration](configuration.md) for the full set of options.
 
@@ -55,7 +62,7 @@ uv run chainlit run main.py -w
 uv run chainagents
 
 # Full-screen terminal UI
-uv run chainagents tui
+uv run chainagents --tui
 
 # FastAPI server
 uv run chainagents-api --host 127.0.0.1 --port 8000
@@ -91,15 +98,19 @@ Set these before starting the app for environment-based overrides:
 | `DEEPAGENT_MODEL_NAME` | Model name |
 | `DEEPAGENT_MODEL_REASONING` | Reasoning effort (`low` / `medium` / `high`) |
 | `DEEPAGENT_MODEL_API_KEY` | API key for secured servers |
-| `ANTHROPIC_API_KEY` | Required for the Anthropic provider |
-| `SNOWFLAKE_PAT` | Required for the Snowflake Cortex provider |
+| `ANTHROPIC_API_KEY` | Anthropic-specific key (alternative to `DEEPAGENT_MODEL_API_KEY`) |
+| `SNOWFLAKE_PAT` | Snowflake Cortex-specific key (alternative to `DEEPAGENT_MODEL_API_KEY`) |
 | `DEEPAGENT_RECURSION_LIMIT` | LangGraph recursion limit |
 | `CHAINLIT_AUTH_SECRET` | Long random string for Chainlit auth |
 | `CHAINLIT_AUTH_USERS` | JSON map of Chainlit usernames to passwords |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | Optional Langfuse tracing |
 
-`DEEPAGENT_MODEL_*` variables override the matching `[model]` values in
-`deepagent.toml`.
+The supported environment overrides are `DEEPAGENT_MODEL_PROVIDER`,
+`DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`,
+`DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_REASONING`, and
+`DEEPAGENT_MODEL_API_KEY`, each overriding the matching `[model]` value in
+`deepagent.toml`. Other model settings (such as `temperature`, `max_tokens`,
+or `thinking`) remain file-configured.
 
 ## Next steps
 
