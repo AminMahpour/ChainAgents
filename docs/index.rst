@@ -40,7 +40,9 @@ Highlights
   files mounted for the agent under ``/workspace/``.
 - Context management: long-thread summarization and tool-output offload.
 - Persistent memory via pluggable LangGraph checkpoint and store backends
-  (Postgres when ``DATABASE_URL`` is set, in-memory otherwise).
+  in stateful mode (Postgres when ``DATABASE_URL`` is set, in-memory
+  otherwise). With ``[agent].state = "stateless"``, no checkpoint or store
+  is created at all.
 - Skills, MCP servers, and bring-your-own tools.
 - Optional Langfuse and LangSmith tracing.
 - Per-response Markdown and PDF export buttons in Chainlit.

@@ -44,7 +44,7 @@ App-specific UI switches live in the `[chainlit]` table of
 ## CLI
 
 ```bash
-uv run chainagents "summarize the notes in /workspace"
+uv run chainagents --prompt "Summarize this repository" --thread-id cli
 ```
 
 The CLI exposes the agent without a UI: status output, slash-command
@@ -77,5 +77,12 @@ external rate limiter is required in front of a public deployment.
 
 ## LangGraph Agent Server
 
-`langgraph.json` points at {py:mod}`chainagents.langgraph.app` so the agent can
-also be served through the LangGraph development server and Studio.
+`langgraph.json` registers the `supervisor` and `async-researcher` graphs
+exported by `langgraph_app.py` (backed by
+{py:mod}`chainagents.langgraph.app`), plus a custom HTTP app, so the agent can
+also be served through the LangGraph development server and Studio. Start it
+with enough worker capacity for the supervisor plus background tasks:
+
+```bash
+uv run --with "langgraph-cli[inmem]" langgraph dev --n-jobs-per-worker 10
+```

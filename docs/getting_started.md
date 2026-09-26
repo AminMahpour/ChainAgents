@@ -82,7 +82,7 @@ The Chainlit app is then available at `http://localhost:8000` by default.
   available via `compose.yaml`:
 
   ```bash
-  docker compose up -d
+  docker compose up -d postgres
   export DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=disable"
   ```
 
@@ -99,8 +99,10 @@ Set these before starting the app for environment-based overrides:
 | `DEEPAGENT_CONFIG` | Path to the config file (default: `deepagent.toml`) |
 | `DEEPAGENT_MODEL_PROVIDER` | `ollama`, `openai_compatible`, `anthropic`, or `snowflake_cortex` |
 | `DEEPAGENT_MODEL_BASE_URL` | Model server base URL |
+| `DEEPAGENT_MODEL_ENDPOINT_URL` | Full non-standard model endpoint URL |
 | `DEEPAGENT_MODEL_NAME` | Model name |
 | `DEEPAGENT_MODEL_REASONING` | Reasoning effort (`low` / `medium` / `high`) |
+| `DEEPAGENT_MODEL_DISABLE_STREAMING` | `true`, `false`, or `tool_calling` |
 | `DEEPAGENT_MODEL_API_KEY` | API key for secured servers |
 | `ANTHROPIC_API_KEY` | Anthropic-specific key (alternative to `DEEPAGENT_MODEL_API_KEY`) |
 | `SNOWFLAKE_PAT` | Snowflake Cortex-specific key (alternative to `DEEPAGENT_MODEL_API_KEY`) |
@@ -111,10 +113,14 @@ Set these before starting the app for environment-based overrides:
 
 The supported environment overrides are `DEEPAGENT_MODEL_PROVIDER`,
 `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`,
-`DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_REASONING`, and
-`DEEPAGENT_MODEL_API_KEY`, each overriding the matching `[model]` value in
-`deepagent.toml`. Other model settings (such as `temperature`, `max_tokens`,
-or `thinking`) remain file-configured.
+`DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_REASONING`,
+`DEEPAGENT_MODEL_API_KEY`, `DEEPAGENT_MODEL_DISABLE_STREAMING`, and
+`DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS` (a convenience alias for
+`DEEPAGENT_MODEL_DISABLE_STREAMING="tool_calling"`), each overriding the
+matching `[model]` value in `deepagent.toml`. `OLLAMA_BASE_URL`,
+`OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only
+compatibility aliases. Other model settings (such as `temperature`,
+`max_tokens`, or `thinking`) remain file-configured.
 
 ## Next steps
 

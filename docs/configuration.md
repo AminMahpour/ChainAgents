@@ -33,9 +33,13 @@ reasoning_effort = "medium"
 At launch, the supported `DEEPAGENT_MODEL_*` environment overrides
 (`DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`,
 `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`,
-`DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_API_KEY`) replace the matching
-`[model]` values. Other model settings (such as `temperature`, `max_tokens`,
-`models`, `modalities`, or `thinking`) are only set in the file.
+`DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_API_KEY`,
+`DEEPAGENT_MODEL_DISABLE_STREAMING`, and
+`DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS`) replace the matching
+`[model]` values. `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING`
+still work as Ollama-only compatibility aliases. Other model settings (such as
+`temperature`, `max_tokens`, `models`, `modalities`, or `thinking`) are only
+set in the file.
 
 ## Agent runtime
 
@@ -100,17 +104,27 @@ subagent may pin its own `model`.
 ## RAG
 
 Workspace documentation RAG (index, uploads, and a search tool) is disabled
-until configured in the `[rag]` table. With Ollama embeddings, pull an
-embedding model such as `nomic-embed-text` first.
+until explicitly enabled in the `[rag]` table:
+
+```toml
+[rag]
+enabled = true
+
+[rag.embedding]
+provider = "auto"
+```
+
+With Ollama embeddings, pull an embedding model such as `nomic-embed-text`
+first.
 
 ## Chainlit app behavior
 
 App-specific Chainlit switches — model selection visibility, per-message
 reasoning overrides (`reasoning_mode_enabled`), and reasoning panel display
 (`reasoning_steps_enabled`) — live in the top-level `[chainlit]` table of
-`deepagent.toml`. The root `chainlit.toml` holds only native Chainlit
-settings (currently the `[steps]` table), and `.chainlit/config.toml` is the
-native Chainlit config.
+`deepagent.toml`. The root `chainlit.toml` holds app-specific UI behavior the
+Chainlit bridge owns (currently the `[steps]` auto-collapse delay, defaulting
+to 3 seconds), and `.chainlit/config.toml` is the native Chainlit config.
 
 ## Tracing
 
@@ -122,14 +136,16 @@ enable switch and credentials:
   `LANGFUSE_BASE_URL`.
 - **LangSmith** — set `[langsmith].enabled = true`, then provide
   `LANGSMITH_API_KEY` (the authentication credential the SDK client is
-  built from) plus `LANGSMITH_PROJECT`; `LANGSMITH_ENDPOINT` and
-  `LANGSMITH_WORKSPACE_ID` are optional routing settings for non-default
-  regions/workspaces.
+  built from). The TOML `project` setting takes precedence over
+  `LANGSMITH_PROJECT`, and when neither is set, traces go to the
+  `chainagents` project. `LANGSMITH_ENDPOINT` and `LANGSMITH_WORKSPACE_ID`
+  are optional routing settings for non-default regions/workspaces.
 
 Setting only the environment variables leaves tracing off; no traces are
 exported until the matching table is enabled.
 
 ## Security
 
-The HTTP API's authentication and rate-limiting model is documented in
-[API_SECURITY.md](API_SECURITY.md).
+The HTTP API's authentication and request-size/resource limits are
+documented in [API_SECURITY.md](API_SECURITY.md). These bounds are not
+rate limits; a public deployment requires an external rate limiter.
