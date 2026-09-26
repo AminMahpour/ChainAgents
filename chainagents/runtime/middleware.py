@@ -14,6 +14,7 @@ from typing import Any
 from deepagents import create_deep_agent
 from deepagents.backends import BackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
@@ -315,6 +316,8 @@ class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
             Whether the next model call will trigger summarization.
         """
         try:
+            if not isinstance(self.inner, SummarizationMiddleware):
+                return False
             messages = state["messages"]
             ensure_ids = getattr(self.inner, "_ensure_message_ids", None)
             if callable(ensure_ids):
@@ -428,18 +431,22 @@ def _build_deepagents_summarization_factory(
 
     def factory(model: Any, backend: Any) -> AgentMiddleware[Any, Any, Any]:
         """Create DeepAgents summarization middleware with configured thresholds."""
+        from langchain.agents.middleware.summarization import ContextSize
+
         from deepagents.middleware.summarization import (
             SummarizationMiddleware,
             compute_summarization_defaults,
         )
 
         defaults = compute_summarization_defaults(model)
-        trigger = (
+        trigger: ContextSize = (
             ("tokens", trigger_tokens)
             if trigger_tokens is not None
             else defaults["trigger"]
         )
-        keep = ("tokens", keep_tokens) if keep_tokens is not None else defaults["keep"]
+        keep: ContextSize = (
+            ("tokens", keep_tokens) if keep_tokens is not None else defaults["keep"]
+        )
         return SummarizationMiddleware(
             model=model,
             backend=backend,
@@ -487,7 +494,13 @@ def create_deep_agent_with_configured_summarization(
             return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
 
         if summarization_factory is not None:
-            deepagents_graph.create_summarization_middleware = summarization_factory
+            # This replacement factory intentionally narrows the signature to
+            # the two positional arguments deepagents actually passes at this
+            # call site; the module-level function's broader keyword-only
+            # defaults are not exercised here.
+            deepagents_graph.create_summarization_middleware = (
+                summarization_factory  # type: ignore[assignment]
+            )
         deepagents_graph._harness_profile_for_model = profile_with_token_guard
         try:
             return create_deep_agent(**kwargs)

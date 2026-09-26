@@ -18,6 +18,7 @@ import warnings
 import zlib
 from dataclasses import dataclass
 from io import BytesIO
+from typing import cast
 from urllib.parse import quote, unquote, unquote_to_bytes, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 from xml.parsers import expat
@@ -225,7 +226,10 @@ def _resolve_public_image_url(
 
     addresses: list[str] = []
     for record in records:
-        value = record[4][0]
+        # getaddrinfo's 5th element is always a socket address tuple (2-tuple
+        # for IPv4, 4-tuple for IPv6) whose first item is the address string.
+        sockaddr = cast("tuple[str, ...]", record[4])
+        value = sockaddr[0]
         try:
             address = ipaddress.ip_address(value)
         except ValueError as exc:
@@ -488,12 +492,12 @@ def _validate_pdf_image(
                 raise PdfImageError("image content is invalid")
             with Image.open(BytesIO(content)) as decoded_image:
                 decoded_image.load()
-                normalized = _normalize_pdf_raster_mode(
+                normalized_raster = _normalize_pdf_raster_mode(
                     decoded_image,
                     max_bytes=max_bytes,
                 )
-                if normalized is not None:
-                    return PdfImageResource(normalized, "image/png", pixel_count)
+                if normalized_raster is not None:
+                    return PdfImageResource(normalized_raster, "image/png", pixel_count)
     except PdfImageError:
         raise
     except (

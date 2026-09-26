@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from collections.abc import Iterator
 
+from langchain_core.runnables import RunnableConfig
+
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.types import LangfuseConfig, LangSmithConfig
 
@@ -70,7 +72,7 @@ class LangSmithTracing:
 
         return LangChainTracer(client=self.client, project_name=self.project)
 
-    def with_callback(self, config: dict[str, Any] | None) -> dict[str, Any]:
+    def with_callback(self, config: RunnableConfig | None) -> RunnableConfig:
         """Add the runtime callback unless this invocation already has its tracer."""
         from langchain_core.runnables.config import ensure_config, merge_configs
         from langchain_core.tracers.langchain import LangChainTracer
@@ -84,10 +86,10 @@ class LangSmithTracing:
             and handler.project_name == self.project
             for handler in handlers
         ):
-            return dict(effective_config)
-        return dict(merge_configs(effective_config, {"callbacks": [self.new_callback()]}))
+            return effective_config
+        return merge_configs(effective_config, {"callbacks": [self.new_callback()]})
 
-    def capture_parent(self, run_config: dict[str, Any]) -> LangSmithParentReference | None:
+    def capture_parent(self, run_config: RunnableConfig) -> LangSmithParentReference | None:
         """Capture only trace identity, without carrying runnable callbacks or context."""
         from langchain_core.callbacks.manager import AsyncCallbackManager, CallbackManager
         from langchain_core.tracers.langchain import LangChainTracer
@@ -145,20 +147,25 @@ class LangSmithTracing:
 
         stack = ExitStack()
         try:
-            linked_parent = (
+            use_linked_parent = mode == "linked" and parent is not None
+            linked_parent: RunTree | Literal[False] = (
                 RunTree.from_dotted_order(
                     parent.dotted_order,
                     client=self.client,
                     project_name=parent.project,
                 )
-                if mode == "linked" and parent is not None
+                if use_linked_parent and parent is not None
                 else False
             )
             stack.enter_context(
                 tracing_context(
                     enabled=True,
                     client=self.client,
-                    project_name=parent.project if linked_parent is not False else self.project,
+                    project_name=(
+                        parent.project
+                        if use_linked_parent and parent is not None
+                        else self.project
+                    ),
                     parent=linked_parent,
                 )
             )

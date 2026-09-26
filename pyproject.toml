@@ -82,10 +82,11 @@ ignore_missing_imports = true
 follow_imports = "silent"
 check_untyped_defs = true
 files = [
-    "chainagents/exports/generated_files.py",
+    "chainagents/events",
+    "chainagents/exports",
     "chainagents/interfaces/api/app.py",
     "chainagents/interfaces/api/security.py",
     "chainagents/interfaces/uploads.py",
-    "chainagents/runtime/reflection.py",
+    "chainagents/runtime",
     "chainagents/turns",
 ]

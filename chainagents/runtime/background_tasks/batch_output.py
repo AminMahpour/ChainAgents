@@ -98,9 +98,9 @@ def create_batch_result_output_store(
     )
 
 
-def _safe_batch_path_component(value: str, *, fallback: str) -> str:
+def _safe_batch_path_component(value: str | None, *, fallback: str) -> str:
     """Normalize an untrusted identifier into one bounded path component."""
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("._-")[:80]
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "").strip("._-")[:80]
     normalized = normalized.strip("._-")
     return normalized or fallback
 
@@ -126,7 +126,7 @@ def _is_missing_delete_error(error: str) -> bool:
 async def _write_batch_markdown_files(
     snapshots: Sequence[BackgroundTaskSnapshot],
     *,
-    tool_call_id: str,
+    tool_call_id: str | None,
     store: BatchResultOutputStore,
 ) -> dict[str, object]:
     """Write one persistent Markdown file per snapshot with atomic visibility."""

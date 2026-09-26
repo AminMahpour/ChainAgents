@@ -7,7 +7,7 @@ import dataclasses
 import json
 import uuid
 from collections.abc import Iterable
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 from langchain.tools import ToolRuntime, tool
@@ -164,7 +164,7 @@ def create_background_task_tools(
                 "configurable": configurable,
                 "recursion_limit": recursion_limit,
             }
-            scope = nullcontext()
+            scope: AbstractContextManager[None] = nullcontext()
             if langsmith_tracing is not None:
                 mode = langsmith_tracing.config.background_trace_mode
                 if mode == "separate":

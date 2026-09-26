@@ -7,10 +7,16 @@ import json
 import logging
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from deepagents.backends import StoreBackend
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.sessions import (
+    SSEConnection,
+    StdioConnection,
+    StreamableHttpConnection,
+    WebsocketConnection,
+)
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
@@ -324,8 +330,15 @@ class AgentRuntime:
     async def _initialize(self) -> None:
         """Initialize persistence, RAG, MCP clients, and configured agents."""
         if self.config.extensions.mcp_servers:
-            self._mcp_pool.client = MultiServerMCPClient(
+            # Parsed from user config as generic dicts; each entry's shape is
+            # validated by MultiServerMCPClient itself at construction time.
+            mcp_servers = cast(
+                "dict[str, StdioConnection | SSEConnection | StreamableHttpConnection "
+                "| WebsocketConnection]",
                 self.config.extensions.mcp_servers,
+            )
+            self._mcp_pool.client = MultiServerMCPClient(
+                mcp_servers,
                 tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
             )
 
@@ -336,15 +349,17 @@ class AgentRuntime:
             self._store = InMemoryStore()
             self._checkpointer = MemorySaver()
         else:
-            self._store = await self._exit_stack.enter_async_context(
+            postgres_store = await self._exit_stack.enter_async_context(
                 AsyncPostgresStore.from_conn_string(self.config.database_url)
             )
-            await self.store.setup()
+            await postgres_store.setup()
+            self._store = postgres_store
 
-            self._checkpointer = await self._exit_stack.enter_async_context(
+            postgres_checkpointer = await self._exit_stack.enter_async_context(
                 AsyncPostgresSaver.from_conn_string(self.config.database_url)
             )
-            await self.checkpointer.setup()
+            await postgres_checkpointer.setup()
+            self._checkpointer = postgres_checkpointer
 
         if self.config.rag is not None:
             self._rag_service = WorkspaceDocsRAG(

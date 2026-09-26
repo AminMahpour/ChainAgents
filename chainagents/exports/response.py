@@ -16,7 +16,7 @@ import weakref
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import chainlit as cl
@@ -338,7 +338,10 @@ def attach_response_export_actions(
     generated_elements = generated_file_elements(generated_files)
     if generated_elements:
         existing_elements = list(getattr(message, "elements", []) or [])
-        message.elements = [*existing_elements, *generated_elements]
+        combined_elements: list[Element] = [*existing_elements, *generated_elements]
+        # cl.Message.elements is typed List[ElementBased], an unbound TypeVar in
+        # chainlit's stub; cast bridges that stub quirk without a runtime effect.
+        message.elements = cast("list[Any]", combined_elements)
 
 
 def response_actions_for_message(

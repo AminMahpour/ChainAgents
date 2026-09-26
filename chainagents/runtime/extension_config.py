@@ -526,7 +526,11 @@ def validate_subagent_names(
 ) -> None:
     """Validate top-level subagent name uniqueness across sync and async specs."""
     seen_names: set[str] = set()
-    for subagent in (*subagents, *async_subagents):
+    combined: tuple[SubagentConfig | AsyncSubagentConfig, ...] = (
+        *subagents,
+        *async_subagents,
+    )
+    for subagent in combined:
         if subagent.name in seen_names:
             raise ValueError(
                 f"Top-level subagent name '{subagent.name}' is defined more than once."
