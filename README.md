@@ -327,6 +327,8 @@ chainagents/
                         upload handling, and event rendering.
     tui/                Full-screen Textual terminal UI.
     api/                FastAPI application, request schemas, and streaming API.
+  turns/                Shared TurnRunner: one agent turn (commands, uploads,
+                        streaming, generated files) used by every interface.
   events/               Shared LangGraph stream normalization used by all
                         interfaces.
   commands/             Native slash-command parsing and dispatch helpers.
@@ -1296,7 +1298,7 @@ Current scope of this config support:
   configured backend must also implement sandbox execution
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
-- if you need custom Python tools, define them alongside the generated UI tool in [chainagents/runtime/commands.py](chainagents/runtime/commands.py), then register them in [graph.py](chainagents/runtime/graph.py) for static graphs and [lifecycle.py](chainagents/runtime/lifecycle.py) for live runtime agents
+- if you need custom Python tools, define them alongside the generated UI tool in [chainagents/runtime/commands.py](chainagents/runtime/commands.py), then add them in `build_main_tools` in [graph.py](chainagents/runtime/graph.py); both the static LangGraph graph and the live runtime agent ([lifecycle.py](chainagents/runtime/lifecycle.py)) assemble their tools through that one function
 
 See [deepagent.toml.example](deepagent.toml.example) for a portable baseline and
 the sections above for optional MCP and subagent examples.
@@ -1321,8 +1323,9 @@ the sections above for optional MCP and subagent examples.
 ## Runtime module structure
 
 The public runtime API is `chainagents.runtime`. `runtime/core.py` explicitly
-re-exports the same objects for compatibility, and `deepagent_runtime` remains an
-alias of that facade.
+re-exports the same objects for compatibility. The root-level `deepagent_runtime`
+module remains an alias of that facade but is deprecated and will be removed in a
+future release; import from `chainagents.runtime` instead.
 
 | Modules in `chainagents/runtime/` | Responsibility |
 | --- | --- |
@@ -1333,8 +1336,12 @@ alias of that facade.
 | `backends.py` | Workspace paths and filesystem/storage backend routing |
 | `middleware.py` | Tool resilience and summarization middleware |
 | `commands.py` | Generated UI tools and skill command discovery |
-| `graph.py` | Tool schemas, nested subagents, and static graph assembly |
+| `artifacts.py` | Session-scoped storage for offloaded large tool results |
+| `graph.py` | Shared agent assembly (main tools, subagent specs, agent kwargs) used by both the static graph and the live runtime |
 | `tracing.py` | Langfuse callbacks and LangGraph run configuration |
+| `mcp_sessions.py` | MCP session pool, stateful transport ownership, and tool discovery caching |
+| `rag_ops.py` | RAG index status, rebuild, and thread-scoped upload operations |
+| `background_tasks/` | Process-local background execution of configured synchronous subagents |
 | `lifecycle.py`, `reflection.py` | Agent/MCP/persistence lifecycle and correction reflection |
 
 Implementation modules import their lower-level owners directly; they never import

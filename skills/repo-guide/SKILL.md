@@ -17,8 +17,11 @@ Working rules:
 1. Read the relevant files in `/workspace/` before answering.
 2. Prefer concrete file references over vague summaries.
 3. Start with the highest-signal files first:
-   `README.md`, `main.py`, `chainagents/runtime/core.py`,
+   `README.md`, `main.py`, `chainagents/runtime/graph.py` (shared agent
+   assembly), `chainagents/runtime/lifecycle.py`, `chainagents/turns/runner.py`
+   (the turn runner shared by every interface),
    `chainagents/interfaces/chainlit/bridge.py`, and config files.
+   `chainagents/runtime/core.py` is only a re-export facade.
 4. If the user asks how to change behavior, identify the likely edit points and explain why.
 5. Keep the answer concise and implementation-oriented.
 
