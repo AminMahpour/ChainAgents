@@ -1977,7 +1977,7 @@ def test_batch_markdown_files_write_standalone_reports_in_input_order(
             backend_prefix=generated_outputs_route_prefix(tmp_path),
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2092,7 +2092,7 @@ def test_batch_markdown_files_use_unique_sanitized_paths(
         )
         identifiers = iter(("firstunique", "secondunique"))
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex=next(identifiers)),
         )
@@ -2181,7 +2181,7 @@ def test_batch_markdown_files_roll_back_partial_writes(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2234,7 +2234,7 @@ def test_batch_markdown_files_remove_the_failed_write_path(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2275,7 +2275,7 @@ def test_batch_markdown_files_remove_real_filesystem_partial_writes(
             backend_prefix=generated_outputs_route_prefix(tmp_path),
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2331,7 +2331,7 @@ def test_batch_markdown_files_preserve_cleanup_errors_during_cancellation(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2386,7 +2386,7 @@ def test_batch_markdown_files_clean_up_a_write_completed_during_cancellation(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
