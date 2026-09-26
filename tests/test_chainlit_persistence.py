@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from chainlit_persistence import (
+from chainagents.interfaces.chainlit.persistence import (
     CHAINLIT_SCHEMA_STATEMENTS,
     AutoMigratingChainlitDataLayer,
     chainlit_data_layer_enabled,

@@ -20,7 +20,12 @@ import pytest
 from PIL import Image
 from pypdf import PdfReader
 
-import response_exports
+import chainagents.exports.response as response_exports
+from chainagents.exports.generated_files import (
+    generated_file_descriptors,
+    generated_file_paths_from_text,
+    resolve_generated_output,
+)
 import chainagents.exports.pdf_images as pdf_images
 
 
@@ -30,20 +35,29 @@ def _png_bytes(*, width: int = 48, height: int = 32) -> bytes:
     return output.getvalue()
 
 
-def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
+def _descriptors_from_text(text: str, project_root: Path):
+    return generated_file_descriptors(
+        list(generated_file_paths_from_text(text)), project_root=project_root
+    )
+
+
+def test_generated_file_elements_for_response_text_paths_include_outputs(
     tmp_path: Path,
 ) -> None:
     """Verify generated response file paths become downloadable Chainlit files."""
-    report_path = tmp_path / "reports" / "summary.csv"
+    report_path = tmp_path / ".files" / "outputs" / "reports" / "summary.csv"
     chart_path = tmp_path / ".files" / "outputs" / "charts" / "plot.png"
     report_path.parent.mkdir(parents=True)
     chart_path.parent.mkdir(parents=True)
     report_path.write_text("name,value\nalpha,1\n", encoding="utf-8")
     chart_path.write_bytes(b"\x89PNG\r\n")
 
-    elements = response_exports.generated_file_elements_from_text(
-        "Created `/workspace/reports/summary.csv` and `.files/outputs/charts/plot.png`.",
-        project_root=tmp_path,
+    elements = response_exports.generated_file_elements(
+        _descriptors_from_text(
+            "Created `/workspace/.files/outputs/reports/summary.csv` and"
+            " `.files/outputs/charts/plot.png`.",
+            tmp_path,
+        )
     )
 
     assert [element.name for element in elements] == ["summary.csv", "plot.png"]
@@ -54,7 +68,7 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
     assert [element.mime for element in elements] == ["text/csv", "image/png"]
 
 
-def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts(
+def test_generated_output_resolves_absolute_workspace_artifacts(
     monkeypatch,
 ) -> None:
     """Verify absolute artifact paths under /workspace are not remapped twice."""
@@ -64,18 +78,18 @@ def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts
     def fake_is_file(path: Path) -> bool:
         return path == artifact_path
 
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
     monkeypatch.setattr(Path, "is_file", fake_is_file)
 
-    elements = response_exports.generated_file_elements_from_text(
-        "Created `/workspace/ChainAgents/.files/outputs/plot.png`.",
+    resolved = resolve_generated_output(
+        "/workspace/ChainAgents/.files/outputs/plot.png",
         project_root=project_root,
     )
 
-    assert [element.name for element in elements] == ["plot.png"]
-    assert [element.path for element in elements] == [artifact_path.as_posix()]
+    assert resolved == artifact_path
 
 
-def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
+def test_generated_file_descriptors_ignore_unsafe_or_unavailable_paths(
     tmp_path: Path,
 ) -> None:
     """Verify only existing generated files under allowed routes are downloadable."""
@@ -84,19 +98,66 @@ def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
     outside_path = tmp_path.parent / "outside.txt"
     outside_path.write_text("secret", encoding="utf-8")
 
-    elements = response_exports.generated_file_elements_from_text(
-        "\n".join(
-            [
-                "`/workspace/reports`",
-                "`/workspace/missing.txt`",
-                "`/workspace/../outside.txt`",
-                outside_path.as_posix(),
-            ]
-        ),
+    descriptors = generated_file_descriptors(
+        [
+            "/workspace/reports",
+            "/workspace/missing.txt",
+            "/workspace/../outside.txt",
+            outside_path.as_posix(),
+        ],
         project_root=tmp_path,
     )
 
-    assert elements == []
+    assert descriptors == []
+
+
+def test_generated_file_descriptors_reject_file_outside_outputs(
+    tmp_path: Path,
+) -> None:
+    """A real, existing file outside `.files/outputs` must not be attached."""
+    outside_path = tmp_path / "README.md"
+    outside_path.write_text("# notes", encoding="utf-8")
+
+    descriptors = generated_file_descriptors(
+        [outside_path.as_posix()],
+        project_root=tmp_path,
+    )
+
+    assert descriptors == []
+
+
+def test_generated_file_descriptors_reject_symlinked_files_directory(
+    tmp_path: Path,
+) -> None:
+    """A symlinked `.files` directory must fail closed instead of being followed."""
+    real_target = tmp_path / "elsewhere"
+    (real_target / "outputs").mkdir(parents=True)
+    output_path = real_target / "outputs" / "plot.png"
+    output_path.write_bytes(b"\x89PNG\r\n")
+    (tmp_path / ".files").symlink_to(real_target, target_is_directory=True)
+
+    descriptors = generated_file_descriptors(
+        [(tmp_path / ".files" / "outputs" / "plot.png").as_posix()],
+        project_root=tmp_path,
+    )
+
+    assert descriptors == []
+
+
+def test_generated_file_elements_attach_descriptor_inside_outputs(
+    tmp_path: Path,
+) -> None:
+    """An existing file under `.files/outputs` is attached."""
+    output_path = tmp_path / ".files" / "outputs" / "plot.png"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"\x89PNG\r\n")
+
+    elements = response_exports.generated_file_elements(
+        generated_file_descriptors([output_path.as_posix()], project_root=tmp_path)
+    )
+
+    assert [element.name for element in elements] == ["plot.png"]
+    assert [element.path for element in elements] == [output_path.as_posix()]
 
 
 def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
@@ -110,11 +171,15 @@ def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
         def write_pdf(self) -> bytes:
             return b"%PDF-WEASYPRINT"
 
+    def blocked_pdf_url_fetcher(url: str, *_args: object, **_kwargs: object) -> object:
+        """Stand in for the restricted WeasyPrint fetcher; always raises."""
+        raise ValueError(f"External resources are disabled for response PDF exports: {url}")
+
     monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=FakeHTML))
     monkeypatch.setattr(
         response_exports,
         "_pdf_url_fetcher",
-        lambda _resources: response_exports._blocked_pdf_url_fetcher,
+        lambda _resources: blocked_pdf_url_fetcher,
     )
 
     pdf_bytes = response_exports.build_pdf_bytes("# Export\n\n- item")
@@ -924,10 +989,10 @@ def test_pdf_image_validation_rejects_circular_svg_presentation_reference() -> N
 def test_pdf_image_validation_decodes_css_escaped_presentation_reference() -> None:
     """CSS escapes must not hide a circular local presentation reference."""
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg"><defs>'
-        '<mask id="loop" style="mask:u\\72l(#loop)">'
-        '<rect width="1" height="1" /></mask></defs></svg>'
-    ).encode()
+        b'<svg xmlns="http://www.w3.org/2000/svg"><defs>'
+        b'<mask id="loop" style="mask:u\\72l(#loop)">'
+        b'<rect width="1" height="1" /></mask></defs></svg>'
+    )
 
     with pytest.raises(pdf_images.PdfImageError, match="circular"):
         pdf_images._validate_pdf_image(svg)
@@ -1108,7 +1173,7 @@ def test_build_pdf_html_document_removes_pdf_hostile_unicode() -> None:
 
 def test_build_pdf_html_document_repairs_common_mojibake() -> None:
     """Verify common UTF-8-as-Windows-1252 artifacts are repaired for PDFs."""
-    html = response_exports.build_pdf_html_document("Hâ‚‚O and xÂ²")
+    html = response_exports.build_pdf_html_document("Hâ‚‚O and xÂ²")  # noqa: RUF001 -- intentional mojibake fixture
 
     assert "H<sub>2</sub>O" in html
     assert "x<sup>2</sup>" in html
@@ -1118,7 +1183,7 @@ def test_build_pdf_html_document_repairs_common_mojibake() -> None:
 
 def test_build_pdf_html_document_repairs_mojibake_with_unicode_text() -> None:
     """Verify mojibake repair still works when surrounding text is Unicode."""
-    html = response_exports.build_pdf_html_document("Δ sample: Hâ‚‚O and xÂ²")
+    html = response_exports.build_pdf_html_document("Δ sample: Hâ‚‚O and xÂ²")  # noqa: RUF001 -- intentional mojibake fixture
 
     assert "Δ sample: H<sub>2</sub>O" in html
     assert "x<sup>2</sup>" in html

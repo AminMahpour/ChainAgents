@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from langchain_mcp_adapters import sessions as mcp_sessions
 from rich.panel import Panel
@@ -17,26 +17,27 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Footer, Header, Markdown, RichLog, Static, TextArea
 
-from chainagents.commands.native import (
-    dumps_tool_result,
-    parse_native_command,
-    resolve_native_command,
-    resolve_runtime_command,
-)
-from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.events.stream import AgentStreamEvent
+from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.runtime.reflection import (
-    ReflectionCollector,
+    ReflectionProposal,
     format_reflection_proposal,
 )
 from chainagents.runtime import (
     AgentRuntime,
     PROJECT_ROOT,
     ReasoningLevel,
-    build_langgraph_run_config,
     normalize_reasoning_level,
 )
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
-from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
+from chainagents.turns import (
+    BaseTurnRenderer,
+    TurnCommandError,
+    TurnRequest,
+    TurnResult,
+    TurnRunner,
+)
 
 
 DEFAULT_TUI_THREAD_ID = "tui"
@@ -70,7 +71,7 @@ def capture_mcp_stdio_stderr(log_path: Path):
 class PromptTextArea(TextArea):
     """Multiline prompt editor that preserves Enter as the send shortcut."""
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Any]] = [
         Binding("enter", "submit", "Send", priority=True),
         Binding("shift+enter", "insert_newline", "New line", priority=True),
     ]
@@ -176,7 +177,7 @@ class ChainAgentsTuiApp(App[int]):
     }
     """.replace("__SIDE_PANEL_WIDTH__", str(TUI_SIDE_PANEL_WIDTH))
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Any]] = [
         ("ctrl+c", "cancel_or_quit", "Cancel/Quit"),
         ("ctrl+l", "clear_conversation", "Clear"),
         ("tab", "complete_slash_command", "Complete command"),
@@ -194,6 +195,7 @@ class ChainAgentsTuiApp(App[int]):
             getattr(args, "reasoning", None),
             default=runtime.config.default_reasoning,
         )
+        self.reasoning_level_is_explicit = getattr(args, "reasoning", None) is not None
         self.model_name = getattr(args, "model", None) or runtime.config.model_name
         self.async_subagent_url = getattr(args, "async_subagent_url", None)
         self.mcp_session_id = getattr(args, "mcp_session_id", None)
@@ -344,11 +346,18 @@ class ChainAgentsTuiApp(App[int]):
         self.reasoning_entry_indexes.clear()
 
         try:
-            resolved_prompt = await self._resolve_prompt(raw_prompt)
-            if resolved_prompt is None:
-                return
-            await self._stream_agent_prompt(resolved_prompt)
-            self._set_status("Ready.")
+            await TurnRunner(self.runtime, sanitize_errors=False).run(
+                TurnRequest(
+                    prompt=raw_prompt,
+                    thread_id=self.thread_id,
+                    model_name=self.model_name,
+                    reasoning_level=self.reasoning_level,
+                    reasoning_level_is_explicit=self.reasoning_level_is_explicit,
+                    async_subagent_url=self.async_subagent_url,
+                    mcp_session_id=self.mcp_session_id,
+                ),
+                TuiRenderer(self),
+            )
         except asyncio.CancelledError:
             self._set_status("Cancelled.")
             raise
@@ -408,130 +417,6 @@ class ChainAgentsTuiApp(App[int]):
         if description:
             return f"/{name} - {description}"
         return f"/{name}"
-
-    async def _resolve_prompt(self, raw_prompt: str) -> str | None:
-        parsed_command = resolve_native_command(raw_text=raw_prompt, selected_command=None)
-        slash_command_from_text = parse_native_command(raw_prompt)
-        if parsed_command is None:
-            return raw_prompt
-
-        try:
-            command_result = await resolve_runtime_command(
-                runtime=self.runtime,
-                parsed=parsed_command,
-                thread_id=self.thread_id,
-                mcp_session_id=self.mcp_session_id,
-            )
-        except Exception as exc:
-            self._append_tool_entry(
-                f"command /{parsed_command.command_name} failed: {exc}"
-            )
-            self._set_status(f"Command /{parsed_command.command_name} failed.")
-            return None
-
-        if command_result.target == "unknown":
-            if slash_command_from_text is not None:
-                self._append_tool_entry(f"unknown command /{parsed_command.command_name}")
-                self._set_status(f"Unknown command /{parsed_command.command_name}.")
-                return None
-            return raw_prompt
-
-        if command_result.target == "mcp_tool":
-            self._append_tool_entry(dumps_tool_result(command_result.tool_result))
-            self._set_status(f"Command /{parsed_command.command_name} finished.")
-            return None
-
-        prompt = command_result.prompt or ""
-        return prompt if prompt.strip() else None
-
-    async def _stream_agent_prompt(self, prompt: str) -> None:
-        agent, mcp_failures = await agent_with_mcp_status(
-            self.runtime,
-            self.reasoning_level,
-            model_name=self.model_name,
-            thread_id=self.thread_id,
-            async_subagent_url_override=self.async_subagent_url,
-            mcp_session_id=self.mcp_session_id,
-        )
-        if mcp_failures:
-            self._append_tool_entry(mcp_outage_warning(mcp_failures))
-        payload = {"messages": [{"role": "user", "content": prompt}]}
-        config = build_langgraph_run_config(
-            self.runtime.config,
-            thread_id=self.thread_id,
-            langsmith_tracing=getattr(self.runtime, "langsmith_tracing", None),
-        )
-        adapter = AgentStreamEventAdapter(prompt=prompt)
-        reflection_collector = ReflectionCollector.from_runtime_config(
-            self.runtime.config,
-            prompt=prompt,
-        )
-        stream = agent.astream_events(
-            payload,
-            config=config,
-            version="v2",
-            stream_mode=["messages", "updates", "custom"],
-            subgraphs=True,
-        )
-
-        stream_error: Exception | None = None
-        try:
-            while True:
-                try:
-                    event = await anext(stream)
-                except StopAsyncIteration:
-                    break
-                for stream_event in adapter.events_from_raw_event(event):
-                    reflection_collector.record_event(stream_event)
-                    await self._handle_stream_event(stream_event)
-        except Exception as exc:
-            stream_error = exc
-            reflection_collector.mark_run_failed(exc)
-        finally:
-            with suppress(Exception):
-                await stream.aclose()
-
-        proposal = reflection_collector.build_proposal()
-        if proposal is not None:
-            self._append_tool_entry(format_reflection_proposal(proposal))
-        if stream_error is not None:
-            raise stream_error
-
-    async def _handle_stream_event(self, event: AgentStreamEvent) -> None:
-        if event.kind == "response_delta":
-            await self._append_response_delta(event.text)
-        elif event.kind == "reasoning_delta":
-            self._append_reasoning(event.source, event.text)
-        elif event.kind == "tool_call":
-            self._append_tool_entry(
-                " ".join(
-                    part
-                    for part in (
-                        event.source,
-                        event.tool_name,
-                        event.status,
-                        event.tool_args,
-                    )
-                    if part
-                )
-            )
-        elif event.kind == "tool_result":
-            self._append_tool_entry(
-                " ".join(
-                    part
-                    for part in (
-                        event.source,
-                        event.tool_name,
-                        event.status,
-                        self._preview(event.tool_result),
-                    )
-                    if part
-                )
-            )
-        elif event.kind == "summarization_status":
-            self._append_tool_entry(
-                f"{event.source} summarization {event.status}: {event.text}"
-            )
 
     async def _append_conversation(self, role: str, text: str) -> None:
         self.conversation_entries.append((role, text))
@@ -639,6 +524,93 @@ class ChainAgentsTuiApp(App[int]):
         if len(compact) <= limit:
             return compact
         return compact[:limit]
+
+
+class TuiRenderer(BaseTurnRenderer):
+    """Render one shared-runner agent turn into the TUI panes and status line."""
+
+    def __init__(self, app: ChainAgentsTuiApp) -> None:
+        self.app = app
+
+    async def on_event(self, event: AgentStreamEvent) -> None:
+        """Render one normalized agent stream event."""
+        app = self.app
+        if event.kind == "mcp_status":
+            app._append_tool_entry(event.text)
+        elif event.kind == "response_delta":
+            await app._append_response_delta(event.text)
+        elif event.kind == "reasoning_delta":
+            app._append_reasoning(event.source, event.text)
+        elif event.kind == "tool_call":
+            app._append_tool_entry(
+                " ".join(
+                    part
+                    for part in (
+                        event.source,
+                        event.tool_name,
+                        event.status,
+                        event.tool_args,
+                    )
+                    if part
+                )
+            )
+        elif event.kind == "tool_result":
+            app._append_tool_entry(
+                " ".join(
+                    part
+                    for part in (
+                        event.source,
+                        event.tool_name,
+                        event.status,
+                        app._preview(event.tool_result),
+                    )
+                    if part
+                )
+            )
+        elif event.kind == "summarization_status":
+            app._append_tool_entry(
+                f"{event.source} summarization {event.status}: {event.text}"
+            )
+
+    async def on_command_result(self, result: RuntimeCommandResult) -> None:
+        """Show MCP-tool command output in the tools pane."""
+        self.app._append_tool_entry(dumps_tool_result(result.tool_result))
+
+    async def on_command_error(self, exc: TurnCommandError, status: int) -> None:
+        """Show a failed or unknown command in the tools pane and status line."""
+        if exc.unknown:
+            self.app._append_tool_entry(f"unknown command /{exc.command_name}")
+            self.app._set_status(f"Unknown command /{exc.command_name}.")
+            return
+        self.app._append_tool_entry(
+            f"command /{exc.command_name} failed: {exc.message}"
+        )
+        self.app._set_status(f"Command /{exc.command_name} failed.")
+
+    async def on_generated_files(self, files: list[GeneratedFileDescriptor]) -> None:
+        """List the turn's generated output files in the tools pane."""
+        for descriptor in files:
+            path = descriptor.path if descriptor.path is not None else descriptor.name
+            self.app._append_tool_entry(f"generated file {path}")
+
+    async def on_reflection(self, proposal: ReflectionProposal) -> None:
+        """Show a reflection proposal in the tools pane."""
+        self.app._append_tool_entry(format_reflection_proposal(proposal))
+
+    async def on_error(self, exc: Exception) -> None:
+        """Show an agent run failure in the tools pane and status line."""
+        self.app._append_tool_entry(f"runtime error {type(exc).__name__}: {exc}")
+        self.app._set_status(f"{type(exc).__name__}: {exc}")
+
+    async def on_complete(self, result: TurnResult) -> None:
+        """Set the final status line for a turn that did not fail."""
+        if not result.ok:
+            return
+        command = result.command_result
+        if command is not None and command.target == "mcp_tool":
+            self.app._set_status(f"Command /{command.command_name} finished.")
+        else:
+            self.app._set_status("Ready.")
 
 
 async def run_tui(runtime: AgentRuntime, args: Any) -> int:

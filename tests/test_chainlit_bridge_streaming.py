@@ -3,20 +3,45 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import weakref
+from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 
-import chainlit_bridge
-from chainlit_bridge import ChainlitEventBridge, RunTaskList
+from chainagents.interfaces.chainlit import bridge as chainlit_bridge
+from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
+from chainagents.events.stream import AgentStreamEventAdapter
+from chainagents.exports.generated_files import GeneratedFileDescriptor
+from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
+
+_FEEDS: weakref.WeakKeyDictionary[ChainlitEventBridge, tuple[AgentStreamEventAdapter, ChainlitTurnRenderer]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def _feed(bridge: ChainlitEventBridge, raw_event: dict[str, Any]) -> None:
+    """Send one raw LangGraph event down the production path.
+
+    The runner's ``AgentStreamEventAdapter`` normalises the event and the
+    ``ChainlitTurnRenderer`` renders it into ``bridge``, one adapter per bridge
+    as in a real turn.
+    """
+    if bridge not in _FEEDS:
+        renderer = ChainlitTurnRenderer(lambda _prompt: bridge, prompt=bridge.prompt)
+        renderer.bridge = bridge
+        _FEEDS[bridge] = (AgentStreamEventAdapter(prompt=bridge.prompt), renderer)
+    adapter, renderer = _FEEDS[bridge]
+    for event in adapter.events_from_raw_event(raw_event):
+        await renderer.on_event(event)
 
 
 class _AnthropicThinkingToken:
     """Provide an internal helper for Anthropic thinking token."""
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, thinking: str) -> None:
         """Initialize the Anthropic thinking token instance.
@@ -120,7 +145,7 @@ class _Message:
         instances: The instances value.
     """
 
-    instances: list["_Message"] = []
+    instances: ClassVar[list[_Message]] = []
 
     def __init__(self, content: str = "", author: str | None = None, **_kwargs: Any) -> None:
         """Initialize the message instance.
@@ -140,7 +165,7 @@ class _Message:
         self.update_count = 0
         self.instances.append(self)
 
-    async def send(self) -> "_Message":
+    async def send(self) -> _Message:
         """Record send calls on the test double.
 
         Returns:
@@ -169,7 +194,7 @@ class _Step:
         instances: The instances value.
     """
 
-    instances: list["_Step"] = []
+    instances: ClassVar[list[_Step]] = []
 
     def __init__(
         self,
@@ -219,7 +244,7 @@ class _Step:
 class _CustomElement:
     """Provide an internal helper for Chainlit custom elements."""
 
-    instances: list["_CustomElement"] = []
+    instances: ClassVar[list[_CustomElement]] = []
 
     def __init__(self, name: str, props: dict[str, Any], display: str = "inline", **_kwargs: Any) -> None:
         """Initialize the custom element test double."""
@@ -264,7 +289,7 @@ class _ToolCallChunkToken:
 
     type = "AIMessageChunk"
     content = ""
-    additional_kwargs: dict[str, str] = {}
+    additional_kwargs: ClassVar[dict[str, str]] = {}
 
     def __init__(self, chunk: dict[str, Any]) -> None:
         """Initialize the token with one tool-call chunk."""
@@ -398,10 +423,8 @@ async def test_cancelled_turn_closes_steps_and_marks_task_list_stopped() -> None
 
 
 @pytest.mark.anyio
-async def test_final_response_receives_generated_file_paths_from_write_tool(
-    monkeypatch,
-) -> None:
-    """Verify successful file writes are offered as final-response downloads."""
+async def test_final_response_attaches_the_runner_generated_files(monkeypatch) -> None:
+    """The bridge attaches exactly the generated files the runner resolved."""
     captured: dict[str, Any] = {}
 
     def capture_export_actions(_message: Any, **kwargs: Any) -> None:
@@ -413,70 +436,20 @@ async def test_final_response_receives_generated_file_paths_from_write_tool(
         "attach_response_export_actions",
         capture_export_actions,
     )
+    files = [
+        GeneratedFileDescriptor(
+            name="summary.csv",
+            mime_type="text/csv",
+            size_bytes=4,
+            download_url="/api/generated-files/summary.csv",
+            path=Path("/project/.files/outputs/summary.csv"),
+        )
+    ]
 
-    await bridge._stream_tool_call(
-        "main-agent",
-        {
-            "id": "call-1",
-            "name": "write_file",
-            "args": '{"path": "/workspace/reports/summary.csv"}',
-        },
-    )
-    await bridge._complete_tool_step(
-        "main-agent",
-        _ToolMessage(
-            name="write_file",
-            tool_call_id="call-1",
-            content="Wrote /workspace/reports/summary.csv",
-        ),
-    )
-    await bridge._stream_response("Created `/workspace/reports/summary.csv`.")
-    await bridge.finish()
+    await bridge._stream_response("Created the report.")
+    await bridge.finish(files)
 
-    assert captured["generated_file_paths"] == ("/workspace/reports/summary.csv",)
-
-
-@pytest.mark.anyio
-async def test_final_response_receives_paths_from_batch_manifest(
-    monkeypatch,
-) -> None:
-    """Batch tool results supply downloads without a final-response path echo."""
-    captured: dict[str, Any] = {}
-    public_path = (
-        "/workspace/.files/outputs/subagent-batches/"
-        "batch-call-unique/01-researcher-task-1.md"
-    )
-
-    def capture_export_actions(_message: Any, **kwargs: Any) -> None:
-        captured.update(kwargs)
-
-    bridge = ChainlitEventBridge(prompt="run research")
-    monkeypatch.setattr(
-        chainlit_bridge,
-        "attach_response_export_actions",
-        capture_export_actions,
-    )
-
-    await bridge._stream_tool_call(
-        "main-agent",
-        {
-            "id": "call-1",
-            "name": "run_subagent_batch",
-            "args": '{"tasks":[{"description":"research"}]}',
-        },
-    )
-    await bridge._complete_tool_step(
-        "main-agent",
-        _ToolMessage(
-            name="run_subagent_batch",
-            tool_call_id="call-1",
-            content=json.dumps({"files": [{"path": public_path}]}),
-        ),
-    )
-    await bridge._stream_response("Batch complete.")
-    await bridge.finish()
-
-    assert captured["generated_file_paths"] == (public_path,)
+    assert captured["generated_files"] == files
 
 
 @pytest.mark.anyio
@@ -485,9 +458,23 @@ async def test_reasoning_after_tool_call_starts_a_new_chronological_step() -> No
     bridge = ChainlitEventBridge(prompt="hello")
 
     await bridge._stream_reasoning("main-agent", "first thought")
-    await bridge._stream_tool_call(
-        "main-agent",
-        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'}
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
     await bridge._stream_reasoning("main-agent", "first thought second thought")
 
@@ -506,7 +493,8 @@ async def test_tool_call_input_accumulates_chunks_by_index_when_id_is_missing() 
     """Verify Chainlit tool steps keep complete args when later chunks omit ids."""
     bridge = ChainlitEventBridge(prompt="hello")
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -528,7 +516,8 @@ async def test_tool_call_input_accumulates_chunks_by_index_when_id_is_missing() 
             },
         }
     )
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -561,7 +550,8 @@ async def test_tool_call_step_rekeys_when_real_id_replaces_synthetic_id() -> Non
     run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
     bridge = ChainlitEventBridge(prompt="hello", run_task_list=run_task_list)
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -582,7 +572,8 @@ async def test_tool_call_step_rekeys_when_real_id_replaces_synthetic_id() -> Non
             },
         }
     )
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -603,7 +594,8 @@ async def test_tool_call_step_rekeys_when_real_id_replaces_synthetic_id() -> Non
             },
         }
     )
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -637,7 +629,6 @@ async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> 
     bridge = ChainlitEventBridge(prompt="hello")
     bridge.response_message = response_message  # type: ignore[assignment]
 
-    monkeypatch.setattr(chainlit_bridge.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(
         chainlit_bridge,
         "attach_response_export_actions",
@@ -675,9 +666,23 @@ async def test_non_chronological_mode_keeps_reasoning_step_open_across_tool_call
     bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
 
     await bridge._stream_reasoning("main-agent", "first thought")
-    await bridge._stream_tool_call(
-        "main-agent",
-        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'}
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
     await bridge._stream_reasoning("main-agent", "first thought second thought")
 
@@ -718,11 +723,37 @@ async def test_bridge_can_hide_reasoning_and_tool_ui_elements(monkeypatch) -> No
     assert task_list.tasks == []
 
     await bridge._stream_reasoning("main-agent", "first thought")
-    await bridge._stream_tool_call(
-        "main-agent",
-        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'}
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
-    await bridge._complete_tool_step("main-agent", _ToolMessage())
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (_ToolMessage(), {}),
+                )
+            },
+        }
+    )
     await bridge._stream_response("Final answer")
     await bridge.finish()
 
@@ -733,94 +764,12 @@ async def test_bridge_can_hide_reasoning_and_tool_ui_elements(monkeypatch) -> No
 
 
 @pytest.mark.anyio
-async def test_astream_events_chain_stream_tuple_chunk_is_normalized() -> None:
-    """Verify that astream events chain stream tuple chunk is normalized."""
-    bridge = ChainlitEventBridge(prompt="hello")
-    handled_parts: list[dict[str, Any]] = []
-
-    async def handle_part(part: dict[str, Any]) -> None:
-        """Capture normalized stream parts for assertions.
-
-        Args:
-            part: The part value.
-        """
-        handled_parts.append(part)
-
-    bridge.handle_part = handle_part  # type: ignore[method-assign]
-
-    await bridge.handle_event(
-        {
-            "event": "on_chain_stream",
-            "data": {
-                "chunk": (
-                    ("tools:abc",),
-                    "updates",
-                    {"tools": {"messages": []}},
-                ),
-            },
-        }
-    )
-
-    assert handled_parts == [
-        {
-            "type": "updates",
-            "ns": ("tools:abc",),
-            "data": {"tools": {"messages": []}},
-        }
-    ]
-
-
-@pytest.mark.anyio
-async def test_astream_events_ignores_non_langgraph_stream_chunks() -> None:
-    """Verify that astream events ignores non langgraph stream chunks."""
-    bridge = ChainlitEventBridge(prompt="hello")
-    handled_parts: list[dict[str, Any]] = []
-
-    async def handle_part(part: dict[str, Any]) -> None:
-        """Capture normalized stream parts for assertions.
-
-        Args:
-            part: The part value.
-        """
-        handled_parts.append(part)
-
-    bridge.handle_part = handle_part  # type: ignore[method-assign]
-
-    await bridge.handle_event(
-        {
-            "event": "on_chat_model_stream",
-            "data": {"chunk": "hello"},
-        }
-    )
-    await bridge.handle_event(
-        {
-            "event": "on_chain_stream",
-            "data": {"chunk": {"output": "not a LangGraph stream part"}},
-        }
-    )
-    await bridge.handle_event(
-        {
-            "event": "on_chain_stream",
-            "parent_ids": ["root-run-id"],
-            "data": {
-                "chunk": (
-                    (),
-                    "messages",
-                    ("duplicate nested token", {}),
-                ),
-            },
-        }
-    )
-
-    assert handled_parts == []
-
-
-@pytest.mark.anyio
 async def test_chainlit_bridge_shows_summarization_status() -> None:
     """Verify that chainlit bridge shows summarization status."""
     bridge = ChainlitEventBridge(prompt="hello")
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -852,7 +801,8 @@ async def test_bridge_renders_whitelisted_ui_message_as_custom_element() -> None
     """Verify whitelisted LangGraph UI events render Chainlit custom elements."""
     bridge = ChainlitEventBridge(prompt="hello")
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -895,7 +845,8 @@ async def test_bridge_sends_generated_ui_after_final_response(monkeypatch) -> No
     )
 
     await bridge._stream_response("Final answer")
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -930,7 +881,8 @@ async def test_bridge_updates_existing_ui_element_by_id() -> None:
     """Verify repeat UI ids update the existing custom element props."""
     bridge = ChainlitEventBridge(prompt="hello")
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -946,7 +898,8 @@ async def test_bridge_updates_existing_ui_element_by_id() -> None:
             },
         }
     )
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -984,7 +937,8 @@ async def test_bridge_updates_shared_ui_element_registry_across_instances() -> N
         generated_ui_elements=generated_ui_elements,
     )
 
-    await first_bridge.handle_event(
+    await _feed(
+        first_bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -1002,7 +956,8 @@ async def test_bridge_updates_shared_ui_element_registry_across_instances() -> N
     )
     await first_bridge.finish()
 
-    await second_bridge.handle_event(
+    await _feed(
+        second_bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -1033,7 +988,8 @@ async def test_bridge_removes_existing_ui_element_by_id() -> None:
     """Verify remove-ui events remove the tracked custom element."""
     bridge = ChainlitEventBridge(prompt="hello")
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -1051,7 +1007,8 @@ async def test_bridge_removes_existing_ui_element_by_id() -> None:
     )
     await bridge.finish()
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {"chunk": ("custom", {"type": "remove-ui", "id": "panel-1"})},
@@ -1067,7 +1024,8 @@ async def test_bridge_ignores_unknown_or_disabled_ui_components() -> None:
     bridge = ChainlitEventBridge(prompt="hello")
     disabled_bridge = ChainlitEventBridge(prompt="hello", generative_ui_enabled=False)
 
-    await bridge.handle_event(
+    await _feed(
+        bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -1083,7 +1041,8 @@ async def test_bridge_ignores_unknown_or_disabled_ui_components() -> None:
             },
         }
     )
-    await disabled_bridge.handle_event(
+    await _feed(
+        disabled_bridge,
         {
             "event": "on_chain_stream",
             "data": {
@@ -1102,3 +1061,74 @@ async def test_bridge_ignores_unknown_or_disabled_ui_components() -> None:
 
     assert _CustomElement.instances == []
     assert _Message.instances == []
+
+
+@pytest.mark.anyio
+async def test_subagent_write_todos_reach_the_task_list_through_events() -> None:
+    """A namespaced (subagent) write_todos call and result update the task list."""
+    task_list = _TaskList()
+    run_task_list = RunTaskList(task_list)  # type: ignore[arg-type]
+    bridge = ChainlitEventBridge(prompt="plan it", run_task_list=run_task_list)
+    namespace = ("task:subagent-1",)
+    metadata = {"lc_agent_name": "researcher"}
+
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    namespace,
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {
+                                "id": "call-todos",
+                                "name": "write_todos",
+                                "args": json.dumps(
+                                    {"todos": [{"content": "Research", "status": "in_progress"}]}
+                                ),
+                            }
+                        ),
+                        metadata,
+                    ),
+                )
+            },
+        },
+    )
+
+    assert [(task.title, task.status) for task in task_list.tasks] == [
+        ("Research", _TaskStatus.RUNNING)
+    ]
+
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    namespace,
+                    "updates",
+                    {
+                        "tools": {
+                            "todos": [{"content": "Research", "status": "completed"}],
+                            "messages": [
+                                _ToolMessage(
+                                    name="write_todos",
+                                    tool_call_id="call-todos",
+                                    content=(
+                                        "Updated todo list to "
+                                        "[{'content': 'Research', 'status': 'completed'}]"
+                                    ),
+                                )
+                            ],
+                        }
+                    },
+                )
+            },
+        },
+    )
+
+    assert [(task.title, task.status) for task in task_list.tasks] == [
+        ("Research", _TaskStatus.DONE)
+    ]

@@ -319,9 +319,18 @@ class SummarizationStatusMiddleware(AgentMiddleware[Any, Any, Any]):
             ensure_ids = getattr(self.inner, "_ensure_message_ids", None)
             if callable(ensure_ids):
                 ensure_ids(messages)
-            token_counter = getattr(self.inner, "token_counter")
-            should_summarize = getattr(self.inner, "_should_summarize")
-            determine_cutoff = getattr(self.inner, "_determine_cutoff_index")
+            # Duck-typed on purpose: `self.inner` may be langchain's or
+            # deepagents' SummarizationMiddleware (constructed dynamically by
+            # name in `create_summarization_middleware`/the deepagents
+            # factory below), which are unrelated classes that happen to
+            # share this shape. getattr keeps mypy happy without pinning to
+            # either concrete type; a missing attribute on some other inner
+            # middleware falls through to the `except` below, same as before.
+            token_counter = getattr(self.inner, "token_counter", None)
+            should_summarize = getattr(self.inner, "_should_summarize", None)
+            determine_cutoff = getattr(self.inner, "_determine_cutoff_index", None)
+            if token_counter is None or should_summarize is None or determine_cutoff is None:
+                return False
             total_tokens = token_counter(messages)
             return bool(
                 should_summarize(messages, total_tokens)
@@ -428,18 +437,22 @@ def _build_deepagents_summarization_factory(
 
     def factory(model: Any, backend: Any) -> AgentMiddleware[Any, Any, Any]:
         """Create DeepAgents summarization middleware with configured thresholds."""
+        from langchain.agents.middleware.summarization import ContextSize
+
         from deepagents.middleware.summarization import (
             SummarizationMiddleware,
             compute_summarization_defaults,
         )
 
         defaults = compute_summarization_defaults(model)
-        trigger = (
+        trigger: ContextSize = (
             ("tokens", trigger_tokens)
             if trigger_tokens is not None
             else defaults["trigger"]
         )
-        keep = ("tokens", keep_tokens) if keep_tokens is not None else defaults["keep"]
+        keep: ContextSize = (
+            ("tokens", keep_tokens) if keep_tokens is not None else defaults["keep"]
+        )
         return SummarizationMiddleware(
             model=model,
             backend=backend,
@@ -487,7 +500,13 @@ def create_deep_agent_with_configured_summarization(
             return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
 
         if summarization_factory is not None:
-            deepagents_graph.create_summarization_middleware = summarization_factory
+            # This replacement factory intentionally narrows the signature to
+            # the two positional arguments deepagents actually passes at this
+            # call site; the module-level function's broader keyword-only
+            # defaults are not exercised here.
+            deepagents_graph.create_summarization_middleware = (
+                summarization_factory  # type: ignore[assignment]
+            )
         deepagents_graph._harness_profile_for_model = profile_with_token_guard
         try:
             return create_deep_agent(**kwargs)

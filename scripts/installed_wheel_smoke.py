@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import os
+import warnings
 from pathlib import Path
 
 
@@ -15,16 +16,23 @@ PUBLIC_MODULES = (
     "chainagents.interfaces.chainlit.bridge",
     "chainagents.rag.runtime",
 )
-LEGACY_MODULES = (
+# main.py is excluded from the deprecation warning: `chainlit run main.py -w`
+# imports it directly.
+SILENT_LEGACY_MODULES = ("main",)
+# Deprecated root-level compatibility shims. Still installed this release
+# (see pyproject.toml py-modules), so an installed wheel must still be able
+# to import them, but each one now warns on first import.
+DEPRECATED_LEGACY_MODULES = (
     "agent_commands",
     "agent_stream_events",
+    "async_task_notifications",
     "chainagents_api",
     "chainagents_cli",
     "chainagents_tui",
     "chainlit_bridge",
     "chainlit_persistence",
     "deepagent_runtime",
-    "main",
+    "langchain_warning_filters",
     "rag_runtime",
     "response_exports",
 )
@@ -48,8 +56,12 @@ enabled = false
 """,
         encoding="utf-8",
     )
-    for module_name in (*PUBLIC_MODULES, *LEGACY_MODULES):
+    for module_name in (*PUBLIC_MODULES, *SILENT_LEGACY_MODULES):
         importlib.import_module(module_name)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        for module_name in DEPRECATED_LEGACY_MODULES:
+            importlib.import_module(module_name)
 
     from chainagents.interfaces.cli.app import resolve_configure_config_path
     from chainagents.runtime import AgentRuntime, RuntimeConfig
@@ -58,7 +70,7 @@ enabled = false
     config = RuntimeConfig.from_env()
     runtime_requirements = importlib.metadata.requires("ChainAgents") or []
 
-    assert runtime_core.PROJECT_ROOT == working_directory
+    assert working_directory == runtime_core.PROJECT_ROOT
     assert runtime_core.PROJECT_ROOT.name != "site-packages"
     assert not any(
         requirement.lower().startswith("pytest")

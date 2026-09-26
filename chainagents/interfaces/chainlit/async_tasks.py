@@ -108,7 +108,7 @@ class LocalBackgroundTaskNotifier:
                     content=format_local_task_result(snapshot),
                     author="Background subagent",
                 ).send()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
                     "Failed to send local background task notice for %s.",
                     snapshot.task_id,
@@ -149,7 +149,7 @@ class LocalBackgroundTaskNotifier:
                         text=pending_text,
                     ),
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
                     "Failed to render local background task activity for %s.",
                     pending.task_id,
@@ -179,7 +179,7 @@ class LocalBackgroundTaskNotifier:
                     await self._handle_live_event(activity, event)
                 elif activity.snapshot is not None:
                     await self._handle_terminal(activity)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
                     "Failed to render local background task activity for %s.",
                     activity.task_id,
@@ -241,15 +241,14 @@ class LocalBackgroundTaskNotifier:
                 if hidden is not None:
                     state.pending_hidden_tool_calls[event.tool_call_id] = hidden
                     state.suppressed_tool_call_ids.add(event.tool_call_id)
-            if not self.tool_steps_enabled:
-                if event.tool_call_id not in state.tool_steps:
-                    if event.tool_call_id:
-                        state.suppressed_tool_call_ids.add(event.tool_call_id)
-                        state.pending_hidden_tool_calls[event.tool_call_id] = (
-                            event.source,
-                            event.tool_name,
-                        )
-                    return
+            if not self.tool_steps_enabled and event.tool_call_id not in state.tool_steps:
+                if event.tool_call_id:
+                    state.suppressed_tool_call_ids.add(event.tool_call_id)
+                    state.pending_hidden_tool_calls[event.tool_call_id] = (
+                        event.source,
+                        event.tool_name,
+                    )
+                return
             state.suppressed_tool_call_ids.discard(event.tool_call_id)
             state.pending_hidden_tool_calls.pop(event.tool_call_id, None)
             call_id = event.tool_call_id or event.source
@@ -399,7 +398,7 @@ class LocalBackgroundTaskNotifier:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "Failed to close local background task steps for %s.",
                 activity.task_id,
@@ -422,7 +421,7 @@ class LocalBackgroundTaskNotifier:
                 step.end = utc_now()
             try:
                 await step.update()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("Failed to close a reasoning step for %s.", task_id)
         tool_states = {
             id(item): item for item in state.tool_steps.values()
@@ -433,13 +432,13 @@ class LocalBackgroundTaskNotifier:
                 step.end = utc_now()
             try:
                 await step.update()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("Failed to close a tool step for %s.", task_id)
         state.parent.output = parent_output
         state.parent.end = utc_now()
         try:
             await state.parent.update()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "Failed to close the background task parent step for %s.",
                 task_id,
@@ -464,7 +463,7 @@ class LocalBackgroundTaskNotifier:
                 await consumer
             except asyncio.CancelledError:
                 pass
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("Local background task notifier stopped unexpectedly.")
         for task_id, state in tuple(self.activity_states.items()):
             await self._close_activity_state(
@@ -685,7 +684,7 @@ class AsyncTaskNotifier:
                 try:
                     run = await client.runs.get(thread_id=thread_id, run_id=run_id)
                     failures = 0
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     failures += 1
                     if failures >= 3:
                         await self._notify_once(

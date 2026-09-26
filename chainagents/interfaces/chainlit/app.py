@@ -7,10 +7,8 @@ import json
 import logging
 import os
 import secrets
-import traceback
 from collections.abc import Iterable, Mapping
-from contextlib import suppress
-from pathlib import Path
+from contextlib import nullcontext, suppress
 from typing import Any
 
 from chainagents.util.langchain_warnings import install_langchain_warning_filters
@@ -19,16 +17,8 @@ install_langchain_warning_filters()
 
 import chainlit as cl
 from chainlit.config import config as chainlit_config
-from chainlit.input_widget import Select, Switch, TextInput
 from chainlit.types import ThreadDict
 
-from chainagents.commands.native import (
-    ParsedNativeCommand,
-    dumps_tool_result,
-    parse_native_command,
-    resolve_native_command,
-    resolve_runtime_command,
-)
 from chainagents.interfaces.chainlit.async_tasks import (
     AsyncTaskNotifier,
     LocalBackgroundTaskNotifier,
@@ -36,36 +26,52 @@ from chainagents.interfaces.chainlit.async_tasks import (
 )
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
-from chainagents.interfaces.uploads import (
-    RAG_UPLOAD_ACCEPT,
-    NormalizedUpload,
-    image_content_part,
-    is_image_upload,
-    prompt_with_images,
-    provider_safe_image_mime_type,
-    uploaded_file_mime_type as _shared_uploaded_file_mime_type,
+from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
+from chainagents.interfaces.chainlit.settings import (
+    SESSION_MCP_SESSION_ID_KEY,  # noqa: F401
+    SESSION_SETTINGS_KEY,
+    build_chat_settings,
+    coerce_settings,
+    current_chainlit_thread_id,
+    current_mcp_session_id,
+    default_reasoning_level_for_model,
+    message_has_reasoning_level_override,
+    publish_modes,
+    resolve_model_name_for_message,
+    resolve_reasoning_level_for_message,
+    settings_payload,  # noqa: F401
+    settings_reasoning_level_is_explicit,
+    store_mcp_session_id,
+    store_settings,
+)
+from chainagents.interfaces.chainlit.uploads import (
+    REBUILD_RAG_INDEX_ACTION,
+    UPLOAD_RAG_FILE_ACTION,
+    ask_for_rag_upload,
+    message_uploaded_image_names,
+    message_uploaded_image_parts,
+    message_uploaded_rag_files,
+    rag_actions,
+    unsupported_uploaded_image_names,
+    unsupported_uploaded_images_message,
+    upload_result_message,
+    upload_result_prompt_note,
 )
 from chainagents.runtime import (
-    DEFAULT_REASONING_LEVEL,
     AgentRuntime,
     AppSettings,
     ChainlitStarterConfig,
     ReasoningLevel,
     RuntimeConfig,
-    build_langgraph_run_config,
     format_model_provider,
-    normalize_reasoning_level,
-    reasoning_level_for_profile,
     resolve_runtime_model_profile,
 )
 from chainagents.runtime.reflection import (
-    ReflectionCollector,
     ReflectionProposal,
     format_reflection_proposal,
     reflection_save_prompt as reflection_save_prompt,
 )
-from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
-from chainagents.rag.runtime import UploadedRagFile
+from chainagents.turns import TurnRequest, TurnRunner
 from chainagents.exports.response import (
     DOWNLOAD_MARKDOWN_ACTION,
     DOWNLOAD_PDF_ACTION,
@@ -78,15 +84,11 @@ from chainagents.exports.response import (
 
 logger = logging.getLogger(__name__)
 
-SESSION_SETTINGS_KEY = "agent_settings"
 SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY = "local_background_task_notifier"
-SESSION_MCP_SESSION_ID_KEY = "mcp_session_id"
 SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
 SESSION_ACTIVE_TURN_KEY = "active_agent_turn"
-REBUILD_RAG_INDEX_ACTION = "rebuild_knowledge_index"
-UPLOAD_RAG_FILE_ACTION = "upload_rag_file"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
 REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
 def load_chainlit_auth_users(
@@ -240,238 +242,6 @@ async def configured_chainlit_starters(
     return build_chainlit_starters(extensions.chainlit_starters)
 
 
-def current_chainlit_thread_id() -> str:
-    """Return the current chainlit thread ID.
-
-    Returns:
-        The current chainlit thread ID.
-    """
-    try:
-        session = cl.context.session
-    except Exception:
-        return ""
-    thread_id = getattr(session, "thread_id", None) or getattr(session, "id", None)
-    return str(thread_id or "").strip()
-
-
-def current_chainlit_session_id() -> str:
-    """Return the current chainlit session ID.
-
-    Returns:
-        The current chainlit session ID.
-    """
-    try:
-        session = cl.context.session
-    except Exception:
-        return ""
-    return str(getattr(session, "id", None) or "").strip()
-
-
-def store_mcp_session_id() -> str:
-    """Store MCP session ID.
-
-    Returns:
-        The stored value.
-    """
-    session_id = current_chainlit_session_id() or current_chainlit_thread_id()
-    cl.user_session.set(SESSION_MCP_SESSION_ID_KEY, session_id)
-    return session_id
-
-
-def current_mcp_session_id() -> str:
-    """Return the current MCP session ID.
-
-    Returns:
-        The current MCP session ID.
-    """
-    session_id = str(cl.user_session.get(SESSION_MCP_SESSION_ID_KEY) or "").strip()
-    if session_id:
-        return session_id
-    return store_mcp_session_id()
-
-
-def settings_payload(settings: AppSettings) -> dict[str, Any]:
-    """Build a serializable payload from Chainlit chat settings.
-
-    Args:
-        settings: The settings value.
-
-    Returns:
-        The constructed a serializable payload from chainlit chat settings.
-    """
-    return {
-        "model_name": settings.model_name,
-        "reasoning_level": settings.reasoning_level,
-        "thread_id": settings.thread_id,
-        "show_reasoning_stream": settings.show_reasoning_stream,
-        "show_tool_calls": settings.show_tool_calls,
-    }
-
-
-def store_settings(settings: AppSettings) -> None:
-    """Store settings.
-
-    Args:
-        settings: The settings value.
-    """
-    cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
-
-
-def build_langgraph_config(
-    settings: AppSettings,
-    *,
-    recursion_limit: int,
-    runtime_config: RuntimeConfig | None = None,
-    langsmith_tracing: Any | None = None,
-) -> dict[str, Any]:
-    """Build the LangGraph run configuration for a Chainlit thread.
-
-    Args:
-        settings: The settings value.
-        recursion_limit: The recursion limit value.
-        runtime_config: Optional resolved runtime config.
-
-    Returns:
-        A LangGraph configuration dictionary for the thread.
-    """
-    if runtime_config is not None:
-        return build_langgraph_run_config(
-            runtime_config,
-            thread_id=settings.thread_id,
-            langsmith_tracing=langsmith_tracing,
-        )
-    return {
-        "configurable": {"thread_id": settings.thread_id},
-        "recursion_limit": recursion_limit,
-    }
-
-
-def build_rag_action() -> cl.Action:
-    """Build RAG action.
-
-    Returns:
-        The constructed rag action.
-    """
-    return cl.Action(
-        name=REBUILD_RAG_INDEX_ACTION,
-        payload={},
-        label="Rebuild Knowledge Index",
-        tooltip="Rebuild the local documentation RAG index.",
-        icon="refresh-cw",
-    )
-
-
-def build_upload_rag_action() -> cl.Action:
-    """Build upload RAG action.
-
-    Returns:
-        The constructed upload rag action.
-    """
-    return cl.Action(
-        name=UPLOAD_RAG_FILE_ACTION,
-        payload={},
-        label="Upload File For RAG",
-        tooltip="Upload a text file and add it to this chat thread's knowledge index.",
-        icon="paperclip",
-    )
-
-
-def rag_actions() -> list[cl.Action]:
-    """Return Chainlit action buttons for RAG workflows.
-
-    Returns:
-        Chainlit action buttons for RAG workflows.
-    """
-    return [build_rag_action(), build_upload_rag_action()]
-
-
-def reflection_actions(*, retry: bool = False) -> list[cl.Action]:
-    """Return Chainlit actions for reflection confirmation."""
-    return [
-        cl.Action(
-            name=REFLECTION_SAVE_ACTION,
-            payload={"value": "retry" if retry else "save"},
-            label="Retry" if retry else "Save lesson",
-            tooltip="Ask the agent to save this lesson into long-term memory.",
-            icon="save",
-        ),
-        cl.Action(
-            name=REFLECTION_DISMISS_ACTION,
-            payload={"value": "dismiss"},
-            label="Dismiss",
-            tooltip="Do not save this reflection lesson.",
-            icon="x",
-        ),
-    ]
-
-
-async def ask_to_save_reflection_lesson(
-    *,
-    runtime: AgentRuntime,
-    settings: AppSettings,
-    proposal: ReflectionProposal,
-    reasoning_level: ReasoningLevel,
-    model_name: str,
-    async_url_override: str | None,
-    mcp_session_id: str | None,
-) -> None:
-    """Ask the Chainlit user whether to save a reflection lesson."""
-    retry = False
-    while True:
-        response = await cl.AskActionMessage(
-            content=format_reflection_proposal(proposal),
-            actions=reflection_actions(retry=retry),
-            author="System",
-            timeout=90,
-            raise_on_timeout=False,
-        ).send()
-        if not response:
-            return
-        payload = response.get("payload") if isinstance(response, dict) else None
-        expected_action = "retry" if retry else "save"
-        if not isinstance(payload, dict) or payload.get("value") != expected_action:
-            return
-        if await save_reflection_lesson(
-            runtime=runtime,
-            settings=settings,
-            proposal=proposal,
-            reasoning_level=reasoning_level,
-            model_name=model_name,
-            async_url_override=async_url_override,
-            mcp_session_id=mcp_session_id,
-        ):
-            return
-        # Chainlit consumes each prompt's actions. Keep this proposal and wait
-        # for a fresh user selection before attempting storage again.
-        retry = True
-
-
-async def save_reflection_lesson(
-    *,
-    runtime: AgentRuntime,
-    settings: AppSettings,
-    proposal: ReflectionProposal,
-    reasoning_level: ReasoningLevel,
-    model_name: str,
-    async_url_override: str | None,
-    mcp_session_id: str | None,
-) -> bool:
-    """Return success only after verified persistence, allowing an explicit retry."""
-    try:
-        await runtime.save_reflection(proposal)
-    except Exception:
-        await cl.Message(
-            content="Reflection could not be saved. Please retry.",
-            author="System",
-        ).send()
-        return False
-    await cl.Message(
-        content=f"Saved lesson to `{proposal.memory_file}`.",
-        author="System",
-    ).send()
-    return True
-
-
 def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
     """Build native command specs.
 
@@ -530,635 +300,6 @@ def rag_status_line(runtime: AgentRuntime) -> str:
     if len(reason) > 160:
         reason = f"{reason[:157].rstrip()}..."
     return f"- RAG: unavailable; {reason}\n"
-
-
-def message_uploads(message: cl.Message) -> list[tuple[Path, str, str]]:
-    """Return readable files attached to a Chainlit message.
-
-    Args:
-        message: Chainlit message or LangChain message to process.
-
-    Returns:
-        Tuples of path, display name, and MIME type for attached files.
-    """
-    uploads: list[tuple[Path, str, str]] = []
-    for element in getattr(message, "elements", []) or []:
-        raw_path = getattr(element, "path", None)
-        if not raw_path:
-            continue
-        path = Path(str(raw_path))
-        if not path.exists() or not path.is_file():
-            continue
-        name = str(getattr(element, "name", "") or path.name).strip() or path.name
-        mime_type = uploaded_file_mime_type(element, path=path, name=name)
-        uploads.append((path, name, mime_type))
-    return uploads
-
-
-def uploaded_file_mime_type(element: Any, *, path: Path, name: str) -> str:
-    """Resolve the MIME type for an uploaded Chainlit file."""
-    for attr in ("mime", "mime_type", "content_type"):
-        raw_mime = getattr(element, attr, None)
-        if isinstance(raw_mime, str) and "/" in raw_mime:
-            return _shared_uploaded_file_mime_type(raw_mime, path=path, name=name)
-    return _shared_uploaded_file_mime_type(None, path=path, name=name)
-
-
-def message_uploaded_rag_files(message: cl.Message) -> list[UploadedRagFile]:
-    """Build the message for uploaded RAG files.
-
-    Args:
-        message: Chainlit message or LangChain message to process.
-
-    Returns:
-        The constructed the message for uploaded rag files.
-    """
-    uploads: list[UploadedRagFile] = []
-    for path, name, mime_type in message_uploads(message):
-        if is_image_upload(path, mime_type):
-            continue
-        uploads.append(UploadedRagFile(path=path, name=name))
-    return uploads
-
-
-def message_uploaded_image_names(message: cl.Message) -> tuple[str, ...]:
-    """Return names for image files attached to a Chainlit message."""
-    return tuple(
-        name
-        for path, name, mime_type in message_uploads(message)
-        if provider_safe_image_mime_type(path, mime_type) is not None
-    )
-
-
-def unsupported_uploaded_image_names(message: cl.Message) -> tuple[str, ...]:
-    """Return names for image files that cannot be sent to vision providers."""
-    return tuple(
-        name
-        for path, name, mime_type in message_uploads(message)
-        if is_image_upload(path, mime_type)
-        and provider_safe_image_mime_type(path, mime_type) is None
-    )
-
-
-def message_uploaded_image_parts(message: cl.Message) -> list[dict[str, Any]]:
-    """Build multimodal content parts for uploaded Chainlit images.
-
-    Args:
-        message: Chainlit message or LangChain message to process.
-
-    Returns:
-        OpenAI-compatible image content parts backed by data URLs.
-    """
-    parts: list[dict[str, Any]] = []
-    for path, _name, mime_type in message_uploads(message):
-        image_mime_type = provider_safe_image_mime_type(path, mime_type)
-        if image_mime_type is None:
-            continue
-        try:
-            data = path.read_bytes()
-        except OSError:
-            continue
-        parts.append(
-            image_content_part(
-                NormalizedUpload(
-                    name=path.name,
-                    mime_type=image_mime_type,
-                    kind="image",
-                    data=data,
-                )
-            )
-        )
-    return parts
-
-
-def chainlit_prompt_text(
-    content: str,
-    *,
-    image_names: tuple[str, ...],
-    prompt_note: str,
-) -> str:
-    """Build the text part of a Chainlit user message sent to the agent."""
-    return prompt_with_images(
-        content,
-        image_names=image_names,
-        prompt_note=prompt_note,
-    )
-
-
-def chainlit_user_message_content(
-    prompt: str,
-    *,
-    image_parts: list[dict[str, Any]],
-) -> str | list[dict[str, Any]]:
-    """Build the multimodal user message content sent from Chainlit."""
-    if not image_parts:
-        return prompt
-    return [{"type": "text", "text": prompt}, *image_parts]
-
-
-def unsupported_uploaded_images_message(image_names: tuple[str, ...]) -> str:
-    """Build a user-facing note for unsupported image uploads."""
-    names = ", ".join(f"`{name}`" for name in image_names)
-    return (
-        "Some uploaded images were not attached to the agent request because their "
-        "formats are not supported by the configured vision providers.\n\n"
-        f"- Unsupported: {names}\n"
-        "- Supported image formats: PNG, JPEG, WEBP, GIF"
-    )
-
-
-def upload_result_prompt_note(added_files: tuple[str, ...]) -> str:
-    """Build the prompt note describing uploaded RAG files.
-
-    Args:
-        added_files: The added files value.
-
-    Returns:
-        The constructed the prompt note describing uploaded rag files.
-    """
-    if not added_files:
-        return ""
-    file_list = ", ".join(f"`{name}`" for name in added_files)
-    return (
-        "\n\nUploaded files are available in this thread's knowledge index: "
-        f"{file_list}. Use `search_workspace_knowledge` if the user refers to them."
-    )
-
-
-def upload_result_message(upload_result) -> str:
-    """Build the Chainlit message for a RAG upload result.
-
-    Args:
-        upload_result: The upload result value.
-
-    Returns:
-        The constructed the chainlit message for a rag upload result.
-    """
-    if upload_result.added_files:
-        added = ", ".join(f"`{name}`" for name in upload_result.added_files)
-        content = (
-            "Uploaded file(s) added to this thread's knowledge index.\n\n"
-            f"- Added: {added}\n"
-            f"- Uploaded files indexed for this thread: `{upload_result.indexed_files}`\n"
-            f"- Uploaded chunks indexed for this thread: `{upload_result.chunk_count}`"
-        )
-        if upload_result.rejected_files:
-            rejected = ", ".join(f"`{name}`" for name in upload_result.rejected_files)
-            content += f"\n- Rejected: {rejected}"
-        return content
-
-    if upload_result.rejected_files:
-        rejected = ", ".join(f"`{name}`" for name in upload_result.rejected_files)
-        return f"No supported text files were added to RAG. Rejected: {rejected}"
-
-    return upload_result.reason or "No files were added to RAG."
-
-async def handle_native_command(
-    *,
-    runtime: AgentRuntime,
-    settings: AppSettings,
-    parsed: ParsedNativeCommand,
-    mcp_session_id: str | None = None,
-) -> str | None:
-    """Handle a native slash command selected in Chainlit.
-
-    Args:
-        runtime: Agent runtime used by the operation.
-        settings: The settings value.
-        parsed: Parsed native command details.
-        mcp_session_id: MCP session identifier.
-
-    Returns:
-        The handle native command result.
-    """
-    result = await resolve_runtime_command(
-        runtime=runtime,
-        parsed=parsed,
-        thread_id=settings.thread_id,
-        mcp_session_id=mcp_session_id,
-    )
-    if result.target == "unknown":
-        return None
-
-    if result.target == "mcp_tool":
-        await cl.Message(
-            author="System",
-            content=(
-                f"Ran `/{result.command_name}` ({result.description}).\n\n"
-                "Tool result:\n```json\n"
-                f"{dumps_tool_result(result.tool_result)}\n"
-                "```"
-            ),
-        ).send()
-        return ""
-
-    return result.prompt
-
-
-async def ask_for_rag_upload() -> list[UploadedRagFile]:
-    """Ask for for RAG upload.
-
-    Returns:
-        The prompt or response used to ask the user.
-    """
-    files = await cl.AskFileMessage(
-        content=(
-            "Upload text-based files for this chat thread's knowledge index.\n\n"
-            "Accepted examples: `.md`, `.txt`, `.rst`, `.json`, `.toml`, `.yaml`, `.yml`, `.csv`, `.log`, `.py`."
-        ),
-        accept=RAG_UPLOAD_ACCEPT,
-        max_size_mb=25,
-        max_files=5,
-        timeout=300,
-        raise_on_timeout=False,
-    ).send()
-    if not files:
-        return []
-    return [
-        UploadedRagFile(path=Path(file.path), name=file.name)
-        for file in files
-        if Path(file.path).exists()
-    ]
-
-
-def resolve_model_name(
-    value: Any | None,
-    *,
-    available_models: tuple[str, ...],
-    default: str,
-) -> str:
-    """Resolve model name.
-
-    Args:
-        value: Value to normalize, convert, or serialize.
-        available_models: The available models value.
-        default: Fallback value used when no explicit value is available.
-
-    Returns:
-        The resolved model name.
-    """
-    candidate = str(value or "").strip()
-    if candidate in available_models:
-        return candidate
-    return default
-
-
-def coerce_bool_setting(value: Any | None, *, default: bool) -> bool:
-    """Coerce a raw Chainlit setting value into a boolean."""
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, int | float) and value in (0, 1):
-        return bool(value)
-    candidate = str(value).strip().lower()
-    if candidate in {"1", "true", "yes", "on", "enabled"}:
-        return True
-    if candidate in {"0", "false", "no", "off", "disabled"}:
-        return False
-    return default
-
-
-def build_chat_settings(
-    settings: AppSettings,
-    *,
-    available_models: tuple[str, ...],
-    model_mode_enabled: bool = True,
-) -> cl.ChatSettings:
-    """Build chat settings.
-
-    Args:
-        settings: The settings value.
-        available_models: The available models value.
-        model_mode_enabled: The model mode enabled value.
-
-    Returns:
-        The constructed chat settings.
-    """
-    reasoning_levels = ["low", "medium", "high"]
-    inputs: list[Any] = []
-    if model_mode_enabled:
-        inputs.append(
-            Select(
-                id="model_name",
-                label="Model",
-                values=list(available_models),
-                initial_index=available_models.index(settings.model_name),
-                description="Select a configured model for this chat session.",
-            )
-        )
-    inputs.extend(
-        [
-            Select(
-                id="reasoning_level",
-                label="Reasoning Level",
-                values=reasoning_levels,
-                initial_index=reasoning_levels.index(settings.reasoning_level),
-                description=(
-                    "Controls the configured model's reasoning setting when the active "
-                    "provider supports it."
-                ),
-            ),
-            TextInput(
-                id="thread_id",
-                label="LangGraph Thread ID",
-                initial=settings.thread_id,
-                description=(
-                    "Defaults to the current Chainlit thread. Override it only if you want "
-                    "to point this chat at a different persisted LangGraph thread."
-                ),
-            ),
-            Switch(
-                id="show_reasoning_stream",
-                label="Show Reasoning Stream",
-                initial=settings.show_reasoning_stream,
-                description="Show streamed reasoning panels and reasoning task entries.",
-            ),
-            Switch(
-                id="show_tool_calls",
-                label="Show Tool Calls",
-                initial=settings.show_tool_calls,
-                description="Show streamed tool-call panels and tool task entries.",
-            ),
-        ]
-    )
-    return cl.ChatSettings(inputs)
-
-
-def build_modes(
-    settings: AppSettings,
-    *,
-    available_models: tuple[str, ...],
-    model_mode_enabled: bool = True,
-    reasoning_mode_enabled: bool = True,
-) -> list[cl.Mode]:
-    """Build modes.
-
-    Args:
-        settings: The settings value.
-        available_models: The available models value.
-        model_mode_enabled: The model mode enabled value.
-        reasoning_mode_enabled: The reasoning mode enabled value.
-
-    Returns:
-        The constructed modes.
-    """
-    reasoning_levels = ["low", "medium", "high"]
-    modes: list[cl.Mode] = []
-    if model_mode_enabled:
-        modes.append(
-            cl.Mode(
-                id="model_name",
-                name="Model",
-                options=[
-                    cl.ModeOption(
-                        id=model_name,
-                        name=model_name,
-                        description="Use this model for the current message.",
-                        icon="bot",
-                        default=model_name == settings.model_name,
-                    )
-                    for model_name in available_models
-                ],
-            )
-        )
-    if reasoning_mode_enabled:
-        modes.append(
-            cl.Mode(
-                id="reasoning_level",
-                name="Reasoning",
-                options=[
-                    cl.ModeOption(
-                        id=level,
-                        name=level.capitalize(),
-                        description=(
-                            "Deeper reasoning with higher latency"
-                            if level == "high"
-                            else (
-                                "Balanced quality and speed"
-                                if level == "medium"
-                                else "Fastest responses with lighter reasoning"
-                            )
-                        ),
-                        icon=(
-                            "brain"
-                            if level == "high"
-                            else ("sparkles" if level == "medium" else "zap")
-                        ),
-                        default=level == settings.reasoning_level,
-                    )
-                    for level in reasoning_levels
-                ],
-            )
-        )
-    return modes
-
-
-async def publish_modes(
-    settings: AppSettings,
-    *,
-    available_models: tuple[str, ...],
-    model_mode_enabled: bool = True,
-    reasoning_mode_enabled: bool = True,
-) -> None:
-    """Publish modes.
-
-    Args:
-        settings: The settings value.
-        available_models: The available models value.
-        model_mode_enabled: The model mode enabled value.
-        reasoning_mode_enabled: The reasoning mode enabled value.
-    """
-    try:
-        await cl.context.emitter.set_modes(
-            build_modes(
-                settings,
-                available_models=available_models,
-                model_mode_enabled=model_mode_enabled,
-                reasoning_mode_enabled=reasoning_mode_enabled,
-            )
-        )
-    except Exception as exc:
-        message = str(exc).lower()
-        missing_modes_column = "modes" in message and (
-            ("column" in message and "does not exist" in message)
-            or "no such column" in message
-        )
-        if not missing_modes_column:
-            raise
-
-
-def coerce_settings(
-    raw_settings: AppSettings | dict[str, Any] | None,
-    *,
-    default_model_name: str,
-    available_models: tuple[str, ...],
-    default_reasoning_level: ReasoningLevel = DEFAULT_REASONING_LEVEL,
-    runtime_config: RuntimeConfig | None = None,
-    show_reasoning_stream_default: bool = True,
-    show_tool_calls_default: bool = True,
-) -> AppSettings:
-    """Coerce settings.
-
-    Args:
-        raw_settings: Raw settings to process.
-        default_model_name: The default model name value.
-        available_models: The available models value.
-        default_reasoning_level: Reasoning default when settings omit it.
-        runtime_config: Runtime config used to derive profile-aware defaults.
-        show_reasoning_stream_default: Default reasoning stream visibility.
-        show_tool_calls_default: Default tool-call visibility.
-
-    Returns:
-        The coerced value.
-    """
-    if raw_settings is None:
-        raw_settings = {}
-    if isinstance(raw_settings, AppSettings):
-        return AppSettings(
-            model_name=resolve_model_name(
-                raw_settings.model_name,
-                available_models=available_models,
-                default=default_model_name,
-            ),
-            reasoning_level=normalize_reasoning_level(raw_settings.reasoning_level),
-            thread_id=raw_settings.thread_id,
-            show_reasoning_stream=coerce_bool_setting(
-                getattr(raw_settings, "show_reasoning_stream", None),
-                default=show_reasoning_stream_default,
-            ),
-            show_tool_calls=coerce_bool_setting(
-                getattr(raw_settings, "show_tool_calls", None),
-                default=show_tool_calls_default,
-            ),
-        )
-    model_name = resolve_model_name(
-        raw_settings.get("model_name"),
-        available_models=available_models,
-        default=default_model_name,
-    )
-    reasoning_default = (
-        default_reasoning_level_for_model(runtime_config, model_name)
-        if runtime_config is not None
-        else default_reasoning_level
-    )
-    reasoning_level = normalize_reasoning_level(
-        raw_settings.get("reasoning_level", reasoning_default),
-        default=reasoning_default,
-    )
-    thread_id = str(
-        raw_settings.get("thread_id") or current_chainlit_thread_id()
-    ).strip()
-    if not thread_id:
-        thread_id = current_chainlit_thread_id()
-    return AppSettings(
-        model_name=model_name,
-        reasoning_level=reasoning_level,
-        thread_id=thread_id.strip(),
-        show_reasoning_stream=coerce_bool_setting(
-            raw_settings.get("show_reasoning_stream"),
-            default=show_reasoning_stream_default,
-        ),
-        show_tool_calls=coerce_bool_setting(
-            raw_settings.get("show_tool_calls"),
-            default=show_tool_calls_default,
-        ),
-    )
-
-
-def resolve_reasoning_level_for_message(
-    message: cl.Message,
-    settings: AppSettings,
-    *,
-    reasoning_mode_enabled: bool = True,
-) -> ReasoningLevel:
-    """Resolve reasoning level for message.
-
-    Args:
-        message: Chainlit message or LangChain message to process.
-        settings: The settings value.
-        reasoning_mode_enabled: The reasoning mode enabled value.
-
-    Returns:
-        The resolved reasoning level for message.
-    """
-    if not reasoning_mode_enabled:
-        return settings.reasoning_level
-    raw_modes = getattr(message, "modes", None)
-    if not isinstance(raw_modes, dict):
-        return settings.reasoning_level
-    return normalize_reasoning_level(
-        raw_modes.get("reasoning_level"),
-        default=settings.reasoning_level,
-    )
-
-
-def message_has_reasoning_level_override(
-    message: cl.Message,
-    *,
-    reasoning_mode_enabled: bool = True,
-) -> bool:
-    """Return whether a message explicitly selected a reasoning level."""
-    if not reasoning_mode_enabled:
-        return False
-    raw_modes = getattr(message, "modes", None)
-    return isinstance(raw_modes, dict) and raw_modes.get("reasoning_level") is not None
-
-
-def default_reasoning_level_for_model(
-    config: RuntimeConfig,
-    model_name: str | None,
-) -> ReasoningLevel:
-    """Return the profile-aware reasoning default for a Chainlit model choice."""
-    model_profile = resolve_runtime_model_profile(config, model_name)
-    return reasoning_level_for_profile(
-        model_profile,
-        config.default_reasoning,
-        fallback_is_explicit=config.model_reasoning_override,
-    )
-
-
-def settings_reasoning_level_is_explicit(
-    config: RuntimeConfig,
-    settings: AppSettings,
-    model_name: str | None = None,
-) -> bool:
-    """Return whether chat settings override the selected model's reasoning default."""
-    selected_model = model_name if model_name is not None else settings.model_name
-    return (
-        normalize_reasoning_level(settings.reasoning_level)
-        != default_reasoning_level_for_model(config, selected_model)
-    )
-
-
-def resolve_model_name_for_message(
-    message: cl.Message,
-    settings: AppSettings,
-    *,
-    available_models: tuple[str, ...],
-    model_mode_enabled: bool = True,
-) -> str:
-    """Resolve model name for message.
-
-    Args:
-        message: Chainlit message or LangChain message to process.
-        settings: The settings value.
-        available_models: The available models value.
-        model_mode_enabled: The model mode enabled value.
-
-    Returns:
-        The resolved model name for message.
-    """
-    if not model_mode_enabled:
-        return settings.model_name
-    raw_modes = getattr(message, "modes", None)
-    if not isinstance(raw_modes, dict):
-        return settings.model_name
-    return resolve_model_name(
-        raw_modes.get("model_name"),
-        available_models=available_models,
-        default=settings.model_name,
-    )
 
 
 if AUTH_ENABLED:
@@ -1627,6 +768,7 @@ async def run_response_action(action: cl.Action) -> None:
                         runtime.config, settings, settings.model_name
                     ),
                     mcp_session_id=current_mcp_session_id(),
+                    resolve_commands=False,
                     display_prompt="",
                     export_label=resolved.label,
                 )
@@ -1729,7 +871,10 @@ async def on_message(message: cl.Message) -> None:
     Args:
         message: Chainlit message or LangChain message to process.
     """
-    await _handle_message(message)
+    # Chainlit wraps this callback in its ``on_message`` run step; swallowing a
+    # stopped turn here keeps that step from being marked as an error.
+    with suppress(asyncio.CancelledError):
+        await _handle_message(message)
 
 
 _chainlit_message_callback = chainlit_config.code.on_message
@@ -1805,64 +950,6 @@ async def _handle_message(message: cl.Message) -> None:
             author="System",
         ).send()
 
-    selected_command = getattr(message, "command", None)
-    selected_command_supplied = bool(
-        str(selected_command or "").strip().lstrip("/")
-    )
-    parsed_command = resolve_native_command(
-        raw_text=message.content,
-        selected_command=selected_command,
-    )
-    slash_command_from_text = parse_native_command(message.content)
-    if (
-        not message.content.strip()
-        and uploaded_files
-        and not uploaded_image_parts
-        and parsed_command is None
-    ):
-        return
-    if (
-        not message.content.strip()
-        and not uploaded_files
-        and not uploaded_image_parts
-        and parsed_command is None
-    ):
-        return
-
-    if parsed_command is not None:
-        try:
-            transformed_prompt = await handle_native_command(
-                runtime=runtime,
-                settings=settings,
-                parsed=parsed_command,
-                mcp_session_id=mcp_session_id,
-            )
-        except Exception as exc:
-            await cl.Message(
-                author="System",
-                content=f"Native command `/{parsed_command.command_name}` failed: {exc}",
-            ).send()
-            return
-        if transformed_prompt is None:
-            if selected_command_supplied or slash_command_from_text is None:
-                await cl.Message(
-                    author="System",
-                    content=(
-                        f"Unknown command `/{parsed_command.command_name}`.\n"
-                        "Use a configured command from startup or send a normal prompt."
-                    ),
-                ).send()
-                return
-        else:
-            if not transformed_prompt.strip():
-                return
-            message.content = transformed_prompt
-
-    agent_prompt = chainlit_prompt_text(
-        message.content,
-        image_names=uploaded_image_names,
-        prompt_note=prompt_note,
-    )
     reasoning_level_is_explicit = (
         message_has_reasoning_level_override(
             message,
@@ -1877,12 +964,15 @@ async def _handle_message(message: cl.Message) -> None:
     await _run_agent_turn(
         runtime=runtime,
         settings=settings,
-        agent_prompt=agent_prompt,
+        agent_prompt=message.content,
         effective_reasoning_level=effective_reasoning_level,
         effective_model_name=effective_model_name,
         reasoning_level_is_explicit=reasoning_level_is_explicit,
         mcp_session_id=mcp_session_id,
+        selected_command=getattr(message, "command", None),
         uploaded_image_parts=uploaded_image_parts,
+        uploaded_image_names=uploaded_image_names,
+        prompt_note=prompt_note,
     )
 
 
@@ -1895,126 +985,165 @@ async def _run_agent_turn(
     effective_model_name: str,
     reasoning_level_is_explicit: bool,
     mcp_session_id: str | None,
+    selected_command: str | None = None,
     uploaded_image_parts: list[dict[str, Any]] | None = None,
+    uploaded_image_names: tuple[str, ...] = (),
+    prompt_note: str = "",
+    resolve_commands: bool = True,
     display_prompt: str | None = None,
     export_label: str = "",
 ) -> None:
-    """Stream one ordinary or response-action turn through the same agent."""
+    """Run one ordinary or response-action turn through the shared runner.
+
+    ``agent_prompt`` is the raw text, resolved as a native command when
+    ``resolve_commands`` is set. ``CancelledError`` propagates to the
+    outermost callback.
+    """
     async_url_override = async_subagent_url_override()
     run_task_list = await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
     )
-    agent, mcp_failures = await agent_with_mcp_status(
-        runtime,
-        effective_reasoning_level,
-        model_name=effective_model_name,
-        reasoning_level_is_explicit=reasoning_level_is_explicit,
-        thread_id=settings.thread_id,
-        async_subagent_url_override=async_url_override,
-        mcp_session_id=mcp_session_id,
-    )
-    if mcp_failures:
-        await cl.Message(content=mcp_outage_warning(mcp_failures)).send()
-    async_task_notifier = get_async_task_notifier(
-        agent=agent,
-        runtime=runtime,
-        url_override=async_url_override,
-    )
-    bridge = ChainlitEventBridge(
+
+    def build_bridge(prompt: str) -> ChainlitEventBridge:
+        return ChainlitEventBridge(
+            prompt=prompt,
+            run_task_list=run_task_list,
+            chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
+            reasoning_steps_enabled=settings.show_reasoning_stream,
+            tool_steps_enabled=settings.show_tool_calls,
+            generative_ui_enabled=runtime.config.extensions.chainlit_generative_ui_enabled,
+            generated_ui_elements=get_generated_ui_elements(),
+            display_prompt=display_prompt,
+            export_label=export_label,
+            response_actions=runtime.config.extensions.chainlit_response_actions,
+        )
+
+    request = TurnRequest(
         prompt=agent_prompt,
-        run_task_list=run_task_list,
-        chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
-        reasoning_steps_enabled=settings.show_reasoning_stream,
-        tool_steps_enabled=settings.show_tool_calls,
-        generative_ui_enabled=runtime.config.extensions.chainlit_generative_ui_enabled,
-        generated_ui_elements=get_generated_ui_elements(),
-        reflection_collector=ReflectionCollector.from_runtime_config(
-            runtime.config,
-            prompt=agent_prompt,
-        ),
-        display_prompt=display_prompt,
-        export_label=export_label,
-        response_actions=runtime.config.extensions.chainlit_response_actions,
+        thread_id=settings.thread_id,
+        model_name=effective_model_name,
+        reasoning_level=effective_reasoning_level,
+        selected_command=selected_command,
+        reasoning_level_is_explicit=reasoning_level_is_explicit,
+        content_parts=tuple(uploaded_image_parts or ()),
+        image_names=uploaded_image_names,
+        prompt_note=prompt_note,
+        async_subagent_url=async_url_override,
+        mcp_session_id=mcp_session_id,
+        resolve_commands=resolve_commands,
     )
-    await bridge.start()
+    renderer = ChainlitTurnRenderer(build_bridge, prompt=agent_prompt)
+    result = await TurnRunner(runtime, sanitize_errors=False).run(request, renderer)
 
-    config = build_langgraph_config(
-        settings,
-        recursion_limit=runtime.config.recursion_limit,
-        runtime_config=runtime.config,
-        langsmith_tracing=getattr(runtime, "langsmith_tracing", None),
-    )
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": chainlit_user_message_content(
-                    agent_prompt,
-                    image_parts=uploaded_image_parts or [],
-                ),
-            }
-        ]
-    }
-    stream = agent.astream_events(
-        payload,
-        config=config,
-        version="v2",
-        stream_mode=["messages", "updates", "custom"],
-        subgraphs=True,
-    )
-
-    try:
-        while True:
-            try:
-                part = await anext(stream)
-            except StopAsyncIteration:
-                break
-            await bridge.handle_event(part)
-    except asyncio.CancelledError:
-        with suppress(Exception):
-            await stream.aclose()
-        with suppress(Exception):
-            await bridge.cancel()
-        return
-    except Exception as exc:
-        with suppress(Exception):
-            await stream.aclose()
-        details = traceback.format_exc(limit=10)
-        with suppress(Exception):
-            await bridge.fail(exc, details)
-        proposal = bridge.reflection_proposal()
-        if proposal is not None:
+    if result.reflection is not None:
+        # A failed turn has already reported its error; never raise a second one.
+        with suppress(Exception) if result.status == "failed" else nullcontext():
+            await ask_to_save_reflection_lesson(
+                runtime=runtime,
+                settings=settings,
+                proposal=result.reflection,
+                reasoning_level=effective_reasoning_level,
+                model_name=effective_model_name,
+                async_url_override=async_url_override,
+                mcp_session_id=mcp_session_id,
+            )
+    if result.status == "completed" and result.agent is not None:
+        async_task_notifier = get_async_task_notifier(
+            agent=result.agent,
+            runtime=runtime,
+            url_override=async_url_override,
+        )
+        if async_task_notifier is not None:
             with suppress(Exception):
-                await ask_to_save_reflection_lesson(
-                    runtime=runtime,
-                    settings=settings,
-                    proposal=proposal,
-                    reasoning_level=effective_reasoning_level,
-                    model_name=effective_model_name,
-                    async_url_override=async_url_override,
-                    mcp_session_id=mcp_session_id,
-                )
-        return
-    finally:
-        with suppress(Exception):
-            await stream.aclose()
+                await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
 
-    await bridge.finish()
-    proposal = bridge.reflection_proposal()
-    if proposal is not None:
-        await ask_to_save_reflection_lesson(
+
+def reflection_actions(*, retry: bool = False) -> list[cl.Action]:
+    """Return Chainlit actions for reflection confirmation."""
+    return [
+        cl.Action(
+            name=REFLECTION_SAVE_ACTION,
+            payload={"value": "retry" if retry else "save"},
+            label="Retry" if retry else "Save lesson",
+            tooltip="Ask the agent to save this lesson into long-term memory.",
+            icon="save",
+        ),
+        cl.Action(
+            name=REFLECTION_DISMISS_ACTION,
+            payload={"value": "dismiss"},
+            label="Dismiss",
+            tooltip="Do not save this reflection lesson.",
+            icon="x",
+        ),
+    ]
+
+
+async def ask_to_save_reflection_lesson(
+    *,
+    runtime: AgentRuntime,
+    settings: AppSettings,
+    proposal: ReflectionProposal,
+    reasoning_level: ReasoningLevel,
+    model_name: str,
+    async_url_override: str | None,
+    mcp_session_id: str | None,
+) -> None:
+    """Ask the Chainlit user whether to save a reflection lesson."""
+    retry = False
+    while True:
+        response = await cl.AskActionMessage(
+            content=format_reflection_proposal(proposal),
+            actions=reflection_actions(retry=retry),
+            author="System",
+            timeout=90,
+            raise_on_timeout=False,
+        ).send()
+        if not response:
+            return
+        payload = response.get("payload") if isinstance(response, dict) else None
+        expected_action = "retry" if retry else "save"
+        if not isinstance(payload, dict) or payload.get("value") != expected_action:
+            return
+        if await save_reflection_lesson(
             runtime=runtime,
             settings=settings,
             proposal=proposal,
-            reasoning_level=effective_reasoning_level,
-            model_name=effective_model_name,
+            reasoning_level=reasoning_level,
+            model_name=model_name,
             async_url_override=async_url_override,
             mcp_session_id=mcp_session_id,
-        )
-    if async_task_notifier is not None:
-        with suppress(Exception):
-            await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
+        ):
+            return
+        # Chainlit consumes each prompt's actions. Keep this proposal and wait
+        # for a fresh user selection before attempting storage again.
+        retry = True
+
+
+async def save_reflection_lesson(
+    *,
+    runtime: AgentRuntime,
+    settings: AppSettings,
+    proposal: ReflectionProposal,
+    reasoning_level: ReasoningLevel,
+    model_name: str,
+    async_url_override: str | None,
+    mcp_session_id: str | None,
+) -> bool:
+    """Return success only after verified persistence, allowing an explicit retry."""
+    try:
+        await runtime.save_reflection(proposal)
+    except Exception:
+        await cl.Message(
+            content="Reflection could not be saved. Please retry.",
+            author="System",
+        ).send()
+        return False
+    await cl.Message(
+        content=f"Saved lesson to `{proposal.memory_file}`.",
+        author="System",
+    ).send()
+    return True
 
 
 @cl.on_chat_end

@@ -5,38 +5,46 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextvars import ContextVar
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from deepagents.backends import StoreBackend
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_mcp_adapters.sessions import (
+    SSEConnection,
+    StdioConnection,
+    StreamableHttpConnection,
+    WebsocketConnection,
+)
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
-import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.graph as runtime_graph
+import chainagents.runtime.mcp_sessions as runtime_mcp_sessions
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
+import chainagents.runtime.rag_ops as runtime_rag_ops
 import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
     RagStatus,
     RagUploadResult,
     UploadedRagFile,
     WorkspaceDocsRAG,
-    compose_rag_system_prompt,
-    create_search_workspace_knowledge_tool,
 )
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.constants import SYSTEM_PROMPT, ReasoningLevel
+from chainagents.runtime.mcp_sessions import (
+    MCPSessionPool,
+    _MCPSessionOwner as _MCPSessionOwner,
+    mcp_outage_warning as mcp_outage_warning,
+)
 from chainagents.runtime.reflection import (
     ReflectionProposal,
     append_reflection_lesson,
@@ -50,9 +58,6 @@ from chainagents.runtime.types import (
 )
 
 logger = logging.getLogger("chainagents.runtime.core")
-_MCP_DISCOVERY_WARNINGS: ContextVar[set[str] | None] = ContextVar(
-    "mcp_discovery_warnings", default=None
-)
 
 
 async def agent_with_mcp_status(
@@ -65,57 +70,10 @@ async def agent_with_mcp_status(
     return await runtime.get_agent(reasoning_level, **kwargs), ()
 
 
-def mcp_outage_warning(server_names: tuple[str, ...]) -> str:
-    """Return a safe user-facing warning without exposing transport details."""
-    names = ", ".join(server_names)
-    return f"MCP server unavailable: {names}. Continuing with available tools."
-
-
-class _MCPSessionOwner:
-    """Enter and exit transport cancel scopes on the same long-lived task."""
-
-    def __init__(self, context: Any) -> None:
-        self._ready = asyncio.get_running_loop().create_future()
-        self._stop = asyncio.Event()
-        self._task = asyncio.create_task(self._run(context))
-
-    async def _run(self, context: Any) -> None:
-        try:
-            async with context as session:
-                self._ready.set_result(session)
-                await self._stop.wait()
-        except BaseException as exc:
-            if not self._ready.done():
-                self._ready.set_exception(exc)
-            else:
-                raise
-
-    async def session(self) -> Any:
-        try:
-            return await asyncio.shield(self._ready)
-        except BaseException:
-            await self.aclose()
-            # Retrieve a startup error even when the requesting task was cancelled.
-            if self._ready.done():
-                self._ready.exception()
-            raise
-
-    async def aclose(self) -> None:
-        self._stop.set()
-        if not self._ready.done():
-            self._task.cancel()
-        await asyncio.shield(self._task)
-
-    @property
-    def terminal(self) -> bool:
-        """Whether the transport task has exited and cannot be closed again."""
-        return self._task.done()
-
-
 class AgentRuntime:
     """Own configured agents, MCP sessions, persistence handles, and RAG state."""
 
-    _instance: "AgentRuntime | None" = None
+    _instance: AgentRuntime | None = None
     _instance_lock = asyncio.Lock()
 
     def __init__(self, config: RuntimeConfig, *, project_root: Path | None = None) -> None:
@@ -130,13 +88,8 @@ class AgentRuntime:
         self.project_root = project_root or runtime_constants.PROJECT_ROOT
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
-        self._mcp_lock = asyncio.Lock()
         self._agents: dict[AgentCacheKey, object] = {}
-        self._mcp_client: MultiServerMCPClient | None = None
-        self._mcp_tools_cache: dict[tuple[str | None, tuple[str, ...]], list[Any]] = {}
-        self._mcp_discovery_failed = False
-        self._mcp_sessions: dict[tuple[str | None, str], Any] = {}
-        self._mcp_session_owners: dict[tuple[str | None, str], _MCPSessionOwner] = {}
+        self._mcp_pool = MCPSessionPool(lambda: self.config.extensions)
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
@@ -247,7 +200,7 @@ class AgentRuntime:
                 raise RuntimeError("Reflection persistence failed.") from exc
 
     @classmethod
-    async def get(cls) -> "AgentRuntime":
+    async def get(cls) -> AgentRuntime:
         """Get the agent runtime.
 
         Returns:
@@ -270,7 +223,7 @@ class AgentRuntime:
         config: RuntimeConfig | None = None,
         *,
         project_root: Path | None = None,
-    ) -> "AgentRuntime":
+    ) -> AgentRuntime:
         """Create the agent runtime.
 
         Args:
@@ -289,7 +242,7 @@ class AgentRuntime:
         return instance
 
     @classmethod
-    def current(cls) -> "AgentRuntime | None":
+    def current(cls) -> AgentRuntime | None:
         """Return the current.
 
         Returns:
@@ -344,7 +297,7 @@ class AgentRuntime:
         Returns:
             Whether the RAG service is available.
         """
-        return self.config.rag_requested
+        return runtime_rag_ops.rag_enabled(self)
 
     @property
     def chainlit_commands(self) -> tuple[ChainlitCommandConfig, ...]:
@@ -371,22 +324,20 @@ class AgentRuntime:
         Returns:
             The current RAG service status.
         """
-        if self._rag_service is not None:
-            return self._rag_service.snapshot()
-        if self.config.rag_requested:
-            return RagStatus.unavailable(
-                reason=self.config.rag_error or "Knowledge index is unavailable.",
-                persist_directory=(
-                    self.config.rag.persist_directory if self.config.rag is not None else None
-                ),
-            )
-        return RagStatus.disabled()
+        return runtime_rag_ops.rag_status(self)
 
     async def _initialize(self) -> None:
         """Initialize persistence, RAG, MCP clients, and configured agents."""
         if self.config.extensions.mcp_servers:
-            self._mcp_client = MultiServerMCPClient(
+            # Parsed from user config as generic dicts; each entry's shape is
+            # validated by MultiServerMCPClient itself at construction time.
+            mcp_servers = cast(
+                "dict[str, StdioConnection | SSEConnection | StreamableHttpConnection "
+                "| WebsocketConnection]",
                 self.config.extensions.mcp_servers,
+            )
+            self._mcp_pool.client = MultiServerMCPClient(
+                mcp_servers,
                 tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
             )
 
@@ -397,15 +348,17 @@ class AgentRuntime:
             self._store = InMemoryStore()
             self._checkpointer = MemorySaver()
         else:
-            self._store = await self._exit_stack.enter_async_context(
+            postgres_store = await self._exit_stack.enter_async_context(
                 AsyncPostgresStore.from_conn_string(self.config.database_url)
             )
-            await self.store.setup()
+            await postgres_store.setup()
+            self._store = postgres_store
 
-            self._checkpointer = await self._exit_stack.enter_async_context(
+            postgres_checkpointer = await self._exit_stack.enter_async_context(
                 AsyncPostgresSaver.from_conn_string(self.config.database_url)
             )
-            await self.checkpointer.setup()
+            await postgres_checkpointer.setup()
+            self._checkpointer = postgres_checkpointer
 
         if self.config.rag is not None:
             self._rag_service = WorkspaceDocsRAG(
@@ -418,210 +371,30 @@ class AgentRuntime:
         elif self.config.rag_requested and self.config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", self.config.rag_error)
 
-    async def _build_runtime_subagent_specs(
+    async def _load_subagent_mcp_tools(
         self,
         *,
-        reasoning_level: ReasoningLevel,
-        reasoning_level_is_explicit: bool,
-        selected_model_profile: ModelDefaults,
-        backend: Any,
-        inherited_tools: list[Any],
-        sanitized_inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
-    ) -> list[Any]:
-        """Build top-level sync subagent specs for a runtime context."""
+    ) -> dict[tuple[str, ...], list[Any]]:
+        """Load each sync subagent's own MCP tools, keyed by agent path."""
         registry = {
             subagent.name: subagent for subagent in self.config.extensions.subagents
         }
-        return [
-            await self._build_runtime_sync_subagent_spec(
-                subagent,
-                registry=registry,
-                reasoning_level=reasoning_level,
-                reasoning_level_is_explicit=reasoning_level_is_explicit,
-                inherited_model=selected_model_profile,
-                backend=backend,
-                inherited_tools=inherited_tools,
-                sanitized_inherited_tools=sanitized_inherited_tools,
+        tools_by_path: dict[tuple[str, ...], list[Any]] = {}
+
+        async def load(subagent: SubagentConfig, agent_path: tuple[str, ...]) -> None:
+            tools_by_path[agent_path] = await self._get_mcp_tools(
+                subagent.mcp_servers,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
-                agent_path=(subagent.name,),
             )
-            for subagent in self.config.extensions.subagents
-        ]
+            for child in runtime_graph.nested_child_subagents(subagent, registry):
+                await load(child, (*agent_path, child.name))
 
-    async def _build_runtime_sync_subagent_spec(
-        self,
-        subagent: SubagentConfig,
-        *,
-        registry: dict[str, SubagentConfig],
-        reasoning_level: ReasoningLevel,
-        reasoning_level_is_explicit: bool,
-        inherited_model: ModelDefaults,
-        backend: Any,
-        inherited_tools: list[Any],
-        sanitized_inherited_tools: list[Any],
-        thread_id: str | None,
-        mcp_session_id: str | None,
-        agent_path: tuple[str, ...],
-    ) -> dict[str, Any]:
-        """Build one sync subagent spec, compiling it when it has children."""
-        effective_model = runtime_models.resolve_runtime_model_profile(
-            self.config,
-            subagent.model,
-            inherited_model=inherited_model,
-        )
-        effective_reasoning_level = runtime_graph.reasoning_level_for_profile(
-            effective_model,
-            reasoning_level,
-            fallback_is_explicit=reasoning_level_is_explicit,
-        )
-        raw_own_tools = await self._get_mcp_tools(
-            subagent.mcp_servers,
-            thread_id=thread_id,
-            mcp_session_id=mcp_session_id,
-        )
-        own_tools = runtime_graph.sanitize_tools_for_model(
-            effective_model.provider,
-            raw_own_tools,
-        )
-        inherited_model_tools = runtime_graph.inherited_tools_for_model(
-            inherited_tools=inherited_tools,
-            sanitized_inherited_tools=sanitized_inherited_tools,
-            inherited_provider=inherited_model.provider,
-            effective_provider=effective_model.provider,
-        )
-        has_configured_own_tools = bool(subagent.mcp_servers)
-        effective_tools = (
-            own_tools
-            if has_configured_own_tools
-            else own_tools or inherited_model_tools
-        )
-        middleware = runtime_middleware.build_agent_middleware(
-            backend=backend,
-            config=self.config,
-            reasoning_level=effective_reasoning_level,
-            model_name=effective_model.name,
-            source=subagent.name,
-            project_root=self.project_root,
-        )
-        global_background_enabled = (
-            self.config.extensions.background_subagents.enabled
-        )
-        child_subagents = runtime_graph.nested_child_subagents(
-            subagent,
-            registry,
-        )
-        target_background_enabled = global_background_enabled and subagent.background
-        background_child_names = {
-            child.name for child in child_subagents if child.background
-        }
-        caller_background_enabled = (
-            global_background_enabled and bool(background_child_names)
-        )
-        if not child_subagents and not target_background_enabled:
-            subagent_tools = own_tools
-            if (
-                not subagent_tools
-                and subagent.model
-                and effective_model.provider != inherited_model.provider
-                and not has_configured_own_tools
-            ):
-                subagent_tools = inherited_model_tools
-            subagent_model = (
-                self._build_model(
-                    effective_reasoning_level,
-                    model_profile=effective_model,
-                )
-                if subagent.model
-                else None
-            )
-            return subagent.to_deepagents_spec(
-                tools=subagent_tools,
-                middleware=middleware,
-                model=subagent_model,
-            )
-
-        child_specs = [
-            await self._build_runtime_sync_subagent_spec(
-                child,
-                registry=registry,
-                reasoning_level=effective_reasoning_level,
-                reasoning_level_is_explicit=reasoning_level_is_explicit,
-                inherited_model=effective_model,
-                backend=backend,
-                inherited_tools=raw_own_tools if has_configured_own_tools else inherited_tools,
-                sanitized_inherited_tools=effective_tools,
-                thread_id=thread_id,
-                mcp_session_id=mcp_session_id,
-                agent_path=(*agent_path, child.name),
-            )
-            for child in child_subagents
-        ]
-        if not child_specs:
-            middleware.append(
-                runtime_middleware.DisableSubagentDelegationMiddleware()
-            )
-        background_tools = (
-            runtime_background_tasks.create_background_task_tools(
-                manager=self.background_tasks,
-                subagents={
-                    spec["name"]: spec["runnable"]
-                    for spec in child_specs
-                    if spec["name"] in background_child_names
-                },
-                agent_path=agent_path,
-                recursion_limit=self.config.recursion_limit,
-                session_generation=(
-                    self.background_tasks.session_generation(thread_id)
-                    if thread_id
-                    else None
-                ),
-                batch_output_store=(
-                    runtime_background_tasks.create_batch_result_output_store(
-                        backend,
-                        backend_prefix=(
-                            runtime_backends.generated_outputs_route_prefix(
-                                self.project_root
-                            )
-                        ),
-                    )
-                ),
-                existing_tools=effective_tools,
-                langsmith_tracing=self.langsmith_tracing,
-            )
-            if caller_background_enabled
-            else []
-        )
-        runnable_kwargs: dict[str, Any] = {
-            "model": self._build_model(
-                effective_reasoning_level,
-                model_profile=effective_model,
-            ),
-            "tools": [*effective_tools, *background_tools] or None,
-            "system_prompt": subagent.system_prompt,
-            "middleware": middleware,
-            "backend": backend,
-            "skills": list(subagent.skills) or None,
-            "subagents": child_specs,
-        }
-        if self.config.agent_state == "stateful":
-            runnable_kwargs["store"] = self.store
-            runnable_kwargs["checkpointer"] = self.checkpointer
-        runnable = runtime_middleware.create_deep_agent_with_configured_summarization(
-            self.config,
-            **runnable_kwargs,
-        )
-        return {
-            "name": subagent.name,
-            "description": subagent.description,
-            "runnable": (
-                runtime_background_tasks.scope_background_task_invocation(runnable)
-                if caller_background_enabled
-                else runnable
-            ),
-        }
+        for subagent in self.config.extensions.subagents:
+            await load(subagent, (subagent.name,))
+        return tools_by_path
 
     async def get_agent(
         self,
@@ -664,7 +437,7 @@ class AgentRuntime:
             reasoning_level,
             fallback_is_explicit=reasoning_level_is_explicit,
         )
-        mcp_scope = self._mcp_scope(
+        mcp_scope = self._mcp_pool.scope(
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
@@ -679,116 +452,45 @@ class AgentRuntime:
         async with self._agent_lock:
             agent = self._agents.get(cache_key)
             if agent is None:
-                self._mcp_discovery_failed = False
-                model = self._build_model(
-                    effective_reasoning_level,
-                    model_profile=selected_model_profile,
-                )
-                rag_tool_enabled = self._rag_service is not None
+                self._mcp_pool.discovery_failed = False
                 raw_main_tools = await self._build_main_tools(
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
-                main_tools = runtime_graph.sanitize_tools_for_model(
-                    selected_model_profile.provider,
-                    raw_main_tools,
-                )
-                backend = runtime_backends.build_deepagent_backend(
-                    project_root=self.project_root,
-                    include_memories=self.config.agent_state == "stateful",
-                    memory_namespace=self.config.extensions.agent_memory_namespace,
-                    artifact_registry=self.large_tool_result_artifacts,
-                )
-                middleware = runtime_middleware.build_agent_middleware(
-                    backend=backend,
-                    config=self.config,
-                    reasoning_level=effective_reasoning_level,
-                    model_name=selected_model,
-                    source="main-agent",
-                    project_root=self.project_root,
-                )
-                subagent_specs = await self._build_runtime_subagent_specs(
-                    reasoning_level=effective_reasoning_level,
-                    reasoning_level_is_explicit=reasoning_level_is_explicit,
-                    selected_model_profile=selected_model_profile,
-                    backend=backend,
-                    inherited_tools=raw_main_tools,
-                    sanitized_inherited_tools=main_tools,
+                subagent_mcp_tools = await self._load_subagent_mcp_tools(
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
-                local_subagent_specs = list(subagent_specs)
-                subagent_specs.extend(
-                    subagent.to_deepagents_spec(
-                        url_override=async_subagent_url_override,
-                    )
-                    for subagent in self.config.extensions.async_subagents
-                )
-                background_subagent_names = {
-                    subagent.name
-                    for subagent in self.config.extensions.subagents
-                    if subagent.background
-                }
-                background_subagents = {
-                    spec["name"]: spec["runnable"]
-                    for spec in local_subagent_specs
-                    if spec["name"] in background_subagent_names
-                }
-                background_tools = (
-                    runtime_background_tasks.create_background_task_tools(
-                        manager=self.background_tasks,
-                        subagents=background_subagents,
-                        agent_path=(),
-                        recursion_limit=self.config.recursion_limit,
-                        session_generation=(
-                            self.background_tasks.session_generation(thread_id)
-                            if thread_id
-                            else None
-                        ),
-                        batch_output_store=(
-                            runtime_background_tasks.create_batch_result_output_store(
-                                backend,
-                                backend_prefix=(
-                                    runtime_backends.generated_outputs_route_prefix(
-                                        self.project_root
-                                    )
-                                ),
-                            )
-                        ),
-                        existing_tools=main_tools,
-                        langsmith_tracing=self.langsmith_tracing,
-                    )
-                    if (
-                        self.config.extensions.background_subagents.enabled
-                        and background_subagents
-                    )
-                    else []
-                )
-                agent_kwargs: dict[str, Any] = {
-                    "model": model,
-                    "tools": [*main_tools, *background_tools] or None,
-                    "system_prompt": compose_rag_system_prompt(
-                        runtime_graph.compose_agent_system_prompt(
-                            runtime_graph.system_prompt_for_agent_state(
-                                SYSTEM_PROMPT,
-                                self.config.agent_state,
-                            ),
-                            self.config.extensions.custom_instruction,
-                            project_root=self.project_root,
-                        ),
-                        rag_enabled=rag_tool_enabled,
+                stateful = self.config.agent_state == "stateful"
+                agent_kwargs = runtime_graph.build_agent_kwargs(
+                    self.config,
+                    tools=raw_main_tools,
+                    model_profile=selected_model_profile,
+                    reasoning_level=effective_reasoning_level,
+                    reasoning_level_is_explicit=reasoning_level_is_explicit,
+                    system_prompt=SYSTEM_PROMPT,
+                    custom_instruction=self.config.extensions.custom_instruction,
+                    rag_enabled=self._rag_service is not None,
+                    project_root=self.project_root,
+                    artifact_registry=self.large_tool_result_artifacts,
+                    include_async_subagents=True,
+                    model_name=selected_model,
+                    async_subagent_url_override=async_subagent_url_override,
+                    subagent_mcp_tools=subagent_mcp_tools,
+                    build_model=lambda level, profile: self._build_model(
+                        level,
+                        model_profile=profile,
                     ),
-                    "middleware": middleware,
-                    "backend": backend,
-                    "skills": list(self.config.extensions.skills) or None,
-                    "subagents": subagent_specs or None,
-                }
-                memory_files = runtime_graph.stateful_agent_memory_files(self.config)
-                if memory_files is not None:
-                    agent_kwargs["memory"] = memory_files
-                if self.config.agent_state == "stateful":
-                    agent_kwargs["store"] = self.store
-                    agent_kwargs["checkpointer"] = self.checkpointer
+                    store=self.store if stateful else None,
+                    checkpointer=self.checkpointer if stateful else None,
+                    background_manager=(
+                        self.background_tasks
+                        if self.config.extensions.background_subagents.enabled
+                        else None
+                    ),
+                    session_id=thread_id,
+                    langsmith_tracing=self.langsmith_tracing,
+                )
                 agent = runtime_middleware.create_deep_agent_with_configured_summarization(
                     self.config,
                     **agent_kwargs,
@@ -799,7 +501,7 @@ class AgentRuntime:
                     artifact_registry=self.large_tool_result_artifacts,
                     fixed_session_id=thread_id,
                 )
-                if not self._mcp_discovery_failed:
+                if not self._mcp_pool.discovery_failed:
                     self._agents[cache_key] = agent
             return agent
 
@@ -808,11 +510,11 @@ class AgentRuntime:
     ) -> tuple[Any, tuple[str, ...]]:
         """Return an agent and MCP discovery failures for this build."""
         warnings: set[str] = set()
-        token = _MCP_DISCOVERY_WARNINGS.set(warnings)
+        token = runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.set(warnings)
         try:
             agent = await self.get_agent(reasoning_level, **kwargs)
         finally:
-            _MCP_DISCOVERY_WARNINGS.reset(token)
+            runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.reset(token)
         return agent, tuple(sorted(warnings))
 
     async def rebuild_rag_index(self) -> RagStatus:
@@ -821,21 +523,7 @@ class AgentRuntime:
         Returns:
             The rebuilt object or status.
         """
-        if self._rag_service is None:
-            if self.config.rag_requested:
-                return RagStatus.unavailable(
-                    reason=self.config.rag_error or "Knowledge index is unavailable.",
-                    persist_directory=(
-                        self.config.rag.persist_directory
-                        if self.config.rag is not None
-                        else None
-                    ),
-                )
-            return RagStatus.disabled()
-
-        status = await asyncio.to_thread(self._rag_service.rebuild)
-        await self._clear_agent_cache()
-        return status
+        return await runtime_rag_ops.rebuild_rag_index(self)
 
     async def ingest_rag_uploads(
         self,
@@ -852,16 +540,8 @@ class AgentRuntime:
         Returns:
             The ingest RAG uploads result.
         """
-        if self._rag_service is None:
-            return RagUploadResult(
-                thread_id=thread_id,
-                reason=self.config.rag_error or "Knowledge index is unavailable.",
-            )
-
-        return await asyncio.to_thread(
-            self._rag_service.ingest_uploaded_files,
-            thread_id=thread_id,
-            uploads=uploads,
+        return await runtime_rag_ops.ingest_rag_uploads(
+            self, thread_id=thread_id, uploads=uploads
         )
 
     async def clone_rag_uploads(
@@ -871,13 +551,8 @@ class AgentRuntime:
         target_thread_id: str,
     ) -> RagUploadResult:
         """Clone thread-scoped RAG uploads for a fresh conversation branch."""
-        if self._rag_service is None:
-            return RagUploadResult(
-                thread_id=target_thread_id,
-                reason=self.config.rag_error or "Knowledge index is unavailable.",
-            )
-        return await asyncio.to_thread(
-            self._rag_service.clone_thread_uploads,
+        return await runtime_rag_ops.clone_rag_uploads(
+            self,
             source_thread_id=source_thread_id,
             target_thread_id=target_thread_id,
         )
@@ -969,29 +644,6 @@ class AgentRuntime:
                 ) from None
         return await selected_tool.ainvoke(parsed_args)
 
-    def _sanitize_tools_for_model(self, tools: list[Any]) -> list[Any]:
-        """Sanitize tools for the active model provider.
-
-        Args:
-            tools: The tools value.
-
-        Returns:
-            The sanitized value.
-        """
-        return runtime_graph.sanitize_tools_for_model(self.config.model_provider, tools)
-
-    @staticmethod
-    def _tool_supports_openai_compatible_schema(tool: Any) -> bool:
-        """Return whether a tool supports OpenAI-compatible schemas.
-
-        Args:
-            tool: The tool value.
-
-        Returns:
-            Whether a tool supports OpenAI-compatible schemas.
-        """
-        return runtime_graph.tool_supports_openai_compatible_schema(tool)
-
     def _build_model(
         self,
         reasoning_level: ReasoningLevel,
@@ -1015,80 +667,6 @@ class AgentRuntime:
                 model_profile,
             )
         return runtime_models.build_model(self.config, reasoning_level, model_name=model_name)
-
-    def _mcp_scope(
-        self,
-        *,
-        mcp_session_id: str | None,
-        thread_id: str | None = None,
-    ) -> str | None:
-        """Open or reuse MCP client resources for the current scope.
-
-        Args:
-            mcp_session_id: MCP session identifier.
-            thread_id: Conversation thread identifier.
-
-        Returns:
-            The MCP scope result.
-        """
-        if not self.config.extensions.mcp_stateful:
-            return None
-
-        candidate = str(mcp_session_id or "").strip()
-        if candidate:
-            return candidate
-
-        fallback = str(thread_id or "").strip()
-        return fallback or None
-
-    async def _get_stateful_mcp_session(
-        self,
-        *,
-        server_name: str,
-        thread_id: str | None,
-        mcp_session_id: str | None,
-    ) -> Any:
-        """Return the cached MCP session for a Chainlit session.
-
-        Args:
-            server_name: The server name value.
-            thread_id: Conversation thread identifier.
-            mcp_session_id: MCP session identifier.
-
-        Returns:
-            The cached MCP session for a Chainlit session.
-
-        Raises:
-            RuntimeError: If the runtime is not in a usable state.
-        """
-        scope = self._mcp_scope(
-            mcp_session_id=mcp_session_id,
-            thread_id=thread_id,
-        )
-        cache_key = (scope, server_name)
-        session = self._mcp_sessions.get(cache_key)
-        if session is not None:
-            return session
-
-        stale_owner = self._mcp_session_owners.get(cache_key)
-        if stale_owner is not None:
-            if not stale_owner.terminal:
-                try:
-                    await stale_owner.aclose()
-                except Exception:
-                    if not stale_owner.terminal:
-                        raise
-                    logger.exception("Failed to close terminal MCP session for %s", server_name)
-            self._mcp_session_owners.pop(cache_key, None)
-
-        if self._mcp_client is None:
-            raise RuntimeError("MCP client is not initialized.")
-
-        owner = _MCPSessionOwner(self._mcp_client.session(server_name))
-        session = await owner.session()
-        self._mcp_session_owners[cache_key] = owner
-        self._mcp_sessions[cache_key] = session
-        return session
 
     async def _get_mcp_tools(
         self,
@@ -1120,67 +698,9 @@ class AgentRuntime:
         mcp_session_id: str | None = None,
     ) -> tuple[list[Any], tuple[str, ...]]:
         """Load available tools while reporting failed servers by name."""
-        if not server_names or self._mcp_client is None:
-            return [], ()
-
-        tool_scope = self._mcp_scope(
-            mcp_session_id=mcp_session_id,
-            thread_id=thread_id,
+        return await self._mcp_pool.tools_with_status(
+            server_names, thread_id=thread_id, mcp_session_id=mcp_session_id
         )
-        async with self._mcp_lock:
-            tools: list[Any] = []
-            failures: list[str] = []
-            for server_name in server_names:
-                cache_key = (tool_scope, (server_name,))
-                cached = self._mcp_tools_cache.get(cache_key)
-                if cached is not None:
-                    tools.extend(cached)
-                    continue
-                session_key = (tool_scope, server_name)
-                had_session = session_key in self._mcp_sessions
-                try:
-                    if self.config.extensions.mcp_stateful:
-                        session = await self._get_stateful_mcp_session(
-                            server_name=server_name,
-                            thread_id=thread_id,
-                            mcp_session_id=mcp_session_id,
-                        )
-                        loaded = await load_mcp_tools(
-                                session,
-                                callbacks=self._mcp_client.callbacks,
-                                tool_interceptors=self._mcp_client.tool_interceptors,
-                                server_name=server_name,
-                                tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
-                            )
-                    else:
-                        loaded = await self._mcp_client.get_tools(server_name=server_name)
-                except BaseException as exc:
-                    if not had_session:
-                        self._mcp_sessions.pop(session_key, None)
-                        owner = self._mcp_session_owners.get(session_key)
-                        if owner is not None:
-                            try:
-                                await owner.aclose()
-                            except Exception:
-                                logger.exception("Failed to close MCP session for %s", server_name)
-                            else:
-                                self._mcp_session_owners.pop(session_key, None)
-                            if owner.terminal:
-                                self._mcp_session_owners.pop(session_key, None)
-                    if isinstance(exc, asyncio.CancelledError):
-                        raise
-                    if not isinstance(exc, Exception):
-                        raise
-                    logger.warning("MCP server %s is unavailable: %s", server_name, exc)
-                    failures.append(server_name)
-                    self._mcp_discovery_failed = True
-                    warnings = _MCP_DISCOVERY_WARNINGS.get()
-                    if warnings is not None:
-                        warnings.add(server_name)
-                    continue
-                self._mcp_tools_cache[cache_key] = list(loaded)
-                tools.extend(loaded)
-            return tools, tuple(failures)
 
     async def _build_main_tools(
         self,
@@ -1197,22 +717,17 @@ class AgentRuntime:
         Returns:
             The constructed the main agent tool list for a runtime context.
         """
-        tools = await self._get_mcp_tools(
+        mcp_tools = await self._get_mcp_tools(
             self.config.extensions.agent_mcp_servers,
             thread_id=thread_id,
             mcp_session_id=mcp_session_id,
         )
-        tools = list(tools)
-        if self.config.extensions.chainlit_generative_ui_enabled:
-            tools.append(runtime_commands.create_render_chainlit_ui_tool())
-        if self._rag_service is not None:
-            tools.append(
-                create_search_workspace_knowledge_tool(
-                    self._rag_service,
-                    thread_id=thread_id,
-                )
-            )
-        return tools
+        return runtime_graph.build_main_tools(
+            self.config,
+            mcp_tools=mcp_tools,
+            rag_service=self._rag_service,
+            thread_id=thread_id,
+        )
 
     async def _clear_agent_cache(self) -> None:
         """Clear cached agents after runtime tool state changes."""
@@ -1225,7 +740,7 @@ class AgentRuntime:
         Args:
             mcp_session_id: MCP session identifier.
         """
-        mcp_scope = self._mcp_scope(mcp_session_id=mcp_session_id)
+        mcp_scope = self._mcp_pool.scope(mcp_session_id=mcp_session_id)
         if mcp_scope is None:
             return
 
@@ -1235,24 +750,9 @@ class AgentRuntime:
                 for key, agent in self._agents.items()
                 if key.mcp_scope != mcp_scope
             }
-            async with self._mcp_lock:
-                owners = [
-                    (key, owner)
-                    for key, owner in self._mcp_session_owners.items()
-                    if key[0] == mcp_scope
-                ]
-                self._mcp_sessions = {
-                    key: session
-                    for key, session in self._mcp_sessions.items()
-                    if key[0] != mcp_scope
-                }
-                self._mcp_tools_cache = {
-                    key: tools
-                    for key, tools in self._mcp_tools_cache.items()
-                    if key[0] != mcp_scope
-                }
+            owners = await self._mcp_pool.evict_scope(mcp_scope)
 
-        await self._close_mcp_owner_entries(owners)
+        await self._mcp_pool.close_owner_entries(owners)
 
     async def close_conversation(
         self, *, thread_id: str | None, mcp_session_id: str | None = None
@@ -1300,32 +800,13 @@ class AgentRuntime:
             return
         await self.close_mcp_session(mcp_session_id)
 
-    async def _close_mcp_owner_entries(
-        self, owners: list[tuple[tuple[str | None, str], _MCPSessionOwner]]
-    ) -> None:
-        """Close owners independently and retain failures for later retry."""
-        results = await asyncio.gather(
-            *(owner.aclose() for _, owner in owners), return_exceptions=True
-        )
-        async with self._mcp_lock:
-            for (key, owner), result in zip(owners, results, strict=True):
-                if not isinstance(result, BaseException) or getattr(owner, "terminal", False):
-                    if self._mcp_session_owners.get(key) is owner:
-                        self._mcp_session_owners.pop(key, None)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-
     async def close_all_mcp_sessions(self) -> None:
         """Close all MCP sessions."""
         async with self._agent_lock:
-            async with self._mcp_lock:
-                owners = list(self._mcp_session_owners.items())
-                self._mcp_sessions.clear()
-                self._mcp_tools_cache.clear()
-                self._agents.clear()
+            owners = await self._mcp_pool.evict_all()
+            self._agents.clear()
 
-        await self._close_mcp_owner_entries(owners)
+        await self._mcp_pool.close_owner_entries(owners)
 
     async def close(self) -> None:
         """Close the agent runtime."""
@@ -1359,20 +840,4 @@ class AgentRuntime:
                     finally:
                         self._checkpointer = None
                         self._store = None
-                        self._mcp_client = None
-
-    def _build_backend(self, runtime):
-        """Build the Deep Agent backend for the current runtime settings.
-
-        Args:
-            runtime: Agent runtime used by the operation.
-
-        Returns:
-            The constructed the deep agent backend for the current runtime settings.
-        """
-        return runtime_backends.build_deepagent_backend(
-            project_root=self.project_root,
-            include_memories=runtime.config.agent_state == "stateful",
-            memory_namespace=runtime.config.extensions.agent_memory_namespace,
-            artifact_registry=self.large_tool_result_artifacts,
-        )
+                        self._mcp_pool.client = None

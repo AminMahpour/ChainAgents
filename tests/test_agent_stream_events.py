@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import ClassVar
 
 
-from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
 from langchain_core.messages import HumanMessageChunk
 
 
 class _Token:
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         self.content = content
@@ -21,7 +22,7 @@ class _Token:
 class _ReasoningToken:
     type = "AIMessageChunk"
     content = ""
-    tool_call_chunks: list[dict[str, str]] = []
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, reasoning: str) -> None:
         self.additional_kwargs = {"reasoning_content": reasoning}
@@ -29,8 +30,8 @@ class _ReasoningToken:
 
 class _AnthropicThinkingToken:
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: object) -> None:
         self.content = content
@@ -39,7 +40,7 @@ class _AnthropicThinkingToken:
 class _ToolCallChunkToken:
     type = "AIMessageChunk"
     content = ""
-    additional_kwargs: dict[str, str] = {}
+    additional_kwargs: ClassVar[dict[str, str]] = {}
 
     def __init__(self, chunk: dict[str, str]) -> None:
         self.tool_call_chunks = [chunk]
@@ -567,3 +568,31 @@ def test_adapter_ignores_nested_chain_events() -> None:
     )
 
     assert events == []
+
+
+def test_langgraph_part_from_namespaced_tuple_chunk_is_normalized() -> None:
+    from chainagents.events.stream import langgraph_part_from_event_chunk
+
+    part = langgraph_part_from_event_chunk(
+        (("tools:abc",), "updates", {"tools": {"messages": []}})
+    )
+
+    assert part == {
+        "type": "updates",
+        "ns": ("tools:abc",),
+        "data": {"tools": {"messages": []}},
+    }
+
+
+def test_adapter_ignores_non_langgraph_stream_events() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    assert adapter.events_from_raw_event(
+        {"event": "on_chat_model_stream", "data": {"chunk": "hello"}}
+    ) == []
+    assert adapter.events_from_raw_event(
+        {
+            "event": "on_chain_stream",
+            "data": {"chunk": {"output": "not a LangGraph stream part"}},
+        }
+    ) == []

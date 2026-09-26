@@ -151,7 +151,7 @@ class ReflectionCollector:
         runtime_config: Any,
         *,
         prompt: str,
-    ) -> "ReflectionCollector":
+    ) -> ReflectionCollector:
         """Build a collector from a runtime config object."""
         extensions = getattr(runtime_config, "extensions", None)
         config = getattr(extensions, "agent_reflection", ReflectionConfig())

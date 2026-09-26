@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 from deepagents.backends import CompositeBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
@@ -24,7 +25,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 import pytest
 
-import deepagent_runtime
+import chainagents.runtime.core as deepagent_runtime
 import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
@@ -32,11 +33,12 @@ import chainagents.runtime.config as runtime_config
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.graph as runtime_graph
 import chainagents.runtime.lifecycle as runtime_lifecycle
+import chainagents.runtime.mcp_sessions as runtime_mcp_sessions
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
 import chainagents.runtime.providers as runtime_providers
 import chainagents.runtime.tracing as runtime_tracing
-from deepagent_runtime import (
+from chainagents.runtime.core import (
     AgentRuntime,
     BackgroundSubagentConfig,
     ChainlitCommandConfig,
@@ -52,7 +54,7 @@ from deepagent_runtime import (
     generated_outputs_route_prefix,
     virtual_workspace_path_to_local,
 )
-from rag_runtime import (
+from chainagents.rag.runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
     RagStatus,
     RagUploadResult,
@@ -643,7 +645,7 @@ max_tokens = {max_tokens}
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="max_tokens.*positive integer"):
+    with pytest.raises(ValueError, match=r"max_tokens.*positive integer"):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -2302,7 +2304,7 @@ api_key = "profile-key"
     monkeypatch.setenv("DEEPAGENT_MODEL_BASE_URL", "https://openai.example/v1")
     monkeypatch.setenv("DEEPAGENT_MODEL_API_KEY", "openai-key")
 
-    with pytest.raises(ValueError, match="provider.*claude-reviewer"):
+    with pytest.raises(ValueError, match=r"provider.*claude-reviewer"):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -2435,7 +2437,7 @@ enabled = "yes"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="langfuse.enabled"):
+    with pytest.raises(ValueError, match=re.escape("langfuse.enabled")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -2835,7 +2837,7 @@ thinking = "manual"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="model.thinking"):
+    with pytest.raises(ValueError, match=re.escape("model.thinking")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -3388,7 +3390,7 @@ enabled = true
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="agent.reflection.enabled"):
+    with pytest.raises(ValueError, match=re.escape("agent.reflection.enabled")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -3442,7 +3444,7 @@ state = "sometimes"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="agent.state"):
+    with pytest.raises(ValueError, match=re.escape("agent.state")):
         deepagent_runtime.RuntimeConfig.from_env()
 
 
@@ -3705,7 +3707,7 @@ def test_build_deepagent_backend_uses_explicit_agent_memory_namespace(
 
     memory_backend = backend.routes["/memories/"]
 
-    assert memory_backend._namespace(None) == ("repo-agent",)  # noqa: SLF001
+    assert memory_backend._namespace(None) == ("repo-agent",)
 
 
 def test_tool_execution_resilience_middleware_returns_error_tool_message() -> None:
@@ -4900,7 +4902,7 @@ def test_get_agent_rejects_configured_background_tool_name_collision(
         try:
             with pytest.raises(
                 ValueError,
-                match="reserved background task tool name.*spawn_background_task",
+                match=r"reserved background task tool name.*spawn_background_task",
             ):
                 await runtime.get_agent("medium", thread_id="thread-1")
         finally:
@@ -6106,6 +6108,67 @@ def test_summarization_status_middleware_emits_stream_events() -> None:
     ]
 
 
+def test_summarization_status_middleware_emits_failed_event_on_error() -> None:
+    """Verify a "failed" status event fires when a triggered summarization errors.
+
+    The inner middleware here is a plain duck-typed stand-in (like DeepAgents'
+    and LangChain's own SummarizationMiddleware classes, which are unrelated
+    to each other) rather than a subclass of either. `_will_summarize` must
+    recognize it by its attributes, not by `isinstance`, or the "failed"
+    event can never fire when a real summarization attempt raises.
+    """
+    events: list[dict[str, str]] = []
+
+    class FakeRuntime:
+        """Represent fake runtime."""
+
+        def stream_writer(self, event: dict[str, str]) -> None:
+            """Capture custom stream events emitted by middleware tests."""
+            events.append(event)
+
+    class FailingSummarizationMiddleware:
+        """Represent a summarization middleware whose model call fails."""
+
+        def token_counter(self, messages) -> int:
+            """Return a fixed token count high enough to trigger summarization."""
+            return 12
+
+        def _should_summarize(self, messages, total_tokens: int) -> bool:
+            """Report that summarization should run."""
+            return total_tokens >= 10
+
+        def _determine_cutoff_index(self, messages) -> int:
+            """Report a cutoff index that confirms summarization would apply."""
+            return 1
+
+        def before_model(self, state, runtime):
+            """Raise, as a real summarization failure would."""
+            raise RuntimeError("summarization backend unavailable")
+
+    middleware = deepagent_runtime.SummarizationStatusMiddleware(
+        FailingSummarizationMiddleware(),
+        source="main-agent",
+    )
+
+    with pytest.raises(RuntimeError, match="summarization backend unavailable"):
+        middleware.before_model({"messages": ["one", "two"]}, FakeRuntime())
+
+    assert events == [
+        {
+            "kind": "summarization_status",
+            "status": "started",
+            "source": "main-agent",
+            "message": "Conversation summarization triggered.",
+        },
+        {
+            "kind": "summarization_status",
+            "status": "failed",
+            "source": "main-agent",
+            "message": "Conversation summarization failed.",
+        },
+    ]
+
+
 def test_get_agent_omits_rag_tool_when_service_is_missing(
     tmp_path: Path,
     monkeypatch,
@@ -6347,7 +6410,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         """
 
         callbacks = object()
-        tool_interceptors: list[object] = []
+        tool_interceptors: ClassVar[list[object]] = []
 
         @asynccontextmanager
         async def session(self, server_name: str, *, auto_initialize: bool = True):
@@ -6398,7 +6461,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         load_calls.append((session, str(server_name)))
         return [SimpleNamespace(name=f"{server_name}_tool", session=session)]
 
-    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", fake_load_mcp_tools)
+    monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", fake_load_mcp_tools)
 
     runtime = AgentRuntime(
         make_runtime_config(
@@ -6409,7 +6472,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
             ),
         )
     )
-    runtime._mcp_client = FakeMCPClient()
+    runtime._mcp_pool._client = FakeMCPClient()
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
     monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
@@ -6448,8 +6511,8 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         )
         await runtime.close_mcp_session("session-1")
         assert len(closed_sessions) == 1
-        assert ("session-1", "repo") not in runtime._mcp_sessions
-        assert ("session-1", ("repo",)) not in runtime._mcp_tools_cache
+        assert ("session-1", "repo") not in runtime._mcp_pool._sessions
+        assert ("session-1", ("repo",)) not in runtime._mcp_pool._tools_cache
         assert first not in runtime._agents.values()
         assert other in runtime._agents.values()
         reopened = await runtime.get_agent(
@@ -7311,7 +7374,7 @@ background = "yes"
     )
     monkeypatch.setenv("DEEPAGENT_CONFIG", str(config_path))
 
-    with pytest.raises(ValueError, match="subagent 'researcher'.*background"):
+    with pytest.raises(ValueError, match=r"subagent 'researcher'.*background"):
         deepagent_runtime.load_extensions_config()
 
 

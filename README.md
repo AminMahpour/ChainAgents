@@ -327,6 +327,8 @@ chainagents/
                         upload handling, and event rendering.
     tui/                Full-screen Textual terminal UI.
     api/                FastAPI application, request schemas, and streaming API.
+  turns/                Shared TurnRunner: one agent turn (commands, uploads,
+                        streaming, generated files) used by every interface.
   events/               Shared LangGraph stream normalization used by all
                         interfaces.
   commands/             Native slash-command parsing and dispatch helpers.
@@ -352,6 +354,12 @@ Compatibility wrappers such as `main.py`, `deepagent_runtime.py`,
 `rag_runtime.py`, and `response_exports.py` import the moved package modules.
 Prefer new code under `chainagents/`, but keep the wrappers until external users
 no longer rely on the old import paths.
+
+**Deprecated:** every root-level wrapper except `main.py` and `langgraph_app.py`
+(which stay silent for `chainlit run main.py -w` and `langgraph.json`) now
+emits a `DeprecationWarning` on first import and will be removed in a future
+release. Import from the package path instead, e.g.
+`chainagents.runtime.core` instead of `deepagent_runtime`.
 
 ## Model Config
 
@@ -579,7 +587,7 @@ memory_files = ["/memories/AGENTS.md"]
 skills = ["skills"]
 mcp_servers = ["repo"]
 # custom_instruction = "Always ask clarifying questions before editing files."
-# custom_instruction_file = "prompts/ui_promots.md"
+# custom_instruction_file = "prompts/ui_prompts.md"
 
 [agent.reflection]
 enabled = true
@@ -600,7 +608,7 @@ Notes:
 - `memory_namespace` is the shared agent-scoped `StoreBackend` namespace for `/memories/`. ChainAgents passes a concrete backend instance and the explicit namespace tuple `(memory_namespace,)`, as required by DeepAgents 0.7. The default is `filesystem` to preserve existing memory data from earlier configs. Use only letters, numbers, hyphens, underscores, dots, `@`, `+`, colons, and tildes.
 - `memory_files` lists `/memories/` files DeepAgents loads into the startup memory prompt. The default is `["/memories/AGENTS.md"]`; set it to `[]` to keep the memory route without startup memory loading.
 - `custom_instruction` appends an inline instruction to the **main/supervisor** agent system prompt.
-- `custom_instruction_file` loads that appended instruction from a UTF-8 text file. Relative paths are resolved from the active `deepagent.toml`; use either `custom_instruction` or `custom_instruction_file`, not both. This repo uses `prompts/ui_promots.md` to encourage active Chainlit generated UI panels and next-step action buttons.
+- `custom_instruction_file` loads that appended instruction from a UTF-8 text file. Relative paths are resolved from the active `deepagent.toml`; use either `custom_instruction` or `custom_instruction_file`, not both. This repo uses `prompts/ui_prompts.md` to encourage active Chainlit generated UI panels and next-step action buttons.
 - `[agent.reflection]` is opt-in. When enabled for stateful agents, ChainAgents proposes a compact lesson for `memory_file` after correction phrases such as "that was wrong" or after unrecovered tool failures. Chainlit asks with Save/Dismiss before writing through the agent; CLI, TUI, and API expose the proposal without mutating memory.
 
 ### DeepAgents 0.7 Compatibility
@@ -1290,7 +1298,7 @@ Current scope of this config support:
   configured backend must also implement sandbox execution
 - it supports config-driven sync subagents and async Agent Protocol subagents
 - it does not yet provide a config-driven registry for custom Python tools per subagent beyond MCP
-- if you need custom Python tools, define them alongside the generated UI tool in [chainagents/runtime/commands.py](chainagents/runtime/commands.py), then register them in [graph.py](chainagents/runtime/graph.py) for static graphs and [lifecycle.py](chainagents/runtime/lifecycle.py) for live runtime agents
+- if you need custom Python tools, define them alongside the generated UI tool in [chainagents/runtime/commands.py](chainagents/runtime/commands.py), then add them in `build_main_tools` in [graph.py](chainagents/runtime/graph.py); both the static LangGraph graph and the live runtime agent ([lifecycle.py](chainagents/runtime/lifecycle.py)) assemble their tools through that one function
 
 See [deepagent.toml.example](deepagent.toml.example) for a portable baseline and
 the sections above for optional MCP and subagent examples.
@@ -1315,8 +1323,9 @@ the sections above for optional MCP and subagent examples.
 ## Runtime module structure
 
 The public runtime API is `chainagents.runtime`. `runtime/core.py` explicitly
-re-exports the same objects for compatibility, and `deepagent_runtime` remains an
-alias of that facade.
+re-exports the same objects for compatibility. The root-level `deepagent_runtime`
+module remains an alias of that facade but is deprecated and will be removed in a
+future release; import from `chainagents.runtime` instead.
 
 | Modules in `chainagents/runtime/` | Responsibility |
 | --- | --- |
@@ -1327,8 +1336,12 @@ alias of that facade.
 | `backends.py` | Workspace paths and filesystem/storage backend routing |
 | `middleware.py` | Tool resilience and summarization middleware |
 | `commands.py` | Generated UI tools and skill command discovery |
-| `graph.py` | Tool schemas, nested subagents, and static graph assembly |
+| `artifacts.py` | Session-scoped storage for offloaded large tool results |
+| `graph.py` | Shared agent assembly (main tools, subagent specs, agent kwargs) used by both the static graph and the live runtime |
 | `tracing.py` | Langfuse callbacks and LangGraph run configuration |
+| `mcp_sessions.py` | MCP session pool, stateful transport ownership, and tool discovery caching |
+| `rag_ops.py` | RAG index status, rebuild, and thread-scoped upload operations |
+| `background_tasks/` | Process-local background execution of configured synchronous subagents |
 | `lifecycle.py`, `reflection.py` | Agent/MCP/persistence lifecycle and correction reflection |
 
 Implementation modules import their lower-level owners directly; they never import

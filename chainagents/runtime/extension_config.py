@@ -292,7 +292,7 @@ def normalize_mcp_server_config(raw_server: dict[str, Any], base_dir: Path) -> d
         server["command"] = str(server["command"]).strip()
     if "args" in server:
         server["args"] = [str(arg) for arg in server.get("args", [])]
-    if "cwd" in server and server["cwd"]:
+    if server.get("cwd"):
         server["cwd"] = str(resolve_local_path(str(server["cwd"]), base_dir))
     if "headers" in server and server["headers"] is not None:
         server["headers"] = {str(k): str(v) for k, v in server["headers"].items()}
@@ -526,7 +526,11 @@ def validate_subagent_names(
 ) -> None:
     """Validate top-level subagent name uniqueness across sync and async specs."""
     seen_names: set[str] = set()
-    for subagent in (*subagents, *async_subagents):
+    combined: tuple[SubagentConfig | AsyncSubagentConfig, ...] = (
+        *subagents,
+        *async_subagents,
+    )
+    for subagent in combined:
         if subagent.name in seen_names:
             raise ValueError(
                 f"Top-level subagent name '{subagent.name}' is defined more than once."

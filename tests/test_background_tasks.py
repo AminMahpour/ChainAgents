@@ -1977,7 +1977,7 @@ def test_batch_markdown_files_write_standalone_reports_in_input_order(
             backend_prefix=generated_outputs_route_prefix(tmp_path),
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2092,7 +2092,7 @@ def test_batch_markdown_files_use_unique_sanitized_paths(
         )
         identifiers = iter(("firstunique", "secondunique"))
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex=next(identifiers)),
         )
@@ -2181,7 +2181,7 @@ def test_batch_markdown_files_roll_back_partial_writes(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2234,7 +2234,7 @@ def test_batch_markdown_files_remove_the_failed_write_path(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2275,12 +2275,12 @@ def test_batch_markdown_files_remove_real_filesystem_partial_writes(
             backend_prefix=generated_outputs_route_prefix(tmp_path),
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
 
-        with pytest.raises(RuntimeError, match="utf-8.*can't encode"):
+        with pytest.raises(RuntimeError, match=r"utf-8.*can't encode"):
             await _write_batch_markdown_files(
                 [batch_snapshot(task_id="task-1", result="\ud800")],
                 tool_call_id="batch-call",
@@ -2331,7 +2331,7 @@ def test_batch_markdown_files_preserve_cleanup_errors_during_cancellation(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2386,7 +2386,7 @@ def test_batch_markdown_files_clean_up_a_write_completed_during_cancellation(
             backend_prefix="/backend/outputs/",
         )
         monkeypatch.setattr(
-            background_tasks.uuid,
+            background_tasks.batch_output.uuid,
             "uuid4",
             lambda: SimpleNamespace(hex="batchunique"),
         )
@@ -2590,7 +2590,7 @@ def test_run_subagent_batch_rejects_the_whole_batch_when_capacity_is_insufficien
             store=None,
         )
 
-        with pytest.raises(RuntimeError, match="running limit.*session"):
+        with pytest.raises(RuntimeError, match=r"running limit.*session"):
             await batch_tool.coroutine(
                 [
                     {"description": "one", "subagent_type": "researcher"},
@@ -3150,7 +3150,7 @@ def test_concurrent_subagent_batches_share_atomic_capacity_limits() -> None:
         first = asyncio.create_task(batch_tool.coroutine(requests, runtime))
         await asyncio.wait_for(child.first_batch_started.wait(), timeout=1)
 
-        with pytest.raises(RuntimeError, match="running limit.*session"):
+        with pytest.raises(RuntimeError, match=r"running limit.*session"):
             await batch_tool.coroutine(requests, runtime)
 
         assert len(await manager.list("session-a")) == 2
@@ -3166,7 +3166,7 @@ def test_background_tools_reject_reserved_name_collisions() -> None:
 
     with pytest.raises(
         ValueError,
-        match="reserved background task tool name.*spawn_background_task",
+        match=r"reserved background task tool name.*spawn_background_task",
     ):
         create_background_task_tools(
             manager=manager,
@@ -3178,7 +3178,7 @@ def test_background_tools_reject_reserved_name_collisions() -> None:
 
     with pytest.raises(
         ValueError,
-        match="reserved background task tool name.*run_subagent_batch",
+        match=r"reserved background task tool name.*run_subagent_batch",
     ):
         create_background_task_tools(
             manager=manager,

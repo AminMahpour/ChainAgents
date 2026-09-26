@@ -623,6 +623,9 @@ def parse_model_profile_defaults(
         and "port" not in raw_model
     )
     if inherits_endpoint:
+        # inherits_endpoint is only true when `base is not None` (see its
+        # definition above); assert narrows for mypy without changing behaviour.
+        assert base is not None
         base_url = base.base_url
         endpoint_query = base.endpoint_query
     elif provider == "ollama":
@@ -912,20 +915,20 @@ def rebase_model_profile_defaults(
             return model_profile
         return replace(model_profile, **updates)
 
-    updates: dict[str, Any] = {}
+    same_provider_updates: dict[str, Any] = {}
     if "name" not in explicit_fields:
-        updates["name"] = base_model.name
-        updates["name_is_explicit"] = base_model.name_is_explicit
+        same_provider_updates["name"] = base_model.name
+        same_provider_updates["name_is_explicit"] = base_model.name_is_explicit
     if "models" not in explicit_fields:
-        updates["models"] = base_model.models
+        same_provider_updates["models"] = base_model.models
     if (
         "base_url" in runtime_override_fields
         or "base_url" not in explicit_fields
     ):
-        updates["base_url"] = base_model.base_url
-        updates["endpoint_query"] = base_model.endpoint_query
+        same_provider_updates["base_url"] = base_model.base_url
+        same_provider_updates["endpoint_query"] = base_model.endpoint_query
     if "api_key" not in explicit_fields:
-        updates["api_key"] = base_model.api_key
+        same_provider_updates["api_key"] = base_model.api_key
     for field_name in (
         "reasoning_effort",
         "thinking",
@@ -939,27 +942,27 @@ def rebase_model_profile_defaults(
             field_name in runtime_override_fields
             or field_name not in explicit_fields
         ):
-            updates[field_name] = getattr(base_model, field_name)
+            same_provider_updates[field_name] = getattr(base_model, field_name)
     if model_profile.runtime_override_fields != runtime_override_fields:
-        updates["runtime_override_fields"] = runtime_override_fields
+        same_provider_updates["runtime_override_fields"] = runtime_override_fields
     if model_profile.cross_provider_base_url != base_model.cross_provider_base_url:
-        updates["cross_provider_base_url"] = base_model.cross_provider_base_url
+        same_provider_updates["cross_provider_base_url"] = base_model.cross_provider_base_url
     if (
         model_profile.cross_provider_endpoint_url
         != base_model.cross_provider_endpoint_url
     ):
-        updates["cross_provider_endpoint_url"] = base_model.cross_provider_endpoint_url
+        same_provider_updates["cross_provider_endpoint_url"] = base_model.cross_provider_endpoint_url
     if (
         model_profile.cross_provider_endpoint_query
         != base_model.cross_provider_endpoint_query
     ):
-        updates["cross_provider_endpoint_query"] = (
+        same_provider_updates["cross_provider_endpoint_query"] = (
             base_model.cross_provider_endpoint_query
         )
 
-    if not updates:
+    if not same_provider_updates:
         return model_profile
-    return replace(model_profile, **updates)
+    return replace(model_profile, **same_provider_updates)
 
 
 def parse_model_defaults(raw_config: dict[str, Any]) -> ModelDefaults:

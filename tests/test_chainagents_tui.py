@@ -5,21 +5,25 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from textual.containers import VerticalScroll
 from textual.widgets import Markdown, RichLog
 
-import chainagents_cli
+from chainagents.interfaces.cli import app as chainagents_cli
+from chainagents.commands.native import dumps_tool_result
 from chainagents.runtime.background_tasks import BackgroundTaskManager
+from chainagents.runtime.reflection import ReflectionConfig
 from chainagents.runtime.types import BackgroundSubagentConfig
-from chainagents_tui import (
+from chainagents.interfaces.tui.app import (
     DEFAULT_TUI_THREAD_ID,
     ChainAgentsTuiApp,
     PromptTextArea,
     TUI_SIDE_PANEL_WIDTH,
+    TuiRenderer,
     capture_mcp_stdio_stderr,
     run_tui,
 )
@@ -27,8 +31,8 @@ from chainagents_tui import (
 
 class _Token:
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         self.content = content
@@ -37,7 +41,7 @@ class _Token:
 class _ReasoningToken:
     type = "AIMessageChunk"
     content = ""
-    tool_call_chunks: list[dict[str, str]] = []
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, reasoning: str) -> None:
         self.additional_kwargs = {"reasoning_content": reasoning}
@@ -46,7 +50,7 @@ class _ReasoningToken:
 class _ToolCallChunkToken:
     type = "AIMessageChunk"
     content = ""
-    additional_kwargs: dict[str, str] = {}
+    additional_kwargs: ClassVar[dict[str, str]] = {}
 
     def __init__(self, chunk: dict[str, str]) -> None:
         self.tool_call_chunks = [chunk]
@@ -376,6 +380,31 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(("reasoning", "explicit"), [(None, False), ("high", True)])
+async def test_tui_marks_reasoning_explicit_only_when_flag_given(
+    reasoning: str | None, explicit: bool
+) -> None:
+    """The TUI forwards --reasoning explicitness to the agent, like the CLI."""
+
+    class _RecordingRuntime(_FakeRuntime):
+        agent_kwargs: dict[str, Any]
+
+        async def get_agent(self, *args, **kwargs):
+            self.agent_kwargs = kwargs
+            return self.agent
+
+    runtime = _RecordingRuntime(_FakeAgent([]))
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args(reasoning=reasoning))
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt", PromptTextArea).load_text("hello")
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert runtime.agent_kwargs["reasoning_level_is_explicit"] is explicit
+
+
+@pytest.mark.anyio
 async def test_tui_shows_mcp_outage_warning() -> None:
     class DegradedRuntime(_FakeRuntime):
         async def get_agent_with_status(self, *args, **kwargs):
@@ -616,22 +645,288 @@ async def test_tui_tab_completes_first_matching_slash_command() -> None:
         assert app.command_help_visible is False
 
 
+class _ScriptedStream:
+    """Replay raw events, then optionally fail or block, recording ``aclose``."""
+
+    def __init__(self, events, *, error: Exception | None = None, block: bool = False):
+        self.events = list(events)
+        self.error = error
+        self.block = block
+        self.started = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.started.set()
+        if self.events:
+            return self.events.pop(0)
+        if self.error is not None:
+            raise self.error
+        if self.block:
+            await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _ScriptedAgent:
+    """Return one scripted stream and keep the last payload."""
+
+    def __init__(self, stream: _ScriptedStream) -> None:
+        self.stream = stream
+        self.payload: dict[str, Any] | None = None
+
+    def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+        self.payload = payload
+        return self.stream
+
+
+def _scripted_runtime(
+    tmp_path: Path,
+    stream: _ScriptedStream,
+    *,
+    reflection: bool = False,
+) -> _FakeRuntime:
+    runtime = _FakeRuntime(_ScriptedAgent(stream))  # type: ignore[arg-type]
+    runtime.project_root = tmp_path
+    if reflection:
+        runtime.config.extensions = SimpleNamespace(
+            agent_reflection=ReflectionConfig(enabled=True),
+        )
+    return runtime
+
+
+def _generated_output(project_root: Path, name: str) -> Path:
+    output = project_root / ".files" / "outputs" / name
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("data\n", encoding="utf-8")
+    return output.resolve()
+
+
+async def _submit(app: ChainAgentsTuiApp, pilot: Any, text: str) -> None:
+    """Submit ``text`` and wait (bounded) for the turn to finish."""
+    app.query_one("#prompt", PromptTextArea).load_text(text)
+    await pilot.press("enter")
+    task = app.active_task
+    if task is not None:
+        await asyncio.wait_for(task, timeout=5)
+    await pilot.pause()
+
+
+def _add_lookup_command(runtime: _FakeRuntime) -> None:
+    runtime.commands["lookup"] = SimpleNamespace(
+        name="lookup",
+        description="Look up",
+        target="mcp_tool",
+        value="lookup_tool",
+        template="",
+        mcp_server=None,
+    )
+
+
 @pytest.mark.anyio
-async def test_tui_ctrl_c_cancels_active_run() -> None:
-    agent = _BlockingAgent()
+async def test_tui_lists_generated_files_in_tools_log(tmp_path: Path) -> None:
+    output = _generated_output(tmp_path, "report.md")
+    text = "Wrote /workspace/.files/outputs/report.md"
+    stream = _ScriptedStream([_raw_event(((), "messages", (_Token(text), {})))])
+    app = ChainAgentsTuiApp(runtime=_scripted_runtime(tmp_path, stream), args=_args())
+
+    async with app.run_test() as pilot:
+        await _submit(app, pilot, "write a report")
+
+    assert app.conversation_entries[-1] == (
+        "Assistant",
+        "Wrote /workspace/.files/outputs/report.md",
+    )
+    assert app.tool_entries == [f"generated file {output}"]
+    assert app.status_message == "Ready."
+    assert stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_tui_shows_reflection_after_a_successful_turn(tmp_path: Path) -> None:
+    stream = _ScriptedStream([_raw_event(((), "messages", (_Token("Fixed."), {})))])
+    app = ChainAgentsTuiApp(
+        runtime=_scripted_runtime(tmp_path, stream, reflection=True),
+        args=_args(),
+    )
+
+    async with app.run_test() as pilot:
+        await _submit(app, pilot, "That was wrong, fix it")
+
+    assert len(app.tool_entries) == 1
+    assert app.tool_entries[0].startswith("Correction reflection")
+    assert app.status_message == "Ready."
+
+
+@pytest.mark.anyio
+async def test_tui_failure_shows_generated_files_reflection_and_error(
+    tmp_path: Path,
+) -> None:
+    output = _generated_output(tmp_path, "partial.csv")
+    text = "Saved /workspace/.files/outputs/partial.csv"
+    stream = _ScriptedStream(
+        [_raw_event(((), "messages", (_Token(text), {})))],
+        error=RuntimeError("model exploded"),
+    )
+    app = ChainAgentsTuiApp(
+        runtime=_scripted_runtime(tmp_path, stream, reflection=True),
+        args=_args(),
+    )
+
+    async with app.run_test() as pilot:
+        await _submit(app, pilot, "That was wrong, fix it")
+        prompt = app.query_one("#prompt", PromptTextArea)
+
+        assert prompt.disabled is False
+
+    assert app.tool_entries[0] == f"generated file {output}"
+    assert app.tool_entries[1].startswith("Correction reflection")
+    assert app.tool_entries[2:] == ["runtime error RuntimeError: model exploded"]
+    assert app.status_message == "RuntimeError: model exploded"
+    assert app.active_task is None
+    assert stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_tui_agent_lookup_failure_is_a_runtime_error(tmp_path: Path) -> None:
+    class BrokenRuntime(_FakeRuntime):
+        async def get_agent(self, *args, **kwargs):
+            raise RuntimeError("no model")
+
+    app = ChainAgentsTuiApp(runtime=BrokenRuntime(_FakeAgent([])), args=_args())
+
+    async with app.run_test() as pilot:
+        await _submit(app, pilot, "hello")
+
+    assert app.tool_entries == ["runtime error RuntimeError: no model"]
+    assert app.status_message == "RuntimeError: no model"
+
+
+@pytest.mark.anyio
+async def test_tui_unknown_slash_command_is_reported_without_running_agent() -> None:
+    agent = _FakeAgent([])
     app = ChainAgentsTuiApp(runtime=_FakeRuntime(agent), args=_args())
 
     async with app.run_test() as pilot:
+        await _submit(app, pilot, "/nope please")
+
+    assert agent.payload is None
+    assert app.tool_entries == ["unknown command /nope"]
+    assert app.status_message == "Unknown command /nope."
+
+
+@pytest.mark.anyio
+async def test_tui_command_error_shows_real_message() -> None:
+    class FailingRuntime(_FakeRuntime):
+        async def invoke_mcp_tool_command(self, **kwargs):
+            raise RuntimeError("backend credential=abc down")
+
+    agent = _FakeAgent([])
+    runtime = FailingRuntime(agent)
+    _add_lookup_command(runtime)
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await _submit(app, pilot, "/lookup q")
+
+    assert agent.payload is None
+    assert app.tool_entries == ["command /lookup failed: backend credential=abc down"]
+    assert app.status_message == "Command /lookup failed."
+
+
+@pytest.mark.anyio
+async def test_tui_mcp_command_output_goes_to_tools_log(tmp_path: Path) -> None:
+    output = _generated_output(tmp_path, "a.txt")
+
+    class ToolRuntime(_FakeRuntime):
+        async def invoke_mcp_tool_command(self, **kwargs):
+            self.tool_kwargs = kwargs
+            return {"path": "/workspace/.files/outputs/a.txt"}
+
+    agent = _FakeAgent([])
+    runtime = ToolRuntime(agent)
+    runtime.project_root = tmp_path
+    _add_lookup_command(runtime)
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args(mcp_session_id="mcp-1"))
+
+    async with app.run_test() as pilot:
+        await _submit(app, pilot, "/lookup q")
+
+    assert agent.payload is None
+    assert runtime.tool_kwargs["tool_name"] == "lookup_tool"
+    assert runtime.tool_kwargs["mcp_session_id"] == "mcp-1"
+    assert app.tool_entries == [
+        dumps_tool_result({"path": "/workspace/.files/outputs/a.txt"}),
+        f"generated file {output}",
+    ]
+    assert app.status_message == "Command /lookup finished."
+
+
+@pytest.mark.anyio
+async def test_tui_blank_command_prompt_skips_agent_and_resets_status() -> None:
+    agent = _FakeAgent([])
+    runtime = _FakeRuntime(agent)
+    runtime.commands["blank"] = SimpleNamespace(
+        name="blank",
+        description="Blank",
+        target="prompt",
+        value="",
+        template="",
+    )
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await _submit(app, pilot, "/blank")
+
+    assert agent.payload is None
+    assert app.tool_entries == []
+    assert app.status_message == "Ready."
+
+
+@pytest.mark.anyio
+async def test_tui_ctrl_c_cancels_active_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled_renderers: list[TuiRenderer] = []
+
+    async def record_cancel(self: TuiRenderer) -> None:
+        cancelled_renderers.append(self)
+
+    monkeypatch.setattr(TuiRenderer, "on_cancelled", record_cancel)
+    stream = _ScriptedStream(
+        [_raw_event(((), "messages", (_Token("partial"), {})))],
+        block=True,
+    )
+    app = ChainAgentsTuiApp(
+        runtime=_scripted_runtime(tmp_path, stream, reflection=True),
+        args=_args(),
+    )
+
+    async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", PromptTextArea)
-        prompt.load_text("wait")
+        prompt.load_text("That was wrong, fix it")
         await pilot.press("enter")
-        await agent.started.wait()
+        task = app.active_task
+        assert task is not None
+        await asyncio.wait_for(stream.started.wait(), timeout=5)
 
         assert prompt.disabled is True
 
         await pilot.press("ctrl+c")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
         await pilot.pause()
 
-        assert agent.cancelled is True
+        assert task.cancelled() is True
+        assert len(cancelled_renderers) == 1
+        assert stream.closed is True
         assert prompt.disabled is False
+        assert app.active_task is None
         assert app.status_message == "Cancelled."
+        # No reflection, generated files or error are reported on cancel.
+        assert app.tool_entries == []

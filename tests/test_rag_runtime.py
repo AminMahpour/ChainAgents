@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,9 +11,9 @@ import pytest
 from langchain_core.documents import Document
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
-import rag_runtime
-from rag_runtime import JsonVectorStore
-from rag_runtime import (
+from chainagents.rag import runtime as rag_runtime
+from chainagents.rag.runtime import JsonVectorStore
+from chainagents.rag.runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
     DEFAULT_RAG_EXCLUDE_GLOBS,
     DEFAULT_RAG_INCLUDE_GLOBS,
@@ -334,7 +335,7 @@ def test_resolve_rag_config_requires_model_for_openai_compatible(tmp_path: Path)
         embedding=RagEmbeddingConfig(provider="auto"),
     )
 
-    with pytest.raises(ValueError, match="rag.embedding.model"):
+    with pytest.raises(ValueError, match=re.escape("rag.embedding.model")):
         resolve_rag_config(
             config,
             model_provider="openai_compatible",
@@ -354,7 +355,7 @@ def test_resolve_rag_config_rejects_auto_for_anthropic(tmp_path: Path) -> None:
         embedding=RagEmbeddingConfig(provider="auto"),
     )
 
-    with pytest.raises(ValueError, match="rag.embedding.provider"):
+    with pytest.raises(ValueError, match=re.escape("rag.embedding.provider")):
         resolve_rag_config(
             config,
             model_provider="anthropic",

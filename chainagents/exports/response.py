@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
-import mimetypes
 import os
 import re
 import sys
@@ -16,18 +16,14 @@ import weakref
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import chainlit as cl
 from chainlit.element import Element, File, Pdf
 from markdown_it import MarkdownIt
 
-from chainagents.exports.generated_files import (
-    GENERATED_FILE_PATH_RE,
-    GENERATED_OUTPUTS_DIRECTORY,
-    MAX_GENERATED_FILES,
-)
+from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.exports.pdf_images import (
     PDF_IMAGE_MAX_BYTES,
     PdfImageDownloadBudget,
@@ -47,7 +43,6 @@ RESTORED_RESPONSE_ACTIONS_CONNECTION_ATTR = "_chainagents_restored_response_acti
 RUN_RESPONSE_ACTION = "run_configured_response_action"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
-MAX_GENERATED_FILE_ATTACHMENTS = MAX_GENERATED_FILES
 MAX_PDF_REMOTE_IMAGES = 20
 MAX_PDF_REMOTE_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_PDF_REMOTE_IMAGE_PIXELS = 50_000_000
@@ -59,7 +54,6 @@ PDF_EXPORT_DEPENDENCY_ERROR = (
     "the Pango packages listed in the WeasyPrint installation guide. Restart "
     "the app after installing the system libraries."
 )
-GENERATED_FILE_TRAILING_PUNCTUATION = ".,;:!?"
 PDF_STYLES = """
 @page {
   size: letter;
@@ -183,7 +177,9 @@ _CHAINLIT_PDF_RENDER_SEMAPHORES: weakref.WeakKeyDictionary[
 ] = weakref.WeakKeyDictionary()
 MOJIBAKE_MARKERS = ("Â", "Ã", "â", "ð", "�")
 PDF_SUBSCRIPT_CHARS = {
-    **dict(zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789")),
+    **dict(
+        zip("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089", "0123456789", strict=True)
+    ),
     "\u208a": "+",
     "\u208b": "-",
     "\u208c": "=",
@@ -306,8 +302,7 @@ def attach_response_export_actions(
     *,
     prompt: str,
     response_text: str,
-    generated_file_paths: Iterable[str | Path] = (),
-    project_root: Path | None = None,
+    generated_files: Iterable[GeneratedFileDescriptor] = (),
     response_actions: Iterable[ChainlitResponseActionConfig] = (),
     export_label: str = "",
 ) -> None:
@@ -317,8 +312,7 @@ def attach_response_export_actions(
         message: Chainlit message or LangChain message to process.
         prompt: The prompt value.
         response_text: The response text value.
-        generated_file_paths: Local, workspace, or artifact paths created during the run.
-        project_root: Project root used to resolve virtual workspace paths.
+        generated_files: Validated generated files attached to the message.
     """
     message_id = str(getattr(message, "id", "") or "").strip()
     if not message_id or not response_text.strip():
@@ -341,14 +335,13 @@ def attach_response_export_actions(
     message.metadata = metadata
     message.actions = response_actions_for_message(message_id, response_actions)
 
-    generated_elements = generated_file_elements_from_text(
-        response_text,
-        generated_file_paths=generated_file_paths,
-        project_root=project_root,
-    )
+    generated_elements = generated_file_elements(generated_files)
     if generated_elements:
         existing_elements = list(getattr(message, "elements", []) or [])
-        message.elements = [*existing_elements, *generated_elements]
+        combined_elements: list[Element] = [*existing_elements, *generated_elements]
+        # cl.Message.elements is typed List[ElementBased], an unbound TypeVar in
+        # chainlit's stub; cast bridges that stub quirk without a runtime effect.
+        message.elements = cast("list[Any]", combined_elements)
 
 
 def response_actions_for_message(
@@ -484,132 +477,28 @@ def restore_response_export_actions(
     return restored
 
 
-def generated_file_elements_from_text(
-    text: str,
-    *,
-    generated_file_paths: Iterable[str | Path] = (),
-    project_root: Path | None = None,
+def generated_file_elements(
+    generated_files: Iterable[GeneratedFileDescriptor],
 ) -> list[File]:
-    """Return Chainlit file elements for generated files mentioned in text.
+    """Return downloadable Chainlit file elements for validated generated files.
 
     Args:
-        text: Response text that may mention generated file paths.
-        generated_file_paths: Additional file paths captured from successful tool calls.
-        project_root: Project root used to resolve virtual workspace paths.
+        generated_files: Descriptors resolved by the strict generated-file rule.
 
     Returns:
-        Downloadable Chainlit file elements for safe, existing generated files.
+        Chainlit file elements for descriptors that carry a local path.
     """
-    raw_paths = [
-        str(path)
-        for path in generated_file_paths
-        if str(path).strip()
+    return [
+        File(
+            thread_id=_current_chainlit_thread_id(),
+            name=descriptor.name,
+            path=descriptor.path.as_posix(),
+            display="inline",
+            mime=descriptor.mime_type,
+        )
+        for descriptor in generated_files
+        if descriptor.path is not None
     ]
-    raw_paths.extend(
-        match.group("path")
-        for match in GENERATED_FILE_PATH_RE.finditer(text)
-        if match.group("path").strip()
-    )
-
-    return generated_file_elements_from_paths(raw_paths, project_root=project_root)
-
-
-def generated_file_elements_from_paths(
-    raw_paths: Iterable[str | Path],
-    *,
-    project_root: Path | None = None,
-) -> list[File]:
-    """Return Chainlit file elements for existing files under allowed routes.
-
-    Args:
-        raw_paths: Candidate generated file paths.
-        project_root: Project root used to resolve virtual workspace paths.
-
-    Returns:
-        Downloadable Chainlit file elements.
-    """
-    root = (project_root or Path.cwd()).resolve()
-    elements: list[File] = []
-    seen: set[Path] = set()
-    for raw_path in raw_paths:
-        path = _resolve_generated_file_path(raw_path, project_root=root)
-        if path is None or path in seen:
-            continue
-        seen.add(path)
-        mime_type, _encoding = mimetypes.guess_type(path.name)
-        elements.append(
-            File(
-                thread_id=_current_chainlit_thread_id(),
-                name=path.name,
-                path=path.as_posix(),
-                display="inline",
-                mime=mime_type,
-            )
-        )
-        if len(elements) >= MAX_GENERATED_FILE_ATTACHMENTS:
-            break
-    return elements
-
-
-def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) -> Path | None:
-    """Resolve one generated file path if it points to a safe existing file."""
-    path_text = _clean_generated_file_path(raw_path)
-    if not path_text:
-        return None
-
-    absolute_candidate = Path(path_text)
-    if absolute_candidate.is_absolute():
-        resolved_absolute = _resolve_existing_project_file(
-            absolute_candidate,
-            project_root=project_root,
-        )
-        if resolved_absolute is not None:
-            return resolved_absolute
-
-    if path_text == "/workspace":
-        return None
-    if path_text.startswith("/workspace/"):
-        candidate = project_root / path_text.removeprefix("/workspace/")
-    elif path_text == GENERATED_OUTPUTS_DIRECTORY.as_posix():
-        return None
-    elif path_text.startswith(f"{GENERATED_OUTPUTS_DIRECTORY.as_posix()}/"):
-        candidate = project_root / path_text
-    else:
-        candidate = Path(path_text)
-        if not candidate.is_absolute():
-            candidate = project_root / candidate
-
-    return _resolve_existing_project_file(candidate, project_root=project_root)
-
-
-def _resolve_existing_project_file(candidate: Path, *, project_root: Path) -> Path | None:
-    """Resolve one candidate path if it is an existing file under project_root."""
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        return None
-
-    if not _is_relative_to(resolved, project_root):
-        return None
-    if not resolved.is_file():
-        return None
-    return resolved
-
-
-def _clean_generated_file_path(raw_path: str | Path) -> str:
-    """Normalize one generated file path token from tool args or Markdown text."""
-    return str(raw_path).strip().strip("`'\"<>[]()").rstrip(
-        GENERATED_FILE_TRAILING_PUNCTUATION
-    )
-
-
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    """Return whether path is inside parent."""
-    try:
-        path.relative_to(parent)
-    except ValueError:
-        return False
-    return True
 
 
 def _current_chainlit_thread_id() -> str:
@@ -1075,20 +964,6 @@ def _pdf_url_fetcher(resources: dict[str, PdfImageResource]) -> object:
     return PdfResourceFetcher()
 
 
-def _blocked_pdf_url_fetcher(url: str, *_args: object, **_kwargs: object) -> object:
-    """Compatibility wrapper around the restricted WeasyPrint fetcher.
-
-    Args:
-        url: The URL WeasyPrint attempted to fetch.
-        _args: Positional arguments from WeasyPrint.
-        _kwargs: Keyword arguments from WeasyPrint.
-
-    Returns:
-        Nothing; this function always raises.
-    """
-    raise ValueError(f"External resources are disabled for response PDF exports: {url}")
-
-
 def _prepare_weasyprint_environment() -> None:
     """Set macOS library lookup defaults before importing WeasyPrint."""
     if sys.platform != "darwin" or not HOMEBREW_LIBRARY_PATH.exists():
@@ -1152,10 +1027,8 @@ async def _build_chainlit_pdf_bytes(text: str) -> bytes:
         try:
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
-            try:
+            with contextlib.suppress(Exception):
                 await worker
-            except Exception:
-                pass
             raise
 
 

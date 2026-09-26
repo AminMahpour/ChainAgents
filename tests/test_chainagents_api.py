@@ -5,28 +5,29 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 from fastapi.testclient import TestClient
 import pytest
 
-import chainagents_api
+from chainagents.interfaces.api import app as chainagents_api
 from chainagents.runtime import core
 from chainagents.runtime.reflection import ReflectionConfig
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
-from rag_runtime import RagUploadResult
+from chainagents.rag.runtime import RagUploadResult
 
 
 class _Token:
     """Provide a minimal streamed AI token for API tests."""
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         """Initialize the token instance."""
@@ -965,13 +966,15 @@ def test_stream_returns_ndjson_agent_events() -> None:
     runtime = _FakeRuntime(agent)
     app = chainagents_api.create_app(runtime=runtime)
 
-    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
-        with client.stream(
+    with (
+        TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client,
+        client.stream(
             "POST",
             "/api/agent/stream",
             json={"prompt": "hello", "thread_id": "thread-1"},
-        ) as response:
-            lines = [json.loads(line) for line in response.iter_lines()]
+        ) as response,
+    ):
+        lines = [json.loads(line) for line in response.iter_lines()]
 
     assert response.status_code == 200
     assert lines == [
@@ -1276,6 +1279,42 @@ def test_stream_emits_verified_files_before_later_run_error(tmp_path: Path) -> N
     assert lines[-1]["error"] == "Agent operation failed. Please retry."
 
 
+def test_stream_ends_with_sanitised_error_when_turn_runner_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify an exception escaping TurnRunner.run still ends the NDJSON stream."""
+
+    async def _raising_run(self, request, renderer):
+        await renderer.on_event(
+            chainagents_api.AgentStreamEvent(
+                kind="response_delta", source="main-agent", text="partial"
+            )
+        )
+        raise RuntimeError("secret backend detail")
+
+    monkeypatch.setattr(chainagents_api.TurnRunner, "run", _raising_run)
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "hello", "thread_id": "thread-1"},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    assert response.status_code == 200
+    assert [line["kind"] for line in lines] == ["response_delta", "error"]
+    assert lines[-1] == {
+        "kind": "error",
+        "error": "Agent operation failed. Please retry.",
+        "thread_id": "thread-1",
+        "model": "fake-model",
+        "reasoning": "medium",
+    }
+    assert "secret" not in response.text
+
+
 def test_generated_file_download_survives_app_recreation(tmp_path: Path) -> None:
     """Verify deterministic artifact links work across API process lifetimes."""
     output_path = tmp_path / ".files" / "outputs" / "reports" / "summary.csv"
@@ -1559,6 +1598,39 @@ def test_multipart_transforms_separately_selected_configured_command() -> None:
         "messages": [
             {"role": "user", "content": "Review carefully: /workspace/api.py"}
         ]
+    }
+
+
+def test_multipart_image_names_are_appended_after_command_resolution() -> None:
+    """Verify a command sees only the typed text; image names follow its prompt."""
+    agent = _FakeAgent([_raw_event(((), "messages", (_Token("Reviewed"), {})))])
+    runtime = _FakeRuntime(agent)
+    runtime.config.model_modalities = ("text", "image")
+    runtime.commands["review"] = SimpleNamespace(
+        name="review",
+        description="Review a change",
+        target="prompt",
+        value="Review the change",
+        template="Review {input} carefully.",
+        mcp_server=None,
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/agent/stream/multipart",
+            data={"prompt": "the diagram", "command": "review", "thread_id": "thread-1"},
+            files={"files": ("scan.png", b"png-bytes", "image/png")},
+        )
+
+    assert response.status_code == 200
+    assert agent.payload["messages"][0]["content"][0] == {
+        "type": "text",
+        "text": (
+            "Review the diagram carefully.\n\n"
+            "Attached image file(s): `scan.png`. Use the image "
+            "content directly when answering."
+        ),
     }
 
 
@@ -2048,7 +2120,7 @@ def test_ui_directory_env_and_invalid_paths_fail_clearly(
     assert response.status_code == 200
     assert response.text == "SparxUI"
 
-    with pytest.raises(ValueError, match="index.html"):
+    with pytest.raises(ValueError, match=re.escape("index.html")):
         chainagents_api.create_app(
             runtime=_FakeRuntime(_FakeAgent([])),
             ui_dir=tmp_path / "missing",
@@ -2087,35 +2159,67 @@ def test_reflection_confirmation_is_retryable_after_cancellation(after_write) ->
         _enable_reflection_storage(runtime)
         runtime.store = _BlockingStore()
         app = chainagents_api.create_app(runtime=runtime)
-        async with app.router.lifespan_context(app):
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-            ) as client:
-                response = await client.post(
-                    "/api/agent/stream",
-                    json={"prompt": "That was wrong", "thread_id": "thread-1"},
-                )
-                proposal = next(
-                    json.loads(line)["proposal"]
-                    for line in response.iter_lines()
-                    if json.loads(line)["kind"] == "reflection_proposal"
-                )
-                runtime.requests.clear()
-                payload = {"thread_id": "thread-1", "proposal": proposal}
-                task = asyncio.create_task(
-                    client.post("/api/reflections/save", json=payload)
-                )
-                await asyncio.wait_for(reached_save.wait(), timeout=2)
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-                runtime.store.block = False
-                retry = await client.post("/api/reflections/save", json=payload)
-                replay = await client.post("/api/reflections/save", json=payload)
-                assert retry.status_code == 200
-                assert replay.status_code == 409
-                assert runtime.requests == []
-                item = await runtime.store.aget(("api-reflections",), "/AGENTS.md")
-                assert item.value["content"].count(proposal["lesson"]) == 1
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            response = await client.post(
+                "/api/agent/stream",
+                json={"prompt": "That was wrong", "thread_id": "thread-1"},
+            )
+            proposal = next(
+                json.loads(line)["proposal"]
+                for line in response.iter_lines()
+                if json.loads(line)["kind"] == "reflection_proposal"
+            )
+            runtime.requests.clear()
+            payload = {"thread_id": "thread-1", "proposal": proposal}
+            task = asyncio.create_task(
+                client.post("/api/reflections/save", json=payload)
+            )
+            await asyncio.wait_for(reached_save.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            runtime.store.block = False
+            retry = await client.post("/api/reflections/save", json=payload)
+            replay = await client.post("/api/reflections/save", json=payload)
+            assert retry.status_code == 200
+            assert replay.status_code == 409
+            assert runtime.requests == []
+            item = await runtime.store.aget(("api-reflections",), "/AGENTS.md")
+            assert item.value["content"].count(proposal["lesson"]) == 1
+
+    asyncio.run(exercise())
+
+
+def test_stream_lines_closing_early_cancels_turn_and_closes_agent_stream() -> None:
+    """Verify an abandoned NDJSON stream cancels the runner task and its agent stream."""
+    closed = asyncio.Event()
+
+    class _EndlessAgent(_FakeAgent):
+        def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+            async def events():
+                try:
+                    while True:
+                        yield _raw_event(((), "messages", (_Token("tick"), {})))
+                finally:
+                    closed.set()
+
+            return events()
+
+    runtime = _FakeRuntime(_EndlessAgent([]))
+    context = chainagents_api._run_context(
+        runtime,
+        chainagents_api.AgentRunRequest(prompt="hi", thread_id="thread-1"),
+    )
+
+    async def exercise() -> None:
+        lines = chainagents_api._agent_stream_lines(
+            runtime, context, issue_reflection_token=lambda *_args: "token"
+        )
+        first = await anext(lines)
+        assert json.loads(first)["text"] == "tick"
+        await lines.aclose()
+        await asyncio.wait_for(closed.wait(), timeout=2)
 
     asyncio.run(exercise())

@@ -8,12 +8,13 @@ from types import SimpleNamespace
 import anyio
 import pytest
 
-import deepagent_runtime as core
+import chainagents.runtime.core as core
 import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.config as runtime_config
 import chainagents.runtime.lifecycle as runtime_lifecycle
+import chainagents.runtime.mcp_sessions as runtime_mcp_sessions
 import chainagents.runtime.middleware as runtime_middleware
 from chainagents.runtime.background_tasks import (
     BackgroundTaskManager,
@@ -60,14 +61,14 @@ def test_stateful_context_closes_on_its_owner_task(runtime, monkeypatch):
             finally:
                 events.append(("close", asyncio.current_task()))
 
-    runtime._mcp_client = SimpleNamespace(
+    runtime._mcp_pool._client = SimpleNamespace(
         session=session, callbacks=None, tool_interceptors=[]
     )
 
     async def load(*a, **kw):
         return []
 
-    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+    monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", load)
 
     async def exercise():
         await asyncio.create_task(
@@ -1333,7 +1334,7 @@ def test_stateless_mcp_tools_are_shared_across_ended_chats(runtime):
         loads.append(kwargs)
         return []
 
-    runtime._mcp_client = SimpleNamespace(get_tools=get_tools)
+    runtime._mcp_pool._client = SimpleNamespace(get_tools=get_tools)
 
     async def exercise():
         for index in range(10):
@@ -1341,11 +1342,11 @@ def test_stateless_mcp_tools_are_shared_across_ended_chats(runtime):
             await runtime.get_agent("medium", thread_id=thread, mcp_session_id=session)
             await runtime.close_conversation(thread_id=thread, mcp_session_id=session)
             assert not runtime._agents
-            assert not runtime._mcp_sessions
-        assert len(runtime._mcp_tools_cache) == 1
+            assert not runtime._mcp_pool._sessions
+        assert len(runtime._mcp_pool._tools_cache) == 1
         assert len(loads) == 1
         await runtime.close()
-        assert not runtime._mcp_tools_cache
+        assert not runtime._mcp_pool._tools_cache
 
     asyncio.run(exercise())
 
@@ -1369,7 +1370,7 @@ def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, c
             finally:
                 closed.append(True)
 
-    runtime._mcp_client = SimpleNamespace(
+    runtime._mcp_pool._client = SimpleNamespace(
         session=session, callbacks=None, tool_interceptors=[]
     )
 
@@ -1379,7 +1380,7 @@ def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, c
             await asyncio.Event().wait()
         raise ValueError("tool loading failed")
 
-    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+    monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", load)
 
     async def exercise():
         task = asyncio.create_task(
@@ -1394,14 +1395,14 @@ def test_mcp_tool_loading_unwinds_new_transport_on_error(runtime, monkeypatch, c
         else:
             await task
         assert closed == [True]
-        assert not runtime._mcp_sessions
-        assert not runtime._mcp_tools_cache
+        assert not runtime._mcp_pool._sessions
+        assert not runtime._mcp_pool._tools_cache
         assert not runtime._agents
 
         async def succeeds(*a, **kw):
             return []
 
-        monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", succeeds)
+        monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", succeeds)
         await runtime.get_agent("medium", thread_id="thread", mcp_session_id="session")
         await runtime.close()
         assert closed == [True, True]
@@ -1424,7 +1425,7 @@ def test_mcp_discovery_keeps_healthy_tools_and_retries_failed_server(runtime):
             raise OSError("server is down")
         return [SimpleNamespace(name=f"{server_name}_tool")]
 
-    runtime._mcp_client = SimpleNamespace(get_tools=get_tools)
+    runtime._mcp_pool._client = SimpleNamespace(get_tools=get_tools)
 
     async def exercise():
         nonlocal failed
@@ -1469,17 +1470,17 @@ def test_failed_mcp_discovery_discards_terminal_owner_and_reconnects(runtime, mo
             raise OSError("tool listing failed")
         return [SimpleNamespace(name="broken_tool")]
 
-    runtime._mcp_client = SimpleNamespace(
+    runtime._mcp_pool._client = SimpleNamespace(
         session=session, callbacks=None, tool_interceptors=[]
     )
-    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+    monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", load)
 
     async def exercise():
         tools, failures = await runtime.get_mcp_tools_with_status(
             ("broken",), mcp_session_id="session"
         )
         assert tools == [] and failures == ("broken",)
-        assert ("session", "broken") not in runtime._mcp_session_owners
+        assert ("session", "broken") not in runtime._mcp_pool._session_owners
         recovered, failures = await runtime.get_mcp_tools_with_status(
             ("broken",), mcp_session_id="session"
         )
@@ -1500,7 +1501,7 @@ def test_direct_mcp_command_reports_failed_discovery_as_outage(runtime):
     async def get_tools(*, server_name):
         raise OSError("transport offline")
 
-    runtime._mcp_client = SimpleNamespace(get_tools=get_tools)
+    runtime._mcp_pool._client = SimpleNamespace(get_tools=get_tools)
 
     async def exercise():
         with pytest.raises(RuntimeError, match="MCP server unavailable: broken"):
@@ -1526,14 +1527,14 @@ def test_mcp_close_failure_keeps_owner_for_later_retry(runtime):
                 raise OSError("close failed")
 
     owner = RetryableOwner()
-    runtime._mcp_session_owners[("session", "repo")] = owner
+    runtime._mcp_pool._session_owners[("session", "repo")] = owner
 
     async def exercise():
         with pytest.raises(OSError, match="close failed"):
             await runtime.close_mcp_session("session")
-        assert runtime._mcp_session_owners[("session", "repo")] is owner
+        assert runtime._mcp_pool._session_owners[("session", "repo")] is owner
         await runtime.close_mcp_session("session")
-        assert runtime._mcp_session_owners == {}
+        assert runtime._mcp_pool._session_owners == {}
         assert owner.attempts == 2
 
     asyncio.run(exercise())
@@ -1559,16 +1560,16 @@ def test_mcp_close_failure_discards_terminal_transport_owner(runtime, monkeypatc
     async def load(*args, **kwargs):
         return [SimpleNamespace(name="repo_tool")]
 
-    runtime._mcp_client = SimpleNamespace(
+    runtime._mcp_pool._client = SimpleNamespace(
         session=session, callbacks=None, tool_interceptors=[]
     )
-    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+    monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", load)
 
     async def exercise():
         await runtime.get_mcp_tools_with_status(("repo",), mcp_session_id="session")
         with pytest.raises(RuntimeError, match="transport close failed"):
             await runtime.close_mcp_session("session")
-        assert ("session", "repo") not in runtime._mcp_session_owners
+        assert ("session", "repo") not in runtime._mcp_pool._session_owners
         tools, failures = await runtime.get_mcp_tools_with_status(
             ("repo",), mcp_session_id="session"
         )
@@ -1590,14 +1591,14 @@ def test_mcp_runtime_close_retains_owner_if_transport_teardown_fails(runtime):
                 raise OSError("close failed")
 
     owner = RetryableOwner()
-    runtime._mcp_session_owners[("session", "repo")] = owner
+    runtime._mcp_pool._session_owners[("session", "repo")] = owner
 
     async def exercise():
         with pytest.raises(OSError, match="close failed"):
             await runtime.close_all_mcp_sessions()
-        assert runtime._mcp_session_owners[("session", "repo")] is owner
+        assert runtime._mcp_pool._session_owners[("session", "repo")] is owner
         await runtime.close_all_mcp_sessions()
-        assert runtime._mcp_session_owners == {}
+        assert runtime._mcp_pool._session_owners == {}
 
     asyncio.run(exercise())
 
@@ -1616,7 +1617,7 @@ def test_agent_build_reports_mcp_failure_and_retries_on_next_run(runtime):
             raise OSError("down")
         return []
 
-    runtime._mcp_client = SimpleNamespace(get_tools=get_tools)
+    runtime._mcp_pool._client = SimpleNamespace(get_tools=get_tools)
 
     async def exercise():
         _, warnings = await runtime.get_agent_with_status("medium", thread_id="thread")
@@ -1657,14 +1658,14 @@ def test_mcp_session_startup_unwinds_owner_and_allows_retry(
             finally:
                 closed.append(True)
 
-    runtime._mcp_client = SimpleNamespace(
+    runtime._mcp_pool._client = SimpleNamespace(
         session=session, callbacks=None, tool_interceptors=[]
     )
 
     async def load(*a, **kw):
         return []
 
-    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", load)
+    monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", load)
 
     async def exercise():
         nonlocal fail
@@ -1680,8 +1681,8 @@ def test_mcp_session_startup_unwinds_owner_and_allows_retry(
         else:
             await task
         assert closed == [True]
-        assert not runtime._mcp_sessions
-        assert not runtime._mcp_session_owners
+        assert not runtime._mcp_pool._sessions
+        assert not runtime._mcp_pool._session_owners
         fail = False
         await runtime.get_agent("medium", thread_id="thread", mcp_session_id="session")
         await runtime.close()

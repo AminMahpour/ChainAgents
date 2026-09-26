@@ -6,11 +6,12 @@ import ast
 import json
 import mimetypes
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import chainagents.runtime.constants as runtime_constants
 
 GENERATED_OUTPUTS_DIRECTORY = Path(".files/outputs")
 GENERATED_FILE_TOOL_SUFFIXES = ("write_file", "edit_file", "create_file")
@@ -38,10 +39,17 @@ class GeneratedFileDescriptor:
     mime_type: str
     size_bytes: int
     download_url: str
+    # Local resolved path for in-process renderers; never part of the wire shape.
+    path: Path | None = field(default=None, compare=False)
 
     def to_payload(self) -> dict[str, str | int]:
         """Return this descriptor in its stable API wire shape."""
-        return asdict(self)
+        return {
+            "name": self.name,
+            "mime_type": self.mime_type,
+            "size_bytes": self.size_bytes,
+            "download_url": self.download_url,
+        }
 
 
 def generated_file_paths_from_tool_args(
@@ -102,9 +110,10 @@ def generated_file_paths_from_tool_result(
 def generated_file_descriptors(
     raw_paths: list[str],
     *,
-    project_root: Path,
+    project_root: Path | None = None,
 ) -> list[GeneratedFileDescriptor]:
     """Resolve, validate, and deduplicate generated output paths."""
+    project_root = project_root or runtime_constants.PROJECT_ROOT
     output_root = _generated_outputs_root(project_root)
     if output_root is None:
         return []
@@ -130,6 +139,7 @@ def generated_file_descriptors(
                     "/api/generated-files/"
                     + "/".join(quote(part, safe="") for part in relative_path.parts)
                 ),
+                path=resolved,
             )
         )
         if len(descriptors) >= MAX_GENERATED_FILES:
@@ -137,13 +147,17 @@ def generated_file_descriptors(
     return descriptors
 
 
-def resolve_generated_output(raw_path: str, *, project_root: Path) -> Path | None:
+def resolve_generated_output(
+    raw_path: str,
+    *,
+    project_root: Path | None = None,
+) -> Path | None:
     """Resolve one existing file only when it stays inside generated outputs."""
     path_text = str(raw_path).strip().strip("`'\"<>[]()").rstrip(".,;:!?")
     if not path_text:
         return None
 
-    resolved_project_root = project_root.resolve()
+    resolved_project_root = (project_root or runtime_constants.PROJECT_ROOT).resolve()
     output_root = _generated_outputs_root(resolved_project_root)
     if output_root is None:
         return None

@@ -18,3 +18,9 @@ wheels/
 
 # LangGraph development server state
 .langgraph_api/
+
+# Local, untracked agent workspace notes
+/AGENTS.md
+
+# Local config overrides
+/deepagent.local.toml

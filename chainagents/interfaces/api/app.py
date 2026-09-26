@@ -14,8 +14,8 @@ import os
 import secrets
 import tempfile
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -27,17 +27,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
-from chainagents.commands.native import (
-    dumps_tool_result,
-    resolve_native_command,
-    resolve_runtime_command,
+from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.events.stream import (
+    AGENT_STREAM_MODES as AGENT_STREAM_MODES,
+    AgentStreamEvent,
 )
-from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
 from chainagents.exports.generated_files import (
-    generated_file_descriptors,
-    generated_file_paths_from_text,
-    generated_file_paths_from_tool_args,
-    generated_file_paths_from_tool_result,
+    GeneratedFileDescriptor,
     resolve_generated_download,
 )
 from chainagents.exports.response import build_pdf_bytes
@@ -55,26 +51,29 @@ from chainagents.interfaces.uploads import (
     SUPPORTED_RAG_EXTENSIONS,
     image_content_part,
     normalize_upload,
-    prompt_with_images,
     upload_result_prompt_note,
 )
 from chainagents.rag.runtime import RagUploadResult, UploadedRagFile
 from chainagents.runtime import (
     AgentRuntime,
     ReasoningLevel,
-    build_langgraph_run_config,
     normalize_reasoning_level,
     resolve_runtime_model_profile,
 )
-from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.runtime.reflection import (
-    ReflectionCollector,
     ReflectionProposal,
     reflection_save_prompt as reflection_save_prompt,
 )
+from chainagents.turns import (
+    BaseTurnRenderer,
+    TurnCommandError,
+    TurnRequest,
+    TurnResult,
+    TurnRunner,
+    safe_backend_error as _safe_backend_error,
+)
 
 
-AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
 MAX_RESPONSE_PDF_CONTENT_LENGTH = 100_000
 MAX_RESPONSE_PDF_LINES = 2_000
@@ -146,7 +145,7 @@ class AgentHistoryMessage(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_content(self) -> "AgentHistoryMessage":
+    def validate_content(self) -> AgentHistoryMessage:
         """Reject blank text and empty multipart messages."""
         if isinstance(self.content, str):
             if not self.content.strip():
@@ -177,7 +176,7 @@ class AgentRunRequest(BaseModel):
     source_thread_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
 
     @model_validator(mode="after")
-    def validate_history_image_count(self) -> "AgentRunRequest":
+    def validate_history_image_count(self) -> AgentRunRequest:
         """Bound replay images to the same aggregate limit as uploads."""
         text_length = sum(
             len(message.content)
@@ -225,12 +224,12 @@ class RuntimeStatusResponse(BaseModel):
     recursion_limit: int
     persistence_mode: str
     ui_api_version: int = 1
-    models: list["RuntimeModelOption"]
+    models: list[RuntimeModelOption]
     reasoning_levels: list[ReasoningLevel]
-    features: "RuntimeFeatureFlags"
-    starters: list["RuntimeStarter"]
-    commands: list["RuntimeCommand"]
-    uploads: "RuntimeUploadCapabilities"
+    features: RuntimeFeatureFlags
+    starters: list[RuntimeStarter]
+    commands: list[RuntimeCommand]
+    uploads: RuntimeUploadCapabilities
 
 
 class RuntimeModelOption(BaseModel):
@@ -340,10 +339,12 @@ class AgentRunContext:
     mcp_session_id: str | None
     history: tuple[dict[str, Any], ...]
     source_thread_id: str | None
-    direct_response: str | None = None
+    selected_command: str | None = None
     command_error: str | None = None
     command_error_status: int = 422
     image_parts: tuple[dict[str, Any], ...] = ()
+    image_names: tuple[str, ...] = ()
+    prompt_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -660,25 +661,24 @@ def create_app(
                 status_code=context.command_error_status,
                 detail=context.command_error,
             )
-        response_parts: list[str] = []
-        warnings: list[str] = []
-        try:
-            async for event in _iter_agent_events(active_runtime, context):
-                if event.kind == "response_delta":
-                    response_parts.append(event.text)
-                elif event.kind == "mcp_status":
-                    warnings.append(event.text)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise _agent_error(exc) from exc
+        renderer = _WarningCollector()
+        result = await TurnRunner(active_runtime).run(
+            _turn_request(context), renderer
+        )
+        if result.command_error is not None:
+            raise HTTPException(
+                status_code=result.command_error.status,
+                detail=result.command_error.message,
+            )
+        if result.error is not None:
+            raise _agent_error(result.error) from result.error
 
         return AgentRunResponse(
-            response="".join(response_parts),
+            response=result.response,
             thread_id=context.thread_id,
             model=context.model_name,
             reasoning=context.reasoning_level,
-            warnings=warnings,
+            warnings=renderer.warnings,
         )
 
     @app.post("/api/agent/stream")
@@ -709,7 +709,7 @@ def create_app(
         history: str | None = Form(None),
         async_subagent_url: str | None = Form(None),
         mcp_session_id: str | None = Form(None),
-        files: list[UploadFile] | None = File(None),
+        files: list[UploadFile] | None = File(None),  # noqa: B008 -- FastAPI requires File() as a parameter default
     ) -> StreamingResponse:
         active_runtime = _runtime_from_request(request)
         normalized_uploads = await _read_multipart_uploads(files or [])
@@ -741,20 +741,21 @@ def create_app(
                 }
             )
             if prompt.strip() or image_uploads:
-                context_request.prompt = prompt_with_images(
-                    prompt,
-                    image_names=tuple(upload.name for upload in image_uploads),
-                )
-                context = await _prepare_run_context(
-                    active_runtime,
-                    context_request,
-                    has_current_images=bool(image_uploads),
+                # Image names are appended by the TurnRunner after native
+                # command resolution, so commands see only the typed text.
+                context = replace(
+                    await _prepare_run_context(
+                        active_runtime,
+                        context_request,
+                        has_current_images=bool(image_uploads),
+                    ),
+                    prompt=prompt.strip(),
                 )
             elif _optional_text(command):
-                context = await _prepare_run_context(
-                    active_runtime,
-                    context_request,
-                    command_raw_text="",
+                # The prompt field is empty, so the command gets no arguments.
+                context = replace(
+                    await _prepare_run_context(active_runtime, context_request),
+                    prompt="",
                 )
             else:
                 context = replace(
@@ -802,30 +803,35 @@ def create_app(
                     )
                     yield _json_line(_attachment_status_payload(upload_result))
 
-                if not active_context.prompt and not image_uploads:
+                if (
+                    not active_context.prompt
+                    and not image_uploads
+                    and not active_context.selected_command
+                ):
                     yield _json_line(_done_payload(active_context))
                     return
 
-                prompt_note = (
-                    upload_result_prompt_note(upload_result.added_files)
-                    if upload_result is not None
-                    else ""
-                )
-                final_prompt = f"{active_context.prompt}{prompt_note}"
-                image_parts = tuple(
-                    image_content_part(upload) for upload in image_uploads
-                )
                 active_context = replace(
                     active_context,
-                    prompt=final_prompt,
-                    image_parts=image_parts,
+                    prompt_note=(
+                        upload_result_prompt_note(upload_result.added_files)
+                        if upload_result is not None
+                        else ""
+                    ),
+                    image_parts=tuple(
+                        image_content_part(upload) for upload in image_uploads
+                    ),
+                    image_names=tuple(upload.name for upload in image_uploads),
                 )
-                async for line in _agent_stream_lines(
-                    active_runtime,
-                    active_context,
-                    issue_reflection_token=issue_reflection_token,
-                ):
-                    yield line
+                async with aclosing(
+                    _agent_stream_lines(
+                        active_runtime,
+                        active_context,
+                        issue_reflection_token=issue_reflection_token,
+                    )
+                ) as lines:
+                    async for line in lines:
+                        yield line
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1026,138 +1032,146 @@ async def _agent_stream_lines(
     context: AgentRunContext,
     *,
     issue_reflection_token: Callable[[str, ReflectionProposal], str],
-) -> AsyncIterator[str]:
-    """Yield the stable NDJSON stream contract for one resolved run."""
-    if context.command_error:
-        yield _json_line(
-            {
-                "kind": "error",
-                "error": context.command_error,
-                "thread_id": context.thread_id,
-                "model": context.model_name,
-                "reasoning": context.reasoning_level,
-            }
-        )
-        return
+) -> AsyncGenerator[str, None]:
+    """Yield the stable NDJSON stream contract for one resolved run.
 
-    reflection_collector = ReflectionCollector.from_runtime_config(
-        runtime.config,
-        prompt=context.prompt,
-    )
-    generated_file_paths: list[str] = []
-    generated_files_emitted = False
-    response_parts: list[str] = []
-    tool_calls: dict[str, tuple[str, str]] = {}
+    An exception escaping the turn runner ends the stream with a sanitised
+    error line instead of truncating the response.
+    """
+    if context.command_error:
+        yield _json_line(_error_payload(context, context.command_error))
+        return
+    renderer = NdjsonRenderer(context, issue_reflection_token=issue_reflection_token)
     try:
-        async for event in _iter_agent_events(
-            runtime,
-            context,
-            reflection_collector=reflection_collector,
-        ):
-            if event.kind == "tool_call":
-                if event.previous_tool_call_id:
-                    tool_calls.pop(event.previous_tool_call_id, None)
-                tool_calls[event.tool_call_id] = (event.tool_name, event.tool_args)
-            elif event.kind == "tool_result":
-                tool_name, tool_args = tool_calls.pop(
-                    event.tool_call_id,
-                    (event.tool_name, ""),
-                )
-                if event.status.lower() != "error":
-                    generated_file_paths.extend(
-                        generated_file_paths_from_tool_args(tool_name, tool_args)
-                    )
-                    generated_file_paths.extend(
-                        generated_file_paths_from_tool_result(
-                            tool_name,
-                            event.tool_result,
-                        )
-                    )
-            elif event.kind == "response_delta":
-                response_parts.append(event.text)
-            yield _json_line(_event_payload(event, context))
-        generated_files_line = _generated_files_line(
-            runtime,
-            context,
-            generated_file_paths=generated_file_paths,
-            response_text="".join(response_parts),
-        )
-        if generated_files_line is not None:
-            yield generated_files_line
-            generated_files_emitted = True
-        proposal = reflection_collector.build_proposal()
-        if proposal is not None:
-            yield _json_line(
-                _reflection_proposal_payload(
-                    proposal,
-                    context,
-                    issue_reflection_token=issue_reflection_token,
-                )
-            )
-        yield _json_line(_done_payload(context))
+        async with aclosing(
+            renderer.lines(TurnRunner(runtime), _turn_request(context))
+        ) as lines:
+            async for line in lines:
+                yield line
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        reflection_collector.mark_run_failed(RuntimeError("Agent operation failed."))
-        if not generated_files_emitted:
-            generated_files_line = _generated_files_line(
-                runtime,
-                context,
-                generated_file_paths=generated_file_paths,
-                response_text="".join(response_parts),
-            )
-            if generated_files_line is not None:
-                yield generated_files_line
-        proposal = reflection_collector.build_proposal()
-        if proposal is not None:
-            yield _json_line(
-                _reflection_proposal_payload(
-                    proposal,
-                    context,
-                    issue_reflection_token=issue_reflection_token,
-                )
-            )
-        yield _json_line(
+        yield _json_line(_error_payload(context, _safe_backend_error(exc)))
+
+
+class NdjsonRenderer(BaseTurnRenderer):
+    """Render one turn as NDJSON lines, streamed with consumer backpressure."""
+
+    def __init__(
+        self,
+        context: AgentRunContext,
+        *,
+        issue_reflection_token: Callable[[str, ReflectionProposal], str],
+    ) -> None:
+        self.context = context
+        self.issue_reflection_token = issue_reflection_token
+        self._lines: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def lines(
+        self, runner: TurnRunner, request: TurnRequest
+    ) -> AsyncGenerator[str, None]:
+        """Run the turn in a task and yield its lines as the consumer reads."""
+        task = asyncio.create_task(runner.run(request, self))
+        task.add_done_callback(lambda _task: self._lines.put_nowait(None))
+        try:
+            while (line := await self._lines.get()) is not None:
+                try:
+                    yield line
+                finally:
+                    self._lines.task_done()
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    async def _emit(self, payload: dict[str, Any]) -> None:
+        # Wait until the consumer has taken the line, like a pull-based stream.
+        self._lines.put_nowait(_json_line(payload))
+        await self._lines.join()
+
+    async def on_event(self, event: AgentStreamEvent) -> None:
+        await self._emit(_event_payload(event, self.context))
+
+    async def on_command_result(self, result: RuntimeCommandResult) -> None:
+        event = AgentStreamEvent(
+            kind="response_delta",
+            source="native-command",
+            text=dumps_tool_result(result.tool_result),
+        )
+        await self._emit(_event_payload(event, self.context))
+
+    async def on_command_error(self, exc: TurnCommandError, status: int) -> None:
+        await self._emit(_error_payload(self.context, exc.message))
+
+    async def on_generated_files(self, files: list[GeneratedFileDescriptor]) -> None:
+        await self._emit(
             {
-                "kind": "error",
-                "error": _safe_backend_error(exc),
-                "thread_id": context.thread_id,
-                "model": context.model_name,
-                "reasoning": context.reasoning_level,
+                "kind": "generated_files",
+                "source": "main-agent",
+                "files": [descriptor.to_payload() for descriptor in files],
+                "thread_id": self.context.thread_id,
+                "model": self.context.model_name,
+                "reasoning": self.context.reasoning_level,
             }
         )
 
+    async def on_reflection(self, proposal: ReflectionProposal) -> None:
+        await self._emit(
+            _reflection_proposal_payload(
+                proposal,
+                self.context,
+                issue_reflection_token=self.issue_reflection_token,
+            )
+        )
 
-def _generated_files_line(
-    runtime: Any,
-    context: AgentRunContext,
-    *,
-    generated_file_paths: list[str],
-    response_text: str,
-) -> str | None:
-    """Build the generated-files event after final filesystem validation."""
-    raw_paths = [
-        *generated_file_paths,
-        *generated_file_paths_from_text(response_text),
-    ]
-    if not raw_paths:
-        return None
-    descriptors = generated_file_descriptors(
-        raw_paths,
-        project_root=Path(runtime.project_root),
+    async def on_error(self, exc: Exception) -> None:
+        await self._emit(_error_payload(self.context, _safe_backend_error(exc)))
+
+    async def on_complete(self, result: TurnResult) -> None:
+        if result.ok:
+            await self._emit(_done_payload(self.context))
+
+
+class _WarningCollector(BaseTurnRenderer):
+    """Collect MCP outage warnings for the non-streaming invoke response."""
+
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    async def on_event(self, event: AgentStreamEvent) -> None:
+        if event.kind == "mcp_status":
+            self.warnings.append(event.text)
+
+
+def _turn_request(context: AgentRunContext) -> TurnRequest:
+    """Adapt a validated API run context to the shared turn runner."""
+    return TurnRequest(
+        prompt=context.prompt,
+        selected_command=context.selected_command,
+        thread_id=context.thread_id,
+        model_name=context.model_name,
+        reasoning_level=context.reasoning_level,
+        reasoning_level_is_explicit=context.reasoning_level_is_explicit,
+        content_parts=context.image_parts,
+        history=context.history,
+        image_names=context.image_names,
+        prompt_note=context.prompt_note,
+        async_subagent_url=context.async_subagent_url,
+        mcp_session_id=context.mcp_session_id,
     )
-    if not descriptors:
-        return None
-    return _json_line(
-        {
-            "kind": "generated_files",
-            "source": "main-agent",
-            "files": [descriptor.to_payload() for descriptor in descriptors],
-            "thread_id": context.thread_id,
-            "model": context.model_name,
-            "reasoning": context.reasoning_level,
-        }
-    )
+
+
+def _error_payload(context: AgentRunContext, error: str) -> dict[str, Any]:
+    """Build a terminal stream error event."""
+    return {
+        "kind": "error",
+        "error": error,
+        "thread_id": context.thread_id,
+        "model": context.model_name,
+        "reasoning": context.reasoning_level,
+    }
 
 
 def _reflection_proposal_payload(
@@ -1273,6 +1287,7 @@ def _run_context(runtime: Any, request: AgentRunRequest) -> AgentRunContext:
         mcp_session_id=thread_id,
         history=tuple(_history_message_payload(message) for message in request.history),
         source_thread_id=_optional_text(request.source_thread_id),
+        selected_command=_optional_text(request.command),
     )
 
 
@@ -1281,9 +1296,11 @@ async def _prepare_run_context(
     request: AgentRunRequest,
     *,
     has_current_images: bool = False,
-    command_raw_text: str | None = None,
 ) -> AgentRunContext:
-    """Resolve validation and native command behavior for one request."""
+    """Validate one request and reserve branch RAG scope before the turn runs.
+
+    Native commands are resolved later by the shared ``TurnRunner``.
+    """
     context = _run_context(runtime, request)
     await _validate_history_replay(runtime, context)
     _validate_image_modalities(
@@ -1291,45 +1308,7 @@ async def _prepare_run_context(
         context.model_name,
         has_images=has_current_images or _history_contains_images(request.history),
     )
-    context = await _clone_branch_rag_before_commands(runtime, context)
-    if context.command_error:
-        return context
-    parsed = resolve_native_command(
-        raw_text=context.prompt if command_raw_text is None else command_raw_text,
-        selected_command=request.command,
-    )
-    if parsed is None:
-        return context
-
-    try:
-        result = await resolve_runtime_command(
-            runtime=runtime,
-            parsed=parsed,
-            thread_id=context.thread_id,
-            mcp_session_id=context.mcp_session_id,
-        )
-    except ValueError as exc:
-        return replace(
-            context,
-            command_error=_safe_command_validation_error(exc),
-            command_error_status=422,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        return replace(
-            context,
-            command_error=_safe_backend_error(exc),
-            command_error_status=500,
-        )
-    if result.target == "unknown":
-        return replace(
-            context,
-            command_error=f"Unknown command `/{result.command_name}`.",
-        )
-    if result.target == "mcp_tool":
-        return replace(context, direct_response=dumps_tool_result(result.tool_result))
-    return replace(context, prompt=(result.prompt or "").strip())
+    return await _clone_branch_rag_before_commands(runtime, context)
 
 
 async def _clone_branch_rag_before_commands(
@@ -1464,74 +1443,6 @@ def _required_text(value: str, field_name: str) -> str:
     return text
 
 
-async def _iter_agent_events(
-    runtime: Any,
-    context: AgentRunContext,
-    *,
-    reflection_collector: ReflectionCollector | None = None,
-) -> AsyncIterator[AgentStreamEvent]:
-    if context.direct_response is not None:
-        yield AgentStreamEvent(
-            kind="response_delta",
-            source="native-command",
-            text=context.direct_response,
-        )
-        return
-
-    agent, mcp_failures = await agent_with_mcp_status(
-        runtime,
-        context.reasoning_level,
-        model_name=context.model_name,
-        reasoning_level_is_explicit=context.reasoning_level_is_explicit,
-        thread_id=context.thread_id,
-        async_subagent_url_override=context.async_subagent_url,
-        mcp_session_id=context.mcp_session_id,
-    )
-    if mcp_failures:
-        yield AgentStreamEvent(
-            kind="mcp_status",
-            source="mcp",
-            status="warning",
-            text=mcp_outage_warning(mcp_failures),
-        )
-    payload = {
-        "messages": [
-            *context.history,
-            {
-                "role": "user",
-                "content": (
-                    [{"type": "text", "text": context.prompt}, *context.image_parts]
-                    if context.image_parts
-                    else context.prompt
-                ),
-            },
-        ]
-    }
-    config = build_langgraph_run_config(
-        runtime.config,
-        thread_id=context.thread_id,
-        langsmith_tracing=getattr(runtime, "langsmith_tracing", None),
-    )
-    adapter = AgentStreamEventAdapter(prompt=context.prompt)
-    stream = agent.astream_events(
-        payload,
-        config=config,
-        version="v2",
-        stream_mode=AGENT_STREAM_MODES,
-        subgraphs=True,
-    )
-
-    try:
-        async for raw_event in stream:
-            for event in adapter.events_from_raw_event(raw_event):
-                if reflection_collector is not None:
-                    reflection_collector.record_event(event)
-                yield event
-    finally:
-        with suppress(Exception):
-            await stream.aclose()
-
-
 def _event_payload(event: AgentStreamEvent, context: AgentRunContext) -> dict[str, Any]:
     payload = asdict(event)
     if event.kind not in {"ui_message", "ui_remove"}:
@@ -1549,24 +1460,6 @@ def _event_payload(event: AgentStreamEvent, context: AgentRunContext) -> dict[st
 
 def _json_line(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
-
-
-def _safe_backend_error(
-    exc: Exception, message: str = "Agent operation failed. Please retry."
-) -> str:
-    logger.error(message, exc_info=(type(exc), exc, exc.__traceback__))
-    return message
-
-
-def _safe_command_validation_error(exc: ValueError) -> str:
-    # Runtime command JSON validation has a stable correction message. Other
-    # ValueErrors can originate from an MCP backend and must not be echoed.
-    message = str(exc)
-    if message.startswith("Command arguments") and message.endswith(
-        "must be valid JSON."
-    ):
-        return "Command arguments must be valid JSON."
-    return _safe_backend_error(exc, "Command arguments could not be validated.")
 
 
 def _safe_validation_errors(

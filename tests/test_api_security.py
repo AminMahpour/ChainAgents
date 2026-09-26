@@ -487,7 +487,9 @@ def test_reflection_fallback_does_not_echo_backend_exception(monkeypatch):
         yield event
         raise RuntimeError("credential=supersecret")
 
-    monkeypatch.setattr(api, "_iter_agent_events", failed_events)
+    from chainagents.turns.runner import TurnRunner
+
+    monkeypatch.setattr(TurnRunner, "_agent_events", failed_events)
     with make_client(monkeypatch) as client:
         client.app.state.runtime.config.extensions.agent_reflection = ReflectionConfig(
             enabled=True
@@ -519,7 +521,9 @@ def test_oversize_multipart_closes_parser_files(monkeypatch):
     opened = []
 
     def recording_file(*args, **kwargs):
-        file = tempfile.SpooledTemporaryFile(*args, **kwargs)
+        # The file's lifecycle belongs to starlette's parser (closed there, asserted
+        # below), so it cannot be opened as a context manager here.
+        file = tempfile.SpooledTemporaryFile(*args, **kwargs)  # noqa: SIM115
         opened.append(file)
         return file
 

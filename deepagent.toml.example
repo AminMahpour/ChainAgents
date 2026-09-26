@@ -80,7 +80,7 @@ mcp_servers = []
 # Optional instruction appended to the main agent system prompt.
 # Use either custom_instruction or custom_instruction_file, not both.
 # custom_instruction = "Always ask clarifying questions before editing files."
-# custom_instruction_file = "prompts/ui_promots.md"
+# custom_instruction_file = "prompts/ui_prompts.md"
 # DeepAgents provides summarization middleware in its base agent stack.
 # ChainAgents restores TodoListMiddleware because DeepAgents 0.7 removed it
 # from the default stack. These token thresholds tune the built-in summarizer.

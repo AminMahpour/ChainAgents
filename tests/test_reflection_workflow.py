@@ -5,11 +5,12 @@ from __future__ import annotations
 import io
 import json
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
-import chainagents_api
-import chainagents_cli
+from chainagents.interfaces.api import app as chainagents_api
+from chainagents.interfaces.cli import app as chainagents_cli
 from chainagents.events.stream import AgentStreamEvent
 from chainagents.runtime.reflection import ReflectionCollector, ReflectionConfig
 
@@ -18,8 +19,8 @@ class _Token:
     """Provide a minimal streamed AI token for reflection tests."""
 
     type = "AIMessageChunk"
-    additional_kwargs: dict[str, str] = {}
-    tool_call_chunks: list[dict[str, str]] = []
+    additional_kwargs: ClassVar[dict[str, str]] = {}
+    tool_call_chunks: ClassVar[list[dict[str, str]]] = []
 
     def __init__(self, content: str = "") -> None:
         """Initialize the token instance."""
@@ -167,13 +168,15 @@ def test_api_stream_emits_reflection_proposal_event() -> None:
 
     from fastapi.testclient import TestClient
 
-    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
-        with client.stream(
+    with (
+        TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client,
+        client.stream(
             "POST",
             "/api/agent/stream",
             json={"prompt": "try it", "thread_id": "thread-1"},
-        ) as response:
-            lines = [json.loads(line) for line in response.iter_lines()]
+        ) as response,
+    ):
+        lines = [json.loads(line) for line in response.iter_lines()]
 
     assert response.status_code == 200
     assert [line["kind"] for line in lines] == [

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
@@ -232,7 +233,7 @@ def build_model(
                 "Anthropic runtime requires DEEPAGENT_MODEL_API_KEY, "
                 "ANTHROPIC_API_KEY, or [model].api_key."
             )
-        kwargs: dict[str, Any] = {
+        kwargs = {
             "model": selected_model,
             "base_url": resolved_profile.base_url,
             "temperature": resolved_profile.temperature,
@@ -274,7 +275,7 @@ def build_model(
             kwargs["default_query"] = default_query
         return SnowflakeCortexChatOpenAI(**kwargs)
 
-    kwargs: dict[str, Any] = {
+    kwargs = {
         "model": selected_model,
         "base_url": resolved_profile.base_url,
         "api_key": api_key or "deepagent",
@@ -296,7 +297,9 @@ def build_model_for_profile(
 ) -> Any:
     """Build a model from resolved profile settings."""
     try:
-        parameters = inspect.signature(build_model).parameters
+        parameters: Mapping[str, inspect.Parameter] = inspect.signature(
+            build_model
+        ).parameters
     except (TypeError, ValueError):
         parameters = {}
     if "model_profile" in parameters:
