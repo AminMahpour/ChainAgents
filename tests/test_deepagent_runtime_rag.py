@@ -32,6 +32,7 @@ import chainagents.runtime.config as runtime_config
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.graph as runtime_graph
 import chainagents.runtime.lifecycle as runtime_lifecycle
+import chainagents.runtime.mcp_sessions as runtime_mcp_sessions
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
 import chainagents.runtime.providers as runtime_providers
@@ -6398,7 +6399,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         load_calls.append((session, str(server_name)))
         return [SimpleNamespace(name=f"{server_name}_tool", session=session)]
 
-    monkeypatch.setattr(runtime_lifecycle, "load_mcp_tools", fake_load_mcp_tools)
+    monkeypatch.setattr(runtime_mcp_sessions, "load_mcp_tools", fake_load_mcp_tools)
 
     runtime = AgentRuntime(
         make_runtime_config(
@@ -6409,7 +6410,7 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
             ),
         )
     )
-    runtime._mcp_client = FakeMCPClient()
+    runtime._mcp_pool._client = FakeMCPClient()
     runtime._store = InMemoryStore()
     runtime._checkpointer = MemorySaver()
     monkeypatch.setattr(runtime, "_build_model", lambda *args, **kwargs: object())
@@ -6448,8 +6449,8 @@ def test_stateful_mcp_reuses_session_per_chainlit_session(
         )
         await runtime.close_mcp_session("session-1")
         assert len(closed_sessions) == 1
-        assert ("session-1", "repo") not in runtime._mcp_sessions
-        assert ("session-1", ("repo",)) not in runtime._mcp_tools_cache
+        assert ("session-1", "repo") not in runtime._mcp_pool._sessions
+        assert ("session-1", ("repo",)) not in runtime._mcp_pool._tools_cache
         assert first not in runtime._agents.values()
         assert other in runtime._agents.values()
         reopened = await runtime.get_agent(

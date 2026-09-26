@@ -5,14 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextvars import ContextVar
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
 from deepagents.backends import StoreBackend
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
@@ -24,8 +22,10 @@ import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.graph as runtime_graph
+import chainagents.runtime.mcp_sessions as runtime_mcp_sessions
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
+import chainagents.runtime.rag_ops as runtime_rag_ops
 import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
     RagStatus,
@@ -35,6 +35,11 @@ from chainagents.rag.runtime import (
 )
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.constants import SYSTEM_PROMPT, ReasoningLevel
+from chainagents.runtime.mcp_sessions import (
+    MCPSessionPool,
+    _MCPSessionOwner as _MCPSessionOwner,
+    mcp_outage_warning as mcp_outage_warning,
+)
 from chainagents.runtime.reflection import (
     ReflectionProposal,
     append_reflection_lesson,
@@ -48,9 +53,6 @@ from chainagents.runtime.types import (
 )
 
 logger = logging.getLogger("chainagents.runtime.core")
-_MCP_DISCOVERY_WARNINGS: ContextVar[set[str] | None] = ContextVar(
-    "mcp_discovery_warnings", default=None
-)
 
 
 async def agent_with_mcp_status(
@@ -61,53 +63,6 @@ async def agent_with_mcp_status(
     if callable(method):
         return await method(reasoning_level, **kwargs)
     return await runtime.get_agent(reasoning_level, **kwargs), ()
-
-
-def mcp_outage_warning(server_names: tuple[str, ...]) -> str:
-    """Return a safe user-facing warning without exposing transport details."""
-    names = ", ".join(server_names)
-    return f"MCP server unavailable: {names}. Continuing with available tools."
-
-
-class _MCPSessionOwner:
-    """Enter and exit transport cancel scopes on the same long-lived task."""
-
-    def __init__(self, context: Any) -> None:
-        self._ready = asyncio.get_running_loop().create_future()
-        self._stop = asyncio.Event()
-        self._task = asyncio.create_task(self._run(context))
-
-    async def _run(self, context: Any) -> None:
-        try:
-            async with context as session:
-                self._ready.set_result(session)
-                await self._stop.wait()
-        except BaseException as exc:
-            if not self._ready.done():
-                self._ready.set_exception(exc)
-            else:
-                raise
-
-    async def session(self) -> Any:
-        try:
-            return await asyncio.shield(self._ready)
-        except BaseException:
-            await self.aclose()
-            # Retrieve a startup error even when the requesting task was cancelled.
-            if self._ready.done():
-                self._ready.exception()
-            raise
-
-    async def aclose(self) -> None:
-        self._stop.set()
-        if not self._ready.done():
-            self._task.cancel()
-        await asyncio.shield(self._task)
-
-    @property
-    def terminal(self) -> bool:
-        """Whether the transport task has exited and cannot be closed again."""
-        return self._task.done()
 
 
 class AgentRuntime:
@@ -128,13 +83,8 @@ class AgentRuntime:
         self.project_root = project_root or runtime_constants.PROJECT_ROOT
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
-        self._mcp_lock = asyncio.Lock()
         self._agents: dict[AgentCacheKey, object] = {}
-        self._mcp_client: MultiServerMCPClient | None = None
-        self._mcp_tools_cache: dict[tuple[str | None, tuple[str, ...]], list[Any]] = {}
-        self._mcp_discovery_failed = False
-        self._mcp_sessions: dict[tuple[str | None, str], Any] = {}
-        self._mcp_session_owners: dict[tuple[str | None, str], _MCPSessionOwner] = {}
+        self._mcp_pool = MCPSessionPool(lambda: self.config.extensions)
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
@@ -342,7 +292,7 @@ class AgentRuntime:
         Returns:
             Whether the RAG service is available.
         """
-        return self.config.rag_requested
+        return runtime_rag_ops.rag_enabled(self)
 
     @property
     def chainlit_commands(self) -> tuple[ChainlitCommandConfig, ...]:
@@ -369,21 +319,12 @@ class AgentRuntime:
         Returns:
             The current RAG service status.
         """
-        if self._rag_service is not None:
-            return self._rag_service.snapshot()
-        if self.config.rag_requested:
-            return RagStatus.unavailable(
-                reason=self.config.rag_error or "Knowledge index is unavailable.",
-                persist_directory=(
-                    self.config.rag.persist_directory if self.config.rag is not None else None
-                ),
-            )
-        return RagStatus.disabled()
+        return runtime_rag_ops.rag_status(self)
 
     async def _initialize(self) -> None:
         """Initialize persistence, RAG, MCP clients, and configured agents."""
         if self.config.extensions.mcp_servers:
-            self._mcp_client = MultiServerMCPClient(
+            self._mcp_pool.client = MultiServerMCPClient(
                 self.config.extensions.mcp_servers,
                 tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
             )
@@ -482,7 +423,7 @@ class AgentRuntime:
             reasoning_level,
             fallback_is_explicit=reasoning_level_is_explicit,
         )
-        mcp_scope = self._mcp_scope(
+        mcp_scope = self._mcp_pool.scope(
             mcp_session_id=mcp_session_id,
             thread_id=thread_id,
         )
@@ -497,7 +438,7 @@ class AgentRuntime:
         async with self._agent_lock:
             agent = self._agents.get(cache_key)
             if agent is None:
-                self._mcp_discovery_failed = False
+                self._mcp_pool.discovery_failed = False
                 raw_main_tools = await self._build_main_tools(
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
@@ -546,7 +487,7 @@ class AgentRuntime:
                     artifact_registry=self.large_tool_result_artifacts,
                     fixed_session_id=thread_id,
                 )
-                if not self._mcp_discovery_failed:
+                if not self._mcp_pool.discovery_failed:
                     self._agents[cache_key] = agent
             return agent
 
@@ -555,11 +496,11 @@ class AgentRuntime:
     ) -> tuple[Any, tuple[str, ...]]:
         """Return an agent and MCP discovery failures for this build."""
         warnings: set[str] = set()
-        token = _MCP_DISCOVERY_WARNINGS.set(warnings)
+        token = runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.set(warnings)
         try:
             agent = await self.get_agent(reasoning_level, **kwargs)
         finally:
-            _MCP_DISCOVERY_WARNINGS.reset(token)
+            runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.reset(token)
         return agent, tuple(sorted(warnings))
 
     async def rebuild_rag_index(self) -> RagStatus:
@@ -568,21 +509,7 @@ class AgentRuntime:
         Returns:
             The rebuilt object or status.
         """
-        if self._rag_service is None:
-            if self.config.rag_requested:
-                return RagStatus.unavailable(
-                    reason=self.config.rag_error or "Knowledge index is unavailable.",
-                    persist_directory=(
-                        self.config.rag.persist_directory
-                        if self.config.rag is not None
-                        else None
-                    ),
-                )
-            return RagStatus.disabled()
-
-        status = await asyncio.to_thread(self._rag_service.rebuild)
-        await self._clear_agent_cache()
-        return status
+        return await runtime_rag_ops.rebuild_rag_index(self)
 
     async def ingest_rag_uploads(
         self,
@@ -599,16 +526,8 @@ class AgentRuntime:
         Returns:
             The ingest RAG uploads result.
         """
-        if self._rag_service is None:
-            return RagUploadResult(
-                thread_id=thread_id,
-                reason=self.config.rag_error or "Knowledge index is unavailable.",
-            )
-
-        return await asyncio.to_thread(
-            self._rag_service.ingest_uploaded_files,
-            thread_id=thread_id,
-            uploads=uploads,
+        return await runtime_rag_ops.ingest_rag_uploads(
+            self, thread_id=thread_id, uploads=uploads
         )
 
     async def clone_rag_uploads(
@@ -618,13 +537,8 @@ class AgentRuntime:
         target_thread_id: str,
     ) -> RagUploadResult:
         """Clone thread-scoped RAG uploads for a fresh conversation branch."""
-        if self._rag_service is None:
-            return RagUploadResult(
-                thread_id=target_thread_id,
-                reason=self.config.rag_error or "Knowledge index is unavailable.",
-            )
-        return await asyncio.to_thread(
-            self._rag_service.clone_thread_uploads,
+        return await runtime_rag_ops.clone_rag_uploads(
+            self,
             source_thread_id=source_thread_id,
             target_thread_id=target_thread_id,
         )
@@ -763,80 +677,6 @@ class AgentRuntime:
             )
         return runtime_models.build_model(self.config, reasoning_level, model_name=model_name)
 
-    def _mcp_scope(
-        self,
-        *,
-        mcp_session_id: str | None,
-        thread_id: str | None = None,
-    ) -> str | None:
-        """Open or reuse MCP client resources for the current scope.
-
-        Args:
-            mcp_session_id: MCP session identifier.
-            thread_id: Conversation thread identifier.
-
-        Returns:
-            The MCP scope result.
-        """
-        if not self.config.extensions.mcp_stateful:
-            return None
-
-        candidate = str(mcp_session_id or "").strip()
-        if candidate:
-            return candidate
-
-        fallback = str(thread_id or "").strip()
-        return fallback or None
-
-    async def _get_stateful_mcp_session(
-        self,
-        *,
-        server_name: str,
-        thread_id: str | None,
-        mcp_session_id: str | None,
-    ) -> Any:
-        """Return the cached MCP session for a Chainlit session.
-
-        Args:
-            server_name: The server name value.
-            thread_id: Conversation thread identifier.
-            mcp_session_id: MCP session identifier.
-
-        Returns:
-            The cached MCP session for a Chainlit session.
-
-        Raises:
-            RuntimeError: If the runtime is not in a usable state.
-        """
-        scope = self._mcp_scope(
-            mcp_session_id=mcp_session_id,
-            thread_id=thread_id,
-        )
-        cache_key = (scope, server_name)
-        session = self._mcp_sessions.get(cache_key)
-        if session is not None:
-            return session
-
-        stale_owner = self._mcp_session_owners.get(cache_key)
-        if stale_owner is not None:
-            if not stale_owner.terminal:
-                try:
-                    await stale_owner.aclose()
-                except Exception:
-                    if not stale_owner.terminal:
-                        raise
-                    logger.exception("Failed to close terminal MCP session for %s", server_name)
-            self._mcp_session_owners.pop(cache_key, None)
-
-        if self._mcp_client is None:
-            raise RuntimeError("MCP client is not initialized.")
-
-        owner = _MCPSessionOwner(self._mcp_client.session(server_name))
-        session = await owner.session()
-        self._mcp_session_owners[cache_key] = owner
-        self._mcp_sessions[cache_key] = session
-        return session
-
     async def _get_mcp_tools(
         self,
         server_names: tuple[str, ...],
@@ -867,67 +707,9 @@ class AgentRuntime:
         mcp_session_id: str | None = None,
     ) -> tuple[list[Any], tuple[str, ...]]:
         """Load available tools while reporting failed servers by name."""
-        if not server_names or self._mcp_client is None:
-            return [], ()
-
-        tool_scope = self._mcp_scope(
-            mcp_session_id=mcp_session_id,
-            thread_id=thread_id,
+        return await self._mcp_pool.tools_with_status(
+            server_names, thread_id=thread_id, mcp_session_id=mcp_session_id
         )
-        async with self._mcp_lock:
-            tools: list[Any] = []
-            failures: list[str] = []
-            for server_name in server_names:
-                cache_key = (tool_scope, (server_name,))
-                cached = self._mcp_tools_cache.get(cache_key)
-                if cached is not None:
-                    tools.extend(cached)
-                    continue
-                session_key = (tool_scope, server_name)
-                had_session = session_key in self._mcp_sessions
-                try:
-                    if self.config.extensions.mcp_stateful:
-                        session = await self._get_stateful_mcp_session(
-                            server_name=server_name,
-                            thread_id=thread_id,
-                            mcp_session_id=mcp_session_id,
-                        )
-                        loaded = await load_mcp_tools(
-                                session,
-                                callbacks=self._mcp_client.callbacks,
-                                tool_interceptors=self._mcp_client.tool_interceptors,
-                                server_name=server_name,
-                                tool_name_prefix=self.config.extensions.mcp_tool_name_prefix,
-                            )
-                    else:
-                        loaded = await self._mcp_client.get_tools(server_name=server_name)
-                except BaseException as exc:
-                    if not had_session:
-                        self._mcp_sessions.pop(session_key, None)
-                        owner = self._mcp_session_owners.get(session_key)
-                        if owner is not None:
-                            try:
-                                await owner.aclose()
-                            except Exception:
-                                logger.exception("Failed to close MCP session for %s", server_name)
-                            else:
-                                self._mcp_session_owners.pop(session_key, None)
-                            if owner.terminal:
-                                self._mcp_session_owners.pop(session_key, None)
-                    if isinstance(exc, asyncio.CancelledError):
-                        raise
-                    if not isinstance(exc, Exception):
-                        raise
-                    logger.warning("MCP server %s is unavailable: %s", server_name, exc)
-                    failures.append(server_name)
-                    self._mcp_discovery_failed = True
-                    warnings = _MCP_DISCOVERY_WARNINGS.get()
-                    if warnings is not None:
-                        warnings.add(server_name)
-                    continue
-                self._mcp_tools_cache[cache_key] = list(loaded)
-                tools.extend(loaded)
-            return tools, tuple(failures)
 
     async def _build_main_tools(
         self,
@@ -967,7 +749,7 @@ class AgentRuntime:
         Args:
             mcp_session_id: MCP session identifier.
         """
-        mcp_scope = self._mcp_scope(mcp_session_id=mcp_session_id)
+        mcp_scope = self._mcp_pool.scope(mcp_session_id=mcp_session_id)
         if mcp_scope is None:
             return
 
@@ -977,24 +759,9 @@ class AgentRuntime:
                 for key, agent in self._agents.items()
                 if key.mcp_scope != mcp_scope
             }
-            async with self._mcp_lock:
-                owners = [
-                    (key, owner)
-                    for key, owner in self._mcp_session_owners.items()
-                    if key[0] == mcp_scope
-                ]
-                self._mcp_sessions = {
-                    key: session
-                    for key, session in self._mcp_sessions.items()
-                    if key[0] != mcp_scope
-                }
-                self._mcp_tools_cache = {
-                    key: tools
-                    for key, tools in self._mcp_tools_cache.items()
-                    if key[0] != mcp_scope
-                }
+            owners = await self._mcp_pool.evict_scope(mcp_scope)
 
-        await self._close_mcp_owner_entries(owners)
+        await self._mcp_pool.close_owner_entries(owners)
 
     async def close_conversation(
         self, *, thread_id: str | None, mcp_session_id: str | None = None
@@ -1042,32 +809,13 @@ class AgentRuntime:
             return
         await self.close_mcp_session(mcp_session_id)
 
-    async def _close_mcp_owner_entries(
-        self, owners: list[tuple[tuple[str | None, str], _MCPSessionOwner]]
-    ) -> None:
-        """Close owners independently and retain failures for later retry."""
-        results = await asyncio.gather(
-            *(owner.aclose() for _, owner in owners), return_exceptions=True
-        )
-        async with self._mcp_lock:
-            for (key, owner), result in zip(owners, results, strict=True):
-                if not isinstance(result, BaseException) or getattr(owner, "terminal", False):
-                    if self._mcp_session_owners.get(key) is owner:
-                        self._mcp_session_owners.pop(key, None)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-
     async def close_all_mcp_sessions(self) -> None:
         """Close all MCP sessions."""
         async with self._agent_lock:
-            async with self._mcp_lock:
-                owners = list(self._mcp_session_owners.items())
-                self._mcp_sessions.clear()
-                self._mcp_tools_cache.clear()
-                self._agents.clear()
+            owners = await self._mcp_pool.evict_all()
+            self._agents.clear()
 
-        await self._close_mcp_owner_entries(owners)
+        await self._mcp_pool.close_owner_entries(owners)
 
     async def close(self) -> None:
         """Close the agent runtime."""
@@ -1101,7 +849,7 @@ class AgentRuntime:
                     finally:
                         self._checkpointer = None
                         self._store = None
-                        self._mcp_client = None
+                        self._mcp_pool.client = None
 
     def _build_backend(self, runtime):
         """Build the Deep Agent backend for the current runtime settings.
