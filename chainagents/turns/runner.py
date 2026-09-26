@@ -390,18 +390,20 @@ class _GeneratedPathTracker:
 
     def __init__(self) -> None:
         self.paths: list[str] = []
-        self._tool_calls: dict[str, tuple[str, str]] = {}
+        # call id -> (source, tool name, accumulated args)
+        self._tool_calls: dict[str, tuple[str, str, str]] = {}
 
     def record(self, event: AgentStreamEvent) -> None:
         if event.kind == "tool_call":
             if event.previous_tool_call_id:
                 self._tool_calls.pop(event.previous_tool_call_id, None)
-            self._tool_calls[event.tool_call_id] = (event.tool_name, event.tool_args)
-        elif event.kind == "tool_result":
-            tool_name, tool_args = self._tool_calls.pop(
-                event.tool_call_id,
-                (event.tool_name, ""),
+            self._tool_calls[event.tool_call_id] = (
+                event.source,
+                event.tool_name,
+                event.tool_args,
             )
+        elif event.kind == "tool_result":
+            tool_name, tool_args = self._pop_call(event)
             if event.status.lower() != "error":
                 self.paths.extend(
                     generated_file_paths_from_tool_args(tool_name, tool_args)
@@ -409,6 +411,29 @@ class _GeneratedPathTracker:
                 self.paths.extend(
                     generated_file_paths_from_tool_result(tool_name, event.tool_result)
                 )
+
+    def _pop_call(self, event: AgentStreamEvent) -> tuple[str, str]:
+        """Return the name and args of the call a tool result completes.
+
+        Results whose id does not match a streamed call (some providers
+        re-key calls) fall back to a pending call of the same tool, preferring
+        the same source.
+        """
+        call_id = event.tool_call_id
+        if call_id not in self._tool_calls:
+            candidates = [
+                key
+                for key, (_source, name, _args) in self._tool_calls.items()
+                if name == event.tool_name
+            ]
+            same_source = [
+                key for key in candidates if self._tool_calls[key][0] == event.source
+            ]
+            call_id = (same_source or candidates or [""])[0]
+        if call_id not in self._tool_calls:
+            return event.tool_name, ""
+        _source, tool_name, tool_args = self._tool_calls.pop(call_id)
+        return tool_name, tool_args
 
 
 def safe_backend_error(exc: Exception, message: str = DEFAULT_BACKEND_ERROR) -> str:

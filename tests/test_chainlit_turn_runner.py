@@ -51,10 +51,18 @@ def _write_file_events(path: str) -> list[dict[str, object]]:
 
 
 class _Stream:
-    def __init__(self, events: list[dict[str, object]], error: Exception | None) -> None:
+    def __init__(
+        self,
+        events: list[dict[str, object]],
+        error: Exception | None,
+        *,
+        block: bool = False,
+    ) -> None:
         self.events = list(events)
         self.error = error
+        self.block = block
         self.closed = False
+        self.started = asyncio.Event()
 
     def __aiter__(self) -> "_Stream":
         return self
@@ -62,6 +70,9 @@ class _Stream:
     async def __anext__(self) -> dict[str, object]:
         if self.events:
             return self.events.pop(0)
+        self.started.set()
+        if self.block:
+            await asyncio.Event().wait()
         if self.error is not None:
             raise self.error
         raise StopAsyncIteration
@@ -86,14 +97,23 @@ class _Runtime:
         project_root: Path,
         events: list[dict[str, object]] | None = None,
         error: Exception | None = None,
+        *,
+        block: bool = False,
+        reflection: bool = False,
     ) -> None:
         self.project_root = project_root
-        self.agent = _Agent(_Stream(events or [], error))
+        self.agent = _Agent(_Stream(events or [], error, block=block))
         self.agent_requests = 0
         self.config = SimpleNamespace(
             recursion_limit=50,
+            model_name="model",
+            model_choices=("model",),
             extensions=SimpleNamespace(
-                agent_reflection=ReflectionConfig(enabled=False),
+                agent_reflection=ReflectionConfig(enabled=reflection),
+                chainlit_reasoning_steps_enabled=False,
+                chainlit_tool_steps_enabled=False,
+                chainlit_reasoning_mode_enabled=False,
+                chainlit_model_mode_enabled=False,
                 chainlit_chronological_ui_enabled=True,
                 chainlit_generative_ui_enabled=False,
                 chainlit_response_actions=(),
@@ -191,7 +211,19 @@ def chainlit_turn(monkeypatch):
             **kwargs,
         )
 
-    return SimpleNamespace(run=run, notifier_calls=notifier_calls, scheduled=scheduled)
+    reflections: list[Any] = []
+
+    async def ask_reflection(**kwargs: Any) -> None:
+        reflections.append(kwargs["proposal"])
+
+    monkeypatch.setattr(main, "ask_to_save_reflection_lesson", ask_reflection)
+    return SimpleNamespace(
+        run=run,
+        settings=settings,
+        notifier_calls=notifier_calls,
+        scheduled=scheduled,
+        reflections=reflections,
+    )
 
 
 def _output_file(tmp_path: Path) -> Path:
@@ -283,3 +315,65 @@ async def test_on_message_swallows_a_stopped_turn(monkeypatch) -> None:
     monkeypatch.setattr(main, "_handle_message", cancelled_turn)
 
     await main.on_message(SimpleNamespace(content="hi"))
+
+
+@pytest.mark.anyio
+async def test_stopping_a_message_turn_cancels_cleanly(
+    chainlit_turn, monkeypatch, tmp_path: Path
+) -> None:
+    runtime = _Runtime(tmp_path, [_token("partial")], block=True, reflection=True)
+    cancelled: list[bool] = []
+
+    class _RecordingBridge(main.ChainlitEventBridge):
+        async def cancel(self) -> None:
+            cancelled.append(True)
+            await super().cancel()
+
+    async def get_runtime() -> _Runtime:
+        return runtime
+
+    monkeypatch.setattr(main, "ChainlitEventBridge", _RecordingBridge)
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "coerce_settings", lambda *_a, **_k: chainlit_turn.settings)
+    monkeypatch.setattr(main, "resolve_reasoning_level_for_message", lambda *_a, **_k: "medium")
+    monkeypatch.setattr(main, "resolve_model_name_for_message", lambda *_a, **_k: "model")
+    monkeypatch.setattr(main, "current_mcp_session_id", lambda: None)
+    monkeypatch.setattr(main, "message_uploaded_rag_files", lambda _m: [])
+    monkeypatch.setattr(main, "message_uploaded_image_parts", lambda _m: [])
+    monkeypatch.setattr(main, "message_uploaded_image_names", lambda _m: ())
+    monkeypatch.setattr(main, "unsupported_uploaded_image_names", lambda _m: ())
+    monkeypatch.setattr(main, "message_has_reasoning_level_override", lambda *_a, **_k: False)
+    monkeypatch.setattr(main, "settings_reasoning_level_is_explicit", lambda *_a, **_k: False)
+
+    # A correction prompt would produce a reflection proposal if the turn finished.
+    message = SimpleNamespace(content="That was wrong, fix it", command=None)
+    task = asyncio.create_task(main.on_message(message))
+    await runtime.agent.stream.started.wait()
+    task.cancel()
+    await task  # the stop is swallowed; nothing is raised out of on_message
+
+    assert cancelled == [True]
+    assert runtime.agent.stream.closed
+    assert chainlit_turn.reflections == []
+    assert chainlit_turn.notifier_calls == []
+    assert chainlit_turn.scheduled == []
+
+
+@pytest.mark.anyio
+async def test_completed_turn_attaches_runner_generated_files_to_response(
+    chainlit_turn, tmp_path: Path
+) -> None:
+    output = _output_file(tmp_path)
+    runtime = _Runtime(
+        tmp_path,
+        [
+            *_write_file_events("/workspace/.files/outputs/report.csv"),
+            _token("Report written."),
+        ],
+    )
+
+    await chainlit_turn.run(runtime, "write a report")
+
+    response = _Message.sent[-1]
+    assert response.content == "Report written."
+    assert [element.path for element in response.elements] == [output.as_posix()]

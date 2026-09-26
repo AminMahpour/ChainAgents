@@ -157,23 +157,45 @@ def test_run_config_preserves_langfuse_while_adding_langsmith(monkeypatch) -> No
     assert run_config["tags"] == ["chainagents"]
 
 
-def test_chainlit_run_config_attaches_runtime_langsmith_client() -> None:
-    from chainagents.interfaces.chainlit.app import build_langgraph_config
-    from chainagents.runtime.types import AppSettings
+def test_turn_runner_run_config_attaches_runtime_langsmith_client() -> None:
+    from chainagents.turns import BaseTurnRenderer, TurnRequest, TurnRunner
 
     tracing = runtime_tracing.LangSmithTracing(
         LangSmithConfig(enabled=True), client=object()
     )
-    settings = AppSettings(
-        model_name="test-model", reasoning_level="medium", thread_id="conversation-1"
+    configs: list[dict] = []
+
+    class _Stream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            return None
+
+    class _Agent:
+        def astream_events(self, _payload, *, config, **_kwargs):
+            configs.append(config)
+            return _Stream()
+
+    class _Runtime:
+        config = runtime_config.RuntimeConfig.from_env()
+        langsmith_tracing = tracing
+
+        async def get_agent(self, *_args, **_kwargs):
+            return _Agent()
+
+    request = TurnRequest(
+        prompt="hello",
+        thread_id="conversation-1",
+        model_name="test-model",
+        reasoning_level="medium",
     )
-    run_config = build_langgraph_config(
-        settings,
-        recursion_limit=50,
-        runtime_config=runtime_config.RuntimeConfig.from_env(),
-        langsmith_tracing=tracing,
-    )
-    callback = run_config["callbacks"][0]
+    asyncio.run(TurnRunner(_Runtime()).run(request, BaseTurnRenderer()))
+
+    callback = configs[0]["callbacks"][0]
     assert isinstance(callback, LangChainTracer)
     assert callback.client is tracing.client
 

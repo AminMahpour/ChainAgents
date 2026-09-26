@@ -21,6 +21,11 @@ from PIL import Image
 from pypdf import PdfReader
 
 import response_exports
+from chainagents.exports.generated_files import (
+    generated_file_descriptors,
+    generated_file_paths_from_text,
+    resolve_generated_output,
+)
 import chainagents.exports.pdf_images as pdf_images
 
 
@@ -28,6 +33,12 @@ def _png_bytes(*, width: int = 48, height: int = 32) -> bytes:
     output = BytesIO()
     Image.new("RGB", (width, height), "#2563eb").save(output, format="PNG")
     return output.getvalue()
+
+
+def _descriptors_from_text(text: str, project_root: Path):
+    return generated_file_descriptors(
+        list(generated_file_paths_from_text(text)), project_root=project_root
+    )
 
 
 def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
@@ -41,10 +52,12 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
     report_path.write_text("name,value\nalpha,1\n", encoding="utf-8")
     chart_path.write_bytes(b"\x89PNG\r\n")
 
-    elements = response_exports.generated_file_elements_from_text(
-        "Created `/workspace/.files/outputs/reports/summary.csv` and"
-        " `.files/outputs/charts/plot.png`.",
-        project_root=tmp_path,
+    elements = response_exports.generated_file_elements(
+        _descriptors_from_text(
+            "Created `/workspace/.files/outputs/reports/summary.csv` and"
+            " `.files/outputs/charts/plot.png`.",
+            tmp_path,
+        )
     )
 
     assert [element.name for element in elements] == ["summary.csv", "plot.png"]
@@ -55,7 +68,7 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
     assert [element.mime for element in elements] == ["text/csv", "image/png"]
 
 
-def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts(
+def test_generated_output_resolves_absolute_workspace_artifacts(
     monkeypatch,
 ) -> None:
     """Verify absolute artifact paths under /workspace are not remapped twice."""
@@ -68,13 +81,12 @@ def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts
     monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
     monkeypatch.setattr(Path, "is_file", fake_is_file)
 
-    elements = response_exports.generated_file_elements_from_text(
-        "Created `/workspace/ChainAgents/.files/outputs/plot.png`.",
+    resolved = resolve_generated_output(
+        "/workspace/ChainAgents/.files/outputs/plot.png",
         project_root=project_root,
     )
 
-    assert [element.name for element in elements] == ["plot.png"]
-    assert [element.path for element in elements] == [artifact_path.as_posix()]
+    assert resolved == artifact_path
 
 
 def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
@@ -86,19 +98,17 @@ def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
     outside_path = tmp_path.parent / "outside.txt"
     outside_path.write_text("secret", encoding="utf-8")
 
-    elements = response_exports.generated_file_elements_from_text(
-        "\n".join(
-            [
-                "`/workspace/reports`",
-                "`/workspace/missing.txt`",
-                "`/workspace/../outside.txt`",
-                outside_path.as_posix(),
-            ]
-        ),
+    descriptors = generated_file_descriptors(
+        [
+            "/workspace/reports",
+            "/workspace/missing.txt",
+            "/workspace/../outside.txt",
+            outside_path.as_posix(),
+        ],
         project_root=tmp_path,
     )
 
-    assert elements == []
+    assert descriptors == []
 
 
 def test_generated_file_elements_from_paths_rejects_file_outside_outputs(
@@ -108,12 +118,12 @@ def test_generated_file_elements_from_paths_rejects_file_outside_outputs(
     outside_path = tmp_path / "README.md"
     outside_path.write_text("# notes", encoding="utf-8")
 
-    elements = response_exports.generated_file_elements_from_paths(
+    descriptors = generated_file_descriptors(
         [outside_path.as_posix()],
         project_root=tmp_path,
     )
 
-    assert elements == []
+    assert descriptors == []
 
 
 def test_generated_file_elements_from_paths_rejects_symlinked_files_directory(
@@ -126,12 +136,12 @@ def test_generated_file_elements_from_paths_rejects_symlinked_files_directory(
     output_path.write_bytes(b"\x89PNG\r\n")
     (tmp_path / ".files").symlink_to(real_target, target_is_directory=True)
 
-    elements = response_exports.generated_file_elements_from_paths(
+    descriptors = generated_file_descriptors(
         [(tmp_path / ".files" / "outputs" / "plot.png").as_posix()],
         project_root=tmp_path,
     )
 
-    assert elements == []
+    assert descriptors == []
 
 
 def test_generated_file_elements_from_paths_attaches_file_inside_outputs(
@@ -142,9 +152,8 @@ def test_generated_file_elements_from_paths_attaches_file_inside_outputs(
     output_path.parent.mkdir(parents=True)
     output_path.write_bytes(b"\x89PNG\r\n")
 
-    elements = response_exports.generated_file_elements_from_paths(
-        [output_path.as_posix()],
-        project_root=tmp_path,
+    elements = response_exports.generated_file_elements(
+        generated_file_descriptors([output_path.as_posix()], project_root=tmp_path)
     )
 
     assert [element.name for element in elements] == ["plot.png"]

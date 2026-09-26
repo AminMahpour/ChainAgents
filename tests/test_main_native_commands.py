@@ -14,7 +14,19 @@ from deepagent_runtime import (
     ModelDefaults,
     RuntimeConfig,
 )
+from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
+from chainagents.interfaces.uploads import prompt_with_images
 from chainagents.runtime.reflection import ReflectionProposal
+from chainagents.turns import TurnRequest, TurnRunner
+
+
+def _turn_request(prompt: str) -> TurnRequest:
+    return TurnRequest(
+        prompt=prompt,
+        thread_id="thread-1",
+        model_name="gpt-oss:20b",
+        reasoning_level="medium",
+    )
 
 
 def test_load_chainlit_auth_users_parses_json_map() -> None:
@@ -510,18 +522,6 @@ def test_resolve_model_name_for_message_ignores_override_when_disabled() -> None
     assert resolved == "gpt-oss:20b"
 
 
-def test_build_langgraph_config_includes_recursion_limit() -> None:
-    """Verify that build langgraph config includes recursion limit."""
-    settings = SimpleNamespace(thread_id="thread-1")
-
-    config = main.build_langgraph_config(settings, recursion_limit=100)
-
-    assert config == {
-        "configurable": {"thread_id": "thread-1"},
-        "recursion_limit": 100,
-    }
-
-
 def test_message_uploaded_rag_files_skips_image_uploads(tmp_path) -> None:
     """Verify that RAG uploads ignore Chainlit image attachments."""
     notes = tmp_path / "notes.md"
@@ -607,24 +607,9 @@ def test_message_uploaded_image_parts_uses_safe_mime_for_octet_stream_image(
     ]
 
 
-def test_chainlit_user_message_content_includes_uploaded_images() -> None:
-    """Verify that agent payload content includes text and uploaded image parts."""
-    image_part = {
-        "type": "image_url",
-        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
-    }
-
-    content = main.chainlit_user_message_content(
-        "OCR this receipt.",
-        image_parts=[image_part],
-    )
-
-    assert content == [{"type": "text", "text": "OCR this receipt."}, image_part]
-
-
-def test_chainlit_prompt_text_defaults_to_ocr_for_image_only_upload() -> None:
+def test_prompt_with_images_defaults_to_ocr_for_image_only_upload() -> None:
     """Verify that image-only messages ask the agent to extract visible text."""
-    prompt = main.chainlit_prompt_text(
+    prompt = prompt_with_images(
         "",
         image_names=("receipt.jpg",),
         prompt_note="",
@@ -634,9 +619,9 @@ def test_chainlit_prompt_text_defaults_to_ocr_for_image_only_upload() -> None:
     assert "receipt.jpg" in prompt
 
 
-def test_chainlit_prompt_text_preserves_text_without_images() -> None:
+def test_prompt_with_images_preserves_text_without_images() -> None:
     """Verify that non-image prompts keep their existing text shape."""
-    prompt = main.chainlit_prompt_text(
+    prompt = prompt_with_images(
         "  keep my spacing  ",
         image_names=(),
         prompt_note="\n\nRAG note",
@@ -838,6 +823,7 @@ class _DummyRuntime:
             command: Configured command to render or execute.
         """
         self.invocation: dict[str, str | None] | None = None
+        self.config = SimpleNamespace()
         self.command = command or SimpleNamespace(
             name="repo-readme",
             description="Read repository README",
@@ -1067,23 +1053,38 @@ async def test_save_reflection_lesson_confirms_only_after_persistence(
 
 
 @pytest.mark.anyio
-async def test_handle_native_command_applies_template_for_mcp_tool(monkeypatch) -> None:
-    """Verify that handle native command applies template for MCP tool.
-
-    Args:
-        monkeypatch: The monkeypatch value.
-    """
+async def test_mcp_command_applies_template_and_renders_tool_result(monkeypatch) -> None:
+    """Verify an MCP command applies its template and shows the tool result."""
     runtime = _DummyRuntime()
-    settings = SimpleNamespace(thread_id="thread-1")
-    monkeypatch.setattr(main.cl, "Message", _DummyMessage)
+    sent: list[dict[str, object]] = []
 
-    result = await main.handle_native_command(
-        runtime=runtime,
-        settings=settings,
-        parsed=agent_commands.ParsedNativeCommand(command_name="repo-readme", raw_args=""),
+    class _RecordedMessage(_DummyMessage):
+        async def send(self):
+            sent.append(self.kwargs)
+
+    def no_bridge(_prompt: str):
+        raise AssertionError("an MCP command must not start an agent turn")
+
+    monkeypatch.setattr(main.cl, "Message", _RecordedMessage)
+
+    result = await TurnRunner(runtime, sanitize_errors=False).run(
+        _turn_request("/repo-readme"),
+        ChainlitTurnRenderer(no_bridge, prompt="/repo-readme"),
     )
 
-    assert result == ""
+    assert result.status == "completed"
+    assert sent == [
+        {
+            "author": "System",
+            "content": (
+                "Ran `/repo-readme` (Read repository README).\n\n"
+                "Tool result:\n```json\n"
+                '{\n  "ok": true\n}\n'
+                "```"
+            ),
+            "elements": [],
+        }
+    ]
     assert runtime.invocation is not None
     assert runtime.invocation["raw_args"] == '{"path":"README.md"}'
     assert runtime.invocation["mcp_session_id"] is None
@@ -1115,8 +1116,8 @@ def test_build_skill_command_prompt_without_request_asks_for_task() -> None:
 
 
 @pytest.mark.anyio
-async def test_handle_native_command_returns_forced_skill_prompt() -> None:
-    """Verify that handle native command returns forced skill prompt."""
+async def test_runtime_command_returns_forced_skill_prompt() -> None:
+    """Verify that a skill command expands to a forced skill prompt."""
     runtime = _DummyRuntime(
         command=SimpleNamespace(
             name="reviewer",
@@ -1129,23 +1130,23 @@ async def test_handle_native_command_returns_forced_skill_prompt() -> None:
     )
     settings = SimpleNamespace(thread_id="thread-1")
 
-    result = await main.handle_native_command(
+    result = await agent_commands.resolve_runtime_command(
         runtime=runtime,
-        settings=settings,
+        thread_id=settings.thread_id,
         parsed=agent_commands.ParsedNativeCommand(
             command_name="reviewer",
             raw_args="inspect this diff",
         ),
     )
 
-    assert result is not None
-    assert "Use the configured `reviewer` skill" in result
-    assert "User request:\ninspect this diff" in result
+    assert result.prompt is not None
+    assert "Use the configured `reviewer` skill" in result.prompt
+    assert "User request:\ninspect this diff" in result.prompt
 
 
 @pytest.mark.anyio
-async def test_handle_native_command_without_skill_args_requests_clarification() -> None:
-    """Verify that handle native command without skill args requests clarification."""
+async def test_runtime_command_without_skill_args_requests_clarification() -> None:
+    """Verify that a skill command without args asks for clarification."""
     runtime = _DummyRuntime(
         command=SimpleNamespace(
             name="reviewer",
@@ -1158,22 +1159,22 @@ async def test_handle_native_command_without_skill_args_requests_clarification()
     )
     settings = SimpleNamespace(thread_id="thread-1")
 
-    result = await main.handle_native_command(
+    result = await agent_commands.resolve_runtime_command(
         runtime=runtime,
-        settings=settings,
+        thread_id=settings.thread_id,
         parsed=agent_commands.ParsedNativeCommand(
             command_name="reviewer",
             raw_args="",
         ),
     )
 
-    assert result is not None
-    assert "briefly explain what it does and ask the user for the specific task" in result
+    assert result.prompt is not None
+    assert "briefly explain what it does and ask the user for the specific task" in result.prompt
 
 
 @pytest.mark.anyio
-async def test_handle_native_command_uses_selected_skill_command_input() -> None:
-    """Verify that handle native command uses selected skill command input."""
+async def test_runtime_command_uses_selected_skill_command_input() -> None:
+    """Verify that a selected skill command uses the message as its input."""
     runtime = _DummyRuntime(
         command=SimpleNamespace(
             name="reviewer",
@@ -1195,14 +1196,14 @@ async def test_handle_native_command_uses_selected_skill_command_input() -> None
         raw_args="inspect this diff",
     )
 
-    result = await main.handle_native_command(
+    result = await agent_commands.resolve_runtime_command(
         runtime=runtime,
-        settings=settings,
+        thread_id=settings.thread_id,
         parsed=parsed,
     )
 
-    assert result is not None
-    assert "User request:\ninspect this diff" in result
+    assert result.prompt is not None
+    assert "User request:\ninspect this diff" in result.prompt
 
 
 def test_chat_end_releases_session_and_current_thread(monkeypatch):

@@ -8,7 +8,7 @@ import logging
 import os
 import secrets
 from collections.abc import Iterable, Mapping
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +21,6 @@ from chainlit.config import config as chainlit_config
 from chainlit.input_widget import Select, Switch, TextInput
 from chainlit.types import ThreadDict
 
-from chainagents.commands.native import (
-    ParsedNativeCommand,
-    resolve_runtime_command,
-)
 from chainagents.interfaces.chainlit.async_tasks import (
     AsyncTaskNotifier,
     LocalBackgroundTaskNotifier,
@@ -32,16 +28,12 @@ from chainagents.interfaces.chainlit.async_tasks import (
 )
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
-from chainagents.interfaces.chainlit.renderer import (
-    ChainlitTurnRenderer,
-    native_command_output_message,
-)
+from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
 from chainagents.interfaces.uploads import (
     RAG_UPLOAD_ACCEPT,
     NormalizedUpload,
     image_content_part,
     is_image_upload,
-    prompt_with_images,
     provider_safe_image_mime_type,
     uploaded_file_mime_type as _shared_uploaded_file_mime_type,
 )
@@ -52,7 +44,6 @@ from chainagents.runtime import (
     ChainlitStarterConfig,
     ReasoningLevel,
     RuntimeConfig,
-    build_langgraph_run_config,
     format_model_provider,
     normalize_reasoning_level,
     reasoning_level_for_profile,
@@ -314,35 +305,6 @@ def store_settings(settings: AppSettings) -> None:
         settings: The settings value.
     """
     cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
-
-
-def build_langgraph_config(
-    settings: AppSettings,
-    *,
-    recursion_limit: int,
-    runtime_config: RuntimeConfig | None = None,
-    langsmith_tracing: Any | None = None,
-) -> dict[str, Any]:
-    """Build the LangGraph run configuration for a Chainlit thread.
-
-    Args:
-        settings: The settings value.
-        recursion_limit: The recursion limit value.
-        runtime_config: Optional resolved runtime config.
-
-    Returns:
-        A LangGraph configuration dictionary for the thread.
-    """
-    if runtime_config is not None:
-        return build_langgraph_run_config(
-            runtime_config,
-            thread_id=settings.thread_id,
-            langsmith_tracing=langsmith_tracing,
-        )
-    return {
-        "configurable": {"thread_id": settings.thread_id},
-        "recursion_limit": recursion_limit,
-    }
 
 
 def build_rag_action() -> cl.Action:
@@ -630,31 +592,6 @@ def message_uploaded_image_parts(message: cl.Message) -> list[dict[str, Any]]:
     return parts
 
 
-def chainlit_prompt_text(
-    content: str,
-    *,
-    image_names: tuple[str, ...],
-    prompt_note: str,
-) -> str:
-    """Build the text part of a Chainlit user message sent to the agent."""
-    return prompt_with_images(
-        content,
-        image_names=image_names,
-        prompt_note=prompt_note,
-    )
-
-
-def chainlit_user_message_content(
-    prompt: str,
-    *,
-    image_parts: list[dict[str, Any]],
-) -> str | list[dict[str, Any]]:
-    """Build the multimodal user message content sent from Chainlit."""
-    if not image_parts:
-        return prompt
-    return [{"type": "text", "text": prompt}, *image_parts]
-
-
 def unsupported_uploaded_images_message(image_names: tuple[str, ...]) -> str:
     """Build a user-facing note for unsupported image uploads."""
     names = ", ".join(f"`{name}`" for name in image_names)
@@ -711,43 +648,6 @@ def upload_result_message(upload_result) -> str:
         return f"No supported text files were added to RAG. Rejected: {rejected}"
 
     return upload_result.reason or "No files were added to RAG."
-
-async def handle_native_command(
-    *,
-    runtime: AgentRuntime,
-    settings: AppSettings,
-    parsed: ParsedNativeCommand,
-    mcp_session_id: str | None = None,
-) -> str | None:
-    """Handle a native slash command selected in Chainlit.
-
-    Args:
-        runtime: Agent runtime used by the operation.
-        settings: The settings value.
-        parsed: Parsed native command details.
-        mcp_session_id: MCP session identifier.
-
-    Returns:
-        The handle native command result.
-    """
-    result = await resolve_runtime_command(
-        runtime=runtime,
-        parsed=parsed,
-        thread_id=settings.thread_id,
-        mcp_session_id=mcp_session_id,
-    )
-    if result.target == "unknown":
-        return None
-
-    if result.target == "mcp_tool":
-        await cl.Message(
-            author="System",
-            content=native_command_output_message(result),
-        ).send()
-        return ""
-
-    return result.prompt
-
 
 async def ask_for_rag_upload() -> list[UploadedRagFile]:
     """Ask for for RAG upload.
@@ -1886,28 +1786,21 @@ async def _run_agent_turn(
         mcp_session_id=mcp_session_id,
         resolve_commands=resolve_commands,
     )
-    renderer = ChainlitTurnRenderer(
-        build_bridge,
-        prompt=agent_prompt,
-        project_root=getattr(runtime, "project_root", None),
-    )
+    renderer = ChainlitTurnRenderer(build_bridge, prompt=agent_prompt)
     result = await TurnRunner(runtime, sanitize_errors=False).run(request, renderer)
 
     if result.reflection is not None:
-        ask = ask_to_save_reflection_lesson(
-            runtime=runtime,
-            settings=settings,
-            proposal=result.reflection,
-            reasoning_level=effective_reasoning_level,
-            model_name=effective_model_name,
-            async_url_override=async_url_override,
-            mcp_session_id=mcp_session_id,
-        )
-        if result.status == "failed":
-            with suppress(Exception):
-                await ask
-        else:
-            await ask
+        # A failed turn has already reported its error; never raise a second one.
+        with suppress(Exception) if result.status == "failed" else nullcontext():
+            await ask_to_save_reflection_lesson(
+                runtime=runtime,
+                settings=settings,
+                proposal=result.reflection,
+                reasoning_level=effective_reasoning_level,
+                model_name=effective_model_name,
+                async_url_override=async_url_override,
+                mcp_session_id=mcp_session_id,
+            )
     if result.status == "completed" and result.agent is not None:
         async_task_notifier = get_async_task_notifier(
             agent=result.agent,

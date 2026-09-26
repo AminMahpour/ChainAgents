@@ -569,3 +569,90 @@ def test_resolve_commands_off_sends_slash_text_as_prompt(tmp_path: Path) -> None
     assert runtime.agent.payload == {
         "messages": [{"role": "user", "content": "/lookup keep this literal"}]
     }
+
+
+def _tool_events(
+    name: str,
+    args: dict[str, object],
+    result: str,
+    *,
+    call_id: str = "call-1",
+    result_id: str | None = None,
+) -> list[dict[str, object]]:
+    call = _Token()
+    call.tool_call_chunks = [{"id": call_id, "name": name, "args": json.dumps(args)}]
+    message = SimpleNamespace(
+        type="tool",
+        name=name,
+        status="success",
+        tool_call_id=result_id or call_id,
+        content=result,
+    )
+    return [_raw(((), "messages", (call, {}))), _raw(((), "messages", (message, {})))]
+
+
+def _outputs(tmp_path: Path, *names: str) -> list[Path]:
+    paths = []
+    for name in names:
+        path = tmp_path / ".files" / "outputs" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+        paths.append(path)
+    return paths
+
+
+def test_generated_files_come_from_tool_args_results_and_response_text(
+    tmp_path: Path,
+) -> None:
+    written, batch, mentioned = _outputs(
+        tmp_path, "written.csv", "batches/01-task.md", "mentioned.txt"
+    )
+    events = [
+        *_tool_events(
+            "write_file", {"file_path": "/workspace/.files/outputs/written.csv"}, "ok"
+        ),
+        *_tool_events(
+            "run_subagent_batch",
+            {"tasks": []},
+            json.dumps({"files": [{"path": "/workspace/.files/outputs/batches/01-task.md"}]}),
+            call_id="call-2",
+        ),
+        _token("See `/workspace/.files/outputs/mentioned.txt`."),
+    ]
+    runtime = _make_runtime(tmp_path, events)
+
+    result, renderer = _run(runtime, _request("make files"))
+
+    assert [file.path for file in result.generated_files] == [written, batch, mentioned]
+    assert renderer.kinds()[-2:] == ["generated_files", "complete"]
+
+
+def test_generated_file_tracking_matches_a_rekeyed_tool_result_by_name(
+    tmp_path: Path,
+) -> None:
+    (written,) = _outputs(tmp_path, "rekeyed.csv")
+    events = _tool_events(
+        "write_file",
+        {"file_path": "/workspace/.files/outputs/rekeyed.csv"},
+        "ok",
+        result_id="provider-call-7",
+    )
+    runtime = _make_runtime(tmp_path, events)
+
+    result, _renderer = _run(runtime, _request("write it"))
+
+    assert [file.path for file in result.generated_files] == [written]
+
+
+def test_failed_tool_results_do_not_generate_files(tmp_path: Path) -> None:
+    _outputs(tmp_path, "failed.csv")
+    call, message = _tool_events(
+        "write_file", {"file_path": "/workspace/.files/outputs/failed.csv"}, "denied"
+    )
+    message["data"]["chunk"][2][0].status = "error"  # type: ignore[index]
+    runtime = _make_runtime(tmp_path, [call, message])
+
+    result, renderer = _run(runtime, _request("write it"))
+
+    assert result.generated_files == []
+    assert "generated_files" not in renderer.kinds()

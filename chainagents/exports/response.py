@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-import mimetypes
 import os
 import re
 import sys
@@ -23,11 +22,7 @@ import chainlit as cl
 from chainlit.element import Element, File, Pdf
 from markdown_it import MarkdownIt
 
-from chainagents.exports.generated_files import (
-    GENERATED_FILE_PATH_RE,
-    MAX_GENERATED_FILES,
-    resolve_generated_output,
-)
+from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.exports.pdf_images import (
     PDF_IMAGE_MAX_BYTES,
     PdfImageDownloadBudget,
@@ -47,7 +42,6 @@ RESTORED_RESPONSE_ACTIONS_CONNECTION_ATTR = "_chainagents_restored_response_acti
 RUN_RESPONSE_ACTION = "run_configured_response_action"
 RESPONSE_EXPORT_ELEMENTS_SESSION_KEY = "response_export_elements"
 DEFAULT_EXPORT_BASENAME = "response"
-MAX_GENERATED_FILE_ATTACHMENTS = MAX_GENERATED_FILES
 MAX_PDF_REMOTE_IMAGES = 20
 MAX_PDF_REMOTE_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_PDF_REMOTE_IMAGE_PIXELS = 50_000_000
@@ -305,8 +299,7 @@ def attach_response_export_actions(
     *,
     prompt: str,
     response_text: str,
-    generated_file_paths: Iterable[str | Path] = (),
-    project_root: Path | None = None,
+    generated_files: Iterable[GeneratedFileDescriptor] = (),
     response_actions: Iterable[ChainlitResponseActionConfig] = (),
     export_label: str = "",
 ) -> None:
@@ -316,8 +309,7 @@ def attach_response_export_actions(
         message: Chainlit message or LangChain message to process.
         prompt: The prompt value.
         response_text: The response text value.
-        generated_file_paths: Local, workspace, or artifact paths created during the run.
-        project_root: Project root used to resolve virtual workspace paths.
+        generated_files: Validated generated files attached to the message.
     """
     message_id = str(getattr(message, "id", "") or "").strip()
     if not message_id or not response_text.strip():
@@ -340,11 +332,7 @@ def attach_response_export_actions(
     message.metadata = metadata
     message.actions = response_actions_for_message(message_id, response_actions)
 
-    generated_elements = generated_file_elements_from_text(
-        response_text,
-        generated_file_paths=generated_file_paths,
-        project_root=project_root,
-    )
+    generated_elements = generated_file_elements(generated_files)
     if generated_elements:
         existing_elements = list(getattr(message, "elements", []) or [])
         message.elements = [*existing_elements, *generated_elements]
@@ -483,70 +471,28 @@ def restore_response_export_actions(
     return restored
 
 
-def generated_file_elements_from_text(
-    text: str,
-    *,
-    generated_file_paths: Iterable[str | Path] = (),
-    project_root: Path | None = None,
+def generated_file_elements(
+    generated_files: Iterable[GeneratedFileDescriptor],
 ) -> list[File]:
-    """Return Chainlit file elements for generated files mentioned in text.
+    """Return downloadable Chainlit file elements for validated generated files.
 
     Args:
-        text: Response text that may mention generated file paths.
-        generated_file_paths: Additional file paths captured from successful tool calls.
-        project_root: Project root used to resolve virtual workspace paths.
+        generated_files: Descriptors resolved by the strict generated-file rule.
 
     Returns:
-        Downloadable Chainlit file elements for safe, existing generated files.
+        Chainlit file elements for descriptors that carry a local path.
     """
-    raw_paths = [
-        str(path)
-        for path in generated_file_paths
-        if str(path).strip()
-    ]
-    raw_paths.extend(
-        match.group("path")
-        for match in GENERATED_FILE_PATH_RE.finditer(text)
-        if match.group("path").strip()
-    )
-
-    return generated_file_elements_from_paths(raw_paths, project_root=project_root)
-
-
-def generated_file_elements_from_paths(
-    raw_paths: Iterable[str | Path],
-    *,
-    project_root: Path | None = None,
-) -> list[File]:
-    """Return Chainlit file elements for existing files under generated outputs.
-
-    Args:
-        raw_paths: Candidate generated file paths.
-        project_root: Project root used to resolve virtual workspace paths.
-
-    Returns:
-        Downloadable Chainlit file elements.
-    """
-    elements: list[File] = []
-    seen: set[Path] = set()
-    for raw_path in raw_paths:
-        path = resolve_generated_output(str(raw_path), project_root=project_root)
-        if path is None or path in seen:
-            continue
-        seen.add(path)
-        mime_type, _encoding = mimetypes.guess_type(path.name)
-        elements.append(
-            File(
-                thread_id=_current_chainlit_thread_id(),
-                name=path.name,
-                path=path.as_posix(),
-                display="inline",
-                mime=mime_type,
-            )
+    return [
+        File(
+            thread_id=_current_chainlit_thread_id(),
+            name=descriptor.name,
+            path=descriptor.path.as_posix(),
+            display="inline",
+            mime=descriptor.mime_type,
         )
-        if len(elements) >= MAX_GENERATED_FILE_ATTACHMENTS:
-            break
-    return elements
+        for descriptor in generated_files
+        if descriptor.path is not None
+    ]
 
 
 def _current_chainlit_thread_id() -> str:

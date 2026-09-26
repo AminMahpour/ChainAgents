@@ -567,3 +567,31 @@ def test_adapter_ignores_nested_chain_events() -> None:
     )
 
     assert events == []
+
+
+def test_langgraph_part_from_namespaced_tuple_chunk_is_normalized() -> None:
+    from chainagents.events.stream import langgraph_part_from_event_chunk
+
+    part = langgraph_part_from_event_chunk(
+        (("tools:abc",), "updates", {"tools": {"messages": []}})
+    )
+
+    assert part == {
+        "type": "updates",
+        "ns": ("tools:abc",),
+        "data": {"tools": {"messages": []}},
+    }
+
+
+def test_adapter_ignores_non_langgraph_stream_events() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    assert adapter.events_from_raw_event(
+        {"event": "on_chat_model_stream", "data": {"chunk": "hello"}}
+    ) == []
+    assert adapter.events_from_raw_event(
+        {
+            "event": "on_chain_stream",
+            "data": {"chunk": {"output": "not a LangGraph stream part"}},
+        }
+    ) == []

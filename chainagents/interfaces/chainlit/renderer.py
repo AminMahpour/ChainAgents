@@ -5,15 +5,13 @@ from __future__ import annotations
 import traceback
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 
 import chainlit as cl
-from chainlit.element import File
 
 from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
 from chainagents.events.stream import AgentStreamEvent
 from chainagents.exports.generated_files import GeneratedFileDescriptor
-from chainagents.exports.response import generated_file_elements_from_paths
+from chainagents.exports.response import generated_file_elements
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge
 from chainagents.turns import BaseTurnRenderer, TurnCommandError, TurnResult
 
@@ -40,18 +38,15 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
         bridge_factory: Callable[[str], ChainlitEventBridge],
         *,
         prompt: str,
-        project_root: Path | None = None,
     ) -> None:
         """Bind the renderer to a bridge factory.
 
         Args:
             bridge_factory: Builds the bridge for the final agent prompt.
             prompt: Raw user text, used when the agent fails before it starts.
-            project_root: Project root used to resolve generated files.
         """
         self.bridge_factory = bridge_factory
         self.prompt = prompt
-        self.project_root = project_root
         self.bridge: ChainlitEventBridge | None = None
         self.command_result: RuntimeCommandResult | None = None
         self.generated_files: list[GeneratedFileDescriptor] = []
@@ -63,8 +58,9 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
         if event.kind == "mcp_status":
             await cl.Message(content=event.text).send()
             return
-        bridge = self.bridge or await self._start_bridge(self.prompt)
-        await bridge.handle_stream_event(event)
+        # The runner calls on_agent_start before any other stream event.
+        assert self.bridge is not None
+        await self.bridge.handle_stream_event(event)
 
     async def on_command_result(self, result: RuntimeCommandResult) -> None:
         self.command_result = result
@@ -91,7 +87,9 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
         details = "".join(traceback.format_exception(exc, limit=10))
         with suppress(Exception):
             bridge = self.bridge or await self._start_bridge(self.prompt)
-            await bridge.fail(exc, details, elements=self._file_elements())
+            await bridge.fail(
+                exc, details, elements=generated_file_elements(self.generated_files)
+            )
 
     async def on_complete(self, result: TurnResult) -> None:
         if result.status != "completed":
@@ -100,19 +98,12 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
             await cl.Message(
                 author="System",
                 content=native_command_output_message(self.command_result),
-                elements=self._file_elements(),
+                elements=generated_file_elements(self.generated_files),
             ).send()
         elif self.bridge is not None:
-            # The bridge attaches generated files to the final response itself.
-            await self.bridge.finish()
+            await self.bridge.finish(self.generated_files)
 
     async def _start_bridge(self, prompt: str) -> ChainlitEventBridge:
         self.bridge = self.bridge_factory(prompt)
         await self.bridge.start()
         return self.bridge
-
-    def _file_elements(self) -> list[File]:
-        return generated_file_elements_from_paths(
-            [file.path for file in self.generated_files if file.path is not None],
-            project_root=self.project_root,
-        )

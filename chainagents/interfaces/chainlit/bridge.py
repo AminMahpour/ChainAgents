@@ -18,23 +18,17 @@ from chainlit.utils import utc_now
 
 from chainagents.events.stream import (
     AgentStreamEvent,
-    AgentStreamEventAdapter,
     anthropic_thinking_text,  # noqa: F401
     assistant_messages_for_current_prompt,  # noqa: F401
     is_assistant_message,  # noqa: F401
     iter_messages,  # noqa: F401
-    langgraph_part_from_event_chunk,
     message_text,  # noqa: F401
     messages_from_node_data,  # noqa: F401
     namespace_label,  # noqa: F401
     reasoning_text_from_token,  # noqa: F401
     stringify_content,
 )
-from chainagents.exports.generated_files import (
-    generated_file_paths_from_tool_args,
-    generated_file_paths_from_tool_result,
-)
-from chainagents.runtime.reflection import ReflectionCollector, ReflectionProposal
+from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.exports.response import attach_response_export_actions
 from chainagents.runtime.types import ChainlitResponseActionConfig
 
@@ -102,53 +96,6 @@ def pretty_data(value: Any) -> str:
         return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True)
     except TypeError:
         return str(value)
-
-
-def todos_from_node_data(data: Any) -> list[dict[str, str]]:
-    """Extract todo items from LangGraph node update payloads.
-
-    Args:
-        data: Payload data to inspect.
-
-    Returns:
-        The extracted todo items from langgraph node update payloads.
-    """
-    if data is None:
-        return []
-
-    raw_todos: Any = None
-    if isinstance(data, dict):
-        raw_todos = data.get("todos")
-        if raw_todos is None:
-            for attr in ("value", "data"):
-                nested = data.get(attr)
-                todos = todos_from_node_data(nested)
-                if todos:
-                    return todos
-    else:
-        for attr in ("todos", "value", "data"):
-            if hasattr(data, attr):
-                nested = getattr(data, attr)
-                if attr == "todos":
-                    raw_todos = nested
-                    break
-                todos = todos_from_node_data(nested)
-                if todos:
-                    return todos
-
-    if not isinstance(raw_todos, list):
-        return []
-
-    todos: list[dict[str, str]] = []
-    for item in raw_todos:
-        if not isinstance(item, dict):
-            continue
-        content = str(item.get("content", "")).strip()
-        status = str(item.get("status", "")).strip()
-        if not content or not status:
-            continue
-        todos.append({"content": content, "status": status})
-    return todos
 
 
 def todos_from_write_todos_args(raw_args: str) -> list[dict[str, str]]:
@@ -721,7 +668,6 @@ class ChainlitEventBridge:
         tool_steps_enabled: bool = True,
         generative_ui_enabled: bool = True,
         generated_ui_elements: dict[str, cl.CustomElement] | None = None,
-        reflection_collector: ReflectionCollector | None = None,
         display_prompt: str | None = None,
         export_label: str = "",
         response_actions: tuple[ChainlitResponseActionConfig, ...] = (),
@@ -736,7 +682,6 @@ class ChainlitEventBridge:
             tool_steps_enabled: Whether to show tool steps.
             generative_ui_enabled: Whether to render generated UI custom elements.
             generated_ui_elements: Shared generated UI element registry for this session.
-            reflection_collector: Optional collector for post-run memory proposals.
         """
         self.prompt = prompt
         self.display_prompt = prompt if display_prompt is None else display_prompt
@@ -748,7 +693,6 @@ class ChainlitEventBridge:
         self.pending_response_stream = ""
         self.response_task_started = False
         self.last_response_flush_at = 0.0
-        self.stream_adapter = AgentStreamEventAdapter(prompt=prompt)
         self.reasoning_steps: dict[str, cl.Step] = {}
         self.reasoning_buffers: dict[str, str] = {}
         self.tool_steps: dict[str, ToolStepState] = {}
@@ -758,36 +702,20 @@ class ChainlitEventBridge:
         )
         self.pending_generated_ui_events: dict[str, AgentStreamEvent] = {}
         self.pending_generated_ui_order: list[str] = []
-        self.generated_file_paths: list[str] = []
         self.collapse_scheduled_step_ids: set[str] = set()
         self.pending_collapse_tasks: set[asyncio.Task[Any]] = set()
         self.chronological_ui_enabled = chronological_ui_enabled
         self.reasoning_steps_enabled = reasoning_steps_enabled
         self.tool_steps_enabled = tool_steps_enabled
         self.generative_ui_enabled = generative_ui_enabled
-        self.reflection_collector = reflection_collector
 
     async def start(self) -> None:
         """Start the chainlit event bridge."""
         if self.run_task_list is not None:
             await self.run_task_list.start()
 
-    async def handle_part(self, part: dict[str, Any]) -> None:
-        """Handle one normalized LangGraph stream part.
-
-        Args:
-            part: The part value.
-        """
-        if part["type"] == "updates" and self.run_task_list is not None:
-            await self._update_todos_from_update_part(part)
-
-        for stream_event in self.stream_adapter.events_from_part(part):
-            await self.handle_stream_event(stream_event)
-
     async def handle_stream_event(self, event: AgentStreamEvent) -> None:
         """Render one normalized agent stream event."""
-        if self.reflection_collector is not None:
-            self.reflection_collector.record_event(event)
         if event.kind == "response_delta":
             await self._stream_response(event.text)
         elif event.kind == "reasoning_delta":
@@ -803,41 +731,17 @@ class ChainlitEventBridge:
         elif event.kind == "ui_remove":
             await self._remove_ui_message(event)
 
-    async def _update_todos_from_update_part(self, part: dict[str, Any]) -> None:
-        """Refresh Chainlit task list todos from a LangGraph update part."""
-        data_by_node = part.get("data")
-        if not isinstance(data_by_node, dict):
-            return
-        for data in data_by_node.values():
-            todos = todos_from_node_data(data)
-            if todos:
-                await self.run_task_list.update_todos(todos)
-
-    async def handle_event(self, event: dict[str, Any]) -> None:
-        """Handle one raw LangGraph stream event.
+    async def finish(
+        self,
+        generated_files: Sequence[GeneratedFileDescriptor] = (),
+    ) -> None:
+        """Finish the chainlit event bridge.
 
         Args:
-            event: LangGraph stream event to process.
+            generated_files: Validated generated files attached to the response.
         """
-        if event.get("event") != "on_chain_stream":
-            return
-        if event.get("parent_ids"):
-            return
-
-        data = event.get("data")
-        if not isinstance(data, dict):
-            return
-
-        part = langgraph_part_from_event_chunk(data.get("chunk"))
-        if part is None:
-            return
-
-        await self.handle_part(part)
-
-    async def finish(self) -> None:
-        """Finish the chainlit event bridge."""
         await self._close_all_open_steps()
-        await self._send_final_response_message()
+        await self._send_final_response_message(generated_files)
         await self._flush_pending_generated_ui_messages()
         if self.run_task_list is not None:
             await self.run_task_list.finish()
@@ -862,8 +766,6 @@ class ChainlitEventBridge:
             details: The details value.
             elements: Elements (generated files) attached to the error message.
         """
-        if self.reflection_collector is not None:
-            self.reflection_collector.mark_run_failed(exc)
         await self._close_all_open_steps()
         if self.run_task_list is not None:
             await self.run_task_list.fail()
@@ -875,12 +777,6 @@ class ChainlitEventBridge:
             author="System",
             elements=list(elements),
         ).send()
-
-    def reflection_proposal(self) -> ReflectionProposal | None:
-        """Return the reflection proposal for the completed run, if any."""
-        if self.reflection_collector is None:
-            return None
-        return self.reflection_collector.build_proposal()
 
     async def _stream_summarization_status_event(self, event: AgentStreamEvent) -> None:
         """Render a normalized summarization status event."""
@@ -1076,9 +972,6 @@ class ChainlitEventBridge:
                 for_id=getattr(state.step, "id", None) if state.step is not None else None,
                 failed=event.status.lower() == "error",
             )
-        if event.status.lower() != "error":
-            self._record_generated_file_paths(state.name, "".join(state.arg_chunks))
-            self._record_generated_file_result_paths(state.name, event.tool_result)
         if state.name == "write_todos" and self.run_task_list is not None:
             todos = todos_from_tool_message_content(event.tool_result)
             if todos:
@@ -1144,7 +1037,10 @@ class ChainlitEventBridge:
                 self.response_message = await cl.Message(content="").send()
             await self._flush_response_stream()
 
-    async def _send_final_response_message(self) -> None:
+    async def _send_final_response_message(
+        self,
+        generated_files: Sequence[GeneratedFileDescriptor] = (),
+    ) -> None:
         """Send the buffered final response as a Chainlit message."""
         if not self.response_buffer:
             return
@@ -1165,7 +1061,7 @@ class ChainlitEventBridge:
             self.response_message,
             prompt=self.prompt,
             response_text=self.response_buffer,
-            generated_file_paths=tuple(self.generated_file_paths),
+            generated_files=generated_files,
             response_actions=self.response_actions,
             export_label=self.export_label,
         )
@@ -1195,22 +1091,6 @@ class ChainlitEventBridge:
             await self.response_message.stream_token(pending)
         self.pending_response_stream = ""
         self.last_response_flush_at = time.monotonic()
-
-    def _record_generated_file_paths(self, tool_name: str, raw_args: str) -> None:
-        """Remember generated file paths from a completed tool call."""
-        for path in generated_file_paths_from_tool_args(tool_name, raw_args):
-            if path not in self.generated_file_paths:
-                self.generated_file_paths.append(path)
-
-    def _record_generated_file_result_paths(
-        self,
-        tool_name: str,
-        result: Any,
-    ) -> None:
-        """Remember generated file paths returned by a completed batch call."""
-        for path in generated_file_paths_from_tool_result(tool_name, result):
-            if path not in self.generated_file_paths:
-                self.generated_file_paths.append(path)
 
     async def _close_reasoning_step(self, source: str) -> None:
         """Close one active Chainlit reasoning step.
