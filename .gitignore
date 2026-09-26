@@ -24,3 +24,7 @@ wheels/
 
 # Local config overrides
 /deepagent.local.toml
+
+# Sphinx build output
+/docs/_build/
+/docs/api/generated/
