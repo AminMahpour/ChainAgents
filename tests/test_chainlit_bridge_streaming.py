@@ -414,21 +414,45 @@ async def test_final_response_receives_generated_file_paths_from_write_tool(
         capture_export_actions,
     )
 
-    await bridge._stream_tool_call(
-        "main-agent",
+    await bridge.handle_event(
         {
-            "id": "call-1",
-            "name": "write_file",
-            "args": '{"path": "/workspace/reports/summary.csv"}',
-        },
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {
+                                "id": "call-1",
+                                "name": "write_file",
+                                "args": '{"path": "/workspace/reports/summary.csv"}',
+                            }
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
-    await bridge._complete_tool_step(
-        "main-agent",
-        _ToolMessage(
-            name="write_file",
-            tool_call_id="call-1",
-            content="Wrote /workspace/reports/summary.csv",
-        ),
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolMessage(
+                            name="write_file",
+                            tool_call_id="call-1",
+                            content="Wrote /workspace/reports/summary.csv",
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
     await bridge._stream_response("Created `/workspace/reports/summary.csv`.")
     await bridge.finish()
@@ -457,21 +481,45 @@ async def test_final_response_receives_paths_from_batch_manifest(
         capture_export_actions,
     )
 
-    await bridge._stream_tool_call(
-        "main-agent",
+    await bridge.handle_event(
         {
-            "id": "call-1",
-            "name": "run_subagent_batch",
-            "args": '{"tasks":[{"description":"research"}]}',
-        },
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {
+                                "id": "call-1",
+                                "name": "run_subagent_batch",
+                                "args": '{"tasks":[{"description":"research"}]}',
+                            }
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
-    await bridge._complete_tool_step(
-        "main-agent",
-        _ToolMessage(
-            name="run_subagent_batch",
-            tool_call_id="call-1",
-            content=json.dumps({"files": [{"path": public_path}]}),
-        ),
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolMessage(
+                            name="run_subagent_batch",
+                            tool_call_id="call-1",
+                            content=json.dumps({"files": [{"path": public_path}]}),
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
     await bridge._stream_response("Batch complete.")
     await bridge.finish()
@@ -485,9 +533,22 @@ async def test_reasoning_after_tool_call_starts_a_new_chronological_step() -> No
     bridge = ChainlitEventBridge(prompt="hello")
 
     await bridge._stream_reasoning("main-agent", "first thought")
-    await bridge._stream_tool_call(
-        "main-agent",
-        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'}
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
     await bridge._stream_reasoning("main-agent", "first thought second thought")
 
@@ -675,9 +736,22 @@ async def test_non_chronological_mode_keeps_reasoning_step_open_across_tool_call
     bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
 
     await bridge._stream_reasoning("main-agent", "first thought")
-    await bridge._stream_tool_call(
-        "main-agent",
-        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'}
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
     await bridge._stream_reasoning("main-agent", "first thought second thought")
 
@@ -718,11 +792,35 @@ async def test_bridge_can_hide_reasoning_and_tool_ui_elements(monkeypatch) -> No
     assert task_list.tasks == []
 
     await bridge._stream_reasoning("main-agent", "first thought")
-    await bridge._stream_tool_call(
-        "main-agent",
-        {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'},
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {"id": "call-1", "name": "read_file", "args": '{"path":"README.md"}'}
+                        ),
+                        {},
+                    ),
+                )
+            },
+        }
     )
-    await bridge._complete_tool_step("main-agent", _ToolMessage())
+    await bridge.handle_event(
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    (),
+                    "messages",
+                    (_ToolMessage(), {}),
+                )
+            },
+        }
+    )
     await bridge._stream_response("Final answer")
     await bridge.finish()
 

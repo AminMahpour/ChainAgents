@@ -25,7 +25,20 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.events.stream import (
+    AgentStreamEvent,
+    AgentStreamEventAdapter,
+    anthropic_thinking_text,  # noqa: F401
+    assistant_messages_for_current_prompt,  # noqa: F401
+    is_assistant_message,  # noqa: F401
+    iter_messages,  # noqa: F401
+    langgraph_part_from_event_chunk,  # noqa: F401
+    message_text,  # noqa: F401
+    messages_from_node_data,  # noqa: F401
+    namespace_label,  # noqa: F401
+    reasoning_text_from_token,  # noqa: F401
+    stringify_content,
+)
 from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.runtime.reflection import (
     ReflectionCollector,
@@ -61,17 +74,6 @@ from chainagents.rag.runtime import RagStatus, RagUploadResult, UploadedRagFile
 
 DEFAULT_CLI_THREAD_ID = "cli"
 TOOL_RESULT_PREVIEW_CHARS = 200
-SUMMARIZATION_STATUS_KIND = "summarization_status"
-ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
-LANGGRAPH_STREAM_MODES = {
-    "values",
-    "updates",
-    "custom",
-    "messages",
-    "checkpoints",
-    "tasks",
-    "debug",
-}
 CLI_PANEL_BOX = box.HEAVY
 CLI_TABLE_BOX = box.SIMPLE_HEAVY
 CLI_PANEL_PADDING = (0, 1)
@@ -883,92 +885,6 @@ def user_message_content(prompt: str, photos: list[dict[str, Any]]) -> str | lis
     return [{"type": "text", "text": prompt}, *photos]
 
 
-def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:
-    """Normalize stream event chunks into LangGraph part metadata.
-
-    Args:
-        chunk: Streamed event chunk to normalize.
-
-    Returns:
-        The langgraph part from event chunk result.
-    """
-    if isinstance(chunk, dict):
-        mode = chunk.get("type")
-        if isinstance(mode, str) and mode in LANGGRAPH_STREAM_MODES and "data" in chunk:
-            return chunk
-        return None
-
-    if not isinstance(chunk, tuple):
-        return None
-
-    if len(chunk) == 3:
-        ns, mode, data = chunk
-    elif len(chunk) == 2:
-        first, data = chunk
-        if isinstance(first, tuple):
-            ns = first
-            mode = "values"
-        else:
-            ns = ()
-            mode = first
-    else:
-        return None
-
-    if not isinstance(mode, str) or mode not in LANGGRAPH_STREAM_MODES:
-        return None
-
-    if isinstance(ns, tuple):
-        namespace = ns
-    elif ns in (None, ""):
-        namespace = ()
-    else:
-        return None
-
-    return {"type": mode, "ns": namespace, "data": data}
-
-
-def stringify_content(value: Any) -> str:
-    """Convert content.
-
-    Args:
-        value: Value to normalize, convert, or serialize.
-
-    Returns:
-        The string representation.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "".join(stringify_content(item) for item in value)
-    if isinstance(value, dict):
-        if value.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
-            return ""
-        for key in ("text", "reasoning", "content"):
-            nested = value.get(key)
-            if isinstance(nested, (str, list, dict)):
-                return stringify_content(nested)
-        return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True)
-    return str(value)
-
-
-def anthropic_thinking_text(value: Any) -> str:
-    """Extract Claude thinking text from LangChain Anthropic content blocks.
-
-    Args:
-        value: Message content to inspect.
-
-    Returns:
-        Extracted thinking text, if present.
-    """
-    if isinstance(value, list):
-        return "".join(anthropic_thinking_text(item) for item in value)
-    if not isinstance(value, dict) or value.get("type") != "thinking":
-        return ""
-    return stringify_content(value.get("thinking"))
-
-
 def truncate_tool_result_content(value: Any) -> str:
     """Truncate tool result content.
 
@@ -1050,153 +966,6 @@ def cli_kv_table() -> Table:
     table.add_column(style="dim", no_wrap=True)
     table.add_column()
     return table
-
-
-def reasoning_text_from_token(token: Any) -> str:
-    """Extract reasoning text from a streamed model token.
-
-    Args:
-        token: Streamed model token to inspect.
-
-    Returns:
-        The extracted reasoning text from a streamed model token.
-    """
-    if hasattr(token, "additional_kwargs"):
-        text = stringify_content(token.additional_kwargs.get("reasoning_content"))
-        if text:
-            return text
-    if hasattr(token, "reasoning_content"):
-        return stringify_content(token.reasoning_content)
-    if hasattr(token, "content"):
-        return anthropic_thinking_text(token.content)
-    return ""
-
-
-def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
-    """Return a display label for a tool namespace.
-
-    Args:
-        ns: The ns value.
-        metadata: The metadata value.
-
-    Returns:
-        A display label for a tool namespace.
-    """
-    agent_name = metadata.get("lc_agent_name")
-    if agent_name:
-        return str(agent_name)
-    if not ns:
-        return "main-agent"
-
-    labels: list[str] = []
-    for segment in ns:
-        if segment.startswith("tools:"):
-            labels.append(f"subagent {segment.split(':', 1)[1]}")
-            continue
-        labels.append(segment.split(":", 1)[0])
-    return " / ".join(labels)
-
-
-def iter_messages(value: Any) -> list[Any]:
-    """Iterate over messages.
-
-    Args:
-        value: Value to normalize, convert, or serialize.
-
-    Returns:
-        An iterator over the matching values.
-    """
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    if isinstance(value, dict):
-        if "messages" in value:
-            return iter_messages(value["messages"])
-        if "value" in value:
-            return iter_messages(value["value"])
-        return [value]
-    if isinstance(value, (str, bytes)):
-        return []
-
-    for attr in ("value", "messages", "data"):
-        if hasattr(value, attr):
-            messages = iter_messages(getattr(value, attr))
-            if messages:
-                return messages
-
-    try:
-        return list(value)
-    except TypeError:
-        return [value]
-
-
-def messages_from_node_data(data: Any) -> list[Any]:
-    """Extract message objects from LangGraph node update payloads.
-
-    Args:
-        data: Payload data to inspect.
-
-    Returns:
-        The extracted message objects from langgraph node update payloads.
-    """
-    if data is None:
-        return []
-    if isinstance(data, dict):
-        return iter_messages(data.get("messages"))
-    return iter_messages(data)
-
-
-def is_assistant_message(message: Any) -> bool:
-    """Return whether assistant message.
-
-    Args:
-        message: Chainlit message or LangChain message to process.
-
-    Returns:
-        Whether assistant message.
-    """
-    return getattr(message, "type", None) in {"ai", "AIMessageChunk"}
-
-
-def message_text(message: Any) -> str:
-    """Build the message for text.
-
-    Args:
-        message: Chainlit message or LangChain message to process.
-
-    Returns:
-        The constructed the message for text.
-    """
-    return stringify_content(getattr(message, "content", "")).strip()
-
-
-def assistant_messages_for_current_prompt(messages: list[Any], prompt: str) -> list[Any]:
-    """Return assistant messages produced after the current prompt began.
-
-    Args:
-        messages: The messages value.
-        prompt: The prompt value.
-
-    Returns:
-        Assistant messages produced after the current prompt began.
-    """
-    prompt_text = prompt.strip()
-    current_prompt_index = -1
-    for index, message in enumerate(messages):
-        if getattr(message, "type", None) != "human":
-            continue
-        if message_text(message) == prompt_text:
-            current_prompt_index = index
-
-    if current_prompt_index < 0:
-        return []
-
-    return [
-        message
-        for message in messages[current_prompt_index + 1 :]
-        if is_assistant_message(message)
-    ]
 
 
 class CliEventRenderer:
@@ -1417,34 +1186,6 @@ class CliEventRenderer:
                 border_style="red" if event.status.lower() == "error" else "green",
             )
         )
-
-    def _tool_result_key(
-        self,
-        *,
-        source: str,
-        name: str,
-        tool_message: Any,
-        content: str,
-    ) -> tuple[str, str, str]:
-        """Build a stable key for deduplicating streamed tool results.
-
-        Args:
-            source: The source value.
-            name: The name value.
-            tool_message: The tool message value.
-            content: Message or document content to process.
-
-        Returns:
-            The constructed a stable key for deduplicating streamed tool results.
-        """
-        stable_id = str(
-            getattr(tool_message, "tool_call_id", None)
-            or getattr(tool_message, "id", None)
-            or ""
-        ).strip()
-        if stable_id:
-            return (source, "id", stable_id)
-        return (source, name, content)
 
 
 def rag_status_payload(status: RagStatus) -> dict[str, Any]:

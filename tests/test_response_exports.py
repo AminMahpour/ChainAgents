@@ -110,11 +110,15 @@ def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:
         def write_pdf(self) -> bytes:
             return b"%PDF-WEASYPRINT"
 
+    def blocked_pdf_url_fetcher(url: str, *_args: object, **_kwargs: object) -> object:
+        """Stand in for the restricted WeasyPrint fetcher; always raises."""
+        raise ValueError(f"External resources are disabled for response PDF exports: {url}")
+
     monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=FakeHTML))
     monkeypatch.setattr(
         response_exports,
         "_pdf_url_fetcher",
-        lambda _resources: response_exports._blocked_pdf_url_fetcher,
+        lambda _resources: blocked_pdf_url_fetcher,
     )
 
     pdf_bytes = response_exports.build_pdf_bytes("# Export\n\n- item")

@@ -1075,20 +1075,6 @@ def _pdf_url_fetcher(resources: dict[str, PdfImageResource]) -> object:
     return PdfResourceFetcher()
 
 
-def _blocked_pdf_url_fetcher(url: str, *_args: object, **_kwargs: object) -> object:
-    """Compatibility wrapper around the restricted WeasyPrint fetcher.
-
-    Args:
-        url: The URL WeasyPrint attempted to fetch.
-        _args: Positional arguments from WeasyPrint.
-        _kwargs: Keyword arguments from WeasyPrint.
-
-    Returns:
-        Nothing; this function always raises.
-    """
-    raise ValueError(f"External resources are disabled for response PDF exports: {url}")
-
-
 def _prepare_weasyprint_environment() -> None:
     """Set macOS library lookup defaults before importing WeasyPrint."""
     if sys.platform != "darwin" or not HOMEBREW_LIBRARY_PATH.exists():
