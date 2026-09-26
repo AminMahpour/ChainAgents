@@ -32,8 +32,6 @@ from chainagents.rag.runtime import (
     RagUploadResult,
     UploadedRagFile,
     WorkspaceDocsRAG,
-    compose_rag_system_prompt,
-    create_search_workspace_knowledge_tool,
 )
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.constants import SYSTEM_PROMPT, ReasoningLevel
@@ -418,210 +416,30 @@ class AgentRuntime:
         elif self.config.rag_requested and self.config.rag_error:
             logger.warning("RAG is configured but unavailable: %s", self.config.rag_error)
 
-    async def _build_runtime_subagent_specs(
+    async def _load_subagent_mcp_tools(
         self,
         *,
-        reasoning_level: ReasoningLevel,
-        reasoning_level_is_explicit: bool,
-        selected_model_profile: ModelDefaults,
-        backend: Any,
-        inherited_tools: list[Any],
-        sanitized_inherited_tools: list[Any],
         thread_id: str | None,
         mcp_session_id: str | None,
-    ) -> list[Any]:
-        """Build top-level sync subagent specs for a runtime context."""
+    ) -> dict[tuple[str, ...], list[Any]]:
+        """Load each sync subagent's own MCP tools, keyed by agent path."""
         registry = {
             subagent.name: subagent for subagent in self.config.extensions.subagents
         }
-        return [
-            await self._build_runtime_sync_subagent_spec(
-                subagent,
-                registry=registry,
-                reasoning_level=reasoning_level,
-                reasoning_level_is_explicit=reasoning_level_is_explicit,
-                inherited_model=selected_model_profile,
-                backend=backend,
-                inherited_tools=inherited_tools,
-                sanitized_inherited_tools=sanitized_inherited_tools,
+        tools_by_path: dict[tuple[str, ...], list[Any]] = {}
+
+        async def load(subagent: SubagentConfig, agent_path: tuple[str, ...]) -> None:
+            tools_by_path[agent_path] = await self._get_mcp_tools(
+                subagent.mcp_servers,
                 thread_id=thread_id,
                 mcp_session_id=mcp_session_id,
-                agent_path=(subagent.name,),
             )
-            for subagent in self.config.extensions.subagents
-        ]
+            for child in runtime_graph.nested_child_subagents(subagent, registry):
+                await load(child, (*agent_path, child.name))
 
-    async def _build_runtime_sync_subagent_spec(
-        self,
-        subagent: SubagentConfig,
-        *,
-        registry: dict[str, SubagentConfig],
-        reasoning_level: ReasoningLevel,
-        reasoning_level_is_explicit: bool,
-        inherited_model: ModelDefaults,
-        backend: Any,
-        inherited_tools: list[Any],
-        sanitized_inherited_tools: list[Any],
-        thread_id: str | None,
-        mcp_session_id: str | None,
-        agent_path: tuple[str, ...],
-    ) -> dict[str, Any]:
-        """Build one sync subagent spec, compiling it when it has children."""
-        effective_model = runtime_models.resolve_runtime_model_profile(
-            self.config,
-            subagent.model,
-            inherited_model=inherited_model,
-        )
-        effective_reasoning_level = runtime_graph.reasoning_level_for_profile(
-            effective_model,
-            reasoning_level,
-            fallback_is_explicit=reasoning_level_is_explicit,
-        )
-        raw_own_tools = await self._get_mcp_tools(
-            subagent.mcp_servers,
-            thread_id=thread_id,
-            mcp_session_id=mcp_session_id,
-        )
-        own_tools = runtime_graph.sanitize_tools_for_model(
-            effective_model.provider,
-            raw_own_tools,
-        )
-        inherited_model_tools = runtime_graph.inherited_tools_for_model(
-            inherited_tools=inherited_tools,
-            sanitized_inherited_tools=sanitized_inherited_tools,
-            inherited_provider=inherited_model.provider,
-            effective_provider=effective_model.provider,
-        )
-        has_configured_own_tools = bool(subagent.mcp_servers)
-        effective_tools = (
-            own_tools
-            if has_configured_own_tools
-            else own_tools or inherited_model_tools
-        )
-        middleware = runtime_middleware.build_agent_middleware(
-            backend=backend,
-            config=self.config,
-            reasoning_level=effective_reasoning_level,
-            model_name=effective_model.name,
-            source=subagent.name,
-            project_root=self.project_root,
-        )
-        global_background_enabled = (
-            self.config.extensions.background_subagents.enabled
-        )
-        child_subagents = runtime_graph.nested_child_subagents(
-            subagent,
-            registry,
-        )
-        target_background_enabled = global_background_enabled and subagent.background
-        background_child_names = {
-            child.name for child in child_subagents if child.background
-        }
-        caller_background_enabled = (
-            global_background_enabled and bool(background_child_names)
-        )
-        if not child_subagents and not target_background_enabled:
-            subagent_tools = own_tools
-            if (
-                not subagent_tools
-                and subagent.model
-                and effective_model.provider != inherited_model.provider
-                and not has_configured_own_tools
-            ):
-                subagent_tools = inherited_model_tools
-            subagent_model = (
-                self._build_model(
-                    effective_reasoning_level,
-                    model_profile=effective_model,
-                )
-                if subagent.model
-                else None
-            )
-            return subagent.to_deepagents_spec(
-                tools=subagent_tools,
-                middleware=middleware,
-                model=subagent_model,
-            )
-
-        child_specs = [
-            await self._build_runtime_sync_subagent_spec(
-                child,
-                registry=registry,
-                reasoning_level=effective_reasoning_level,
-                reasoning_level_is_explicit=reasoning_level_is_explicit,
-                inherited_model=effective_model,
-                backend=backend,
-                inherited_tools=raw_own_tools if has_configured_own_tools else inherited_tools,
-                sanitized_inherited_tools=effective_tools,
-                thread_id=thread_id,
-                mcp_session_id=mcp_session_id,
-                agent_path=(*agent_path, child.name),
-            )
-            for child in child_subagents
-        ]
-        if not child_specs:
-            middleware.append(
-                runtime_middleware.DisableSubagentDelegationMiddleware()
-            )
-        background_tools = (
-            runtime_background_tasks.create_background_task_tools(
-                manager=self.background_tasks,
-                subagents={
-                    spec["name"]: spec["runnable"]
-                    for spec in child_specs
-                    if spec["name"] in background_child_names
-                },
-                agent_path=agent_path,
-                recursion_limit=self.config.recursion_limit,
-                session_generation=(
-                    self.background_tasks.session_generation(thread_id)
-                    if thread_id
-                    else None
-                ),
-                batch_output_store=(
-                    runtime_background_tasks.create_batch_result_output_store(
-                        backend,
-                        backend_prefix=(
-                            runtime_backends.generated_outputs_route_prefix(
-                                self.project_root
-                            )
-                        ),
-                    )
-                ),
-                existing_tools=effective_tools,
-                langsmith_tracing=self.langsmith_tracing,
-            )
-            if caller_background_enabled
-            else []
-        )
-        runnable_kwargs: dict[str, Any] = {
-            "model": self._build_model(
-                effective_reasoning_level,
-                model_profile=effective_model,
-            ),
-            "tools": [*effective_tools, *background_tools] or None,
-            "system_prompt": subagent.system_prompt,
-            "middleware": middleware,
-            "backend": backend,
-            "skills": list(subagent.skills) or None,
-            "subagents": child_specs,
-        }
-        if self.config.agent_state == "stateful":
-            runnable_kwargs["store"] = self.store
-            runnable_kwargs["checkpointer"] = self.checkpointer
-        runnable = runtime_middleware.create_deep_agent_with_configured_summarization(
-            self.config,
-            **runnable_kwargs,
-        )
-        return {
-            "name": subagent.name,
-            "description": subagent.description,
-            "runnable": (
-                runtime_background_tasks.scope_background_task_invocation(runnable)
-                if caller_background_enabled
-                else runnable
-            ),
-        }
+        for subagent in self.config.extensions.subagents:
+            await load(subagent, (subagent.name,))
+        return tools_by_path
 
     async def get_agent(
         self,
@@ -680,115 +498,44 @@ class AgentRuntime:
             agent = self._agents.get(cache_key)
             if agent is None:
                 self._mcp_discovery_failed = False
-                model = self._build_model(
-                    effective_reasoning_level,
-                    model_profile=selected_model_profile,
-                )
-                rag_tool_enabled = self._rag_service is not None
                 raw_main_tools = await self._build_main_tools(
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
-                main_tools = runtime_graph.sanitize_tools_for_model(
-                    selected_model_profile.provider,
-                    raw_main_tools,
-                )
-                backend = runtime_backends.build_deepagent_backend(
-                    project_root=self.project_root,
-                    include_memories=self.config.agent_state == "stateful",
-                    memory_namespace=self.config.extensions.agent_memory_namespace,
-                    artifact_registry=self.large_tool_result_artifacts,
-                )
-                middleware = runtime_middleware.build_agent_middleware(
-                    backend=backend,
-                    config=self.config,
-                    reasoning_level=effective_reasoning_level,
-                    model_name=selected_model,
-                    source="main-agent",
-                    project_root=self.project_root,
-                )
-                subagent_specs = await self._build_runtime_subagent_specs(
-                    reasoning_level=effective_reasoning_level,
-                    reasoning_level_is_explicit=reasoning_level_is_explicit,
-                    selected_model_profile=selected_model_profile,
-                    backend=backend,
-                    inherited_tools=raw_main_tools,
-                    sanitized_inherited_tools=main_tools,
+                subagent_mcp_tools = await self._load_subagent_mcp_tools(
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
                 )
-                local_subagent_specs = list(subagent_specs)
-                subagent_specs.extend(
-                    subagent.to_deepagents_spec(
-                        url_override=async_subagent_url_override,
-                    )
-                    for subagent in self.config.extensions.async_subagents
-                )
-                background_subagent_names = {
-                    subagent.name
-                    for subagent in self.config.extensions.subagents
-                    if subagent.background
-                }
-                background_subagents = {
-                    spec["name"]: spec["runnable"]
-                    for spec in local_subagent_specs
-                    if spec["name"] in background_subagent_names
-                }
-                background_tools = (
-                    runtime_background_tasks.create_background_task_tools(
-                        manager=self.background_tasks,
-                        subagents=background_subagents,
-                        agent_path=(),
-                        recursion_limit=self.config.recursion_limit,
-                        session_generation=(
-                            self.background_tasks.session_generation(thread_id)
-                            if thread_id
-                            else None
-                        ),
-                        batch_output_store=(
-                            runtime_background_tasks.create_batch_result_output_store(
-                                backend,
-                                backend_prefix=(
-                                    runtime_backends.generated_outputs_route_prefix(
-                                        self.project_root
-                                    )
-                                ),
-                            )
-                        ),
-                        existing_tools=main_tools,
-                        langsmith_tracing=self.langsmith_tracing,
-                    )
-                    if (
-                        self.config.extensions.background_subagents.enabled
-                        and background_subagents
-                    )
-                    else []
-                )
-                agent_kwargs: dict[str, Any] = {
-                    "model": model,
-                    "tools": [*main_tools, *background_tools] or None,
-                    "system_prompt": compose_rag_system_prompt(
-                        runtime_graph.compose_agent_system_prompt(
-                            runtime_graph.system_prompt_for_agent_state(
-                                SYSTEM_PROMPT,
-                                self.config.agent_state,
-                            ),
-                            self.config.extensions.custom_instruction,
-                            project_root=self.project_root,
-                        ),
-                        rag_enabled=rag_tool_enabled,
+                stateful = self.config.agent_state == "stateful"
+                agent_kwargs = runtime_graph.build_agent_kwargs(
+                    self.config,
+                    tools=raw_main_tools,
+                    model_profile=selected_model_profile,
+                    reasoning_level=effective_reasoning_level,
+                    reasoning_level_is_explicit=reasoning_level_is_explicit,
+                    system_prompt=SYSTEM_PROMPT,
+                    custom_instruction=self.config.extensions.custom_instruction,
+                    rag_enabled=self._rag_service is not None,
+                    project_root=self.project_root,
+                    artifact_registry=self.large_tool_result_artifacts,
+                    include_async_subagents=True,
+                    model_name=selected_model,
+                    async_subagent_url_override=async_subagent_url_override,
+                    subagent_mcp_tools=subagent_mcp_tools,
+                    build_model=lambda level, profile: self._build_model(
+                        level,
+                        model_profile=profile,
                     ),
-                    "middleware": middleware,
-                    "backend": backend,
-                    "skills": list(self.config.extensions.skills) or None,
-                    "subagents": subagent_specs or None,
-                }
-                memory_files = runtime_graph.stateful_agent_memory_files(self.config)
-                if memory_files is not None:
-                    agent_kwargs["memory"] = memory_files
-                if self.config.agent_state == "stateful":
-                    agent_kwargs["store"] = self.store
-                    agent_kwargs["checkpointer"] = self.checkpointer
+                    store=self.store if stateful else None,
+                    checkpointer=self.checkpointer if stateful else None,
+                    background_manager=(
+                        self.background_tasks
+                        if self.config.extensions.background_subagents.enabled
+                        else None
+                    ),
+                    session_id=thread_id,
+                    langsmith_tracing=self.langsmith_tracing,
+                )
                 agent = runtime_middleware.create_deep_agent_with_configured_summarization(
                     self.config,
                     **agent_kwargs,
@@ -1197,22 +944,17 @@ class AgentRuntime:
         Returns:
             The constructed the main agent tool list for a runtime context.
         """
-        tools = await self._get_mcp_tools(
+        mcp_tools = await self._get_mcp_tools(
             self.config.extensions.agent_mcp_servers,
             thread_id=thread_id,
             mcp_session_id=mcp_session_id,
         )
-        tools = list(tools)
-        if self.config.extensions.chainlit_generative_ui_enabled:
-            tools.append(runtime_commands.create_render_chainlit_ui_tool())
-        if self._rag_service is not None:
-            tools.append(
-                create_search_workspace_knowledge_tool(
-                    self._rag_service,
-                    thread_id=thread_id,
-                )
-            )
-        return tools
+        return runtime_graph.build_main_tools(
+            self.config,
+            mcp_tools=mcp_tools,
+            rag_service=self._rag_service,
+            thread_id=thread_id,
+        )
 
     async def _clear_agent_cache(self) -> None:
         """Clear cached agents after runtime tool state changes."""
