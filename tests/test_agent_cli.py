@@ -2145,6 +2145,37 @@ async def test_cli_event_renderer_streams_final_response() -> None:
 
 
 @pytest.mark.anyio
+async def test_cli_event_renderer_ends_partial_stream_line_on_failure() -> None:
+    """A failed streamed turn ends its partial stdout line before the error."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    renderer = chainagents_cli.CliEventRenderer(
+        stdout=stdout,
+        stderr=stderr,
+        stream=True,
+        json_output=False,
+        show_reasoning=False,
+        show_tools=False,
+    )
+    feed = _event_feeder(renderer)
+    await feed(
+        {
+            "event": "on_chain_stream",
+            "data": {"chunk": ((), "messages", (_Token("Partial"), {}))},
+        }
+    )
+
+    await renderer.on_complete(
+        TurnResult(
+            status="failed", prompt="hello", error=RuntimeError("stream broke")
+        )
+    )
+
+    assert stdout.getvalue() == "Partial\n"
+    assert stderr.getvalue() == "RuntimeError: stream broke\n"
+
+
+@pytest.mark.anyio
 async def test_cli_event_renderer_formats_reasoning_trace() -> None:
     """Verify that CLI event renderer formats reasoning trace."""
     stderr = io.StringIO()

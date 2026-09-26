@@ -195,6 +195,7 @@ class ChainAgentsTuiApp(App[int]):
             getattr(args, "reasoning", None),
             default=runtime.config.default_reasoning,
         )
+        self.reasoning_level_is_explicit = getattr(args, "reasoning", None) is not None
         self.model_name = getattr(args, "model", None) or runtime.config.model_name
         self.async_subagent_url = getattr(args, "async_subagent_url", None)
         self.mcp_session_id = getattr(args, "mcp_session_id", None)
@@ -351,6 +352,7 @@ class ChainAgentsTuiApp(App[int]):
                     thread_id=self.thread_id,
                     model_name=self.model_name,
                     reasoning_level=self.reasoning_level,
+                    reasoning_level_is_explicit=self.reasoning_level_is_explicit,
                     async_subagent_url=self.async_subagent_url,
                     mcp_session_id=self.mcp_session_id,
                 ),

@@ -380,6 +380,31 @@ async def test_tui_submits_prompt_and_streams_response() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(("reasoning", "explicit"), [(None, False), ("high", True)])
+async def test_tui_marks_reasoning_explicit_only_when_flag_given(
+    reasoning: str | None, explicit: bool
+) -> None:
+    """The TUI forwards --reasoning explicitness to the agent, like the CLI."""
+
+    class _RecordingRuntime(_FakeRuntime):
+        agent_kwargs: dict[str, Any]
+
+        async def get_agent(self, *args, **kwargs):
+            self.agent_kwargs = kwargs
+            return self.agent
+
+    runtime = _RecordingRuntime(_FakeAgent([]))
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args(reasoning=reasoning))
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt", PromptTextArea).load_text("hello")
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert runtime.agent_kwargs["reasoning_level_is_explicit"] is explicit
+
+
+@pytest.mark.anyio
 async def test_tui_shows_mcp_outage_warning() -> None:
     class DegradedRuntime(_FakeRuntime):
         async def get_agent_with_status(self, *args, **kwargs):

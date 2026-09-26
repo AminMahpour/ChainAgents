@@ -197,6 +197,7 @@ class CliEventRenderer(BaseTurnRenderer):
             self._finish_response()
         else:
             self._close_reasoning_line()
+            self._end_streamed_response_line()
         # A successful JSON agent turn carries the files in its payload instead.
         if result.generated_files and not (
             self.json_output and result.status == "completed" and not command_output
@@ -219,11 +220,20 @@ class CliEventRenderer(BaseTurnRenderer):
         if self.json_output:
             return
         if self.stream:
-            if self.response_buffer and not self.response_buffer.endswith("\n"):
-                self.stdout_console.print()
+            self._end_streamed_response_line()
             return
         if self.response_buffer:
             self.stdout_console.print(Text(self.response_buffer, style="bright_white"))
+
+    def _end_streamed_response_line(self) -> None:
+        """Terminate partially streamed stdout text with a newline."""
+        if (
+            self.stream
+            and not self.json_output
+            and self.response_buffer
+            and not self.response_buffer.endswith("\n")
+        ):
+            self.stdout_console.print()
 
     def _print_generated_files(self, result: TurnResult) -> None:
         """List the turn's generated file paths on stderr."""
