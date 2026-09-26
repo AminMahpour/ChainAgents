@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 
 import chainagents_cli
+from chainagents.interfaces.cli import configure as cli_configure
 from chainagents.events.stream import AgentStreamEventAdapter
 from chainagents.turns import TurnResult
 from deepagent_runtime import RuntimeConfig
@@ -783,7 +784,7 @@ async def test_run_cli_configure_honors_deepagent_config_env(
     cwd = tmp_path / "workdir"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
-    monkeypatch.setattr(chainagents_cli, "PROJECT_ROOT", project_root, raising=False)
+    monkeypatch.setattr(cli_configure, "PROJECT_ROOT", project_root, raising=False)
     monkeypatch.setenv("DEEPAGENT_CONFIG", "prod.toml")
     args = chainagents_cli.parse_args(["--configure"])
 
@@ -819,7 +820,7 @@ async def test_run_cli_configure_resolves_relative_config_against_project_root(
     cwd = project_root / "subdir"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
-    monkeypatch.setattr(chainagents_cli, "PROJECT_ROOT", project_root, raising=False)
+    monkeypatch.setattr(cli_configure, "PROJECT_ROOT", project_root, raising=False)
     args = chainagents_cli.parse_args(["--configure", "--config", "custom.toml"])
 
     code = await chainagents_cli.run_cli(
