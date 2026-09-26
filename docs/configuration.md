@@ -51,7 +51,9 @@ The `[agent]` table controls the Deep Agent runtime:
 - `delete_tool_enabled` — recursive file deletion is **disabled** unless this
   is `true`.
 - `execute_tool_enabled` — command execution is **disabled** unless this is
-  `true`.
+  `true`. The flag only exposes the `execute` tool; the default ChainAgents
+  backend is not execution-capable, so running commands also requires a
+  compatible execution-capable sandbox backend.
 - `custom_instruction` / `custom_instruction_file` — extra system
   instructions, inline or from a file (typically under `prompts/`).
   Relative `custom_instruction_file` paths resolve from the directory of

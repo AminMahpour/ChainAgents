@@ -41,7 +41,10 @@ The design separates the agent runtime from the user-facing surfaces:
   stream back to the user.
 - **Turns** — {py:mod}`chainagents.turns.runner` executes exactly one agent
   turn end to end, so every interface gets identical command handling,
-  upload processing, streaming, and generated-file behavior.
+  streaming, and generated-file behavior. Upload ingestion stays in the
+  interface layer: Chainlit, CLI, and FastAPI read and normalize attached
+  files before constructing the `TurnRequest`, and the runner processes
+  those already-normalized content parts. The TUI has no upload surface.
 - **Events** — LangGraph's raw stream is normalized once in
   {py:mod}`chainagents.events.stream`, and all interfaces consume the
   normalized stream.
@@ -79,7 +82,7 @@ user/configuration content rather than importable package code:
 
 ```bash
 uv sync --locked
-uv run ruff check chainagents *.py scripts/*.py
+uv run ruff check chainagents *.py scripts/*.py tests
 uv run mypy
 uv run pytest
 bash scripts/verify-installed-wheel.sh
