@@ -51,7 +51,6 @@ from chainagents.interfaces.uploads import (
     SUPPORTED_RAG_EXTENSIONS,
     image_content_part,
     normalize_upload,
-    prompt_with_images,
     upload_result_prompt_note,
 )
 from chainagents.rag.runtime import RagUploadResult, UploadedRagFile
@@ -344,6 +343,7 @@ class AgentRunContext:
     command_error: str | None = None
     command_error_status: int = 422
     image_parts: tuple[dict[str, Any], ...] = ()
+    image_names: tuple[str, ...] = ()
     prompt_note: str = ""
 
 
@@ -741,14 +741,15 @@ def create_app(
                 }
             )
             if prompt.strip() or image_uploads:
-                context_request.prompt = prompt_with_images(
-                    prompt,
-                    image_names=tuple(upload.name for upload in image_uploads),
-                )
-                context = await _prepare_run_context(
-                    active_runtime,
-                    context_request,
-                    has_current_images=bool(image_uploads),
+                # Image names are appended by the TurnRunner after native
+                # command resolution, so commands see only the typed text.
+                context = replace(
+                    await _prepare_run_context(
+                        active_runtime,
+                        context_request,
+                        has_current_images=bool(image_uploads),
+                    ),
+                    prompt=prompt.strip(),
                 )
             elif _optional_text(command):
                 # The prompt field is empty, so the command gets no arguments.
@@ -820,6 +821,7 @@ def create_app(
                     image_parts=tuple(
                         image_content_part(upload) for upload in image_uploads
                     ),
+                    image_names=tuple(upload.name for upload in image_uploads),
                 )
                 async with aclosing(
                     _agent_stream_lines(
@@ -1031,16 +1033,25 @@ async def _agent_stream_lines(
     *,
     issue_reflection_token: Callable[[str, ReflectionProposal], str],
 ) -> AsyncGenerator[str, None]:
-    """Yield the stable NDJSON stream contract for one resolved run."""
+    """Yield the stable NDJSON stream contract for one resolved run.
+
+    An exception escaping the turn runner ends the stream with a sanitised
+    error line instead of truncating the response.
+    """
     if context.command_error:
         yield _json_line(_error_payload(context, context.command_error))
         return
     renderer = NdjsonRenderer(context, issue_reflection_token=issue_reflection_token)
-    async with aclosing(
-        renderer.lines(TurnRunner(runtime), _turn_request(context))
-    ) as lines:
-        async for line in lines:
-            yield line
+    try:
+        async with aclosing(
+            renderer.lines(TurnRunner(runtime), _turn_request(context))
+        ) as lines:
+            async for line in lines:
+                yield line
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        yield _json_line(_error_payload(context, _safe_backend_error(exc)))
 
 
 class NdjsonRenderer(BaseTurnRenderer):
@@ -1145,6 +1156,7 @@ def _turn_request(context: AgentRunContext) -> TurnRequest:
         reasoning_level_is_explicit=context.reasoning_level_is_explicit,
         content_parts=context.image_parts,
         history=context.history,
+        image_names=context.image_names,
         prompt_note=context.prompt_note,
         async_subagent_url=context.async_subagent_url,
         mcp_session_id=context.mcp_session_id,

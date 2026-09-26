@@ -11,7 +11,9 @@ from typing import Any, ClassVar
 import pytest
 
 from chainagents.runtime.reflection import ReflectionConfig
+from chainagents.events.stream import AgentStreamEvent
 from chainagents.turns import BaseTurnRenderer, TurnRequest, TurnRunner
+from chainagents.turns.runner import _GeneratedPathTracker
 
 
 class _Token:
@@ -642,6 +644,42 @@ def test_generated_file_tracking_matches_a_rekeyed_tool_result_by_name(
     result, _renderer = _run(runtime, _request("write it"))
 
     assert [file.path for file in result.generated_files] == [written]
+
+
+def test_rekeyed_subagent_result_does_not_consume_a_main_agent_call() -> None:
+    tracker = _GeneratedPathTracker()
+    args = json.dumps({"file_path": "/workspace/.files/outputs/main.csv"})
+    tracker.record(
+        AgentStreamEvent(
+            kind="tool_call",
+            source="main-agent",
+            tool_call_id="call-main",
+            tool_name="write_file",
+            tool_args=args,
+        )
+    )
+    # A failed subagent write whose id matches no streamed call must not fall
+    # back to (and discard) the main agent's pending call of the same tool.
+    tracker.record(
+        AgentStreamEvent(
+            kind="tool_result",
+            source="researcher",
+            tool_call_id="sub-provider-1",
+            tool_name="write_file",
+            status="error",
+        )
+    )
+    tracker.record(
+        AgentStreamEvent(
+            kind="tool_result",
+            source="main-agent",
+            tool_call_id="main-provider-1",
+            tool_name="write_file",
+            status="success",
+        )
+    )
+
+    assert tracker.paths == ["/workspace/.files/outputs/main.csv"]
 
 
 def test_failed_tool_results_do_not_generate_files(tmp_path: Path) -> None:

@@ -416,20 +416,17 @@ class _GeneratedPathTracker:
         """Return the name and args of the call a tool result completes.
 
         Results whose id does not match a streamed call (some providers
-        re-key calls) fall back to a pending call of the same tool, preferring
-        the same source.
+        re-key calls) fall back to a pending call of the same tool from the
+        same source, so a subagent result never consumes a main-agent call.
         """
         call_id = event.tool_call_id
         if call_id not in self._tool_calls:
-            candidates = [
-                key
-                for key, (_source, name, _args) in self._tool_calls.items()
-                if name == event.tool_name
-            ]
             same_source = [
-                key for key in candidates if self._tool_calls[key][0] == event.source
+                key
+                for key, (source, name, _args) in self._tool_calls.items()
+                if name == event.tool_name and source == event.source
             ]
-            call_id = (same_source or candidates or [""])[0]
+            call_id = (same_source or [""])[0]
         if call_id not in self._tool_calls:
             return event.tool_name, ""
         _source, tool_name, tool_args = self._tool_calls.pop(call_id)

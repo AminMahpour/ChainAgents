@@ -1279,6 +1279,42 @@ def test_stream_emits_verified_files_before_later_run_error(tmp_path: Path) -> N
     assert lines[-1]["error"] == "Agent operation failed. Please retry."
 
 
+def test_stream_ends_with_sanitised_error_when_turn_runner_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify an exception escaping TurnRunner.run still ends the NDJSON stream."""
+
+    async def _raising_run(self, request, renderer):
+        await renderer.on_event(
+            chainagents_api.AgentStreamEvent(
+                kind="response_delta", source="main-agent", text="partial"
+            )
+        )
+        raise RuntimeError("secret backend detail")
+
+    monkeypatch.setattr(chainagents_api.TurnRunner, "run", _raising_run)
+    runtime = _FakeRuntime(_FakeAgent([]))
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/agent/stream",
+            json={"prompt": "hello", "thread_id": "thread-1"},
+        )
+
+    lines = [json.loads(line) for line in response.iter_lines()]
+    assert response.status_code == 200
+    assert [line["kind"] for line in lines] == ["response_delta", "error"]
+    assert lines[-1] == {
+        "kind": "error",
+        "error": "Agent operation failed. Please retry.",
+        "thread_id": "thread-1",
+        "model": "fake-model",
+        "reasoning": "medium",
+    }
+    assert "secret" not in response.text
+
+
 def test_generated_file_download_survives_app_recreation(tmp_path: Path) -> None:
     """Verify deterministic artifact links work across API process lifetimes."""
     output_path = tmp_path / ".files" / "outputs" / "reports" / "summary.csv"
@@ -1562,6 +1598,39 @@ def test_multipart_transforms_separately_selected_configured_command() -> None:
         "messages": [
             {"role": "user", "content": "Review carefully: /workspace/api.py"}
         ]
+    }
+
+
+def test_multipart_image_names_are_appended_after_command_resolution() -> None:
+    """Verify a command sees only the typed text; image names follow its prompt."""
+    agent = _FakeAgent([_raw_event(((), "messages", (_Token("Reviewed"), {})))])
+    runtime = _FakeRuntime(agent)
+    runtime.config.model_modalities = ("text", "image")
+    runtime.commands["review"] = SimpleNamespace(
+        name="review",
+        description="Review a change",
+        target="prompt",
+        value="Review the change",
+        template="Review {input} carefully.",
+        mcp_server=None,
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/agent/stream/multipart",
+            data={"prompt": "the diagram", "command": "review", "thread_id": "thread-1"},
+            files={"files": ("scan.png", b"png-bytes", "image/png")},
+        )
+
+    assert response.status_code == 200
+    assert agent.payload["messages"][0]["content"][0] == {
+        "type": "text",
+        "text": (
+            "Review the diagram carefully.\n\n"
+            "Attached image file(s): `scan.png`. Use the image "
+            "content directly when answering."
+        ),
     }
 
 
