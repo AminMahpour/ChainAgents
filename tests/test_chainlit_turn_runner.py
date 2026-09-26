@@ -348,7 +348,7 @@ async def test_stopping_a_message_turn_cancels_cleanly(
     # A correction prompt would produce a reflection proposal if the turn finished.
     message = SimpleNamespace(content="That was wrong, fix it", command=None)
     task = asyncio.create_task(main.on_message(message))
-    await runtime.agent.stream.started.wait()
+    await asyncio.wait_for(runtime.agent.stream.started.wait(), timeout=5)
     task.cancel()
     await task  # the stop is swallowed; nothing is raised out of on_message
 

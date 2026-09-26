@@ -25,12 +25,14 @@ SILENT_LEGACY_MODULES = ("main",)
 DEPRECATED_LEGACY_MODULES = (
     "agent_commands",
     "agent_stream_events",
+    "async_task_notifications",
     "chainagents_api",
     "chainagents_cli",
     "chainagents_tui",
     "chainlit_bridge",
     "chainlit_persistence",
     "deepagent_runtime",
+    "langchain_warning_filters",
     "rag_runtime",
     "response_exports",
 )

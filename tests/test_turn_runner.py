@@ -433,7 +433,7 @@ def test_cancellation_notifies_renderer_reraises_and_closes_stream(
 
     async def exercise() -> None:
         task = asyncio.create_task(TurnRunner(runtime).run(_request("hi"), renderer))
-        await runtime.agent.stream.started.wait()
+        await asyncio.wait_for(runtime.agent.stream.started.wait(), timeout=5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

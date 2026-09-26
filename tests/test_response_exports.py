@@ -41,7 +41,7 @@ def _descriptors_from_text(text: str, project_root: Path):
     )
 
 
-def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
+def test_generated_file_elements_for_response_text_paths_include_outputs(
     tmp_path: Path,
 ) -> None:
     """Verify generated response file paths become downloadable Chainlit files."""
@@ -89,7 +89,7 @@ def test_generated_output_resolves_absolute_workspace_artifacts(
     assert resolved == artifact_path
 
 
-def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
+def test_generated_file_descriptors_ignore_unsafe_or_unavailable_paths(
     tmp_path: Path,
 ) -> None:
     """Verify only existing generated files under allowed routes are downloadable."""
@@ -111,7 +111,7 @@ def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
     assert descriptors == []
 
 
-def test_generated_file_elements_from_paths_rejects_file_outside_outputs(
+def test_generated_file_descriptors_reject_file_outside_outputs(
     tmp_path: Path,
 ) -> None:
     """A real, existing file outside `.files/outputs` must not be attached."""
@@ -126,7 +126,7 @@ def test_generated_file_elements_from_paths_rejects_file_outside_outputs(
     assert descriptors == []
 
 
-def test_generated_file_elements_from_paths_rejects_symlinked_files_directory(
+def test_generated_file_descriptors_reject_symlinked_files_directory(
     tmp_path: Path,
 ) -> None:
     """A symlinked `.files` directory must fail closed instead of being followed."""
@@ -144,7 +144,7 @@ def test_generated_file_elements_from_paths_rejects_symlinked_files_directory(
     assert descriptors == []
 
 
-def test_generated_file_elements_from_paths_attaches_file_inside_outputs(
+def test_generated_file_elements_attach_descriptor_inside_outputs(
     tmp_path: Path,
 ) -> None:
     """An existing file under `.files/outputs` is attached."""

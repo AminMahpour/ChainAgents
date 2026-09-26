@@ -1524,7 +1524,7 @@ async def test_cli_cancelled_turn_propagates_and_closes_stream(tmp_path: Path) -
             stderr=stderr,
         )
     )
-    await stream.blocked.wait()
+    await asyncio.wait_for(stream.blocked.wait(), timeout=5)
     await asyncio.sleep(0)
 
     task.cancel()
@@ -1733,8 +1733,16 @@ state = "stateless"
     master_fd, slave_fd = pty.openpty()
     environment = os.environ.copy()
     environment["DEEPAGENT_CONFIG"] = str(config_path)
+    # A parent that ignores SIGINT (e.g. pytest started as a background shell
+    # job) makes the child inherit SIG_IGN, so asyncio.run never installs its
+    # SIGINT handler. Restore the default handler before running the CLI.
+    launcher = (
+        "import runpy, signal; "
+        "signal.signal(signal.SIGINT, signal.default_int_handler); "
+        "runpy.run_module('chainagents.interfaces.cli.app', run_name='__main__')"
+    )
     process = subprocess.Popen(
-        [sys.executable, "-m", "chainagents.interfaces.cli.app"],
+        [sys.executable, "-c", launcher],
         cwd=Path(__file__).parents[1],
         env=environment,
         stdin=slave_fd,

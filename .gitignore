@@ -20,4 +20,4 @@ wheels/
 .langgraph_api/
 
 # Local, untracked agent workspace notes
-AGENTS.md
+/AGENTS.md
