@@ -6108,6 +6108,67 @@ def test_summarization_status_middleware_emits_stream_events() -> None:
     ]
 
 
+def test_summarization_status_middleware_emits_failed_event_on_error() -> None:
+    """Verify a "failed" status event fires when a triggered summarization errors.
+
+    The inner middleware here is a plain duck-typed stand-in (like DeepAgents'
+    and LangChain's own SummarizationMiddleware classes, which are unrelated
+    to each other) rather than a subclass of either. `_will_summarize` must
+    recognize it by its attributes, not by `isinstance`, or the "failed"
+    event can never fire when a real summarization attempt raises.
+    """
+    events: list[dict[str, str]] = []
+
+    class FakeRuntime:
+        """Represent fake runtime."""
+
+        def stream_writer(self, event: dict[str, str]) -> None:
+            """Capture custom stream events emitted by middleware tests."""
+            events.append(event)
+
+    class FailingSummarizationMiddleware:
+        """Represent a summarization middleware whose model call fails."""
+
+        def token_counter(self, messages) -> int:
+            """Return a fixed token count high enough to trigger summarization."""
+            return 12
+
+        def _should_summarize(self, messages, total_tokens: int) -> bool:
+            """Report that summarization should run."""
+            return total_tokens >= 10
+
+        def _determine_cutoff_index(self, messages) -> int:
+            """Report a cutoff index that confirms summarization would apply."""
+            return 1
+
+        def before_model(self, state, runtime):
+            """Raise, as a real summarization failure would."""
+            raise RuntimeError("summarization backend unavailable")
+
+    middleware = deepagent_runtime.SummarizationStatusMiddleware(
+        FailingSummarizationMiddleware(),
+        source="main-agent",
+    )
+
+    with pytest.raises(RuntimeError, match="summarization backend unavailable"):
+        middleware.before_model({"messages": ["one", "two"]}, FakeRuntime())
+
+    assert events == [
+        {
+            "kind": "summarization_status",
+            "status": "started",
+            "source": "main-agent",
+            "message": "Conversation summarization triggered.",
+        },
+        {
+            "kind": "summarization_status",
+            "status": "failed",
+            "source": "main-agent",
+            "message": "Conversation summarization failed.",
+        },
+    ]
+
+
 def test_get_agent_omits_rag_tool_when_service_is_missing(
     tmp_path: Path,
     monkeypatch,
