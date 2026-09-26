@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+import importlib
+import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from chainagents.runtime import core as runtime_core
+
+# Root-level compatibility shims that emit a DeprecationWarning before aliasing
+# themselves to their package path. Excludes ``main`` and ``langgraph_app``,
+# which stay silent because external tooling (`chainlit run main.py`,
+# `langgraph.json`) imports them directly.
+DEPRECATED_SHIM_TARGETS = {
+    "agent_commands": "chainagents.commands.native",
+    "agent_stream_events": "chainagents.events.stream",
+    "async_task_notifications": "chainagents.interfaces.chainlit.async_tasks",
+    "chainagents_api": "chainagents.interfaces.api.app",
+    "chainagents_cli": "chainagents.interfaces.cli.app",
+    "chainagents_tui": "chainagents.interfaces.tui.app",
+    "chainlit_bridge": "chainagents.interfaces.chainlit.bridge",
+    "chainlit_persistence": "chainagents.interfaces.chainlit.persistence",
+    "deepagent_runtime": "chainagents.runtime.core",
+    "langchain_warning_filters": "chainagents.util.langchain_warnings",
+    "rag_runtime": "chainagents.rag.runtime",
+    "response_exports": "chainagents.exports.response",
+}
 
 
 def dependency_name(requirement: str) -> str:
@@ -34,30 +57,42 @@ def test_package_imports_expose_preferred_runtime_and_interface_paths() -> None:
 
 def test_legacy_imports_alias_moved_modules() -> None:
     """Verify that old top-level import paths still resolve to moved modules."""
-    import agent_commands
-    import agent_stream_events
-    import chainagents_api
-    import chainagents_cli
-    import chainagents_tui
-    import chainlit_bridge
-    import chainlit_persistence
-    import deepagent_runtime
     import main
-    import rag_runtime
-    import response_exports
 
-    assert deepagent_runtime.__name__ == "chainagents.runtime.core"
-    assert chainlit_bridge.__name__ == "chainagents.interfaces.chainlit.bridge"
     assert main.__name__ == "chainagents.interfaces.chainlit.app"
-    assert chainagents_cli.__name__ == "chainagents.interfaces.cli.app"
-    assert chainagents_api.__name__ == "chainagents.interfaces.api.app"
-    assert chainagents_tui.__name__ == "chainagents.interfaces.tui.app"
-    assert rag_runtime.__name__ == "chainagents.rag.runtime"
-    assert response_exports.__name__ == "chainagents.exports.response"
-    assert agent_stream_events.__name__ == "chainagents.events.stream"
-    assert agent_commands.__name__ == "chainagents.commands.native"
-    assert (
-        chainlit_persistence.__name__ == "chainagents.interfaces.chainlit.persistence"
+
+
+def test_deprecated_shims_alias_and_warn_on_first_import() -> None:
+    """Verify every deprecated root shim aliases correctly and warns once.
+
+    Module caching means a shim only warns the first time it is imported in
+    a process, so each shim name is removed from ``sys.modules`` before the
+    import to make the warning fire deterministically, then restored.
+    """
+    for name, target in DEPRECATED_SHIM_TARGETS.items():
+        previous = sys.modules.pop(name, None)
+        try:
+            with pytest.warns(DeprecationWarning, match=f"'{name}' is deprecated"):
+                module = importlib.import_module(name)
+            assert module.__name__ == target
+        finally:
+            sys.modules.pop(name, None)
+            if previous is not None:
+                sys.modules[name] = previous
+
+
+def test_excluded_entrypoint_shims_do_not_warn(recwarn: pytest.WarningsRecorder) -> None:
+    """main.py and langgraph_app.py stay silent for their external entrypoints."""
+    for name in ("main", "langgraph_app"):
+        previous = sys.modules.pop(name, None)
+        try:
+            importlib.import_module(name)
+        finally:
+            if previous is not None:
+                sys.modules[name] = previous
+
+    assert not any(
+        issubclass(warning.category, DeprecationWarning) for warning in recwarn.list
     )
 
 
@@ -112,7 +147,7 @@ def test_runtime_facades_preserve_owner_identity() -> None:
     """Bind supported objects once, including private legacy helper access."""
     import importlib
     import chainagents.runtime as runtime
-    import deepagent_runtime as legacy
+    import chainagents.runtime.core as legacy
 
     owners = {
         "constants": ["PROJECT_ROOT", "SYSTEM_PROMPT", "_resolve_default_project_root"],

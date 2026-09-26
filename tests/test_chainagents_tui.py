@@ -13,12 +13,12 @@ import pytest
 from textual.containers import VerticalScroll
 from textual.widgets import Markdown, RichLog
 
-import chainagents_cli
+from chainagents.interfaces.cli import app as chainagents_cli
 from chainagents.commands.native import dumps_tool_result
 from chainagents.runtime.background_tasks import BackgroundTaskManager
 from chainagents.runtime.reflection import ReflectionConfig
 from chainagents.runtime.types import BackgroundSubagentConfig
-from chainagents_tui import (
+from chainagents.interfaces.tui.app import (
     DEFAULT_TUI_THREAD_ID,
     ChainAgentsTuiApp,
     PromptTextArea,

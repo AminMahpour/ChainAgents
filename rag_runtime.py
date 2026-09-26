@@ -1,10 +1,12 @@
-"""Compatibility wrapper for the moved RAG runtime."""
+"""Compatibility wrapper for the moved RAG runtime.
+
+Deprecated: this root-level module will be removed in a future release.
+Import from ``chainagents.rag.runtime`` instead.
+"""
 
 from __future__ import annotations
 
-import sys as _sys
-
 from chainagents.rag import runtime as _module
+from chainagents.util.compat import alias_module
 
-_sys.modules[__name__] = _module
-
+alias_module(__name__, _module)

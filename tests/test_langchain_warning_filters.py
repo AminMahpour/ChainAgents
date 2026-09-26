@@ -20,7 +20,7 @@ def test_deepagent_runtime_import_suppresses_allowed_objects_warning() -> None:
             "-W",
             "default",
             "-c",
-            "import deepagent_runtime",
+            "import chainagents.runtime.core",
         ],
         check=False,
         capture_output=True,

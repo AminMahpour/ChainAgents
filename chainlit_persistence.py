@@ -1,10 +1,12 @@
-"""Compatibility wrapper for the moved Chainlit persistence helpers."""
+"""Compatibility wrapper for the moved Chainlit persistence helpers.
+
+Deprecated: this root-level module will be removed in a future release.
+Import from ``chainagents.interfaces.chainlit.persistence`` instead.
+"""
 
 from __future__ import annotations
 
-import sys as _sys
-
 from chainagents.interfaces.chainlit import persistence as _module
+from chainagents.util.compat import alias_module
 
-_sys.modules[__name__] = _module
-
+alias_module(__name__, _module)

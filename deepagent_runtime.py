@@ -1,10 +1,12 @@
-"""Compatibility wrapper for the moved ChainAgents runtime."""
+"""Compatibility wrapper for the moved ChainAgents runtime.
+
+Deprecated: this root-level module will be removed in a future release.
+Import from ``chainagents.runtime.core`` instead.
+"""
 
 from __future__ import annotations
 
-import sys as _sys
-
 from chainagents.runtime import core as _module
+from chainagents.util.compat import alias_module
 
-_sys.modules[__name__] = _module
-
+alias_module(__name__, _module)

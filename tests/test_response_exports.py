@@ -20,7 +20,7 @@ import pytest
 from PIL import Image
 from pypdf import PdfReader
 
-import response_exports
+import chainagents.exports.response as response_exports
 from chainagents.exports.generated_files import (
     generated_file_descriptors,
     generated_file_paths_from_text,

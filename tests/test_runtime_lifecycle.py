@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import anyio
 import pytest
 
-import deepagent_runtime as core
+import chainagents.runtime.core as core
 import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks

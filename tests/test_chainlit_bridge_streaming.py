@@ -9,8 +9,8 @@ from typing import Any, ClassVar
 
 import pytest
 
-import chainlit_bridge
-from chainlit_bridge import ChainlitEventBridge, RunTaskList
+from chainagents.interfaces.chainlit import bridge as chainlit_bridge
+from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.events.stream import AgentStreamEventAdapter
 from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer

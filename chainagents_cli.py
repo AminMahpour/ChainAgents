@@ -1,10 +1,12 @@
-"""Compatibility wrapper for the moved ChainAgents CLI."""
+"""Compatibility wrapper for the moved ChainAgents CLI.
+
+Deprecated: this root-level module will be removed in a future release.
+Import from ``chainagents.interfaces.cli.app`` instead.
+"""
 
 from __future__ import annotations
 
-import sys as _sys
-
 from chainagents.interfaces.cli import app as _module
+from chainagents.util.compat import alias_module
 
-_sys.modules[__name__] = _module
-
+alias_module(__name__, _module)

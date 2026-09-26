@@ -11,9 +11,9 @@ import pytest
 from langchain_core.documents import Document
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
-import rag_runtime
-from rag_runtime import JsonVectorStore
-from rag_runtime import (
+from chainagents.rag import runtime as rag_runtime
+from chainagents.rag.runtime import JsonVectorStore
+from chainagents.rag.runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
     DEFAULT_RAG_EXCLUDE_GLOBS,
     DEFAULT_RAG_INCLUDE_GLOBS,

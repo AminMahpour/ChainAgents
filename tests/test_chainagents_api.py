@@ -15,11 +15,11 @@ from typing import Any, ClassVar
 from fastapi.testclient import TestClient
 import pytest
 
-import chainagents_api
+from chainagents.interfaces.api import app as chainagents_api
 from chainagents.runtime import core
 from chainagents.runtime.reflection import ReflectionConfig
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
-from rag_runtime import RagUploadResult
+from chainagents.rag.runtime import RagUploadResult
 
 
 class _Token:

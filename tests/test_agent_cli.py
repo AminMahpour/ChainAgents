@@ -22,17 +22,21 @@ from typing import ClassVar
 
 import pytest
 
-import chainagents_cli
+from chainagents.interfaces.cli import app as chainagents_cli
 from chainagents.interfaces.cli import configure as cli_configure
-from chainagents.events.stream import AgentStreamEventAdapter
+from chainagents.events.stream import (
+    AgentStreamEventAdapter,
+    reasoning_text_from_token,
+    stringify_content,
+)
 from chainagents.turns import TurnResult
-from deepagent_runtime import RuntimeConfig
+from chainagents.runtime.core import RuntimeConfig
 from chainagents.runtime.background_tasks import (
     BackgroundTaskManager,
     BackgroundTaskSnapshot,
 )
 from chainagents.runtime.types import BackgroundSubagentConfig
-from rag_runtime import RagStatus, RagUploadResult
+from chainagents.rag.runtime import RagStatus, RagUploadResult
 
 
 CLI_STARTUP_TIMEOUT_SECONDS = float(
@@ -1974,14 +1978,14 @@ def test_reasoning_text_from_token_extracts_anthropic_thinking_block() -> None:
     """Verify that Anthropic thinking content blocks are treated as reasoning."""
     token = _AnthropicThinkingToken("checking Claude reasoning")
 
-    assert chainagents_cli.reasoning_text_from_token(token) == "checking Claude reasoning"
+    assert reasoning_text_from_token(token) == "checking Claude reasoning"
 
 
 def test_stringify_content_omits_anthropic_thinking_block() -> None:
     """Verify that Anthropic thinking content blocks do not render as answer text."""
     token = _AnthropicThinkingToken("hidden reasoning")
 
-    assert chainagents_cli.stringify_content(token.content) == ""
+    assert stringify_content(token.content) == ""
 
 
 class _ReasoningToken:

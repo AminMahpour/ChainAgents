@@ -25,7 +25,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 import pytest
 
-import deepagent_runtime
+import chainagents.runtime.core as deepagent_runtime
 import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
@@ -38,7 +38,7 @@ import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
 import chainagents.runtime.providers as runtime_providers
 import chainagents.runtime.tracing as runtime_tracing
-from deepagent_runtime import (
+from chainagents.runtime.core import (
     AgentRuntime,
     BackgroundSubagentConfig,
     ChainlitCommandConfig,
@@ -54,7 +54,7 @@ from deepagent_runtime import (
     generated_outputs_route_prefix,
     virtual_workspace_path_to_local,
 )
-from rag_runtime import (
+from chainagents.rag.runtime import (
     DEFAULT_OLLAMA_EMBEDDING_MODEL,
     RagStatus,
     RagUploadResult,

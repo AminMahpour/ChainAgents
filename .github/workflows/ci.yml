@@ -34,7 +34,7 @@ jobs:
         run: uv sync --locked
 
       - name: Validate Python imports
-        run: uv run python -c "import chainagents.runtime, chainagents.interfaces.cli.app, chainlit_bridge, deepagent_runtime, main"
+        run: uv run python -c "import chainagents.runtime, chainagents.interfaces.cli.app, chainagents.interfaces.chainlit.bridge, chainagents.runtime.core, main"
 
       - name: Byte-compile application modules
         run: uv run python -m compileall chainagents main.py langgraph_app.py deepagent_runtime.py chainlit_bridge.py rag_runtime.py

@@ -353,6 +353,12 @@ Compatibility wrappers such as `main.py`, `deepagent_runtime.py`,
 Prefer new code under `chainagents/`, but keep the wrappers until external users
 no longer rely on the old import paths.
 
+**Deprecated:** every root-level wrapper except `main.py` and `langgraph_app.py`
+(which stay silent for `chainlit run main.py -w` and `langgraph.json`) now
+emits a `DeprecationWarning` on first import and will be removed in a future
+release. Import from the package path instead, e.g.
+`chainagents.runtime.core` instead of `deepagent_runtime`.
+
 ## Model Config
 
 You can keep the model defaults in `deepagent.toml`:

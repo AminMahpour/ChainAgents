@@ -9,8 +9,8 @@ from typing import ClassVar
 
 import pytest
 
-import chainagents_api
-import chainagents_cli
+from chainagents.interfaces.api import app as chainagents_api
+from chainagents.interfaces.cli import app as chainagents_cli
 from chainagents.events.stream import AgentStreamEvent
 from chainagents.runtime.reflection import ReflectionCollector, ReflectionConfig
 

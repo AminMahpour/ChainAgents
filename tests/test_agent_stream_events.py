@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import ClassVar
 
 
-from agent_stream_events import AgentStreamEvent, AgentStreamEventAdapter
+from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
 from langchain_core.messages import HumanMessageChunk
 
 

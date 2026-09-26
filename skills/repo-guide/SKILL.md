@@ -17,7 +17,8 @@ Working rules:
 1. Read the relevant files in `/workspace/` before answering.
 2. Prefer concrete file references over vague summaries.
 3. Start with the highest-signal files first:
-   `README.md`, `main.py`, `deepagent_runtime.py`, `chainlit_bridge.py`, and config files.
+   `README.md`, `main.py`, `chainagents/runtime/core.py`,
+   `chainagents/interfaces/chainlit/bridge.py`, and config files.
 4. If the user asks how to change behavior, identify the likely edit points and explain why.
 5. Keep the answer concise and implementation-oriented.
 

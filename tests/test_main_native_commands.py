@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import agent_commands
 import main
 import pytest
-from deepagent_runtime import (
+from chainagents.commands import native as agent_commands
+from chainagents.runtime.core import (
     AppSettings,
     ChainlitStarterConfig,
     ExtensionsConfig,
