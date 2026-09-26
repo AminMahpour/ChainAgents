@@ -227,7 +227,7 @@ Install the locked development environment, then run the same gates used by CI:
 
 ```bash
 uv sync --locked
-uv run ruff check chainagents *.py scripts/*.py
+uv run ruff check chainagents *.py scripts/*.py tests
 uv run mypy
 uv run pytest
 bash scripts/verify-installed-wheel.sh
