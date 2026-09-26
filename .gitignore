@@ -21,3 +21,6 @@ wheels/
 
 # Local, untracked agent workspace notes
 /AGENTS.md
+
+# Local config overrides
+/deepagent.local.toml
