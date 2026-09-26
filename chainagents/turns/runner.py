@@ -52,6 +52,8 @@ class TurnRequest:
     ``content_parts`` (image parts) after ``history``. ``run_config_extras``
     keys shallowly override the keys of ``build_langgraph_run_config`` (for
     example a ``callbacks`` or ``metadata`` entry replaces the tracing value).
+    ``resolve_commands=False`` sends ``prompt`` to the agent as-is, for turns
+    whose text is not user input (for example a configured response action).
     """
 
     prompt: str
@@ -67,6 +69,7 @@ class TurnRequest:
     async_subagent_url: str | None = None
     mcp_session_id: str | None = None
     run_config_extras: Mapping[str, Any] = field(default_factory=dict)
+    resolve_commands: bool = True
 
 
 class TurnCommandError(Exception):
@@ -135,10 +138,11 @@ class TurnRunner:
 
         Command and agent failures are reported to the renderer and returned in
         the result; they are not raised. A renderer callback that raises while
-        events stream counts as an agent failure, but one that raises during
-        the finish steps (``on_generated_files``, ``on_reflection``,
-        ``on_error``, ``on_complete``) or a command outcome propagates out of
-        ``run``. ``CancelledError`` is re-raised after ``renderer.on_cancelled()``.
+        the agent runs (``on_agent_start``, ``on_event``) counts as an agent
+        failure, but one that raises during the finish steps
+        (``on_generated_files``, ``on_reflection``, ``on_error``,
+        ``on_complete``) or a command outcome propagates out of ``run``.
+        ``CancelledError`` is re-raised after ``renderer.on_cancelled()``.
         """
         try:
             return await self._run(request, renderer)
@@ -152,9 +156,13 @@ class TurnRunner:
     async def _run(self, request: TurnRequest, renderer: TurnRenderer) -> TurnResult:
         prompt = request.prompt
         command_result: RuntimeCommandResult | None = None
-        parsed = resolve_native_command(
-            raw_text=request.prompt,
-            selected_command=request.selected_command,
+        parsed = (
+            resolve_native_command(
+                raw_text=request.prompt,
+                selected_command=request.selected_command,
+            )
+            if request.resolve_commands
+            else None
         )
         if parsed is not None:
             command_error: TurnCommandError | None = None
@@ -283,6 +291,7 @@ class TurnRunner:
                         text=mcp_outage_warning(mcp_failures),
                     )
                 )
+            await renderer.on_agent_start(prompt)
             async with aclosing(self._agent_events(agent, request, prompt)) as events:
                 async for event in events:
                     collector.record_event(event)

@@ -536,3 +536,36 @@ def test_mcp_command_can_emit_reflection_from_user_text(tmp_path: Path) -> None:
     assert result.reflection is not None
     assert result.reflection.reason == "correction"
     assert runtime.agent_requests == []
+
+
+def test_agent_start_follows_mcp_status_with_final_prompt(tmp_path: Path) -> None:
+    class _DegradedRuntime(_FakeRuntime):
+        async def get_agent_with_status(self, *args, **kwargs):
+            return self.agent, ("docs",)
+
+    class _StartRecorder(_RecordingRenderer):
+        async def on_agent_start(self, prompt):
+            self.calls.append(("agent_start", prompt))
+
+    runtime = _DegradedRuntime(_FakeAgent(_FakeStream([_token("Ready")])), tmp_path)
+    renderer = _StartRecorder()
+
+    asyncio.run(TurnRunner(runtime).run(_request("/review the diff"), renderer))
+
+    assert renderer.kinds() == ["event", "agent_start", "event", "complete"]
+    assert renderer.calls[0][1].kind == "mcp_status"
+    assert renderer.calls[1][1] == "Review the diff"
+
+
+def test_resolve_commands_off_sends_slash_text_as_prompt(tmp_path: Path) -> None:
+    runtime = _make_runtime(tmp_path, [_token("Done")])
+
+    result, renderer = _run(
+        runtime, _request("/lookup keep this literal", resolve_commands=False)
+    )
+
+    assert result.status == "completed"
+    assert runtime.command_requests == []
+    assert runtime.agent.payload == {
+        "messages": [{"role": "user", "content": "/lookup keep this literal"}]
+    }

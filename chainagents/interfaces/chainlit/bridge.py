@@ -7,11 +7,13 @@ import ast
 import json
 import time
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import chainlit as cl
+from chainlit.element import Element
 from chainlit.utils import utc_now
 
 from chainagents.events.stream import (
@@ -780,9 +782,9 @@ class ChainlitEventBridge:
             await self._update_todos_from_update_part(part)
 
         for stream_event in self.stream_adapter.events_from_part(part):
-            await self._handle_stream_event(stream_event)
+            await self.handle_stream_event(stream_event)
 
-    async def _handle_stream_event(self, event: AgentStreamEvent) -> None:
+    async def handle_stream_event(self, event: AgentStreamEvent) -> None:
         """Render one normalized agent stream event."""
         if self.reflection_collector is not None:
             self.reflection_collector.record_event(event)
@@ -846,12 +848,19 @@ class ChainlitEventBridge:
         if self.run_task_list is not None:
             await self.run_task_list.cancel()
 
-    async def fail(self, exc: Exception, details: str) -> None:
+    async def fail(
+        self,
+        exc: Exception,
+        details: str,
+        *,
+        elements: Sequence[Element] = (),
+    ) -> None:
         """Fail the chainlit event bridge.
 
         Args:
             exc: The exc value.
             details: The details value.
+            elements: Elements (generated files) attached to the error message.
         """
         if self.reflection_collector is not None:
             self.reflection_collector.mark_run_failed(exc)
@@ -861,7 +870,11 @@ class ChainlitEventBridge:
         async with cl.Step(name="runtime error", type="tool") as step:
             step.input = self.display_prompt
             step.output = details
-        await cl.Message(content=f"{type(exc).__name__}: {exc}", author="System").send()
+        await cl.Message(
+            content=f"{type(exc).__name__}: {exc}",
+            author="System",
+            elements=list(elements),
+        ).send()
 
     def reflection_proposal(self) -> ReflectionProposal | None:
         """Return the reflection proposal for the completed run, if any."""

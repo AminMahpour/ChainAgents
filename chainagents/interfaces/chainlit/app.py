@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import secrets
-import traceback
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
@@ -24,9 +23,6 @@ from chainlit.types import ThreadDict
 
 from chainagents.commands.native import (
     ParsedNativeCommand,
-    dumps_tool_result,
-    parse_native_command,
-    resolve_native_command,
     resolve_runtime_command,
 )
 from chainagents.interfaces.chainlit.async_tasks import (
@@ -36,6 +32,10 @@ from chainagents.interfaces.chainlit.async_tasks import (
 )
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
+from chainagents.interfaces.chainlit.renderer import (
+    ChainlitTurnRenderer,
+    native_command_output_message,
+)
 from chainagents.interfaces.uploads import (
     RAG_UPLOAD_ACCEPT,
     NormalizedUpload,
@@ -59,13 +59,12 @@ from chainagents.runtime import (
     resolve_runtime_model_profile,
 )
 from chainagents.runtime.reflection import (
-    ReflectionCollector,
     ReflectionProposal,
     format_reflection_proposal,
     reflection_save_prompt as reflection_save_prompt,
 )
-from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.rag.runtime import UploadedRagFile
+from chainagents.turns import TurnRequest, TurnRunner
 from chainagents.exports.response import (
     DOWNLOAD_MARKDOWN_ACTION,
     DOWNLOAD_PDF_ACTION,
@@ -743,12 +742,7 @@ async def handle_native_command(
     if result.target == "mcp_tool":
         await cl.Message(
             author="System",
-            content=(
-                f"Ran `/{result.command_name}` ({result.description}).\n\n"
-                "Tool result:\n```json\n"
-                f"{dumps_tool_result(result.tool_result)}\n"
-                "```"
-            ),
+            content=native_command_output_message(result),
         ).send()
         return ""
 
@@ -1627,6 +1621,7 @@ async def run_response_action(action: cl.Action) -> None:
                         runtime.config, settings, settings.model_name
                     ),
                     mcp_session_id=current_mcp_session_id(),
+                    resolve_commands=False,
                     display_prompt="",
                     export_label=resolved.label,
                 )
@@ -1729,7 +1724,10 @@ async def on_message(message: cl.Message) -> None:
     Args:
         message: Chainlit message or LangChain message to process.
     """
-    await _handle_message(message)
+    # Chainlit wraps this callback in its ``on_message`` run step; swallowing a
+    # stopped turn here keeps that step from being marked as an error.
+    with suppress(asyncio.CancelledError):
+        await _handle_message(message)
 
 
 _chainlit_message_callback = chainlit_config.code.on_message
@@ -1805,64 +1803,6 @@ async def _handle_message(message: cl.Message) -> None:
             author="System",
         ).send()
 
-    selected_command = getattr(message, "command", None)
-    selected_command_supplied = bool(
-        str(selected_command or "").strip().lstrip("/")
-    )
-    parsed_command = resolve_native_command(
-        raw_text=message.content,
-        selected_command=selected_command,
-    )
-    slash_command_from_text = parse_native_command(message.content)
-    if (
-        not message.content.strip()
-        and uploaded_files
-        and not uploaded_image_parts
-        and parsed_command is None
-    ):
-        return
-    if (
-        not message.content.strip()
-        and not uploaded_files
-        and not uploaded_image_parts
-        and parsed_command is None
-    ):
-        return
-
-    if parsed_command is not None:
-        try:
-            transformed_prompt = await handle_native_command(
-                runtime=runtime,
-                settings=settings,
-                parsed=parsed_command,
-                mcp_session_id=mcp_session_id,
-            )
-        except Exception as exc:
-            await cl.Message(
-                author="System",
-                content=f"Native command `/{parsed_command.command_name}` failed: {exc}",
-            ).send()
-            return
-        if transformed_prompt is None:
-            if selected_command_supplied or slash_command_from_text is None:
-                await cl.Message(
-                    author="System",
-                    content=(
-                        f"Unknown command `/{parsed_command.command_name}`.\n"
-                        "Use a configured command from startup or send a normal prompt."
-                    ),
-                ).send()
-                return
-        else:
-            if not transformed_prompt.strip():
-                return
-            message.content = transformed_prompt
-
-    agent_prompt = chainlit_prompt_text(
-        message.content,
-        image_names=uploaded_image_names,
-        prompt_note=prompt_note,
-    )
     reasoning_level_is_explicit = (
         message_has_reasoning_level_override(
             message,
@@ -1877,12 +1817,15 @@ async def _handle_message(message: cl.Message) -> None:
     await _run_agent_turn(
         runtime=runtime,
         settings=settings,
-        agent_prompt=agent_prompt,
+        agent_prompt=message.content,
         effective_reasoning_level=effective_reasoning_level,
         effective_model_name=effective_model_name,
         reasoning_level_is_explicit=reasoning_level_is_explicit,
         mcp_session_id=mcp_session_id,
+        selected_command=getattr(message, "command", None),
         uploaded_image_parts=uploaded_image_parts,
+        uploaded_image_names=uploaded_image_names,
+        prompt_note=prompt_note,
     )
 
 
@@ -1895,126 +1838,85 @@ async def _run_agent_turn(
     effective_model_name: str,
     reasoning_level_is_explicit: bool,
     mcp_session_id: str | None,
+    selected_command: str | None = None,
     uploaded_image_parts: list[dict[str, Any]] | None = None,
+    uploaded_image_names: tuple[str, ...] = (),
+    prompt_note: str = "",
+    resolve_commands: bool = True,
     display_prompt: str | None = None,
     export_label: str = "",
 ) -> None:
-    """Stream one ordinary or response-action turn through the same agent."""
+    """Run one ordinary or response-action turn through the shared runner.
+
+    ``agent_prompt`` is the raw text, resolved as a native command when
+    ``resolve_commands`` is set. ``CancelledError`` propagates to the
+    outermost callback.
+    """
     async_url_override = async_subagent_url_override()
     run_task_list = await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
     )
-    agent, mcp_failures = await agent_with_mcp_status(
-        runtime,
-        effective_reasoning_level,
-        model_name=effective_model_name,
-        reasoning_level_is_explicit=reasoning_level_is_explicit,
-        thread_id=settings.thread_id,
-        async_subagent_url_override=async_url_override,
-        mcp_session_id=mcp_session_id,
-    )
-    if mcp_failures:
-        await cl.Message(content=mcp_outage_warning(mcp_failures)).send()
-    async_task_notifier = get_async_task_notifier(
-        agent=agent,
-        runtime=runtime,
-        url_override=async_url_override,
-    )
-    bridge = ChainlitEventBridge(
+
+    def build_bridge(prompt: str) -> ChainlitEventBridge:
+        return ChainlitEventBridge(
+            prompt=prompt,
+            run_task_list=run_task_list,
+            chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
+            reasoning_steps_enabled=settings.show_reasoning_stream,
+            tool_steps_enabled=settings.show_tool_calls,
+            generative_ui_enabled=runtime.config.extensions.chainlit_generative_ui_enabled,
+            generated_ui_elements=get_generated_ui_elements(),
+            display_prompt=display_prompt,
+            export_label=export_label,
+            response_actions=runtime.config.extensions.chainlit_response_actions,
+        )
+
+    request = TurnRequest(
         prompt=agent_prompt,
-        run_task_list=run_task_list,
-        chronological_ui_enabled=runtime.config.extensions.chainlit_chronological_ui_enabled,
-        reasoning_steps_enabled=settings.show_reasoning_stream,
-        tool_steps_enabled=settings.show_tool_calls,
-        generative_ui_enabled=runtime.config.extensions.chainlit_generative_ui_enabled,
-        generated_ui_elements=get_generated_ui_elements(),
-        reflection_collector=ReflectionCollector.from_runtime_config(
-            runtime.config,
-            prompt=agent_prompt,
-        ),
-        display_prompt=display_prompt,
-        export_label=export_label,
-        response_actions=runtime.config.extensions.chainlit_response_actions,
+        thread_id=settings.thread_id,
+        model_name=effective_model_name,
+        reasoning_level=effective_reasoning_level,
+        selected_command=selected_command,
+        reasoning_level_is_explicit=reasoning_level_is_explicit,
+        content_parts=tuple(uploaded_image_parts or ()),
+        image_names=uploaded_image_names,
+        prompt_note=prompt_note,
+        async_subagent_url=async_url_override,
+        mcp_session_id=mcp_session_id,
+        resolve_commands=resolve_commands,
     )
-    await bridge.start()
-
-    config = build_langgraph_config(
-        settings,
-        recursion_limit=runtime.config.recursion_limit,
-        runtime_config=runtime.config,
-        langsmith_tracing=getattr(runtime, "langsmith_tracing", None),
+    renderer = ChainlitTurnRenderer(
+        build_bridge,
+        prompt=agent_prompt,
+        project_root=getattr(runtime, "project_root", None),
     )
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": chainlit_user_message_content(
-                    agent_prompt,
-                    image_parts=uploaded_image_parts or [],
-                ),
-            }
-        ]
-    }
-    stream = agent.astream_events(
-        payload,
-        config=config,
-        version="v2",
-        stream_mode=["messages", "updates", "custom"],
-        subgraphs=True,
-    )
+    result = await TurnRunner(runtime, sanitize_errors=False).run(request, renderer)
 
-    try:
-        while True:
-            try:
-                part = await anext(stream)
-            except StopAsyncIteration:
-                break
-            await bridge.handle_event(part)
-    except asyncio.CancelledError:
-        with suppress(Exception):
-            await stream.aclose()
-        with suppress(Exception):
-            await bridge.cancel()
-        return
-    except Exception as exc:
-        with suppress(Exception):
-            await stream.aclose()
-        details = traceback.format_exc(limit=10)
-        with suppress(Exception):
-            await bridge.fail(exc, details)
-        proposal = bridge.reflection_proposal()
-        if proposal is not None:
-            with suppress(Exception):
-                await ask_to_save_reflection_lesson(
-                    runtime=runtime,
-                    settings=settings,
-                    proposal=proposal,
-                    reasoning_level=effective_reasoning_level,
-                    model_name=effective_model_name,
-                    async_url_override=async_url_override,
-                    mcp_session_id=mcp_session_id,
-                )
-        return
-    finally:
-        with suppress(Exception):
-            await stream.aclose()
-
-    await bridge.finish()
-    proposal = bridge.reflection_proposal()
-    if proposal is not None:
-        await ask_to_save_reflection_lesson(
+    if result.reflection is not None:
+        ask = ask_to_save_reflection_lesson(
             runtime=runtime,
             settings=settings,
-            proposal=proposal,
+            proposal=result.reflection,
             reasoning_level=effective_reasoning_level,
             model_name=effective_model_name,
             async_url_override=async_url_override,
             mcp_session_id=mcp_session_id,
         )
-    if async_task_notifier is not None:
-        with suppress(Exception):
-            await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
+        if result.status == "failed":
+            with suppress(Exception):
+                await ask
+        else:
+            await ask
+    if result.status == "completed" and result.agent is not None:
+        async_task_notifier = get_async_task_notifier(
+            agent=result.agent,
+            runtime=runtime,
+            url_override=async_url_override,
+        )
+        if async_task_notifier is not None:
+            with suppress(Exception):
+                await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
 
 
 @cl.on_chat_end

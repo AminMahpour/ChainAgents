@@ -19,13 +19,19 @@ class TurnRenderer(Protocol):
 
     - command error: ``on_command_error`` then ``on_complete``;
     - MCP-tool command: ``on_command_result``, then the finish steps;
-    - agent run: ``on_event`` for every stream event, then the finish steps.
+    - agent run: an optional ``mcp_status`` ``on_event``, ``on_agent_start``
+      once the agent is ready, ``on_event`` for every stream event, then the
+      finish steps.
 
     Finish steps are ``on_generated_files`` (only when files exist),
     ``on_reflection`` (only when a proposal exists), ``on_error`` (only when the
     agent run failed) and finally ``on_complete``. On cancellation only
     ``on_cancelled`` is called and the runner re-raises ``CancelledError``.
     """
+
+    async def on_agent_start(self, prompt: str) -> None:
+        """Prepare to render the agent run for the final agent ``prompt``."""
+        ...
 
     async def on_event(self, event: AgentStreamEvent) -> None:
         """Render one normalized agent stream event."""
@@ -62,6 +68,9 @@ class TurnRenderer(Protocol):
 
 class BaseTurnRenderer:
     """No-op ``TurnRenderer`` for front ends that only need a few callbacks."""
+
+    async def on_agent_start(self, prompt: str) -> None:
+        """Ignore the agent start."""
 
     async def on_event(self, event: AgentStreamEvent) -> None:
         """Ignore the event."""
