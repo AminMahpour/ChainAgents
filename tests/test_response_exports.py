@@ -34,7 +34,7 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
     tmp_path: Path,
 ) -> None:
     """Verify generated response file paths become downloadable Chainlit files."""
-    report_path = tmp_path / "reports" / "summary.csv"
+    report_path = tmp_path / ".files" / "outputs" / "reports" / "summary.csv"
     chart_path = tmp_path / ".files" / "outputs" / "charts" / "plot.png"
     report_path.parent.mkdir(parents=True)
     chart_path.parent.mkdir(parents=True)
@@ -42,7 +42,8 @@ def test_generated_file_elements_from_text_includes_workspace_and_artifacts(
     chart_path.write_bytes(b"\x89PNG\r\n")
 
     elements = response_exports.generated_file_elements_from_text(
-        "Created `/workspace/reports/summary.csv` and `.files/outputs/charts/plot.png`.",
+        "Created `/workspace/.files/outputs/reports/summary.csv` and"
+        " `.files/outputs/charts/plot.png`.",
         project_root=tmp_path,
     )
 
@@ -64,6 +65,7 @@ def test_generated_file_elements_from_text_resolves_absolute_workspace_artifacts
     def fake_is_file(path: Path) -> bool:
         return path == artifact_path
 
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
     monkeypatch.setattr(Path, "is_file", fake_is_file)
 
     elements = response_exports.generated_file_elements_from_text(
@@ -97,6 +99,56 @@ def test_generated_file_elements_from_text_ignores_unsafe_or_unavailable_paths(
     )
 
     assert elements == []
+
+
+def test_generated_file_elements_from_paths_rejects_file_outside_outputs(
+    tmp_path: Path,
+) -> None:
+    """A real, existing file outside `.files/outputs` must not be attached."""
+    outside_path = tmp_path / "README.md"
+    outside_path.write_text("# notes", encoding="utf-8")
+
+    elements = response_exports.generated_file_elements_from_paths(
+        [outside_path.as_posix()],
+        project_root=tmp_path,
+    )
+
+    assert elements == []
+
+
+def test_generated_file_elements_from_paths_rejects_symlinked_files_directory(
+    tmp_path: Path,
+) -> None:
+    """A symlinked `.files` directory must fail closed instead of being followed."""
+    real_target = tmp_path / "elsewhere"
+    (real_target / "outputs").mkdir(parents=True)
+    output_path = real_target / "outputs" / "plot.png"
+    output_path.write_bytes(b"\x89PNG\r\n")
+    (tmp_path / ".files").symlink_to(real_target, target_is_directory=True)
+
+    elements = response_exports.generated_file_elements_from_paths(
+        [(tmp_path / ".files" / "outputs" / "plot.png").as_posix()],
+        project_root=tmp_path,
+    )
+
+    assert elements == []
+
+
+def test_generated_file_elements_from_paths_attaches_file_inside_outputs(
+    tmp_path: Path,
+) -> None:
+    """An existing file under `.files/outputs` is attached."""
+    output_path = tmp_path / ".files" / "outputs" / "plot.png"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"\x89PNG\r\n")
+
+    elements = response_exports.generated_file_elements_from_paths(
+        [output_path.as_posix()],
+        project_root=tmp_path,
+    )
+
+    assert [element.name for element in elements] == ["plot.png"]
+    assert [element.path for element in elements] == [output_path.as_posix()]
 
 
 def test_build_pdf_bytes_uses_weasyprint_html_renderer(monkeypatch) -> None:

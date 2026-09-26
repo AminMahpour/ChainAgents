@@ -25,8 +25,8 @@ from markdown_it import MarkdownIt
 
 from chainagents.exports.generated_files import (
     GENERATED_FILE_PATH_RE,
-    GENERATED_OUTPUTS_DIRECTORY,
     MAX_GENERATED_FILES,
+    resolve_generated_output,
 )
 from chainagents.exports.pdf_images import (
     PDF_IMAGE_MAX_BYTES,
@@ -59,7 +59,6 @@ PDF_EXPORT_DEPENDENCY_ERROR = (
     "the Pango packages listed in the WeasyPrint installation guide. Restart "
     "the app after installing the system libraries."
 )
-GENERATED_FILE_TRAILING_PUNCTUATION = ".,;:!?"
 PDF_STYLES = """
 @page {
   size: letter;
@@ -519,7 +518,7 @@ def generated_file_elements_from_paths(
     *,
     project_root: Path | None = None,
 ) -> list[File]:
-    """Return Chainlit file elements for existing files under allowed routes.
+    """Return Chainlit file elements for existing files under generated outputs.
 
     Args:
         raw_paths: Candidate generated file paths.
@@ -528,11 +527,10 @@ def generated_file_elements_from_paths(
     Returns:
         Downloadable Chainlit file elements.
     """
-    root = (project_root or Path.cwd()).resolve()
     elements: list[File] = []
     seen: set[Path] = set()
     for raw_path in raw_paths:
-        path = _resolve_generated_file_path(raw_path, project_root=root)
+        path = resolve_generated_output(str(raw_path), project_root=project_root)
         if path is None or path in seen:
             continue
         seen.add(path)
@@ -549,67 +547,6 @@ def generated_file_elements_from_paths(
         if len(elements) >= MAX_GENERATED_FILE_ATTACHMENTS:
             break
     return elements
-
-
-def _resolve_generated_file_path(raw_path: str | Path, *, project_root: Path) -> Path | None:
-    """Resolve one generated file path if it points to a safe existing file."""
-    path_text = _clean_generated_file_path(raw_path)
-    if not path_text:
-        return None
-
-    absolute_candidate = Path(path_text)
-    if absolute_candidate.is_absolute():
-        resolved_absolute = _resolve_existing_project_file(
-            absolute_candidate,
-            project_root=project_root,
-        )
-        if resolved_absolute is not None:
-            return resolved_absolute
-
-    if path_text == "/workspace":
-        return None
-    if path_text.startswith("/workspace/"):
-        candidate = project_root / path_text.removeprefix("/workspace/")
-    elif path_text == GENERATED_OUTPUTS_DIRECTORY.as_posix():
-        return None
-    elif path_text.startswith(f"{GENERATED_OUTPUTS_DIRECTORY.as_posix()}/"):
-        candidate = project_root / path_text
-    else:
-        candidate = Path(path_text)
-        if not candidate.is_absolute():
-            candidate = project_root / candidate
-
-    return _resolve_existing_project_file(candidate, project_root=project_root)
-
-
-def _resolve_existing_project_file(candidate: Path, *, project_root: Path) -> Path | None:
-    """Resolve one candidate path if it is an existing file under project_root."""
-    try:
-        resolved = candidate.resolve()
-    except OSError:
-        return None
-
-    if not _is_relative_to(resolved, project_root):
-        return None
-    if not resolved.is_file():
-        return None
-    return resolved
-
-
-def _clean_generated_file_path(raw_path: str | Path) -> str:
-    """Normalize one generated file path token from tool args or Markdown text."""
-    return str(raw_path).strip().strip("`'\"<>[]()").rstrip(
-        GENERATED_FILE_TRAILING_PUNCTUATION
-    )
-
-
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    """Return whether path is inside parent."""
-    try:
-        path.relative_to(parent)
-    except ValueError:
-        return False
-    return True
 
 
 def _current_chainlit_thread_id() -> str:
