@@ -63,6 +63,8 @@ BACKGROUND_TASK_TOOL_NAMES = frozenset(
         "cancel_background_task",
     }
 )
+# Bound per-subscriber buffers so a stalled consumer cannot grow memory without limit.
+SUBSCRIBER_QUEUE_MAXSIZE = 1000
 _LANGGRAPH_CHECKPOINTER_KEY = "__pregel_checkpointer"
 _LANGGRAPH_RUNTIME_KEY = "__pregel_runtime"
 _T = TypeVar("_T")
@@ -122,6 +124,47 @@ def current_background_invocation_path() -> tuple[str, ...]:
 def current_background_session_generation() -> BackgroundSessionGeneration | None:
     """Return the lifecycle capability attached to the current graph run."""
     return _CURRENT_BACKGROUND_SESSION_GENERATION.get()
+
+
+def _put_evicting_oldest(queue: asyncio.Queue[_T], item: _T) -> None:
+    """Enqueue a must-deliver item, discarding the oldest entry when full."""
+    while queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    queue.put_nowait(item)
+
+
+def _put_activity_evicting_live(
+    queue: asyncio.Queue[BackgroundTaskActivity],
+    item: BackgroundTaskActivity,
+) -> None:
+    """Enqueue a terminal activity, preferring to discard best-effort live events.
+
+    Terminal snapshots close the rendered state of a task in the interfaces, so a
+    full queue drops the oldest live event instead. Only when every queued entry
+    is terminal does the oldest of those give way.
+    """
+    while queue.full():
+        retained: list[BackgroundTaskActivity] = []
+        dropped = False
+        while True:
+            try:
+                queued = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not dropped and queued.snapshot is None:
+                dropped = True
+                continue
+            retained.append(queued)
+        if not dropped and retained:
+            retained.pop(0)
+        for queued in retained:
+            queue.put_nowait(queued)
+        if not retained and not dropped:
+            break
+    queue.put_nowait(item)
 
 
 async def await_preserving_cancellation(task: asyncio.Task[_T]) -> _T:
@@ -642,6 +685,8 @@ class _BackgroundTaskRecord:
     cleanup_task: asyncio.Task[None] | None = None
     cancel_task: asyncio.Task[BackgroundTaskSnapshot] | None = None
     cancelling: bool = False
+    # Number of callers blocked on this record; pins it against eviction.
+    waiters: int = 0
 
     def snapshot(self) -> BackgroundTaskSnapshot:
         return BackgroundTaskSnapshot(
@@ -1359,11 +1404,11 @@ class BackgroundTaskManager:
                     "Background running limit reached for this process "
                     f"({self.config.max_running_total})."
                 )
-            if len(session_ids) + batch_size > self.config.max_tasks_per_session:
-                raise RuntimeError(
-                    "Background retained task limit reached for this session "
-                    f"({self.config.max_tasks_per_session})."
-                )
+            # Validate the requested parent before eviction, and spare it: the new
+            # children are not retained yet, so nothing else would stop eviction
+            # from removing the very parent this spawn needs. Its own ancestors are
+            # already spared as parents of a retained record.
+            protected: set[str] | None = None
             if parent_task_id is not None:
                 parent = self._records.get(parent_task_id)
                 if parent is None or parent.session_id != normalized_session:
@@ -1372,6 +1417,23 @@ class BackgroundTaskManager:
                     )
                 if parent.cancelling:
                     raise RuntimeError("Background parent task is cancelling.")
+                protected = {parent.task_id}
+            overflow = (
+                len(session_ids) + batch_size - self.config.max_tasks_per_session
+            )
+            if overflow > 0:
+                evictable = self._evictable_record_ids(
+                    normalized_session,
+                    overflow,
+                    protected=protected,
+                )
+                if len(evictable) < overflow:
+                    raise RuntimeError(
+                        "Background retained task limit reached for this session "
+                        f"({self.config.max_tasks_per_session})."
+                    )
+                self._forget_records(normalized_session, evictable)
+                session_ids = self._session_task_ids.get(normalized_session, [])
 
             retained_ids = self._session_task_ids.setdefault(normalized_session, [])
             records: list[_BackgroundTaskRecord] = []
@@ -1407,6 +1469,72 @@ class BackgroundTaskManager:
                     context=contextvars.Context(),
                 )
             return [record.snapshot() for record in records]
+
+    def _evictable_record_ids(
+        self,
+        session_id: str,
+        count: int,
+        *,
+        protected: set[str] | None = None,
+    ) -> set[str]:
+        """Select up to ``count`` of the oldest settled records in a session.
+
+        Only terminal records that no waiter is blocked on, whose cleanup has
+        completed, and that no retained record names as its parent are eligible,
+        so ancestry, pending cleanup and in-flight waits stay intact. ``protected``
+        additionally spares records the caller still needs, such as the parent a
+        pending spawn names, which nothing retained points at yet. This only
+        selects; ``_forget_records`` performs the removal once the caller knows
+        the batch is admissible. Callers must hold ``self._lock``.
+        """
+        session_ids = self._session_task_ids.get(session_id)
+        if not session_ids:
+            return set()
+        spared = protected or set()
+        evicted: set[str] = set()
+        while len(evicted) < count:
+            parent_ids = {
+                self._records[task_id].parent_task_id
+                for task_id in session_ids
+                if task_id not in evicted
+            }
+            candidate = next(
+                (
+                    task_id
+                    for task_id in session_ids
+                    if task_id not in evicted
+                    and task_id not in spared
+                    and task_id not in parent_ids
+                    and self._is_evictable(self._records[task_id])
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            evicted.add(candidate)
+        return evicted
+
+    def _forget_records(self, session_id: str, task_ids: set[str]) -> None:
+        """Drop selected records from a session's retention. Callers hold the lock."""
+        if not task_ids:
+            return
+        session_ids = self._session_task_ids.get(session_id)
+        if session_ids is not None:
+            session_ids[:] = [
+                task_id for task_id in session_ids if task_id not in task_ids
+            ]
+        for task_id in task_ids:
+            self._records.pop(task_id, None)
+
+    @staticmethod
+    def _is_evictable(record: _BackgroundTaskRecord) -> bool:
+        return (
+            record.status in TERMINAL_BACKGROUND_TASK_STATUSES
+            and record.waiters == 0
+            and record.cleanup is None
+            and record.cleanup_task is None
+            and (record.cancel_task is None or record.cancel_task.done())
+        )
 
     async def _execute(
         self,
@@ -1530,7 +1658,7 @@ class BackgroundTaskManager:
                 self._activity_subscribers.get(record.session_id, ())
             )
         for completion_queue in subscribers:
-            completion_queue.put_nowait(snapshot)
+            _put_evicting_oldest(completion_queue, snapshot)
         terminal_activity = BackgroundTaskActivity(
             task_id=record.task_id,
             session_id=record.session_id,
@@ -1539,7 +1667,7 @@ class BackgroundTaskManager:
             snapshot=snapshot,
         )
         for activity_queue in activity_subscribers:
-            activity_queue.put_nowait(terminal_activity)
+            _put_activity_evicting_live(activity_queue, terminal_activity)
 
     async def publish_activity(
         self,
@@ -1560,7 +1688,9 @@ class BackgroundTaskManager:
                 event=event,
             )
         for queue in subscribers:
-            queue.put_nowait(activity)
+            # Live events are best effort; drop new ones while a consumer lags.
+            if not queue.full():
+                queue.put_nowait(activity)
 
     def _is_visible(
         self,
@@ -1640,15 +1770,25 @@ class BackgroundTaskManager:
             )
             completion = record.completion
             snapshot = record.snapshot()
-        if (
-            wait_seconds
-            and snapshot.status not in TERMINAL_BACKGROUND_TASK_STATUSES
-            and completion is not None
-        ):
+            waiting = (
+                bool(wait_seconds)
+                and snapshot.status not in TERMINAL_BACKGROUND_TASK_STATUSES
+                and completion is not None
+            )
+            if waiting:
+                record.waiters += 1
+        if waiting:
+            assert completion is not None
             try:
                 await asyncio.wait_for(completion.wait(), timeout=wait_seconds)
             except TimeoutError:
                 pass
+            finally:
+                # Release the pin even when this caller is cancelled. A bare
+                # decrement needs no lock: without a suspension point the loop
+                # cannot interleave a reader, and awaiting the lock here could
+                # itself be cancelled and leak the pin.
+                record.waiters -= 1
             async with self._lock:
                 self._validate_session_generation(
                     session_id,
@@ -1910,7 +2050,9 @@ class BackgroundTaskManager:
 
     def subscribe(self, session_id: str) -> asyncio.Queue[BackgroundTaskSnapshot]:
         """Subscribe to terminal task snapshots for one conversation."""
-        queue: asyncio.Queue[BackgroundTaskSnapshot] = asyncio.Queue()
+        queue: asyncio.Queue[BackgroundTaskSnapshot] = asyncio.Queue(
+            maxsize=SUBSCRIBER_QUEUE_MAXSIZE
+        )
         self._subscribers.setdefault(session_id, set()).add(queue)
         return queue
 
@@ -1932,7 +2074,9 @@ class BackgroundTaskManager:
         session_id: str,
     ) -> asyncio.Queue[BackgroundTaskActivity]:
         """Subscribe to ordered live and terminal task activity."""
-        queue: asyncio.Queue[BackgroundTaskActivity] = asyncio.Queue()
+        queue: asyncio.Queue[BackgroundTaskActivity] = asyncio.Queue(
+            maxsize=SUBSCRIBER_QUEUE_MAXSIZE
+        )
         self._activity_subscribers.setdefault(session_id, set()).add(queue)
         return queue
 
@@ -1987,9 +2131,14 @@ class BackgroundTaskManager:
         session_ids: builtins.list[str],
     ) -> None:
         """Close the manager's sessions and release completion subscribers."""
-        await asyncio.gather(
-            *(self.close_session(session_id) for session_id in session_ids),
-            return_exceptions=False,
-        )
-        self._subscribers.clear()
-        self._activity_subscribers.clear()
+        try:
+            results = await asyncio.gather(
+                *(self.close_session(session_id) for session_id in session_ids),
+                return_exceptions=True,
+            )
+        finally:
+            self._subscribers.clear()
+            self._activity_subscribers.clear()
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
