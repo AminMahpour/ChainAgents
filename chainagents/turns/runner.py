@@ -145,6 +145,33 @@ class TurnRunner:
         ``CancelledError`` is re-raised after ``renderer.on_cancelled()``.
         """
         try:
+            extensions = getattr(self.runtime.config, "extensions", None)
+            serialize_turns = any(
+                getattr(getattr(extensions, name, None), "enabled", False)
+                for name in ("messaging", "user_input")
+            )
+            if serialize_turns:
+                turn_lock = getattr(self.runtime, "turn_lock", None)
+                if callable(turn_lock):
+                    controller = (
+                        getattr(self.runtime, "user_input", None)
+                        if getattr(getattr(extensions, "user_input", None), "enabled", False)
+                        else None
+                    )
+                    if controller is not None and not controller.turn_waiting(request.thread_id):
+                        return await self._paused_result(request, renderer)
+                    try:
+                        async with turn_lock(request.thread_id):
+                            if controller is not None and not controller.turn_started(request.thread_id):
+                                return await self._paused_result(request, renderer)
+                            try:
+                                return await self._run(request, renderer)
+                            finally:
+                                if controller is not None:
+                                    controller.turn_finished(request.thread_id)
+                    finally:
+                        if controller is not None:
+                            controller.turn_wait_finished(request.thread_id)
             return await self._run(request, renderer)
         except asyncio.CancelledError:
             try:
@@ -152,6 +179,20 @@ class TurnRunner:
             except Exception:
                 logger.exception("Turn renderer failed while handling cancellation.")
             raise
+
+    async def _paused_result(
+        self, request: TurnRequest, renderer: TurnRenderer
+    ) -> TurnResult:
+        """Report a stopped conversation before invoking the agent."""
+        error = TurnCommandError(
+            "Conversation is paused. Resume before starting a turn.",
+            command_name="/stop",
+            status=409,
+        )
+        await renderer.on_command_error(error, error.status)
+        return TurnResult(
+            status="command_error", prompt=request.prompt, command_error=error
+        )
 
     async def _run(self, request: TurnRequest, renderer: TurnRenderer) -> TurnResult:
         prompt = request.prompt

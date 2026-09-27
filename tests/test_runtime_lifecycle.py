@@ -1,6 +1,7 @@
 """Exercise runtime resource ownership without live transports or models."""
 
 import asyncio
+import gc
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -77,6 +78,20 @@ def test_stateful_context_closes_on_its_owner_task(runtime, monkeypatch):
         await runtime.close_mcp_session("session")
         assert len(events) == 2
         assert events[0][1] is events[1][1]
+
+    asyncio.run(exercise())
+
+
+def test_conversation_close_keeps_lock_held_by_external_turn(runtime):
+    async def exercise():
+        lock = runtime.turn_lock("thread")
+        async with lock:
+            await runtime.close_conversation(thread_id="thread")
+            assert runtime.turn_lock("thread") is lock
+        del lock
+        gc.collect()
+        assert "thread" not in runtime._turn_locks
+        await runtime.close()
 
     asyncio.run(exercise())
 

@@ -18,6 +18,7 @@ from chainagents.runtime.types import (
     AsyncSubagentConfig,
     BackgroundSubagentConfig,
     ExtensionsConfig,
+    MessagingConfig,
     SubagentConfig,
 )
 from langgraph.checkpoint.memory import MemorySaver
@@ -205,3 +206,56 @@ def test_live_assembly_ignores_background_flag_when_background_is_disabled(
         _summarize(kwargs) for kwargs in live_calls
     ]
     assert "runnable" not in live_calls[-1]["subagents"][0]
+
+
+def test_only_opted_in_subagents_receive_messaging_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _assembly_config(
+        tmp_path,
+        agent_state="stateless",
+        extensions=ExtensionsConfig(
+            config_path=None,
+            messaging=MessagingConfig(enabled=True),
+            subagents=(
+                SubagentConfig("receiver", "Receives", "Receive", messaging=True),
+                SubagentConfig("plain", "Plain", "Plain"),
+            ),
+        ),
+    )
+    static_calls, live_calls = _build_both(tmp_path, monkeypatch, config)
+    for calls in (static_calls, live_calls):
+        assert len(calls) == 3
+        assert "send_agent_message" in _summarize(calls[0])["tools"]
+        assert "AgentMessageMiddleware" in _summarize(calls[0])["middleware"]
+        assert "send_agent_message" not in _summarize(calls[1])["tools"]
+        assert "AgentMessageMiddleware" not in _summarize(calls[1])["middleware"]
+        main = calls[-1]
+        assert "send_agent_message" in _summarize(main)["tools"]
+        assert "runnable" in main["subagents"][0]
+        assert "runnable" in main["subagents"][1]
+
+
+def test_nested_unopted_child_does_not_inherit_parent_messaging_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _assembly_config(
+        tmp_path,
+        agent_state="stateless",
+        extensions=ExtensionsConfig(
+            config_path=None,
+            messaging=MessagingConfig(enabled=True),
+            subagents=(
+                SubagentConfig(
+                    "parent", "Parent", "Coordinate", messaging=True,
+                    subagents=(SubagentConfig("child", "Child", "Work"),),
+                ),
+            ),
+        ),
+    )
+    static_calls, live_calls = _build_both(tmp_path, monkeypatch, config)
+    for calls in (static_calls, live_calls):
+        assert len(calls) == 3
+        assert "send_agent_message" not in _summarize(calls[0])["tools"]
+        assert "send_agent_message" in _summarize(calls[1])["tools"]
+        assert "send_agent_message" in _summarize(calls[2])["tools"]

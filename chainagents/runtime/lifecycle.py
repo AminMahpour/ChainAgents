@@ -6,8 +6,10 @@ import asyncio
 import json
 import logging
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from weakref import WeakValueDictionary
 
 from deepagents.backends import StoreBackend
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -30,6 +32,7 @@ import chainagents.runtime.graph as runtime_graph
 import chainagents.runtime.mcp_sessions as runtime_mcp_sessions
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
+import chainagents.runtime.messaging as runtime_messaging
 import chainagents.runtime.rag_ops as runtime_rag_ops
 import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
@@ -83,12 +86,15 @@ class AgentRuntime:
             config: Configuration object used by the operation.
             project_root: Project root used to resolve local paths.
         """
+        from chainagents.turns.controller import ConversationInputController
+
         self.config = config
         self.langsmith_tracing = runtime_tracing.build_langsmith_tracing(config.langsmith)
         self.project_root = project_root or runtime_constants.PROJECT_ROOT
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
         self._agents: dict[AgentCacheKey, object] = {}
+        self._turn_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._mcp_pool = MCPSessionPool(lambda: self.config.extensions)
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
@@ -102,6 +108,13 @@ class AgentRuntime:
             artifact_registry=self.large_tool_result_artifacts,
         )
         self._exit_stack.push_async_callback(self.background_tasks.close)
+        broker_config = config.extensions.messaging
+        if config.extensions.user_input.enabled and not broker_config.enabled:
+            broker_config = replace(broker_config, enabled=True)
+        self.message_broker = runtime_messaging.MessageBroker(broker_config)
+        self.user_input = ConversationInputController(
+            config.extensions.user_input, self.message_broker, runner_serialized=True
+        )
         self._chainlit_commands, self._chainlit_command_notes = runtime_commands.build_chainlit_command_catalog(
             config.extensions,
             project_root=self.project_root,
@@ -249,6 +262,10 @@ class AgentRuntime:
             The current.
         """
         return cls._instance
+
+    def turn_lock(self, thread_id: str) -> asyncio.Lock:
+        """Serialize main agent turns from all interfaces in one conversation."""
+        return self._turn_locks.setdefault(thread_id, asyncio.Lock())
 
     @property
     def checkpointer(self) -> AsyncPostgresSaver | MemorySaver:
@@ -490,6 +507,7 @@ class AgentRuntime:
                     ),
                     session_id=thread_id,
                     langsmith_tracing=self.langsmith_tracing,
+                    messaging_broker=self.message_broker,
                 )
                 agent = runtime_middleware.create_deep_agent_with_configured_summarization(
                     self.config,
@@ -773,6 +791,8 @@ class AgentRuntime:
         """Complete conversation teardown independently of its caller."""
         if thread_id:
             async with self.background_tasks.closing_session(thread_id):
+                await self.user_input.close_session(thread_id)
+                self.message_broker.close_session(thread_id)
                 errors: list[BaseException] = []
                 try:
                     await self.large_tool_result_artifacts.close_session(thread_id)
@@ -811,6 +831,7 @@ class AgentRuntime:
     async def close(self) -> None:
         """Close the agent runtime."""
         try:
+            await self.user_input.close_all()
             await self.background_tasks.close()
         finally:
             try:

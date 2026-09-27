@@ -444,6 +444,44 @@ def test_cancellation_notifies_renderer_reraises_and_closes_stream(
     assert runtime.agent.stream.closed
 
 
+def test_messaging_only_turns_serialize_on_the_same_thread(monkeypatch) -> None:
+    """A second model step cannot reclaim the first turn's mailbox messages."""
+
+    async def exercise() -> None:
+        lock = asyncio.Lock()
+        runtime = SimpleNamespace(
+            config=SimpleNamespace(
+                extensions=SimpleNamespace(
+                    messaging=SimpleNamespace(enabled=True),
+                    user_input=SimpleNamespace(enabled=False),
+                )
+            ),
+            turn_lock=lambda _thread_id: lock,
+        )
+        entered: list[str] = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def run(_runner, request, _renderer):
+            entered.append(request.prompt)
+            if request.prompt == "first":
+                first_started.set()
+                await release_first.wait()
+            return request.prompt
+
+        monkeypatch.setattr(TurnRunner, "_run", run)
+        first = asyncio.create_task(TurnRunner(runtime).run(_request("first"), _RecordingRenderer()))
+        await first_started.wait()
+        second = asyncio.create_task(TurnRunner(runtime).run(_request("second"), _RecordingRenderer()))
+        await asyncio.sleep(0)
+        assert entered == ["first"]
+        release_first.set()
+        assert await asyncio.gather(first, second) == ["first", "second"]
+        assert entered == ["first", "second"]
+
+    asyncio.run(exercise())
+
+
 def test_unsanitised_runner_keeps_real_error_text(tmp_path: Path) -> None:
     runtime = _make_runtime(tmp_path)
     runtime.command_error = RuntimeError("backend exploded")

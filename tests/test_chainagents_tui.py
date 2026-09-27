@@ -157,6 +157,68 @@ class _FakeRuntime:
 
 
 @pytest.mark.anyio
+async def test_tui_keeps_prompt_enabled_and_accepts_steering_during_run() -> None:
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import MessagingConfig, UserInputConfig
+    from chainagents.turns.controller import ConversationInputController
+
+    agent = _BlockingAgent()
+    runtime = _FakeRuntime(agent)
+    runtime.config.extensions = SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(runtime.config.extensions.user_input, broker)
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt", PromptTextArea)
+        event = SimpleNamespace(stop=lambda: None, text_area=prompt)
+        prompt.load_text("first")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        await agent.started.wait()
+        assert prompt.disabled is False
+        prompt.load_text("second")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert prompt.text == "second"
+        prompt.load_text("/steer revised direction")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert [message.body for message in broker.pending(app.thread_id, "main")] == ["revised direction"]
+        await app.action_cancel_or_quit()
+        assert runtime.user_input.status(app.thread_id)["paused"] is True
+        await runtime.user_input.wait_idle(app.thread_id)
+        await pilot.pause()
+
+
+@pytest.mark.anyio
+async def test_tui_queue_command_strips_prefix_while_paused() -> None:
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import MessagingConfig, UserInputConfig
+    from chainagents.turns.controller import ConversationInputController
+
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions = SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, MessageBroker(MessagingConfig(enabled=True))
+    )
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt", PromptTextArea)
+        event = SimpleNamespace(stop=lambda: None, text_area=prompt)
+        prompt.load_text("/stop")
+        await app.on_prompt_submitted(event)
+        prompt.load_text("/queue inspect the tests")
+        await app.on_prompt_submitted(event)
+        queued_id = runtime.user_input.status(app.thread_id)["queued_job_ids"][0]
+        assert runtime.user_input.get(app.thread_id, queued_id).payload == "inspect the tests"
+        await pilot.pause()
+
+
+@pytest.mark.anyio
 async def test_run_tui_leaves_app_stderr_visible(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

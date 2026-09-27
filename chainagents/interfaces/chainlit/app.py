@@ -88,6 +88,11 @@ SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY = "local_background_task_notifier"
 SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
+SESSION_INPUT_DRAFTS_KEY = "pending_input_drafts"
+STEER_INPUT_ACTION = "steer_busy_input"
+QUEUE_INPUT_ACTION = "queue_busy_input"
+STOP_INPUT_ACTION = "stop_active_input"
+RESUME_INPUT_ACTION = "resume_queued_input"
 SESSION_ACTIVE_TURN_KEY = "active_agent_turn"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
 REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
@@ -725,9 +730,185 @@ async def _send_turn_busy() -> None:
     ).send()
 
 
+def _submit_nonblocking_message(
+    runtime: AgentRuntime,
+    thread_id: str,
+    message: cl.Message,
+    *,
+    settings: AppSettings | None = None,
+) -> str:
+    """Schedule a Chainlit turn while its socket callback returns promptly."""
+    settings_snapshot = settings or coerce_settings(
+        cl.user_session.get(SESSION_SETTINGS_KEY),
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+        show_reasoning_stream_default=(
+            runtime.config.extensions.chainlit_reasoning_steps_enabled
+        ),
+        show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
+    )
+
+    async def run(item: tuple[cl.Message, bool]) -> None:
+        current, show_user = item
+        if show_user:
+            current = await cl.Message(content=current.content, author="User").send()
+        async with cl.Step(name="on_message", type="run", parent_id=current.id) as step:
+            step.input = current.content
+            await _handle_message(current, settings_override=settings_snapshot)
+
+    job = runtime.user_input.submit(
+        thread_id,
+        (message, False),
+        run,
+        followup_factory=lambda text: (cl.Message(content=text), True),
+        input_id=str(message.id) if getattr(message, "id", None) else None,
+    )
+    return job.id
+
+
+def _current_input_thread_id(runtime: AgentRuntime) -> str:
+    """Resolve the configured LangGraph thread from this Chainlit connection."""
+    settings = coerce_settings(
+        cl.user_session.get(SESSION_SETTINGS_KEY),
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+    )
+    return settings.thread_id
+
+
+async def _offer_busy_input(runtime: AgentRuntime, thread_id: str, message: cl.Message) -> None:
+    draft_id = secrets.token_hex(12)
+    drafts = getattr(cl.context.session, SESSION_INPUT_DRAFTS_KEY, None)
+    if drafts is None:
+        drafts = {}
+        setattr(cl.context.session, SESSION_INPUT_DRAFTS_KEY, drafts)
+    if len(drafts) >= runtime.config.extensions.user_input.max_queued_turns:
+        await cl.Message(
+            content="Too many pending input choices. Choose one before sending another prompt.",
+            author="System",
+        ).send()
+        return
+    drafts[draft_id] = (thread_id, message)
+    await cl.Message(
+        content="The agent is working. Choose how to send this input.",
+        author="System",
+        actions=[
+            cl.Action(name=STEER_INPUT_ACTION, payload={"draft_id": draft_id}, label="Steer active turn"),
+            cl.Action(name=QUEUE_INPUT_ACTION, payload={"draft_id": draft_id}, label="Queue next turn"),
+        ],
+    ).send()
+
+
+@cl.action_callback(STEER_INPUT_ACTION)
+@cl.action_callback(QUEUE_INPUT_ACTION)
+async def _submit_busy_input(action: cl.Action) -> None:
+    drafts = getattr(cl.context.session, SESSION_INPUT_DRAFTS_KEY, {})
+    draft = drafts.pop(str(action.payload.get("draft_id", "")), None)
+    if draft is None:
+        await cl.Message(content="This input choice expired. Please resend the prompt.", author="System").send()
+        return
+    thread_id, message = draft
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+    if thread_id != _current_input_thread_id(runtime):
+        await cl.Message(content="This input choice belongs to another conversation.", author="System").send()
+        return
+    try:
+        if action.name == STEER_INPUT_ACTION:
+            if message.elements:
+                raise ValueError("Steering accepts text only; queue this turn to include attachments.")
+            runtime.user_input.steer(thread_id, message.content)
+            response = "Steering note sent to the active turn."
+        else:
+            job_id = _submit_nonblocking_message(runtime, thread_id, message)
+            response = f"Queued turn `{job_id}`."
+        await cl.Message(content=response, author="System").send()
+    except ValueError as exc:
+        await cl.Message(content=str(exc), author="System").send()
+
+
+@cl.action_callback(STOP_INPUT_ACTION)
+async def _stop_nonblocking_input(action: cl.Action) -> None:
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+    thread_id = str(action.payload.get("thread_id", "")).strip()
+    if not thread_id or thread_id != _current_input_thread_id(runtime):
+        await cl.Message(content="This Stop action belongs to another conversation.", author="System").send()
+        return
+    runtime.user_input.stop(thread_id)
+    await cl.Message(
+        content="Active turn stopped. Queued turns are paused.",
+        author="System",
+        actions=[cl.Action(
+            name=RESUME_INPUT_ACTION,
+            payload={"thread_id": thread_id},
+            label="Resume queue",
+        )],
+    ).send()
+
+
+@cl.action_callback(RESUME_INPUT_ACTION)
+async def _resume_nonblocking_input(action: cl.Action) -> None:
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+    thread_id = str(action.payload.get("thread_id", "")).strip()
+    if not thread_id or thread_id != _current_input_thread_id(runtime):
+        await cl.Message(content="This Resume action belongs to another conversation.", author="System").send()
+        return
+    runtime.user_input.resume(thread_id)
+    await cl.Message(content="Queued turns resumed.", author="System").send()
+
+
 @cl.action_callback(RUN_RESPONSE_ACTION)
 async def run_response_action(action: cl.Action) -> None:
     """Run a configured response action without creating a user message."""
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+    if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
+        resolved = resolve_response_action(
+            action, runtime.config.extensions.chainlit_response_actions
+        )
+        if resolved is None:
+            await cl.Message(content="This response action is no longer available.", author="System").send()
+            return
+        settings = coerce_settings(
+            cl.user_session.get(SESSION_SETTINGS_KEY),
+            default_model_name=runtime.config.model_name,
+            available_models=runtime.config.model_choices,
+        )
+
+        async def run(item: tuple[str, bool]) -> None:
+            prompt, is_followup = item
+            if is_followup:
+                await cl.Message(content=prompt, author="User").send()
+            await _run_agent_turn(
+                runtime=runtime,
+                settings=settings,
+                agent_prompt=prompt,
+                effective_reasoning_level=settings.reasoning_level,
+                effective_model_name=settings.model_name,
+                reasoning_level_is_explicit=settings_reasoning_level_is_explicit(
+                    runtime.config, settings, settings.model_name
+                ),
+                mcp_session_id=current_mcp_session_id(),
+                resolve_commands=False,
+                display_prompt=prompt if is_followup else "",
+                export_label="" if is_followup else resolved.label,
+            )
+
+        try:
+            job = runtime.user_input.submit(
+                settings.thread_id, (resolved.prompt, False), run,
+                followup_factory=lambda text: (text, True),
+            )
+            await cl.Message(content=f"Response action turn `{job.id}`: {job.status}.", author="System").send()
+        except ValueError as exc:
+            await cl.Message(content=str(exc), author="System").send()
+        return
     if not _claim_active_turn():
         await _send_turn_busy()
         return
@@ -791,6 +972,12 @@ async def run_response_action(action: cl.Action) -> None:
 @cl.on_stop
 async def on_stop() -> None:
     """Stop the active agent turn, including an action callback turn."""
+    runtime = AgentRuntime.current()
+    if runtime is not None and getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
+        thread_id = _current_input_thread_id(runtime)
+        if thread_id:
+            runtime.user_input.stop(thread_id)
+        return
     active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
     if isinstance(active, asyncio.Task) and active is not asyncio.current_task():
         active.cancel()
@@ -882,6 +1069,37 @@ _chainlit_message_callback = chainlit_config.code.on_message
 
 async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
     """Reject a busy message before Chainlit creates its on_message run step."""
+    runtime = await get_runtime_or_notify()
+    if runtime is None:
+        return
+    if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
+        settings = coerce_settings(
+            cl.user_session.get(SESSION_SETTINGS_KEY),
+            default_model_name=runtime.config.model_name,
+            available_models=runtime.config.model_choices,
+            show_reasoning_stream_default=(
+                runtime.config.extensions.chainlit_reasoning_steps_enabled
+            ),
+            show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
+        )
+        thread_id = settings.thread_id
+        status = runtime.user_input.status(thread_id)
+        if status["active_job_id"] is not None:
+            await _offer_busy_input(runtime, thread_id, message)
+        else:
+            try:
+                job_id = _submit_nonblocking_message(runtime, thread_id, message, settings=settings)
+                await cl.Message(
+                    content=f"Working on turn `{job_id}`.", author="System",
+                    actions=[cl.Action(
+                        name=STOP_INPUT_ACTION,
+                        payload={"thread_id": thread_id},
+                        label="Stop",
+                    )],
+                ).send()
+            except ValueError as exc:
+                await cl.Message(content=str(exc), author="System").send()
+        return
     if not _claim_active_turn():
         await _send_turn_busy()
         return
@@ -895,12 +1113,14 @@ async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
 chainlit_config.code.on_message = _guarded_chainlit_message_callback
 
 
-async def _handle_message(message: cl.Message) -> None:
+async def _handle_message(
+    message: cl.Message, *, settings_override: AppSettings | None = None
+) -> None:
     """Prepare a normal user request for the shared agent turn."""
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
-    settings = coerce_settings(
+    settings = settings_override or coerce_settings(
         cl.user_session.get(SESSION_SETTINGS_KEY),
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,
@@ -1149,6 +1369,8 @@ async def save_reflection_lesson(
 @cl.on_chat_end
 async def on_chat_end() -> None:
     """Clean up runtime resources when the Chainlit chat ends."""
+    with suppress(Exception):
+        setattr(cl.context.session, SESSION_INPUT_DRAFTS_KEY, {})
     active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
     if isinstance(active, asyncio.Task) and active is not asyncio.current_task():
         active.cancel()

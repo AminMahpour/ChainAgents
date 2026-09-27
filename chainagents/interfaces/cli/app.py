@@ -371,6 +371,62 @@ async def interactive_repl(
                 return 130
             if not prompt.strip():
                 continue
+            if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
+                stripped = prompt.strip()
+                if stripped == "/stop":
+                    runtime.user_input.stop(thread_id)
+                    print("Active turn stopped; queued turns paused. Use /resume.", file=stderr)
+                    continue
+                if stripped == "/resume":
+                    runtime.user_input.resume(thread_id)
+                    print("Queued turns resumed.", file=stderr)
+                    continue
+                active = runtime.user_input.status(thread_id)["active_job_id"] is not None
+                if active and stripped.startswith("/steer "):
+                    try:
+                        runtime.user_input.steer(thread_id, stripped.removeprefix("/steer "))
+                        print("Steering note sent.", file=stderr)
+                    except ValueError as exc:
+                        print(str(exc), file=stderr)
+                    continue
+                if active and not stripped.startswith("/queue "):
+                    choice = await _read_terminal_line(
+                        stdin=stdin,
+                        stdout=stdout,
+                        prompt="Agent working: [s]teer or [q]ueue? ",
+                    )
+                    if choice.strip().lower() not in {"s", "q"}:
+                        print("Input cancelled.", file=stderr)
+                        continue
+                    if choice.strip().lower() == "s":
+                        try:
+                            runtime.user_input.steer(thread_id, prompt)
+                            print("Steering note sent.", file=stderr)
+                        except ValueError as exc:
+                            print(str(exc), file=stderr)
+                        continue
+                submitted = stripped.removeprefix("/queue ") if stripped.startswith("/queue ") else prompt
+
+                async def run_queued(item: tuple[str, bool]) -> None:
+                    text, include_photos = item
+                    turn_args = (
+                        args if include_photos
+                        else argparse.Namespace(**{**vars(args), "photo": []})
+                    )
+                    await run_agent_prompt(
+                        runtime, turn_args, prompt=text,
+                        stdout=stdout, stderr=stderr,
+                    )
+
+                try:
+                    job = runtime.user_input.submit(
+                        thread_id, (submitted, True), run_queued,
+                        followup_factory=lambda text: (text, False),
+                    )
+                    print(f"Turn {job.id}: {job.status}.", file=stderr)
+                except ValueError as exc:
+                    print(str(exc), file=stderr)
+                continue
             code = await run_agent_prompt(
                 runtime,
                 args,
@@ -381,6 +437,8 @@ async def interactive_repl(
             if code not in (0,):
                 return code
     finally:
+        if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
+            await runtime.user_input.close_session(thread_id)
         runtime.background_tasks.unsubscribe(thread_id, queue)
         notice_task.cancel()
         with suppress(asyncio.CancelledError):

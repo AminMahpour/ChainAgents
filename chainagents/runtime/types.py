@@ -54,6 +54,7 @@ class SubagentConfig:
     mcp_servers: tuple[str, ...] = ()
     model: str | None = None
     background: bool = False
+    messaging: bool = False
     nested_subagent_names: tuple[str, ...] = ()
     subagents: tuple[SubagentConfig, ...] = ()
 
@@ -110,6 +111,26 @@ class BackgroundSubagentConfig:
     max_running_per_session: int = 4
     max_running_total: int = 16
     max_tasks_per_session: int = 100
+
+
+@dataclass(frozen=True)
+class MessagingConfig:
+    """Bound process-local messages between opted-in agents."""
+
+    enabled: bool = False
+    max_message_chars: int = 8000
+    max_pending_per_recipient: int = 100
+    max_messages_per_session: int = 1000
+    max_deliveries_per_step: int = 10
+
+
+@dataclass(frozen=True)
+class UserInputConfig:
+    """Configure prompts accepted while a main-agent run is active."""
+
+    enabled: bool = False
+    max_queued_turns: int = 20
+    max_completed_turns: int = 100
 
 
 @dataclass(frozen=True)
@@ -326,6 +347,8 @@ class ExtensionsConfig:
     subagents: tuple[SubagentConfig, ...] = ()
     async_subagents: tuple[AsyncSubagentConfig, ...] = ()
     background_subagents: BackgroundSubagentConfig = BackgroundSubagentConfig()
+    messaging: MessagingConfig = MessagingConfig()
+    user_input: UserInputConfig = UserInputConfig()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
     chainlit_response_actions: tuple[ChainlitResponseActionConfig, ...] = ()
@@ -356,6 +379,8 @@ class ExtensionsConfig:
             or self.subagents
             or self.async_subagents
             or self.background_subagents.enabled
+            or self.messaging.enabled
+            or self.user_input.enabled
             or self.chainlit_commands
             or self.chainlit_starters
             or self.chainlit_response_actions

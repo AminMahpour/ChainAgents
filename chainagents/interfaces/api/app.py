@@ -203,6 +203,26 @@ class AgentRunRequest(BaseModel):
         return self
 
 
+class AgentInputRequest(AgentRunRequest):
+    """A turn to start or queue, or text that steers an active turn."""
+
+    mode: Literal["turn", "steer", "queue"] = "turn"
+    input_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
+    attachments: list[AgentImageContentPart] = Field(default_factory=list, max_length=MAX_UPLOAD_FILES)
+
+    @model_validator(mode="after")
+    def validate_total_images(self) -> AgentInputRequest:
+        history_images = sum(
+            isinstance(part, AgentImageContentPart)
+            for message in self.history
+            if isinstance(message.content, list)
+            for part in message.content
+        )
+        if history_images + len(self.attachments) > MAX_UPLOAD_FILES:
+            raise ValueError(f"history and attachments may contain at most {MAX_UPLOAD_FILES} images")
+        return self
+
+
 class AgentRunResponse(BaseModel):
     """HTTP response body for a completed agent run."""
 
@@ -680,6 +700,182 @@ def create_app(
             reasoning=context.reasoning_level,
             warnings=renderer.warnings,
         )
+
+    @app.post("/api/agent/input", status_code=202)
+    async def submit_agent_input(payload: AgentInputRequest, request: Request) -> dict[str, Any]:
+        active_runtime = _runtime_from_request(request)
+        if not active_runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        controller = active_runtime.user_input
+        session_id = _required_text(payload.thread_id, "thread_id")
+        def existing_turn() -> dict[str, Any] | None:
+            if not payload.input_id:
+                return None
+            existing = controller.find_input_id(session_id, payload.input_id)
+            if existing is None:
+                return None
+            return {"turn_id": existing.id, "thread_id": session_id, "status": existing.status}
+
+        def ensure_idle() -> None:
+            if payload.mode != "turn":
+                return
+            status = controller.status(session_id)
+            if (
+                status["active_job_id"] is not None
+                or status["external_active"]
+                or status["paused"]
+                or status["queued_job_ids"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Choose steer or queue while a conversation is busy or paused.",
+                )
+
+        if payload.mode == "steer":
+            if payload.history or payload.attachments:
+                raise HTTPException(status_code=422, detail="Steering accepts text only.")
+            try:
+                message_id = controller.steer(
+                    session_id, payload.prompt, input_id=payload.input_id
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"status": "sent", "message_id": message_id, "thread_id": session_id}
+        if existing := existing_turn():
+            return existing
+        ensure_idle()
+        try:
+            context = await _prepare_run_context(
+                active_runtime, payload,
+                has_current_images=bool(payload.attachments),
+                clone_branch=False,
+            )
+        except Exception:
+            if existing := existing_turn():
+                return existing
+            raise
+        if existing := existing_turn():
+            return existing
+        if context.command_error:
+            raise HTTPException(status_code=context.command_error_status, detail=context.command_error)
+        if payload.attachments:
+            context = replace(
+                context,
+                image_parts=(*context.image_parts, *(part.model_dump() for part in payload.attachments)),
+            )
+
+        async def run_queued(current: AgentRunContext) -> dict[str, Any]:
+            if current.history and active_runtime.config.agent_state == "stateful":
+                try:
+                    checkpoint = await active_runtime.checkpointer.aget_tuple(
+                        {"configurable": {"thread_id": current.thread_id}}
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(_safe_backend_error(exc)) from exc
+                if checkpoint is not None:
+                    raise ValueError("History cannot be replayed into an existing stateful thread.")
+            current = await _clone_branch_rag_before_commands(active_runtime, current)
+            if current.command_error:
+                raise ValueError(current.command_error)
+            renderer = _WarningCollector()
+            result = await TurnRunner(active_runtime).run(_turn_request(current), renderer)
+            error = (
+                result.command_error.message if result.command_error is not None
+                else _safe_backend_error(result.error) if result.error is not None
+                else None
+            )
+            if result.status in {"failed", "command_error"}:
+                raise ValueError(error or "Agent operation failed. Please retry.")
+            return {
+                "status": result.status,
+                "response": result.response,
+                "warnings": renderer.warnings,
+                "error": error,
+            }
+
+        followup_base = replace(
+            context, prompt="", history=(), selected_command=None,
+            source_thread_id=None, image_parts=(), image_names=(), prompt_note="",
+        )
+        if existing := existing_turn():
+            return existing
+        ensure_idle()
+        try:
+            job = controller.submit(
+                session_id,
+                context,
+                run_queued,
+                followup_factory=lambda text: replace(followup_base, prompt=text),
+                input_id=payload.input_id,
+                require_idle=payload.mode == "turn",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"turn_id": job.id, "thread_id": session_id, "status": job.status}
+
+    @app.get("/api/agent/turns/{thread_id}")
+    async def get_conversation_turns(thread_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        return runtime.user_input.status(_required_text(thread_id, "thread_id"))
+
+    @app.get("/api/agent/turns/{thread_id}/{turn_id}")
+    async def get_conversation_turn(thread_id: str, turn_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        try:
+            job = runtime.user_input.get(_required_text(thread_id, "thread_id"), turn_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"turn_id": job.id, "status": job.status, "result": job.result, "error": job.error}
+
+    @app.get("/api/agent/turns/{thread_id}/{turn_id}/events")
+    async def stream_conversation_turn(thread_id: str, turn_id: str, request: Request) -> StreamingResponse:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        try:
+            job = runtime.user_input.get(_required_text(thread_id, "thread_id"), turn_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        async def lines() -> AsyncGenerator[str, None]:
+            previous = ""
+            while True:
+                if job.status != previous:
+                    previous = job.status
+                    yield json.dumps({"type": "status", "turn_id": turn_id, "status": previous}) + "\n"
+                    continue
+                if job.status in {"completed", "failed", "cancelled"}:
+                    yield json.dumps({"type": "result", "turn_id": turn_id, "result": job.result, "error": job.error}) + "\n"
+                    return
+                await asyncio.sleep(0.1)
+
+        return StreamingResponse(lines(), media_type=NDJSON_MEDIA_TYPE)
+
+    @app.post("/api/agent/turns/{thread_id}/stop")
+    async def stop_conversation_turns(thread_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        thread_id = _required_text(thread_id, "thread_id")
+        if not runtime.user_input.has_session(thread_id):
+            return runtime.user_input.status(thread_id)
+        runtime.user_input.stop(thread_id)
+        return runtime.user_input.status(thread_id)
+
+    @app.post("/api/agent/turns/{thread_id}/resume")
+    async def resume_conversation_turns(thread_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        thread_id = _required_text(thread_id, "thread_id")
+        runtime.user_input.resume(thread_id)
+        return runtime.user_input.status(thread_id)
 
     @app.post("/api/agent/stream")
     async def stream_agent(
@@ -1296,8 +1492,9 @@ async def _prepare_run_context(
     request: AgentRunRequest,
     *,
     has_current_images: bool = False,
+    clone_branch: bool = True,
 ) -> AgentRunContext:
-    """Validate one request and reserve branch RAG scope before the turn runs.
+    """Validate one request and optionally reserve its branch RAG scope.
 
     Native commands are resolved later by the shared ``TurnRunner``.
     """
@@ -1308,7 +1505,9 @@ async def _prepare_run_context(
         context.model_name,
         has_images=has_current_images or _history_contains_images(request.history),
     )
-    return await _clone_branch_rag_before_commands(runtime, context)
+    if clone_branch:
+        return await _clone_branch_rag_before_commands(runtime, context)
+    return context
 
 
 async def _clone_branch_rag_before_commands(

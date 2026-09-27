@@ -7,12 +7,14 @@ import base64
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 import pytest
 
 from chainagents.interfaces.api import app as chainagents_api
@@ -20,6 +22,10 @@ from chainagents.runtime import core
 from chainagents.runtime.reflection import ReflectionConfig
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
 from chainagents.rag.runtime import RagUploadResult
+from chainagents.runtime.messaging import MessageBroker
+from chainagents.runtime.types import MessagingConfig, UserInputConfig
+from chainagents.turns.controller import ConversationInputController
+from chainagents.turns.runner import TurnRequest, TurnResult, TurnRunner
 
 
 class _Token:
@@ -2190,6 +2196,550 @@ def test_reflection_confirmation_is_retryable_after_cancellation(after_write) ->
             assert item.value["content"].count(proposal["lesson"]) == 1
 
     asyncio.run(exercise())
+
+
+def test_nonblocking_input_endpoint_returns_turn_id_and_status() -> None:
+    runtime = _FakeRuntime(_FakeAgent([_raw_event(((), "messages", (_Token("ok"), {})))]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        body = {"prompt": "hello", "thread_id": "thread-1", "input_id": "request-1"}
+        first = client.post("/api/agent/input", json=body)
+        assert first.status_code == 202
+        turn_id = first.json()["turn_id"]
+        second = client.post("/api/agent/input", json=body)
+        assert second.json()["turn_id"] == turn_id
+        detail = client.get(f"/api/agent/turns/thread-1/{turn_id}")
+        assert detail.status_code == 200
+        assert detail.json()["status"] in {"running", "completed"}
+
+
+@pytest.mark.anyio
+async def test_nonblocking_input_reports_agent_failure_as_failed_job() -> None:
+    class FailingAgent(_FakeAgent):
+        def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+            async def events():
+                raise RuntimeError("secret backend detail")
+                yield  # pragma: no cover
+
+            return events()
+
+    runtime = _FakeRuntime(FailingAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        submitted = await client.post("/api/agent/input", json={
+            "prompt": "fail", "thread_id": "thread-1",
+        })
+        await runtime.user_input.wait_idle("thread-1")
+        turn_id = submitted.json()["turn_id"]
+        detail = await client.get(f"/api/agent/turns/thread-1/{turn_id}")
+        events = await client.get(f"/api/agent/turns/thread-1/{turn_id}/events")
+    assert detail.json()["status"] == "failed"
+    assert detail.json()["error"] == "Agent operation failed. Please retry."
+    assert "secret" not in detail.text
+    assert '"status": "failed"' in events.text
+
+
+@pytest.mark.anyio
+async def test_nonblocking_input_reports_command_error_as_failed_job() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.commands["lookup"] = SimpleNamespace(
+        name="lookup", description="Look something up", target="mcp_tool",
+        value="lookup", template=None, mcp_server="docs",
+    )
+    runtime.command_error = RuntimeError("secret MCP detail")
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        submitted = await client.post("/api/agent/input", json={
+            "prompt": "/lookup topic", "thread_id": "thread-1",
+        })
+        await runtime.user_input.wait_idle("thread-1")
+        detail = await client.get(
+            f"/api/agent/turns/thread-1/{submitted.json()['turn_id']}"
+        )
+    assert detail.json()["status"] == "failed"
+    assert detail.json()["error"] == "Agent operation failed. Please retry."
+    assert "secret" not in detail.text
+
+
+def test_stop_and_resume_unknown_api_threads_do_not_create_sessions() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        for index in range(10):
+            thread_id = f"unknown-{index}"
+            stopped = client.post(f"/api/agent/turns/{thread_id}/stop")
+            resumed = client.post(f"/api/agent/turns/{thread_id}/resume")
+            assert stopped.status_code == resumed.status_code == 200
+            assert stopped.json()["paused"] is False
+            assert resumed.json()["paused"] is False
+    assert runtime.user_input._sessions == {}
+
+
+@pytest.mark.anyio
+async def test_input_endpoint_rejects_turn_during_legacy_run_and_queues_next(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.config.extensions.messaging = MessagingConfig(enabled=False)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    turn_lock = asyncio.Lock()
+    runtime.turn_lock = lambda _thread_id: turn_lock
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run(_runner, request, _renderer):
+        if request.prompt == "legacy":
+            started.set()
+            await release.wait()
+        return TurnResult(status="completed", prompt=request.prompt, response="ok")
+
+    monkeypatch.setattr(TurnRunner, "_run", run)
+    request = TurnRequest(
+        prompt="legacy", thread_id="thread-1", model_name="fake-model",
+        reasoning_level="medium",
+    )
+    renderer = SimpleNamespace(on_cancelled=lambda: asyncio.sleep(0))
+    legacy = asyncio.create_task(TurnRunner(runtime).run(request, renderer))
+    await started.wait()
+    app = chainagents_api.create_app(runtime=runtime)
+    try:
+        async with app.router.lifespan_context(app), AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            turn = await client.post("/api/agent/input", json={
+                "prompt": "new", "thread_id": "thread-1", "mode": "turn",
+            })
+            queued = await client.post("/api/agent/input", json={
+                "prompt": "next", "thread_id": "thread-1", "mode": "queue",
+            })
+            steering = await client.post("/api/agent/input", json={
+                "prompt": "steer", "thread_id": "thread-1", "mode": "steer",
+            })
+    finally:
+        release.set()
+        await legacy
+        await runtime.user_input.wait_idle("thread-1")
+    assert turn.status_code == 409
+    assert queued.status_code == 202
+    assert queued.json()["status"] == "queued"
+    assert steering.status_code == 409
+
+
+@pytest.mark.anyio
+async def test_input_turn_rechecks_busy_state_after_async_preparation(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    original_prepare = chainagents_api._prepare_run_context
+    preparing = asyncio.Event()
+    release_prepare = asyncio.Event()
+    release_active = asyncio.Event()
+
+    async def delayed_prepare(*args, **kwargs):
+        preparing.set()
+        await release_prepare.wait()
+        return await original_prepare(*args, **kwargs)
+
+    async def active_run(_payload):
+        await release_active.wait()
+
+    monkeypatch.setattr(chainagents_api, "_prepare_run_context", delayed_prepare)
+    app = chainagents_api.create_app(runtime=runtime)
+    try:
+        async with app.router.lifespan_context(app), AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            pending = asyncio.create_task(client.post("/api/agent/input", json={
+                "prompt": "late", "thread_id": "thread-1", "mode": "turn",
+            }))
+            await preparing.wait()
+            runtime.user_input.submit(
+                "thread-1", "active", active_run, followup_factory=lambda text: text
+            )
+            release_prepare.set()
+            response = await pending
+            assert response.status_code == 409
+    finally:
+        release_active.set()
+        await runtime.user_input.wait_idle("thread-1")
+
+
+def test_turn_mode_rejects_paused_and_queued_conversations() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("thread-1")
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        paused = client.post("/api/agent/input", json={
+            "prompt": "first", "thread_id": "thread-1", "mode": "turn",
+        })
+        queued = client.post("/api/agent/input", json={
+            "prompt": "first", "thread_id": "thread-1", "mode": "queue",
+        })
+        behind_queue = client.post("/api/agent/input", json={
+            "prompt": "second", "thread_id": "thread-1", "mode": "turn",
+        })
+    assert paused.status_code == behind_queue.status_code == 409
+    assert queued.status_code == 202
+    assert queued.json()["status"] == "queued"
+
+
+@pytest.mark.anyio
+async def test_input_normalizes_thread_id_before_turn_and_steer(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.config.extensions.messaging = MessagingConfig(enabled=False)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker,
+        runner_serialized=True,
+    )
+    lock = asyncio.Lock()
+    runtime.turn_lock = lambda _thread_id: lock
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run(_runner, request, _renderer):
+        assert request.thread_id == "thread-1"
+        started.set()
+        await release.wait()
+        return TurnResult(status="completed", prompt=request.prompt, response="ok")
+
+    monkeypatch.setattr(TurnRunner, "_run", run)
+    app = chainagents_api.create_app(runtime=runtime)
+    try:
+        async with app.router.lifespan_context(app), AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            turn = await client.post("/api/agent/input", json={
+                "prompt": "hello", "thread_id": "  thread-1  ", "mode": "turn",
+            })
+            assert turn.status_code == 202
+            await asyncio.wait_for(started.wait(), timeout=3)
+            steering = await client.post("/api/agent/input", json={
+                "prompt": "change focus", "thread_id": "  thread-1  ", "mode": "steer",
+            })
+            assert steering.status_code == 202
+            assert steering.json()["thread_id"] == "thread-1"
+            assert runtime.user_input.status("thread-1")["active_job_id"] == turn.json()["turn_id"]
+            release.set()
+            await asyncio.wait_for(runtime.user_input.wait_idle("thread-1"), timeout=3)
+    finally:
+        release.set()
+        await asyncio.wait_for(runtime.user_input.wait_idle("thread-1"), timeout=3)
+
+
+@pytest.mark.anyio
+async def test_input_retry_rechecks_id_after_preparation_error(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("branch-thread")
+    preparing = asyncio.Event()
+    release_prepare = asyncio.Event()
+
+    async def delayed_prepare(_runtime, payload, **_kwargs):
+        preparing.set()
+        await release_prepare.wait()
+        return replace(
+            chainagents_api._run_context(runtime, payload),
+            command_error="Target branch thread is not fresh.",
+            command_error_status=409,
+        )
+
+    async def run(_payload):
+        return None
+
+    monkeypatch.setattr(chainagents_api, "_prepare_run_context", delayed_prepare)
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        pending = asyncio.create_task(client.post("/api/agent/input", json={
+            "prompt": "retry", "thread_id": "branch-thread", "input_id": "same",
+            "mode": "queue",
+        }))
+        await asyncio.wait_for(preparing.wait(), timeout=3)
+        existing = runtime.user_input.submit(
+            "branch-thread", "accepted", run,
+            followup_factory=lambda text: text, input_id="same",
+        )
+        release_prepare.set()
+        response = await pending
+    assert response.status_code == 202
+    assert response.json()["turn_id"] == existing.id
+
+
+def test_rejected_queue_request_does_not_clone_branch_uploads() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(
+        enabled=True, max_queued_turns=1
+    )
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("branch-thread")
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        first = client.post("/api/agent/input", json={
+            "prompt": "first", "thread_id": "branch-thread", "mode": "queue",
+        })
+        rejected = client.post("/api/agent/input", json={
+            "prompt": "branch", "thread_id": "branch-thread", "mode": "queue",
+            "source_thread_id": "source-thread",
+            "history": [{"role": "user", "content": "earlier"}],
+        })
+    assert first.status_code == 202
+    assert rejected.status_code == 409
+    assert runtime.cloned_threads == []
+
+
+@pytest.mark.anyio
+async def test_accepted_queue_clones_branch_only_when_job_starts(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("branch-thread")
+    calls = []
+
+    async def run(_runner, request, _renderer):
+        calls.append(request.prompt)
+        return TurnResult(status="completed", prompt=request.prompt, response="ok")
+
+    monkeypatch.setattr(TurnRunner, "_run", run)
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        submitted = await client.post("/api/agent/input", json={
+            "thread_id": "branch-thread", "source_thread_id": "source-thread",
+            "history": [{"role": "user", "content": "earlier"}],
+            "prompt": "continue", "mode": "queue",
+        })
+        assert submitted.status_code == 202
+        assert runtime.cloned_threads == []
+        runtime.user_input.resume("branch-thread")
+        await runtime.user_input.wait_idle("branch-thread")
+    assert runtime.cloned_threads == [("source-thread", "branch-thread")]
+    assert calls == ["continue"]
+
+
+@pytest.mark.anyio
+async def test_queued_history_replay_rechecks_checkpoint_when_job_starts(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("branch-thread")
+    calls = []
+
+    async def run(_runner, request, _renderer):
+        calls.append(request.prompt)
+        runtime.checkpointer.existing_threads.add(request.thread_id)
+        return TurnResult(status="completed", prompt=request.prompt, response="ok")
+
+    monkeypatch.setattr(TurnRunner, "_run", run)
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        base = {
+            "thread_id": "branch-thread", "source_thread_id": "source-thread",
+            "history": [{"role": "user", "content": "earlier"}], "mode": "queue",
+        }
+        first = await client.post("/api/agent/input", json={**base, "prompt": "first"})
+        second = await client.post("/api/agent/input", json={**base, "prompt": "second"})
+        assert first.status_code == second.status_code == 202
+        runtime.user_input.resume("branch-thread")
+        await runtime.user_input.wait_idle("branch-thread")
+        result = await client.get(
+            f"/api/agent/turns/branch-thread/{second.json()['turn_id']}"
+        )
+    assert calls == ["first"]
+    assert result.json()["status"] == "failed"
+    assert "History cannot be replayed" in result.json()["error"]
+
+
+@pytest.mark.anyio
+async def test_queued_history_checkpoint_failure_does_not_expose_backend_details() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("branch-thread")
+    lookups = 0
+
+    async def lookup(_config):
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            return None
+        raise RuntimeError("postgres://user:secret@internal.example")
+
+    runtime.checkpointer.aget_tuple = lookup
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        submitted = await client.post("/api/agent/input", json={
+            "thread_id": "branch-thread", "source_thread_id": "source-thread",
+            "history": [{"role": "user", "content": "earlier"}],
+            "prompt": "continue", "mode": "queue",
+        })
+        assert submitted.status_code == 202
+        runtime.user_input.resume("branch-thread")
+        await runtime.user_input.wait_idle("branch-thread")
+        result = await client.get(
+            f"/api/agent/turns/branch-thread/{submitted.json()['turn_id']}"
+        )
+    assert lookups == 2
+    assert result.json()["status"] == "failed"
+    assert result.json()["error"] == "Agent operation failed. Please retry."
+    assert "secret" not in result.text
+
+
+@pytest.mark.anyio
+async def test_turn_events_finish_after_result_is_evicted() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(
+        enabled=True, max_completed_turns=1
+    )
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+
+    release_first = asyncio.Event()
+
+    async def run(value):
+        if value == "first":
+            await release_first.wait()
+        return value
+
+    first = runtime.user_input.submit(
+        "thread-1", "first", run, followup_factory=lambda text: text
+    )
+    await asyncio.sleep(0)
+    app = chainagents_api.create_app(runtime=runtime)
+    app.state.runtime = runtime
+    endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", None) == "/api/agent/turns/{thread_id}/{turn_id}/events"
+    )
+    response = await endpoint("thread-1", first.id, SimpleNamespace(app=app))
+    lines = response.body_iterator
+    status = json.loads(await anext(lines))
+    assert status["status"] == "running"
+    release_first.set()
+    await runtime.user_input.wait_idle("thread-1")
+    runtime.user_input.submit(
+        "thread-1", "second", run, followup_factory=lambda text: text
+    )
+    await runtime.user_input.wait_idle("thread-1")
+    next_status = json.loads(await anext(lines))
+    assert next_status["status"] == "completed"
+    result = json.loads(await anext(lines))
+    assert result == {"type": "result", "turn_id": first.id, "result": "first", "error": None}
+
+
+@pytest.mark.anyio
+async def test_turn_events_finish_when_queued_session_is_closed() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    async def seed(_value):
+        return None
+
+    runtime.user_input.submit(
+        "thread-1", "seed", seed, followup_factory=lambda text: text
+    )
+    await runtime.user_input.wait_idle("thread-1")
+    runtime.user_input.stop("thread-1")
+
+    async def run(_value):
+        raise AssertionError("queued turn must not run")
+
+    job = runtime.user_input.submit(
+        "thread-1", "queued", run, followup_factory=lambda text: text
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    app.state.runtime = runtime
+    endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", None) == "/api/agent/turns/{thread_id}/{turn_id}/events"
+    )
+    response = await endpoint("thread-1", job.id, SimpleNamespace(app=app))
+    lines = response.body_iterator
+    assert json.loads(await anext(lines))["status"] == "queued"
+    await runtime.user_input.close_session("thread-1")
+    assert json.loads(await anext(lines))["status"] == "cancelled"
+    assert json.loads(await anext(lines)) == {
+        "type": "result", "turn_id": job.id, "result": None, "error": None,
+    }
+
+
+def test_nonblocking_input_rejects_current_images_for_text_only_model() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        response = client.post("/api/agent/input", json={
+            "prompt": "inspect", "thread_id": "thread-1",
+            "attachments": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}}],
+        })
+    assert response.status_code == 422
+    assert runtime.requests == []
 
 
 def test_stream_lines_closing_early_cancels_turn_and_closes_agent_stream() -> None:

@@ -7,7 +7,7 @@ import copy
 import logging
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
+import chainagents.runtime.messaging as runtime_messaging
 import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
     WorkspaceDocsRAG,
@@ -49,6 +50,7 @@ _STATIC_LARGE_TOOL_RESULT_ARTIFACTS = (
     runtime_artifacts.LargeToolResultArtifactRegistry()
 )
 _STATIC_LANGSMITH_TRACINGS: set[runtime_tracing.LangSmithTracing] = set()
+_STATIC_MESSAGE_BROKER: runtime_messaging.MessageBroker | None = None
 
 
 def static_background_task_managers() -> tuple[
@@ -62,6 +64,8 @@ async def close_static_background_tasks() -> None:
     """Close exported-graph task managers and remaining result artifacts."""
     managers = tuple(_STATIC_BACKGROUND_TASK_MANAGERS)
     _STATIC_BACKGROUND_TASK_MANAGERS.clear()
+    global _STATIC_MESSAGE_BROKER
+    _STATIC_MESSAGE_BROKER = None
     errors: list[BaseException] = []
     if managers:
         results = await asyncio.gather(
@@ -104,6 +108,8 @@ async def close_static_background_session(session_id: str) -> None:
 async def _close_static_background_session(session_id: str) -> None:
     """Complete exported session teardown independently of its caller."""
     managers = static_background_task_managers()
+    if _STATIC_MESSAGE_BROKER is not None:
+        _STATIC_MESSAGE_BROKER.close_session(session_id)
     if managers:
         async with AsyncExitStack() as stack:
             for manager in managers:
@@ -392,6 +398,7 @@ class _SubagentBuildContext:
     background_manager: runtime_background_tasks.BackgroundTaskManager | None
     session_id: str | None
     langsmith_tracing: runtime_tracing.LangSmithTracing | None
+    messaging_broker: runtime_messaging.MessageBroker | None
 
     @classmethod
     def create(
@@ -408,6 +415,7 @@ class _SubagentBuildContext:
         background_manager: runtime_background_tasks.BackgroundTaskManager | None,
         session_id: str | None,
         langsmith_tracing: runtime_tracing.LangSmithTracing | None,
+        messaging_broker: runtime_messaging.MessageBroker | None = None,
     ) -> _SubagentBuildContext:
         """Build a context with the configured subagent registry and model builder."""
         return cls(
@@ -423,6 +431,7 @@ class _SubagentBuildContext:
             background_manager=background_manager,
             session_id=session_id,
             langsmith_tracing=langsmith_tracing,
+            messaging_broker=messaging_broker,
         )
 
     def background_task_tools(
@@ -510,6 +519,7 @@ def _build_sync_subagent_spec(
         if has_configured_own_tools
         else own_tools or inherited_model_tools
     )
+    child_inherited_tools = effective_tools
     middleware = runtime_middleware.build_agent_middleware(
         backend=context.backend,
         config=config,
@@ -518,6 +528,21 @@ def _build_sync_subagent_spec(
         source=subagent.name,
         project_root=context.project_root,
     )
+    messaging_enabled = (
+        config.extensions.messaging.enabled
+        and subagent.messaging
+        and context.messaging_broker is not None
+    )
+    if messaging_enabled:
+        assert context.messaging_broker is not None
+        runtime_messaging.validate_agent_message_tool_names(effective_tools)
+        middleware.append(runtime_messaging.AgentMessageMiddleware(context.messaging_broker, context.session_id))
+        effective_tools = [
+            *effective_tools,
+            *runtime_messaging.create_agent_message_tools(
+                context.messaging_broker, fixed_session_id=context.session_id
+            ),
+        ]
     background_enabled = context.background_manager is not None
     child_subagents = nested_child_subagents(subagent, context.registry)
     target_background_enabled = background_enabled and subagent.background
@@ -525,7 +550,11 @@ def _build_sync_subagent_spec(
         child.name for child in child_subagents if child.background
     }
     caller_background_enabled = background_enabled and bool(background_child_names)
-    if not child_subagents and not target_background_enabled:
+    if (
+        not child_subagents
+        and not target_background_enabled
+        and not config.extensions.messaging.enabled
+    ):
         subagent_tools = own_tools
         if (
             not subagent_tools
@@ -552,7 +581,7 @@ def _build_sync_subagent_spec(
             inherited_tools=(
                 raw_own_tools if has_configured_own_tools else inherited_tools
             ),
-            sanitized_inherited_tools=effective_tools,
+            sanitized_inherited_tools=child_inherited_tools,
             inherited_model=effective_model,
             reasoning_level=effective_reasoning_level,
             agent_path=(*agent_path, child.name),
@@ -591,6 +620,12 @@ def _build_sync_subagent_spec(
         config,
         **runnable_kwargs,
     )
+    if config.extensions.messaging.enabled and context.messaging_broker is not None:
+        assert context.messaging_broker is not None
+        runnable = runtime_messaging.MessagingScopedRunnable(
+            runnable, context.messaging_broker, subagent.name, context.session_id,
+            participant=messaging_enabled,
+        )
     return {
         "name": subagent.name,
         "description": subagent.description,
@@ -819,6 +854,7 @@ def build_agent_kwargs(
     background_manager: runtime_background_tasks.BackgroundTaskManager | None = None,
     session_id: str | None = None,
     langsmith_tracing: runtime_tracing.LangSmithTracing | None = None,
+    messaging_broker: runtime_messaging.MessageBroker | None = None,
 ) -> dict[str, Any]:
     """Build the DeepAgents keyword arguments for a configured main agent.
 
@@ -854,6 +890,7 @@ def build_agent_kwargs(
     model_builder = build_model or _default_model_builder(config)
     model = model_builder(reasoning_level, model_profile)
     main_tools = sanitize_tools_for_model(model_profile.provider, tools)
+    inherited_model_tools = list(main_tools)
     backend = runtime_backends.build_deepagent_backend(
         project_root=project_root,
         include_memories=config.agent_state == "stateful",
@@ -868,6 +905,27 @@ def build_agent_kwargs(
         source="main-agent",
         project_root=project_root,
     )
+    if config.extensions.messaging.enabled or config.extensions.user_input.enabled:
+        if messaging_broker is None:
+            global _STATIC_MESSAGE_BROKER
+            if _STATIC_MESSAGE_BROKER is None:
+                broker_config = config.extensions.messaging
+                if config.extensions.user_input.enabled and not broker_config.enabled:
+                    broker_config = replace(broker_config, enabled=True)
+                _STATIC_MESSAGE_BROKER = runtime_messaging.MessageBroker(broker_config)
+            elif _STATIC_MESSAGE_BROKER.config != (
+                config.extensions.messaging
+                if config.extensions.messaging.enabled
+                else replace(config.extensions.messaging, enabled=True)
+            ):
+                raise RuntimeError(
+                    "Exported graphs must use one agent.messaging configuration."
+                )
+            messaging_broker = _STATIC_MESSAGE_BROKER
+        middleware.append(runtime_messaging.AgentMessageMiddleware(messaging_broker, session_id))
+        if config.extensions.messaging.enabled:
+            runtime_messaging.validate_agent_message_tool_names(main_tools)
+            main_tools.extend(runtime_messaging.create_agent_message_tools(messaging_broker, fixed_session_id=session_id))
     context = _SubagentBuildContext.create(
         config,
         backend=backend,
@@ -880,11 +938,12 @@ def build_agent_kwargs(
         background_manager=background_manager,
         session_id=session_id,
         langsmith_tracing=langsmith_tracing,
+        messaging_broker=messaging_broker,
     )
     subagent_specs = _build_subagent_specs(
         context,
         inherited_tools=tools,
-        sanitized_inherited_tools=main_tools,
+        sanitized_inherited_tools=inherited_model_tools,
         inherited_model=model_profile,
         reasoning_level=reasoning_level,
         include_async_subagents=include_async_subagents,
