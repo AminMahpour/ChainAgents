@@ -73,6 +73,34 @@ def test_queue_runs_one_turn_at_a_time_and_stop_pauses_until_resume():
     asyncio.run(exercise())
 
 
+def test_stop_before_task_starts_releases_active_slot():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        started = []
+
+        async def run(text):
+            started.append(text)
+
+        first = controller.submit(
+            "s", "first", run, followup_factory=lambda text: text, input_id="first"
+        )
+        second = controller.submit("s", "second", run, followup_factory=lambda text: text)
+        controller.stop("s")
+        await asyncio.wait_for(controller.wait_idle("s"), timeout=1)
+        assert first.status == "cancelled"
+        assert first.payload is None
+        assert controller.find_input_id("s", "first") is first
+        assert controller.status("s")["active_job_id"] is None
+        controller.resume("s")
+        await controller.wait_idle("s")
+        assert second.status == "completed"
+        assert started == ["second"]
+
+    asyncio.run(exercise())
+
+
 def test_late_steering_becomes_followup_before_queued_turn():
     async def exercise():
         broker = MessageBroker(MessagingConfig(enabled=True))

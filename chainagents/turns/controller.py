@@ -115,9 +115,31 @@ class ConversationInputController:
         job.status = "waiting" if self.runner_serialized else "running"
         session.active_job = job
         self.broker.open(session_id, "main", name="main", parent=None)
-        session.active = asyncio.create_task(
+        task = asyncio.create_task(
             self._run(job), name=f"agent-turn-{job.id}", context=job.context
         )
+        session.active = task
+        task.add_done_callback(
+            lambda done: self._finalize_unstarted_job(session_id, session, job, done)
+        )
+
+    def _finalize_unstarted_job(
+        self,
+        session_id: str,
+        session: _Conversation,
+        job: InputJob,
+        task: asyncio.Task[None],
+    ) -> None:
+        """Release the active slot when cancellation prevented ``_run`` from starting."""
+        if self._sessions.get(session_id) is not session or session.active is not task:
+            return
+        if task.cancelled():
+            job.status = "cancelled"
+        else:
+            error = task.exception()
+            job.status = "failed"
+            job.error = str(error) if error is not None else "Turn ended without finalizing."
+        self._finish_job(session, job)
 
     async def _run(self, job: InputJob) -> None:
         session = self._session(job.session_id)
@@ -130,41 +152,44 @@ class ConversationInputController:
             job.status = "failed"
             job.error = str(exc)
         finally:
-            # A late steering note becomes a visible follow-up ahead of queued turns.
-            self.broker.recover(job.session_id, "main")
-            steering = self.broker.take_late_user_steering(job.session_id)
-            batch_size = self.broker.config.max_deliveries_per_step
-            batches = [
-                steering[index : index + batch_size]
-                for index in range(0, len(steering), batch_size)
-            ]
-            for batch in reversed(batches):
-                notes = "\n\n".join(item.body for item in batch)
-                followup = InputJob(
-                    uuid.uuid4().hex,
-                    job.session_id,
-                    job.followup_factory(notes),
-                    job.run,
-                    job.followup_factory,
-                    context=job.context.copy(),
-                )
-                session.jobs[followup.id] = followup
-                session.queue.appendleft(followup)
-            job.payload = None
-            job.followup_factory = lambda text: text
-            session.completed.append(job.id)
-            while len(session.completed) > self.config.max_completed_turns:
-                expired_id = session.completed.popleft()
-                session.jobs.pop(expired_id, None)
-                for input_id, known_id in tuple(session.input_ids.items()):
-                    if known_id == expired_id:
-                        session.input_ids.pop(input_id, None)
-                for input_id, (_, known_id) in tuple(session.steer_ids.items()):
-                    if known_id == expired_id:
-                        session.steer_ids.pop(input_id, None)
-            session.active = None
-            session.active_job = None
-            self._start_next(job.session_id)
+            self._finish_job(session, job)
+
+    def _finish_job(self, session: _Conversation, job: InputJob) -> None:
+        # A late steering note becomes a visible follow-up ahead of queued turns.
+        self.broker.recover(job.session_id, "main")
+        steering = self.broker.take_late_user_steering(job.session_id)
+        batch_size = self.broker.config.max_deliveries_per_step
+        batches = [
+            steering[index : index + batch_size]
+            for index in range(0, len(steering), batch_size)
+        ]
+        for batch in reversed(batches):
+            notes = "\n\n".join(item.body for item in batch)
+            followup = InputJob(
+                uuid.uuid4().hex,
+                job.session_id,
+                job.followup_factory(notes),
+                job.run,
+                job.followup_factory,
+                context=job.context.copy(),
+            )
+            session.jobs[followup.id] = followup
+            session.queue.appendleft(followup)
+        job.payload = None
+        job.followup_factory = lambda text: text
+        session.completed.append(job.id)
+        while len(session.completed) > self.config.max_completed_turns:
+            expired_id = session.completed.popleft()
+            session.jobs.pop(expired_id, None)
+            for input_id, known_id in tuple(session.input_ids.items()):
+                if known_id == expired_id:
+                    session.input_ids.pop(input_id, None)
+            for input_id, (_, known_id) in tuple(session.steer_ids.items()):
+                if known_id == expired_id:
+                    session.steer_ids.pop(input_id, None)
+        session.active = None
+        session.active_job = None
+        self._start_next(job.session_id)
 
     def steer(self, session_id: str, text: str, *, input_id: str | None = None) -> str:
         if not self.config.enabled:

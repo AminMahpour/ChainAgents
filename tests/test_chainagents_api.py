@@ -2218,6 +2218,68 @@ def test_nonblocking_input_endpoint_returns_turn_id_and_status() -> None:
         assert detail.json()["status"] in {"running", "completed"}
 
 
+@pytest.mark.anyio
+async def test_nonblocking_input_reports_agent_failure_as_failed_job() -> None:
+    class FailingAgent(_FakeAgent):
+        def astream_events(self, payload, *, config, version, stream_mode, subgraphs):
+            async def events():
+                raise RuntimeError("secret backend detail")
+                yield  # pragma: no cover
+
+            return events()
+
+    runtime = _FakeRuntime(FailingAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        submitted = await client.post("/api/agent/input", json={
+            "prompt": "fail", "thread_id": "thread-1",
+        })
+        await runtime.user_input.wait_idle("thread-1")
+        turn_id = submitted.json()["turn_id"]
+        detail = await client.get(f"/api/agent/turns/thread-1/{turn_id}")
+        events = await client.get(f"/api/agent/turns/thread-1/{turn_id}/events")
+    assert detail.json()["status"] == "failed"
+    assert detail.json()["error"] == "Agent operation failed. Please retry."
+    assert "secret" not in detail.text
+    assert '"status": "failed"' in events.text
+
+
+@pytest.mark.anyio
+async def test_nonblocking_input_reports_command_error_as_failed_job() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.commands["lookup"] = SimpleNamespace(
+        name="lookup", description="Look something up", target="mcp_tool",
+        value="lookup", template=None, mcp_server="docs",
+    )
+    runtime.command_error = RuntimeError("secret MCP detail")
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        submitted = await client.post("/api/agent/input", json={
+            "prompt": "/lookup topic", "thread_id": "thread-1",
+        })
+        await runtime.user_input.wait_idle("thread-1")
+        detail = await client.get(
+            f"/api/agent/turns/thread-1/{submitted.json()['turn_id']}"
+        )
+    assert detail.json()["status"] == "failed"
+    assert detail.json()["error"] == "Agent operation failed. Please retry."
+    assert "secret" not in detail.text
+
+
 def test_stop_and_resume_unknown_api_threads_do_not_create_sessions() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     runtime.config.extensions.user_input = UserInputConfig(enabled=True)

@@ -833,8 +833,9 @@ async def _stop_nonblocking_input(action: cl.Action) -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
-    thread_id = _current_input_thread_id(runtime)
-    if not thread_id:
+    thread_id = str(action.payload.get("thread_id", "")).strip()
+    if not thread_id or thread_id != _current_input_thread_id(runtime):
+        await cl.Message(content="This Stop action belongs to another conversation.", author="System").send()
         return
     runtime.user_input.stop(thread_id)
     await cl.Message(
@@ -853,8 +854,9 @@ async def _resume_nonblocking_input(action: cl.Action) -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
-    thread_id = _current_input_thread_id(runtime)
-    if not thread_id:
+    thread_id = str(action.payload.get("thread_id", "")).strip()
+    if not thread_id or thread_id != _current_input_thread_id(runtime):
+        await cl.Message(content="This Resume action belongs to another conversation.", author="System").send()
         return
     runtime.user_input.resume(thread_id)
     await cl.Message(content="Queued turns resumed.", author="System").send()

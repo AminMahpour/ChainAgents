@@ -781,15 +781,18 @@ def create_app(
                 raise ValueError(current.command_error)
             renderer = _WarningCollector()
             result = await TurnRunner(active_runtime).run(_turn_request(current), renderer)
+            error = (
+                result.command_error.message if result.command_error is not None
+                else _safe_backend_error(result.error) if result.error is not None
+                else None
+            )
+            if result.status in {"failed", "command_error"}:
+                raise ValueError(error or "Agent operation failed. Please retry.")
             return {
                 "status": result.status,
                 "response": result.response,
                 "warnings": renderer.warnings,
-                "error": (
-                    result.command_error.message if result.command_error is not None
-                    else _safe_backend_error(result.error) if result.error is not None
-                    else None
-                ),
+                "error": error,
             }
 
         followup_base = replace(

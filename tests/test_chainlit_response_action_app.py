@@ -241,9 +241,13 @@ async def test_chainlit_accepts_busy_input_and_offers_steer_or_queue(monkeypatch
         ("on_message", "second", "second"),
     ]
     await main._stop_nonblocking_input(SimpleNamespace(payload={"thread_id": "another-chat"}))
-    assert user_input.status("s")["paused"] is True
+    assert user_input.status("s")["paused"] is False
     assert user_input.status("another-chat")["paused"] is False
     await main._resume_nonblocking_input(SimpleNamespace(payload={"thread_id": "another-chat"}))
+    assert user_input.status("s")["paused"] is False
+    await main._stop_nonblocking_input(SimpleNamespace(payload={"thread_id": "s"}))
+    assert user_input.status("s")["paused"] is True
+    await main._resume_nonblocking_input(SimpleNamespace(payload={"thread_id": "s"}))
     assert user_input.status("s")["paused"] is False
 
 
