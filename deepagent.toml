@@ -104,6 +104,22 @@ max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100
 
+[agent.messaging]
+# Process-local direct messages between the main agent and explicitly opted-in
+# synchronous subagent invocations. Set messaging = true on each subagent.
+enabled = false
+max_message_chars = 8000
+max_pending_per_recipient = 100
+max_messages_per_session = 1000
+max_deliveries_per_step = 10
+
+[agent.user_input]
+# Keep Chainlit, TUI, CLI and API input available while a main turn runs.
+# Busy input can steer the active turn or queue a later turn.
+enabled = false
+max_queued_turns = 20
+max_completed_turns = 100
+
 [agent.reflection]
 enabled = false
 memory_file = "/memories/AGENTS.md"

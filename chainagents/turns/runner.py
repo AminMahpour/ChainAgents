@@ -145,6 +145,11 @@ class TurnRunner:
         ``CancelledError`` is re-raised after ``renderer.on_cancelled()``.
         """
         try:
+            if getattr(getattr(getattr(self.runtime.config, "extensions", None), "user_input", None), "enabled", False):
+                turn_lock = getattr(self.runtime, "turn_lock", None)
+                if callable(turn_lock):
+                    async with turn_lock(request.thread_id):
+                        return await self._run(request, renderer)
             return await self._run(request, renderer)
         except asyncio.CancelledError:
             try:

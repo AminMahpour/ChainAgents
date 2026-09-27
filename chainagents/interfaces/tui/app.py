@@ -179,6 +179,7 @@ class ChainAgentsTuiApp(App[int]):
 
     BINDINGS: ClassVar[list[Any]] = [
         ("ctrl+c", "cancel_or_quit", "Cancel/Quit"),
+        ("ctrl+r", "resume_queue", "Resume queue"),
         ("ctrl+l", "clear_conversation", "Clear"),
         ("tab", "complete_slash_command", "Complete command"),
     ]
@@ -292,6 +293,48 @@ class ChainAgentsTuiApp(App[int]):
         """Send a submitted prompt to the agent."""
         event.stop()
         prompt = event.text_area.text.strip()
+        if getattr(getattr(getattr(self.runtime.config, "extensions", None), "user_input", None), "enabled", False):
+            if not prompt:
+                return
+            status = self.runtime.user_input.status(self.thread_id)
+            active = status["active_job_id"] is not None
+            if prompt == "/resume":
+                self.runtime.user_input.resume(self.thread_id)
+                event.text_area.load_text("")
+                self._set_status("Queued turns resumed.")
+                return
+            if prompt == "/stop":
+                self.runtime.user_input.stop(self.thread_id)
+                event.text_area.load_text("")
+                self._set_status("Active turn stopped; queue paused. Use /resume.")
+                return
+            if active and prompt.startswith("/steer "):
+                try:
+                    self.runtime.user_input.steer(self.thread_id, prompt.removeprefix("/steer "))
+                except ValueError as exc:
+                    self._set_status(str(exc))
+                    return
+                event.text_area.load_text("")
+                self._set_status("Steering note sent.")
+                return
+            if active and not prompt.startswith("/queue "):
+                self._set_status("Agent is working. Use /steer or /queue before this prompt.")
+                return
+            submitted = prompt.removeprefix("/queue ") if active else prompt
+            try:
+                job = self.runtime.user_input.submit(
+                    self.thread_id,
+                    submitted,
+                    self._run_nonblocking_prompt,
+                    followup_factory=lambda text: text,
+                )
+            except ValueError as exc:
+                self._set_status(str(exc))
+                return
+            event.text_area.load_text("")
+            self.hide_command_help()
+            self._set_status(f"Turn {job.id}: {job.status}.")
+            return
         if not prompt or self.active_task is not None:
             return
 
@@ -306,12 +349,24 @@ class ChainAgentsTuiApp(App[int]):
 
     async def action_cancel_or_quit(self) -> None:
         """Cancel an active run, or exit when idle."""
+        if getattr(getattr(getattr(self.runtime.config, "extensions", None), "user_input", None), "enabled", False):
+            status = self.runtime.user_input.status(self.thread_id)
+            if status["active_job_id"] is not None:
+                self.runtime.user_input.stop(self.thread_id)
+                self._set_status("Active turn stopped; queue paused. Press Ctrl+R to resume.")
+                return
         if self.active_task is not None and not self.active_task.done():
             self.active_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self.active_task
             return
         self.exit(0)
+
+    def action_resume_queue(self) -> None:
+        """Resume queued turns after a stop."""
+        if getattr(getattr(getattr(self.runtime.config, "extensions", None), "user_input", None), "enabled", False):
+            self.runtime.user_input.resume(self.thread_id)
+            self._set_status("Queued turns resumed.")
 
     def action_clear_conversation(self) -> None:
         """Clear the visible conversation panes."""
@@ -338,9 +393,13 @@ class ChainAgentsTuiApp(App[int]):
         prompt.cursor_location = (0, len(completed_command))
         self.hide_command_help()
 
-    async def _run_prompt(self, raw_prompt: str) -> None:
+    async def _run_nonblocking_prompt(self, raw_prompt: str) -> None:
+        await self._run_prompt(raw_prompt, nonblocking=True)
+
+    async def _run_prompt(self, raw_prompt: str, *, nonblocking: bool = False) -> None:
         prompt_input = self.query_one("#prompt", PromptTextArea)
-        prompt_input.disabled = True
+        if not nonblocking:
+            prompt_input.disabled = True
         self._set_status("Running...")
         await self._append_conversation("You", raw_prompt)
         self.reasoning_entry_indexes.clear()
@@ -365,9 +424,10 @@ class ChainAgentsTuiApp(App[int]):
             self._append_tool_entry(f"runtime error {type(exc).__name__}: {exc}")
             self._set_status(f"{type(exc).__name__}: {exc}")
         finally:
-            prompt_input.disabled = False
-            prompt_input.focus()
-            self.active_task = None
+            if not nonblocking:
+                prompt_input.disabled = False
+                prompt_input.focus()
+                self.active_task = None
 
     def refresh_command_help(self, prompt_value: str) -> None:
         """Show matching slash commands when the prompt starts with slash."""

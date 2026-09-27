@@ -20,6 +20,9 @@ from chainagents.runtime import core
 from chainagents.runtime.reflection import ReflectionConfig
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
 from chainagents.rag.runtime import RagUploadResult
+from chainagents.runtime.messaging import MessageBroker
+from chainagents.runtime.types import MessagingConfig, UserInputConfig
+from chainagents.turns.controller import ConversationInputController
 
 
 class _Token:
@@ -2190,6 +2193,43 @@ def test_reflection_confirmation_is_retryable_after_cancellation(after_write) ->
             assert item.value["content"].count(proposal["lesson"]) == 1
 
     asyncio.run(exercise())
+
+
+def test_nonblocking_input_endpoint_returns_turn_id_and_status() -> None:
+    runtime = _FakeRuntime(_FakeAgent([_raw_event(((), "messages", (_Token("ok"), {})))]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        body = {"prompt": "hello", "thread_id": "thread-1", "input_id": "request-1"}
+        first = client.post("/api/agent/input", json=body)
+        assert first.status_code == 202
+        turn_id = first.json()["turn_id"]
+        second = client.post("/api/agent/input", json=body)
+        assert second.json()["turn_id"] == turn_id
+        detail = client.get(f"/api/agent/turns/thread-1/{turn_id}")
+        assert detail.status_code == 200
+        assert detail.json()["status"] in {"running", "completed"}
+
+
+def test_nonblocking_input_rejects_current_images_for_text_only_model() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        response = client.post("/api/agent/input", json={
+            "prompt": "inspect", "thread_id": "thread-1",
+            "attachments": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}}],
+        })
+    assert response.status_code == 422
+    assert runtime.requests == []
 
 
 def test_stream_lines_closing_early_cancels_turn_and_closes_agent_stream() -> None:

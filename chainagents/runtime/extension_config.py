@@ -20,6 +20,8 @@ from chainagents.runtime.types import (
     BATCH_RESULT_FORMATS,
     BatchResultFormat,
     BackgroundSubagentConfig,
+    MessagingConfig,
+    UserInputConfig,
     AsyncSubagentConfig,
     ChainlitCommandConfig,
     ChainlitStarterConfig,
@@ -27,6 +29,34 @@ from chainagents.runtime.types import (
     ExtensionsConfig,
     SubagentConfig,
 )
+
+
+def _normalize_opt_in_config(value: Any, *, name: str, defaults: Any) -> Any:
+    if value is None:
+        return defaults
+    if not isinstance(value, dict):
+        raise ValueError(f"The top-level 'agent.{name}' config must be a table/object.")
+    values: dict[str, Any] = {}
+    for field_name in defaults.__dataclass_fields__:
+        raw = value.get(field_name, getattr(defaults, field_name))
+        if field_name == "enabled":
+            if not isinstance(raw, bool):
+                raise ValueError(f"The top-level 'agent.{name}.{field_name}' config must be a boolean.")
+        elif not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+            raise ValueError(f"The top-level 'agent.{name}.{field_name}' config must be a positive integer.")
+        values[field_name] = raw
+    unknown = sorted(set(value) - set(values))
+    if unknown:
+        raise ValueError(f"Unknown 'agent.{name}' config field(s): {', '.join(unknown)}.")
+    return type(defaults)(**values)
+
+
+def normalize_messaging_config(value: Any) -> MessagingConfig:
+    return _normalize_opt_in_config(value, name="messaging", defaults=MessagingConfig())
+
+
+def normalize_user_input_config(value: Any) -> UserInputConfig:
+    return _normalize_opt_in_config(value, name="user_input", defaults=UserInputConfig())
 
 
 def normalize_background_subagent_config(value: Any) -> BackgroundSubagentConfig:
@@ -364,6 +394,7 @@ def parse_async_subagent_config(
             "skills",
             "mcp_servers",
             "model",
+            "messaging",
         )
         if field in raw_subagent
     )
@@ -460,6 +491,9 @@ def parse_sync_subagent_config(
         raise ValueError(
             f"subagent '{name}' background config must be a boolean."
         )
+    messaging = raw_subagent.get("messaging", False)
+    if not isinstance(messaging, bool):
+        raise ValueError(f"subagent '{name}' messaging config must be a boolean.")
 
     nested_subagent_names = normalize_required_string_list(
         raw_subagent.get("nested_subagents", []),
@@ -495,6 +529,7 @@ def parse_sync_subagent_config(
         mcp_servers=raw_subagent_mcp_servers,
         model=model,
         background=background,
+        messaging=messaging,
         nested_subagent_names=nested_subagent_names,
         subagents=tuple(nested_subagents),
     )
@@ -663,6 +698,8 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     background_subagents = normalize_background_subagent_config(
         agent_section.get("background_subagents")
     )
+    messaging = normalize_messaging_config(agent_section.get("messaging"))
+    user_input = normalize_user_input_config(agent_section.get("user_input"))
     agent_reflection = normalize_reflection_config(
         agent_section.get("reflection"),
         agent_state=agent_state,
@@ -935,6 +972,8 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         subagents=tuple(subagents),
         async_subagents=tuple(async_subagents),
         background_subagents=background_subagents,
+        messaging=messaging,
+        user_input=user_input,
         chainlit_commands=tuple(chainlit_commands),
         chainlit_starters=tuple(chainlit_starters),
         chainlit_response_actions=tuple(chainlit_response_actions),

@@ -203,6 +203,26 @@ class AgentRunRequest(BaseModel):
         return self
 
 
+class AgentInputRequest(AgentRunRequest):
+    """A turn to start or queue, or text that steers an active turn."""
+
+    mode: Literal["turn", "steer", "queue"] = "turn"
+    input_id: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
+    attachments: list[AgentImageContentPart] = Field(default_factory=list, max_length=MAX_UPLOAD_FILES)
+
+    @model_validator(mode="after")
+    def validate_total_images(self) -> AgentInputRequest:
+        history_images = sum(
+            isinstance(part, AgentImageContentPart)
+            for message in self.history
+            if isinstance(message.content, list)
+            for part in message.content
+        )
+        if history_images + len(self.attachments) > MAX_UPLOAD_FILES:
+            raise ValueError(f"history and attachments may contain at most {MAX_UPLOAD_FILES} images")
+        return self
+
+
 class AgentRunResponse(BaseModel):
     """HTTP response body for a completed agent run."""
 
@@ -680,6 +700,128 @@ def create_app(
             reasoning=context.reasoning_level,
             warnings=renderer.warnings,
         )
+
+    @app.post("/api/agent/input", status_code=202)
+    async def submit_agent_input(payload: AgentInputRequest, request: Request) -> dict[str, Any]:
+        active_runtime = _runtime_from_request(request)
+        if not active_runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        controller = active_runtime.user_input
+        session_id = payload.thread_id
+        if payload.mode == "steer":
+            if payload.history or payload.attachments:
+                raise HTTPException(status_code=422, detail="Steering accepts text only.")
+            try:
+                message_id = controller.steer(
+                    session_id, payload.prompt, input_id=payload.input_id
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"status": "sent", "message_id": message_id, "thread_id": session_id}
+        if payload.input_id:
+            existing = controller.find_input_id(session_id, payload.input_id)
+            if existing is not None:
+                return {"turn_id": existing.id, "thread_id": session_id, "status": existing.status}
+        if payload.mode == "turn" and controller.status(session_id)["active_job_id"] is not None:
+            raise HTTPException(status_code=409, detail="Choose steer or queue while a turn is active.")
+        context = await _prepare_run_context(
+            active_runtime, payload, has_current_images=bool(payload.attachments)
+        )
+        if context.command_error:
+            raise HTTPException(status_code=context.command_error_status, detail=context.command_error)
+        if payload.attachments:
+            context = replace(
+                context,
+                image_parts=(*context.image_parts, *(part.model_dump() for part in payload.attachments)),
+            )
+
+        async def run_queued(current: AgentRunContext) -> dict[str, Any]:
+            renderer = _WarningCollector()
+            result = await TurnRunner(active_runtime).run(_turn_request(current), renderer)
+            return {
+                "status": result.status,
+                "response": result.response,
+                "warnings": renderer.warnings,
+                "error": (
+                    result.command_error.message if result.command_error is not None
+                    else _safe_backend_error(result.error) if result.error is not None
+                    else None
+                ),
+            }
+
+        followup_base = replace(
+            context, prompt="", history=(), selected_command=None,
+            source_thread_id=None, image_parts=(), image_names=(), prompt_note="",
+        )
+        try:
+            job = controller.submit(
+                session_id,
+                context,
+                run_queued,
+                followup_factory=lambda text: replace(followup_base, prompt=text),
+                input_id=payload.input_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"turn_id": job.id, "thread_id": session_id, "status": job.status}
+
+    @app.get("/api/agent/turns/{thread_id}")
+    async def get_conversation_turns(thread_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        return runtime.user_input.status(thread_id)
+
+    @app.get("/api/agent/turns/{thread_id}/{turn_id}")
+    async def get_conversation_turn(thread_id: str, turn_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        try:
+            job = runtime.user_input.get(thread_id, turn_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"turn_id": job.id, "status": job.status, "result": job.result, "error": job.error}
+
+    @app.get("/api/agent/turns/{thread_id}/{turn_id}/events")
+    async def stream_conversation_turn(thread_id: str, turn_id: str, request: Request) -> StreamingResponse:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        try:
+            runtime.user_input.get(thread_id, turn_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        async def lines() -> AsyncGenerator[str, None]:
+            previous = ""
+            while True:
+                job = runtime.user_input.get(thread_id, turn_id)
+                if job.status != previous:
+                    yield json.dumps({"type": "status", "turn_id": turn_id, "status": job.status}) + "\n"
+                    previous = job.status
+                if job.status in {"completed", "failed", "cancelled"}:
+                    yield json.dumps({"type": "result", "turn_id": turn_id, "result": job.result, "error": job.error}) + "\n"
+                    return
+                await asyncio.sleep(0.1)
+
+        return StreamingResponse(lines(), media_type=NDJSON_MEDIA_TYPE)
+
+    @app.post("/api/agent/turns/{thread_id}/stop")
+    async def stop_conversation_turns(thread_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        runtime.user_input.stop(thread_id)
+        return runtime.user_input.status(thread_id)
+
+    @app.post("/api/agent/turns/{thread_id}/resume")
+    async def resume_conversation_turns(thread_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        if not runtime.config.extensions.user_input.enabled:
+            raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        runtime.user_input.resume(thread_id)
+        return runtime.user_input.status(thread_id)
 
     @app.post("/api/agent/stream")
     async def stream_agent(

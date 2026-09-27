@@ -12,6 +12,9 @@ import pytest
 import main
 from chainagents.exports import response as exports
 from chainagents.runtime.types import ChainlitResponseActionConfig
+from chainagents.runtime.types import MessagingConfig, UserInputConfig
+from chainagents.runtime.messaging import MessageBroker
+from chainagents.turns.controller import ConversationInputController
 
 chainlit_socket = importlib.import_module("chainlit.socket")
 chainlit_callbacks = importlib.import_module("chainlit.callbacks")
@@ -34,6 +37,128 @@ class Session:
 
     def set(self, key: str, value: Any) -> None:
         self.values[key] = value
+
+
+@pytest.mark.anyio
+async def test_chainlit_accepts_busy_input_and_offers_steer_or_queue(monkeypatch) -> None:
+    session = Session()
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    user_input = ConversationInputController(UserInputConfig(enabled=True), broker)
+    runtime = SimpleNamespace(
+        user_input=user_input,
+        config=SimpleNamespace(model_name="model", model_choices=("model",),
+            extensions=SimpleNamespace(user_input=UserInputConfig(enabled=True))),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[str] = []
+    notices: list[Any] = []
+
+    class Message:
+        def __init__(self, content: str, author: str = "User", actions=None):
+            self.id = content
+            self.content = content
+            self.author = author
+            self.actions = actions or []
+            self.elements = []
+
+        async def send(self):
+            notices.append(self)
+
+    async def get_runtime():
+        return runtime
+
+    async def handle(message):
+        seen.append(message.content)
+        if message.content == "first":
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(main.cl, "user_session", session)
+    monkeypatch.setattr(main.cl, "Message", Message)
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="ui-chat")))
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "coerce_settings", lambda *_args, **_kwargs: SimpleNamespace(thread_id="s"))
+    monkeypatch.setattr(main, "_handle_message", handle)
+
+    await main._guarded_chainlit_message_callback(Message("first"))
+    await entered.wait()
+    await main._guarded_chainlit_message_callback(Message("second"))
+    assert seen == ["first"]
+    assert [action.label for action in notices[-1].actions] == ["Steer active turn", "Queue next turn"]
+    draft_id = notices[-1].actions[1].payload["draft_id"]
+    await main._submit_busy_input(SimpleNamespace(name=main.QUEUE_INPUT_ACTION, payload={"draft_id": draft_id}))
+    release.set()
+    await user_input.wait_idle("s")
+    assert seen == ["first", "second"]
+    await main._stop_nonblocking_input(SimpleNamespace(payload={"thread_id": "another-chat"}))
+    assert user_input.status("s")["paused"] is True
+    assert user_input.status("another-chat")["paused"] is False
+    await main._resume_nonblocking_input(SimpleNamespace(payload={"thread_id": "another-chat"}))
+    assert user_input.status("s")["paused"] is False
+
+
+@pytest.mark.anyio
+async def test_late_steering_followup_after_response_action_is_visible(monkeypatch) -> None:
+    session = Session()
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    user_input = ConversationInputController(UserInputConfig(enabled=True), broker)
+    action_config = ChainlitResponseActionConfig(
+        name="summarize", label="Summarize", prompt="Summarize {response}"
+    )
+    runtime = SimpleNamespace(
+        user_input=user_input,
+        config=SimpleNamespace(
+            model_name="model", model_choices=("model",),
+            extensions=SimpleNamespace(
+                user_input=UserInputConfig(enabled=True),
+                chainlit_response_actions=(action_config,),
+            ),
+        ),
+    )
+    settings = SimpleNamespace(
+        thread_id="s", model_name="model", reasoning_level="medium"
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    turns: list[dict[str, Any]] = []
+    messages: list[tuple[str, str]] = []
+
+    class Message:
+        def __init__(self, content: str, author: str = "Assistant"):
+            self.content = content
+            self.author = author
+
+        async def send(self):
+            messages.append((self.author, self.content))
+
+    async def get_runtime():
+        return runtime
+
+    async def run_turn(**kwargs):
+        turns.append(kwargs)
+        if len(turns) == 1:
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(main.cl, "user_session", session)
+    monkeypatch.setattr(main.cl, "Message", Message)
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "coerce_settings", lambda *_args, **_kwargs: settings)
+    monkeypatch.setattr(main, "current_mcp_session_id", lambda: "s")
+    monkeypatch.setattr(main, "settings_reasoning_level_is_explicit", lambda *_args: False)
+    monkeypatch.setattr(main, "_run_agent_turn", run_turn)
+
+    await main.run_response_action(SimpleNamespace(
+        forId="earlier", payload={"response_id": "earlier", "action_name": "summarize"}
+    ))
+    await entered.wait()
+    user_input.steer("s", "late correction")
+    release.set()
+    await user_input.wait_idle("s")
+    assert turns[1]["display_prompt"] == "late correction"
+    assert turns[1]["export_label"] == ""
+    assert ("User", "late correction") in messages
 
 
 @pytest.mark.anyio
