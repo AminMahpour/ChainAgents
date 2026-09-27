@@ -833,6 +833,8 @@ def create_app(
         runtime = _runtime_from_request(request)
         if not runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        if not runtime.user_input.has_session(thread_id):
+            return runtime.user_input.status(thread_id)
         runtime.user_input.stop(thread_id)
         return runtime.user_input.status(thread_id)
 

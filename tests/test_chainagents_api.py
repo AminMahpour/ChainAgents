@@ -2217,6 +2217,25 @@ def test_nonblocking_input_endpoint_returns_turn_id_and_status() -> None:
         assert detail.json()["status"] in {"running", "completed"}
 
 
+def test_stop_and_resume_unknown_api_threads_do_not_create_sessions() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        for index in range(10):
+            thread_id = f"unknown-{index}"
+            stopped = client.post(f"/api/agent/turns/{thread_id}/stop")
+            resumed = client.post(f"/api/agent/turns/{thread_id}/resume")
+            assert stopped.status_code == resumed.status_code == 200
+            assert stopped.json()["paused"] is False
+            assert resumed.json()["paused"] is False
+    assert runtime.user_input._sessions == {}
+
+
 @pytest.mark.anyio
 async def test_input_endpoint_rejects_turn_during_legacy_run_and_queues_next(monkeypatch) -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
@@ -2441,6 +2460,13 @@ async def test_turn_events_finish_when_queued_session_is_closed() -> None:
     runtime.user_input = ConversationInputController(
         runtime.config.extensions.user_input, runtime.message_broker
     )
+    async def seed(_value):
+        return None
+
+    runtime.user_input.submit(
+        "thread-1", "seed", seed, followup_factory=lambda text: text
+    )
+    await runtime.user_input.wait_idle("thread-1")
     runtime.user_input.stop("thread-1")
 
     async def run(_value):

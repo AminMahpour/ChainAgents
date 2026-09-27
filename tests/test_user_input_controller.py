@@ -328,6 +328,82 @@ def test_stop_cancels_running_external_turn(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_stop_cancels_external_turn_waiting_for_same_lock(monkeypatch):
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        lock = asyncio.Lock()
+        runtime = SimpleNamespace(
+            config=SimpleNamespace(extensions=SimpleNamespace(
+                user_input=UserInputConfig(enabled=True),
+                messaging=MessagingConfig(enabled=False),
+            )),
+            user_input=controller,
+            turn_lock=lambda _session_id: lock,
+        )
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def run(_runner, request, _renderer):
+            if request.prompt == "first":
+                first_started.set()
+            else:
+                second_started.set()
+            await asyncio.Future()
+
+        monkeypatch.setattr(TurnRunner, "_run", run)
+        command_errors = []
+
+        async def on_command_error(exc, status):
+            command_errors.append((exc.message, status))
+
+        renderer = SimpleNamespace(
+            on_cancelled=lambda: asyncio.sleep(0),
+            on_command_error=on_command_error,
+        )
+
+        def request(prompt):
+            return TurnRequest(
+                prompt=prompt, thread_id="s", model_name="fake", reasoning_level="medium"
+            )
+
+        first = asyncio.create_task(TurnRunner(runtime).run(request("first"), renderer))
+        await first_started.wait()
+        second = asyncio.create_task(TurnRunner(runtime).run(request("second"), renderer))
+        await asyncio.sleep(0)
+        controller.stop("s")
+        try:
+            for task in (first, second):
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+            assert not second_started.is_set()
+            assert controller.status("s")["paused"] is True
+            third = await asyncio.wait_for(
+                TurnRunner(runtime).run(request("third"), renderer), timeout=1
+            )
+            assert third.command_error is not None
+            assert third.command_error.status == 409
+            assert command_errors == [
+                ("Conversation is paused. Resume before starting a turn.", 409)
+            ]
+        finally:
+            for task in (first, second):
+                task.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_resume_unknown_thread_does_not_create_session():
+    controller = ConversationInputController(
+        UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+    )
+    for index in range(100):
+        controller.resume(f"unknown-{index}")
+    assert controller._sessions == {}
+
+
 def test_read_only_turn_lookups_do_not_create_sessions():
     controller = ConversationInputController(
         UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
@@ -349,6 +425,11 @@ def test_close_session_cancels_queued_jobs_retained_by_event_consumers():
         controller = ConversationInputController(
             UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
         )
+        async def seed(_payload):
+            return None
+
+        controller.submit("s", "seed", seed, followup_factory=lambda text: text)
+        await controller.wait_idle("s")
         controller.stop("s")
 
         async def run(_payload):
