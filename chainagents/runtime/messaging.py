@@ -15,7 +15,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import Runnable, RunnableConfig
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 from chainagents.runtime.background_tasks.context import current_background_session_id
@@ -26,6 +26,29 @@ _CURRENT_AGENT_ADDRESS: contextvars.ContextVar[str] = contextvars.ContextVar(
 _CURRENT_MESSAGING_SESSION: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "chainagents_messaging_session", default=None
 )
+
+AGENT_MESSAGE_TOOL_NAMES = frozenset({
+    "list_agent_recipients",
+    "send_agent_message",
+    "get_agent_message",
+    "wait_for_agent_messages",
+})
+
+
+def validate_agent_message_tool_names(existing_tools: Iterable[object]) -> None:
+    """Reject configured tools that would be shadowed by messaging actions."""
+    collisions = sorted({
+        name
+        for candidate in existing_tools
+        if (name := str(
+            getattr(candidate, "name", None) or getattr(candidate, "__name__", "")
+        ).strip()) in AGENT_MESSAGE_TOOL_NAMES
+    })
+    if collisions:
+        raise ValueError(
+            "Configured tools use reserved agent messaging tool names: "
+            f"{', '.join(collisions)}. Rename or prefix the configured tools."
+        )
 
 
 @dataclass

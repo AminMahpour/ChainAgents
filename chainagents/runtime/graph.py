@@ -519,6 +519,7 @@ def _build_sync_subagent_spec(
         if has_configured_own_tools
         else own_tools or inherited_model_tools
     )
+    child_inherited_tools = effective_tools
     middleware = runtime_middleware.build_agent_middleware(
         backend=context.backend,
         config=config,
@@ -534,6 +535,7 @@ def _build_sync_subagent_spec(
     )
     if messaging_enabled:
         assert context.messaging_broker is not None
+        runtime_messaging.validate_agent_message_tool_names(effective_tools)
         middleware.append(runtime_messaging.AgentMessageMiddleware(context.messaging_broker, context.session_id))
         effective_tools = [
             *effective_tools,
@@ -579,7 +581,7 @@ def _build_sync_subagent_spec(
             inherited_tools=(
                 raw_own_tools if has_configured_own_tools else inherited_tools
             ),
-            sanitized_inherited_tools=effective_tools,
+            sanitized_inherited_tools=child_inherited_tools,
             inherited_model=effective_model,
             reasoning_level=effective_reasoning_level,
             agent_path=(*agent_path, child.name),
@@ -922,6 +924,7 @@ def build_agent_kwargs(
             messaging_broker = _STATIC_MESSAGE_BROKER
         middleware.append(runtime_messaging.AgentMessageMiddleware(messaging_broker, session_id))
         if config.extensions.messaging.enabled:
+            runtime_messaging.validate_agent_message_tool_names(main_tools)
             main_tools.extend(runtime_messaging.create_agent_message_tools(messaging_broker, fixed_session_id=session_id))
     context = _SubagentBuildContext.create(
         config,

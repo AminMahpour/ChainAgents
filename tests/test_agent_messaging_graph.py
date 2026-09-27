@@ -5,6 +5,8 @@ from dataclasses import replace
 
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
+import pytest
 
 from chainagents.runtime.artifacts import LargeToolResultArtifactRegistry
 from chainagents.runtime.graph import build_agent_kwargs
@@ -162,3 +164,39 @@ def test_unopted_subagent_graph_does_not_receive_message_tools(tmp_path):
     tool_names = set(graph.nodes["tools"].bound.tools_by_name)
     assert "send_agent_message" not in tool_names
     assert "list_agent_recipients" not in tool_names
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["send_agent_message", "get_agent_message", "list_agent_recipients", "wait_for_agent_messages"],
+)
+def test_messaging_rejects_configured_tool_name_collisions(tmp_path, name):
+    config = replace(
+        make_runtime_config(
+            tmp_path,
+            extensions=ExtensionsConfig(
+                config_path=None, messaging=MessagingConfig(enabled=True)
+            ),
+        ),
+        rag=None, rag_requested=False, agent_state="stateless",
+    )
+
+    def conflicting(query: str) -> str:
+        """Return the supplied query."""
+        return query
+
+    configured_tool = tool(name)(conflicting)
+    with pytest.raises(ValueError, match=rf"reserved agent messaging tool name.*{name}"):
+        build_agent_kwargs(
+            config,
+            tools=[configured_tool],
+            model_profile=ModelDefaults(provider="ollama", name="fake"),
+            reasoning_level="medium",
+            reasoning_level_is_explicit=False,
+            system_prompt="Main.", custom_instruction=None, rag_enabled=False,
+            project_root=tmp_path,
+            artifact_registry=LargeToolResultArtifactRegistry(),
+            include_async_subagents=False,
+            build_model=lambda _level, _profile: object(),
+            session_id="s", messaging_broker=MessageBroker(config.extensions.messaging),
+        )

@@ -739,9 +739,14 @@ def create_app(
 
         async def run_queued(current: AgentRunContext) -> dict[str, Any]:
             if current.history and active_runtime.config.agent_state == "stateful":
-                checkpoint = await active_runtime.checkpointer.aget_tuple(
-                    {"configurable": {"thread_id": current.thread_id}}
-                )
+                try:
+                    checkpoint = await active_runtime.checkpointer.aget_tuple(
+                        {"configurable": {"thread_id": current.thread_id}}
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(_safe_backend_error(exc)) from exc
                 if checkpoint is not None:
                     raise ValueError("History cannot be replayed into an existing stateful thread.")
             renderer = _WarningCollector()

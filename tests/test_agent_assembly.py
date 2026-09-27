@@ -234,3 +234,28 @@ def test_only_opted_in_subagents_receive_messaging_tools(
         assert "send_agent_message" in _summarize(main)["tools"]
         assert "runnable" in main["subagents"][0]
         assert "runnable" in main["subagents"][1]
+
+
+def test_nested_unopted_child_does_not_inherit_parent_messaging_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _assembly_config(
+        tmp_path,
+        agent_state="stateless",
+        extensions=ExtensionsConfig(
+            config_path=None,
+            messaging=MessagingConfig(enabled=True),
+            subagents=(
+                SubagentConfig(
+                    "parent", "Parent", "Coordinate", messaging=True,
+                    subagents=(SubagentConfig("child", "Child", "Work"),),
+                ),
+            ),
+        ),
+    )
+    static_calls, live_calls = _build_both(tmp_path, monkeypatch, config)
+    for calls in (static_calls, live_calls):
+        assert len(calls) == 3
+        assert "send_agent_message" not in _summarize(calls[0])["tools"]
+        assert "send_agent_message" in _summarize(calls[1])["tools"]
+        assert "send_agent_message" in _summarize(calls[2])["tools"]

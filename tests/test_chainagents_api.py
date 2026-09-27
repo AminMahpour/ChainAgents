@@ -2350,6 +2350,46 @@ async def test_queued_history_replay_rechecks_checkpoint_when_job_starts(monkeyp
 
 
 @pytest.mark.anyio
+async def test_queued_history_checkpoint_failure_does_not_expose_backend_details() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("branch-thread")
+    lookups = 0
+
+    async def lookup(_config):
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            return None
+        raise RuntimeError("postgres://user:secret@internal.example")
+
+    runtime.checkpointer.aget_tuple = lookup
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        submitted = await client.post("/api/agent/input", json={
+            "thread_id": "branch-thread", "source_thread_id": "source-thread",
+            "history": [{"role": "user", "content": "earlier"}],
+            "prompt": "continue", "mode": "queue",
+        })
+        assert submitted.status_code == 202
+        runtime.user_input.resume("branch-thread")
+        await runtime.user_input.wait_idle("branch-thread")
+        result = await client.get(
+            f"/api/agent/turns/branch-thread/{submitted.json()['turn_id']}"
+        )
+    assert lookups == 2
+    assert result.json()["status"] == "failed"
+    assert result.json()["error"] == "Agent operation failed. Please retry."
+    assert "secret" not in result.text
+
+
+@pytest.mark.anyio
 async def test_turn_events_finish_after_result_is_evicted() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     runtime.config.extensions.user_input = UserInputConfig(
@@ -2391,6 +2431,38 @@ async def test_turn_events_finish_after_result_is_evicted() -> None:
     assert next_status["status"] == "completed"
     result = json.loads(await anext(lines))
     assert result == {"type": "result", "turn_id": first.id, "result": "first", "error": None}
+
+
+@pytest.mark.anyio
+async def test_turn_events_finish_when_queued_session_is_closed() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("thread-1")
+
+    async def run(_value):
+        raise AssertionError("queued turn must not run")
+
+    job = runtime.user_input.submit(
+        "thread-1", "queued", run, followup_factory=lambda text: text
+    )
+    app = chainagents_api.create_app(runtime=runtime)
+    app.state.runtime = runtime
+    endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", None) == "/api/agent/turns/{thread_id}/{turn_id}/events"
+    )
+    response = await endpoint("thread-1", job.id, SimpleNamespace(app=app))
+    lines = response.body_iterator
+    assert json.loads(await anext(lines))["status"] == "queued"
+    await runtime.user_input.close_session("thread-1")
+    assert json.loads(await anext(lines))["status"] == "cancelled"
+    assert json.loads(await anext(lines)) == {
+        "type": "result", "turn_id": job.id, "result": None, "error": None,
+    }
 
 
 def test_nonblocking_input_rejects_current_images_for_text_only_model() -> None:

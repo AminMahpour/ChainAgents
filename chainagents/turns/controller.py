@@ -154,7 +154,9 @@ class ConversationInputController:
     def steer(self, session_id: str, text: str, *, input_id: str | None = None) -> str:
         if not self.config.enabled:
             raise ValueError("Nonblocking user input is disabled.")
-        session = self._session(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ValueError("No active turn to steer.")
         if input_id is not None and input_id in session.steer_ids:
             return session.steer_ids[input_id][0]
         if (
@@ -178,6 +180,8 @@ class ConversationInputController:
     def stop(self, session_id: str) -> None:
         session = self._session(session_id)
         session.paused = True
+        if session.external_task is not None:
+            session.external_task.cancel()
         if session.active is not None:
             session.active.cancel()
 
@@ -187,7 +191,14 @@ class ConversationInputController:
         self._start_next(session_id)
 
     def status(self, session_id: str) -> dict[str, Any]:
-        session = self._session(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            return {
+                "active_job_id": None,
+                "external_active": False,
+                "queued_job_ids": [],
+                "paused": False,
+            }
         return {
             "active_job_id": session.active_job.id if session.active_job else None,
             "external_active": session.external_task is not None,
@@ -207,7 +218,9 @@ class ConversationInputController:
 
     def turn_finished(self, session_id: str) -> None:
         """Release an external turn before starting queued controller work."""
-        session = self._session(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
         task = asyncio.current_task()
         if task is session.active:
             if session.active_job is not None and session.active_job.status == "running":
@@ -218,18 +231,21 @@ class ConversationInputController:
 
     def get(self, session_id: str, job_id: str) -> InputJob:
         try:
-            return self._session(session_id).jobs[job_id]
+            return self._sessions[session_id].jobs[job_id]
         except KeyError as exc:
             raise ValueError("Turn is unavailable in this conversation.") from exc
 
     def find_input_id(self, session_id: str, input_id: str) -> InputJob | None:
-        session = self._session(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
         job_id = session.input_ids.get(input_id)
         return session.jobs.get(job_id) if job_id is not None else None
 
     async def wait_idle(self, session_id: str) -> None:
         while True:
-            task = self._session(session_id).active
+            session = self._sessions.get(session_id)
+            task = session.active if session is not None else None
             if task is None:
                 return
             await asyncio.gather(task, return_exceptions=True)
@@ -239,9 +255,25 @@ class ConversationInputController:
         if session is None:
             return
         session.paused = True
+        current_task = asyncio.current_task()
+        if session.external_task is not None and session.external_task is not current_task:
+            session.external_task.cancel()
         if session.active is not None:
             session.active.cancel()
-            await asyncio.gather(session.active, return_exceptions=True)
+        closing_tasks = [
+            task for task in (session.active, session.external_task)
+            if task is not None and task is not current_task
+        ]
+        await asyncio.gather(
+            *closing_tasks,
+            return_exceptions=True,
+        )
+        if session.active_job is not None and session.active_job.status not in {"completed", "failed", "cancelled"}:
+            session.active_job.status = "cancelled"
+        for job in session.queue:
+            job.status = "cancelled"
+            job.payload = None
+        session.queue.clear()
         self._sessions.pop(session_id, None)
 
     async def close_all(self) -> None:

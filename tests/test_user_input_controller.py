@@ -285,6 +285,84 @@ def test_legacy_turn_blocks_controller_start_and_steering(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_stop_cancels_running_external_turn(monkeypatch):
+    async def exercise():
+        broker = MessageBroker(MessagingConfig(enabled=True))
+        controller = ConversationInputController(UserInputConfig(enabled=True), broker)
+        lock = asyncio.Lock()
+        runtime = SimpleNamespace(
+            config=SimpleNamespace(extensions=SimpleNamespace(
+                user_input=UserInputConfig(enabled=True),
+                messaging=MessagingConfig(enabled=False),
+            )),
+            user_input=controller,
+            turn_lock=lambda _session_id: lock,
+        )
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def run(_runner, _request, _renderer):
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(TurnRunner, "_run", run)
+        request = TurnRequest(
+            prompt="legacy", thread_id="s", model_name="fake", reasoning_level="medium"
+        )
+        renderer = SimpleNamespace(on_cancelled=lambda: asyncio.sleep(0))
+        legacy = asyncio.create_task(TurnRunner(runtime).run(request, renderer))
+        await started.wait()
+        controller.stop("s")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(legacy, timeout=1)
+        assert cancelled.is_set()
+        assert controller.status("s") == {
+            "active_job_id": None, "external_active": False,
+            "queued_job_ids": [], "paused": True,
+        }
+
+    asyncio.run(exercise())
+
+
+def test_read_only_turn_lookups_do_not_create_sessions():
+    controller = ConversationInputController(
+        UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+    )
+    for index in range(100):
+        session_id = f"unknown-{index}"
+        assert controller.status(session_id) == {
+            "active_job_id": None, "external_active": False,
+            "queued_job_ids": [], "paused": False,
+        }
+        assert controller.find_input_id(session_id, "request") is None
+        with pytest.raises(ValueError, match="Turn is unavailable"):
+            controller.get(session_id, "turn")
+    assert controller._sessions == {}
+
+
+def test_close_session_cancels_queued_jobs_retained_by_event_consumers():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        controller.stop("s")
+
+        async def run(_payload):
+            raise AssertionError("paused jobs must not run")
+
+        job = controller.submit("s", "queued", run, followup_factory=lambda text: text)
+        assert job.status == "queued"
+        await controller.close_session("s")
+        assert job.status == "cancelled"
+        assert "s" not in controller._sessions
+
+    asyncio.run(exercise())
+
+
 def test_queued_turn_cannot_be_steered_while_legacy_waiter_owns_lock(monkeypatch):
     async def exercise():
         broker = MessageBroker(MessagingConfig(enabled=True))
