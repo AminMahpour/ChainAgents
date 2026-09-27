@@ -77,8 +77,11 @@ The Chainlit app is then available at `http://localhost:8000` by default.
 
 - **When set**, LangGraph checkpoints and `/memories/` are persisted in
   Postgres — but only in stateful mode. With `[agent].state = "stateless"`
-  in `deepagent.toml`, no checkpoint or store handles are opened at all and
-  nothing is persisted, even with `DATABASE_URL` set. A local Postgres is
+  in `deepagent.toml`, no checkpoint or store handles are opened at all, so
+  agent state is not persisted even with `DATABASE_URL` set. Stateless is
+  not a no-retention setting, though: whenever `DATABASE_URL` is present,
+  Chainlit's own data layer still records thread, step, feedback, and
+  element records independently of agent state. A local Postgres is
   available via `compose.yaml`:
 
   ```bash
@@ -87,8 +90,9 @@ The Chainlit app is then available at `http://localhost:8000` by default.
   ```
 
 - **When unset**, the app falls back to in-memory persistence for the current
-  process only. In stateless mode there is no persistence at all — with or
-  without `DATABASE_URL` — because no store or checkpointer is created.
+  process only. In stateless mode there is no agent-state persistence at all —
+  with or without `DATABASE_URL` — because no store or checkpointer is
+  created.
 
 ## Environment variables
 
