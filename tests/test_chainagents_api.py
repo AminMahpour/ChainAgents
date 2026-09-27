@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 import pytest
 
 from chainagents.interfaces.api import app as chainagents_api
@@ -23,6 +24,7 @@ from chainagents.rag.runtime import RagUploadResult
 from chainagents.runtime.messaging import MessageBroker
 from chainagents.runtime.types import MessagingConfig, UserInputConfig
 from chainagents.turns.controller import ConversationInputController
+from chainagents.turns.runner import TurnRequest, TurnResult, TurnRunner
 
 
 class _Token:
@@ -2213,6 +2215,58 @@ def test_nonblocking_input_endpoint_returns_turn_id_and_status() -> None:
         detail = client.get(f"/api/agent/turns/thread-1/{turn_id}")
         assert detail.status_code == 200
         assert detail.json()["status"] in {"running", "completed"}
+
+
+@pytest.mark.anyio
+async def test_input_endpoint_rejects_turn_during_legacy_run_and_queues_next(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.config.extensions.messaging = MessagingConfig(enabled=False)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    turn_lock = asyncio.Lock()
+    runtime.turn_lock = lambda _thread_id: turn_lock
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run(_runner, request, _renderer):
+        if request.prompt == "legacy":
+            started.set()
+            await release.wait()
+        return TurnResult(status="completed", prompt=request.prompt, response="ok")
+
+    monkeypatch.setattr(TurnRunner, "_run", run)
+    request = TurnRequest(
+        prompt="legacy", thread_id="thread-1", model_name="fake-model",
+        reasoning_level="medium",
+    )
+    renderer = SimpleNamespace(on_cancelled=lambda: asyncio.sleep(0))
+    legacy = asyncio.create_task(TurnRunner(runtime).run(request, renderer))
+    await started.wait()
+    app = chainagents_api.create_app(runtime=runtime)
+    try:
+        async with app.router.lifespan_context(app), AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            turn = await client.post("/api/agent/input", json={
+                "prompt": "new", "thread_id": "thread-1", "mode": "turn",
+            })
+            queued = await client.post("/api/agent/input", json={
+                "prompt": "next", "thread_id": "thread-1", "mode": "queue",
+            })
+            steering = await client.post("/api/agent/input", json={
+                "prompt": "steer", "thread_id": "thread-1", "mode": "steer",
+            })
+    finally:
+        release.set()
+        await legacy
+        await runtime.user_input.wait_idle("thread-1")
+    assert turn.status_code == 409
+    assert queued.status_code == 202
+    assert queued.json()["status"] == "queued"
+    assert steering.status_code == 409
 
 
 def test_nonblocking_input_rejects_current_images_for_text_only_model() -> None:

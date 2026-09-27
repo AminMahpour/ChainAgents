@@ -722,8 +722,10 @@ def create_app(
             existing = controller.find_input_id(session_id, payload.input_id)
             if existing is not None:
                 return {"turn_id": existing.id, "thread_id": session_id, "status": existing.status}
-        if payload.mode == "turn" and controller.status(session_id)["active_job_id"] is not None:
-            raise HTTPException(status_code=409, detail="Choose steer or queue while a turn is active.")
+        if payload.mode == "turn":
+            status = controller.status(session_id)
+            if status["active_job_id"] is not None or status["external_active"]:
+                raise HTTPException(status_code=409, detail="Choose steer or queue while a turn is active.")
         context = await _prepare_run_context(
             active_runtime, payload, has_current_images=bool(payload.attachments)
         )

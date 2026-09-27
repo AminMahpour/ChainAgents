@@ -2501,3 +2501,45 @@ async def test_interactive_cli_accepts_queued_input_while_first_turn_runs(monkey
     )
     assert code == 0
     assert seen == ["first", "second"]
+
+
+@pytest.mark.anyio
+async def test_interactive_cli_strips_queue_prefix_while_paused(monkeypatch) -> None:
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import MessagingConfig, UserInputConfig
+    from chainagents.turns.controller import ConversationInputController
+
+    manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
+    config = SimpleNamespace(
+        extensions=SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    )
+    runtime = SimpleNamespace(
+        background_tasks=manager,
+        config=config,
+        user_input=ConversationInputController(
+            config.extensions.user_input, MessageBroker(MessagingConfig(enabled=True))
+        ),
+    )
+    prompts = iter(("/stop", "/queue inspect the tests", "/resume"))
+    seen: list[str] = []
+
+    async def fake_read(**_kwargs):
+        try:
+            return next(prompts)
+        except StopIteration:
+            await runtime.user_input.wait_idle("thread-1")
+            raise EOFError from None
+
+    async def fake_run(_runtime, _args, *, prompt, **_kwargs):
+        seen.append(prompt)
+        return 0
+
+    monkeypatch.setattr(chainagents_cli, "_read_terminal_line", fake_read)
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", fake_run)
+    code = await chainagents_cli.interactive_repl(
+        runtime,
+        chainagents_cli.parse_args(["--thread-id", "thread-1"]),
+        stdout=io.StringIO(), stderr=io.StringIO(), stdin=io.StringIO(),
+    )
+    assert code == 0
+    assert seen == ["inspect the tests"]

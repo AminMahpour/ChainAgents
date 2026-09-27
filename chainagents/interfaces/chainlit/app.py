@@ -730,13 +730,31 @@ async def _send_turn_busy() -> None:
     ).send()
 
 
-def _submit_nonblocking_message(runtime: AgentRuntime, thread_id: str, message: cl.Message) -> str:
+def _submit_nonblocking_message(
+    runtime: AgentRuntime,
+    thread_id: str,
+    message: cl.Message,
+    *,
+    settings: AppSettings | None = None,
+) -> str:
     """Schedule a Chainlit turn while its socket callback returns promptly."""
+    settings_snapshot = settings or coerce_settings(
+        cl.user_session.get(SESSION_SETTINGS_KEY),
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+        show_reasoning_stream_default=(
+            runtime.config.extensions.chainlit_reasoning_steps_enabled
+        ),
+        show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
+    )
+
     async def run(item: tuple[cl.Message, bool]) -> None:
         current, show_user = item
         if show_user:
-            await cl.Message(content=current.content, author="User").send()
-        await _handle_message(current)
+            current = await cl.Message(content=current.content, author="User").send()
+        async with cl.Step(name="on_message", type="run", parent_id=current.id) as step:
+            step.input = current.content
+            await _handle_message(current, settings_override=settings_snapshot)
 
     job = runtime.user_input.submit(
         thread_id,
@@ -1057,6 +1075,10 @@ async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
             cl.user_session.get(SESSION_SETTINGS_KEY),
             default_model_name=runtime.config.model_name,
             available_models=runtime.config.model_choices,
+            show_reasoning_stream_default=(
+                runtime.config.extensions.chainlit_reasoning_steps_enabled
+            ),
+            show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
         )
         thread_id = settings.thread_id
         status = runtime.user_input.status(thread_id)
@@ -1064,7 +1086,7 @@ async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
             await _offer_busy_input(runtime, thread_id, message)
         else:
             try:
-                job_id = _submit_nonblocking_message(runtime, thread_id, message)
+                job_id = _submit_nonblocking_message(runtime, thread_id, message, settings=settings)
                 await cl.Message(
                     content=f"Working on turn `{job_id}`.", author="System",
                     actions=[cl.Action(
@@ -1089,12 +1111,14 @@ async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
 chainlit_config.code.on_message = _guarded_chainlit_message_callback
 
 
-async def _handle_message(message: cl.Message) -> None:
+async def _handle_message(
+    message: cl.Message, *, settings_override: AppSettings | None = None
+) -> None:
     """Prepare a normal user request for the shared agent turn."""
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
-    settings = coerce_settings(
+    settings = settings_override or coerce_settings(
         cl.user_session.get(SESSION_SETTINGS_KEY),
         default_model_name=runtime.config.model_name,
         available_models=runtime.config.model_choices,

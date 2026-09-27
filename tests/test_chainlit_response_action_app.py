@@ -40,6 +40,130 @@ class Session:
 
 
 @pytest.mark.anyio
+async def test_queued_chainlit_prompt_keeps_submitted_settings(monkeypatch) -> None:
+    session = Session()
+    session.set(main.SESSION_SETTINGS_KEY, {"model": "original"})
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    controller = ConversationInputController(UserInputConfig(enabled=True), broker)
+    runtime = SimpleNamespace(
+        user_input=controller,
+        config=SimpleNamespace(
+            model_name="original", model_choices=("original", "changed"),
+            extensions=SimpleNamespace(
+                chainlit_reasoning_steps_enabled=True,
+                chainlit_tool_steps_enabled=True,
+            ),
+        ),
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    seen: list[tuple[str, str]] = []
+
+    class Message:
+        def __init__(self, content: str):
+            self.id = content
+            self.content = content
+
+    class Step:
+        def __init__(self, **_kwargs):
+            self.input = ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def get_runtime():
+        return runtime
+
+    async def handle(message, *, settings_override=None):
+        model = (
+            settings_override.model_name
+            if settings_override is not None
+            else session.get(main.SESSION_SETTINGS_KEY)["model"]
+        )
+        seen.append((message.content, model))
+        if message.content == "first":
+            first_started.set()
+            await release_first.wait()
+
+    monkeypatch.setattr(main.cl, "user_session", session)
+    monkeypatch.setattr(main.cl, "Step", Step)
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "_handle_message", handle)
+    monkeypatch.setattr(
+        main, "coerce_settings",
+        lambda raw, **_kwargs: SimpleNamespace(thread_id="s", model_name=raw["model"]),
+    )
+
+    main._submit_nonblocking_message(runtime, "s", Message("first"))
+    await first_started.wait()
+    main._submit_nonblocking_message(runtime, "s", Message("second"))
+    session.set(main.SESSION_SETTINGS_KEY, {"model": "changed"})
+    release_first.set()
+    await controller.wait_idle("s")
+    assert seen == [("first", "original"), ("second", "original")]
+
+
+@pytest.mark.anyio
+async def test_nonblocking_chainlit_prompt_keeps_configured_rendering_defaults(monkeypatch) -> None:
+    session = Session()
+    controller = ConversationInputController(
+        UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+    )
+    runtime = SimpleNamespace(
+        user_input=controller,
+        config=SimpleNamespace(
+            model_name="model", model_choices=("model",),
+            extensions=SimpleNamespace(
+                user_input=UserInputConfig(enabled=True),
+                chainlit_reasoning_steps_enabled=False,
+                chainlit_tool_steps_enabled=False,
+            ),
+        ),
+    )
+    seen: list[tuple[bool, bool]] = []
+
+    class Message:
+        def __init__(self, content: str, author: str = "User", actions=None):
+            self.id = content
+            self.content = content
+            self.author = author
+            self.actions = actions or []
+
+        async def send(self):
+            return self
+
+    class Step:
+        def __init__(self, **_kwargs):
+            self.input = ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def get_runtime():
+        return runtime
+
+    async def handle(_message, *, settings_override):
+        seen.append((settings_override.show_reasoning_stream, settings_override.show_tool_calls))
+
+    monkeypatch.setattr(main.cl, "user_session", session)
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="s")))
+    monkeypatch.setattr(main.cl, "Message", Message)
+    monkeypatch.setattr(main.cl, "Step", Step)
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "_handle_message", handle)
+
+    await main._guarded_chainlit_message_callback(Message("hello"))
+    await controller.wait_idle("s")
+    assert seen == [(False, False)]
+
+
+@pytest.mark.anyio
 async def test_chainlit_accepts_busy_input_and_offers_steer_or_queue(monkeypatch) -> None:
     session = Session()
     broker = MessageBroker(MessagingConfig(enabled=True))
@@ -47,12 +171,17 @@ async def test_chainlit_accepts_busy_input_and_offers_steer_or_queue(monkeypatch
     runtime = SimpleNamespace(
         user_input=user_input,
         config=SimpleNamespace(model_name="model", model_choices=("model",),
-            extensions=SimpleNamespace(user_input=UserInputConfig(enabled=True))),
+            extensions=SimpleNamespace(
+                user_input=UserInputConfig(enabled=True),
+                chainlit_reasoning_steps_enabled=True,
+                chainlit_tool_steps_enabled=True,
+            )),
     )
     entered = asyncio.Event()
     release = asyncio.Event()
     seen: list[str] = []
     notices: list[Any] = []
+    run_steps: list[tuple[str, str, str]] = []
 
     class Message:
         def __init__(self, content: str, author: str = "User", actions=None):
@@ -64,11 +193,26 @@ async def test_chainlit_accepts_busy_input_and_offers_steer_or_queue(monkeypatch
 
         async def send(self):
             notices.append(self)
+            return self
+
+    class Step:
+        def __init__(self, *, name, type, parent_id):
+            self.name = name
+            self.type = type
+            self.parent_id = parent_id
+            self.input = ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            run_steps.append((self.name, self.parent_id, self.input))
+            return False
 
     async def get_runtime():
         return runtime
 
-    async def handle(message):
+    async def handle(message, *, settings_override=None):
         seen.append(message.content)
         if message.content == "first":
             entered.set()
@@ -76,6 +220,7 @@ async def test_chainlit_accepts_busy_input_and_offers_steer_or_queue(monkeypatch
 
     monkeypatch.setattr(main.cl, "user_session", session)
     monkeypatch.setattr(main.cl, "Message", Message)
+    monkeypatch.setattr(main.cl, "Step", Step)
     monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="ui-chat")))
     monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
     monkeypatch.setattr(main, "coerce_settings", lambda *_args, **_kwargs: SimpleNamespace(thread_id="s"))
@@ -91,6 +236,10 @@ async def test_chainlit_accepts_busy_input_and_offers_steer_or_queue(monkeypatch
     release.set()
     await user_input.wait_idle("s")
     assert seen == ["first", "second"]
+    assert run_steps == [
+        ("on_message", "first", "first"),
+        ("on_message", "second", "second"),
+    ]
     await main._stop_nonblocking_input(SimpleNamespace(payload={"thread_id": "another-chat"}))
     assert user_input.status("s")["paused"] is True
     assert user_input.status("another-chat")["paused"] is False

@@ -112,7 +112,7 @@ class AgentRuntime:
             broker_config = replace(broker_config, enabled=True)
         self.message_broker = runtime_messaging.MessageBroker(broker_config)
         self.user_input = ConversationInputController(
-            config.extensions.user_input, self.message_broker
+            config.extensions.user_input, self.message_broker, runner_serialized=True
         )
         self._chainlit_commands, self._chainlit_command_notes = runtime_commands.build_chainlit_command_catalog(
             config.extensions,

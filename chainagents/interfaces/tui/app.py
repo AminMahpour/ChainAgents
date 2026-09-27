@@ -320,7 +320,7 @@ class ChainAgentsTuiApp(App[int]):
             if active and not prompt.startswith("/queue "):
                 self._set_status("Agent is working. Use /steer or /queue before this prompt.")
                 return
-            submitted = prompt.removeprefix("/queue ") if active else prompt
+            submitted = prompt.removeprefix("/queue ")
             try:
                 job = self.runtime.user_input.submit(
                     self.thread_id,

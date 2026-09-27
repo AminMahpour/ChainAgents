@@ -30,19 +30,27 @@ class _Conversation:
     queue: deque[InputJob] = field(default_factory=deque)
     active: asyncio.Task[None] | None = None
     active_job: InputJob | None = None
+    external_task: asyncio.Task[Any] | None = None
     paused: bool = False
     jobs: dict[str, InputJob] = field(default_factory=dict)
     input_ids: dict[str, str] = field(default_factory=dict)
-    steer_ids: dict[str, str] = field(default_factory=dict)
+    steer_ids: dict[str, tuple[str, str]] = field(default_factory=dict)
     completed: deque[str] = field(default_factory=deque)
 
 
 class ConversationInputController:
     """Accept new input immediately while serializing agent turns per session."""
 
-    def __init__(self, config: UserInputConfig, broker: MessageBroker) -> None:
+    def __init__(
+        self,
+        config: UserInputConfig,
+        broker: MessageBroker,
+        *,
+        runner_serialized: bool = False,
+    ) -> None:
         self.config = config
         self.broker = broker
+        self.runner_serialized = runner_serialized
         self._sessions: dict[str, _Conversation] = {}
 
     def _session(self, session_id: str) -> _Conversation:
@@ -79,10 +87,15 @@ class ConversationInputController:
 
     def _start_next(self, session_id: str) -> None:
         session = self._session(session_id)
-        if session.paused or session.active is not None or not session.queue:
+        if (
+            session.paused
+            or session.active is not None
+            or session.external_task is not None
+            or not session.queue
+        ):
             return
         job = session.queue.popleft()
-        job.status = "running"
+        job.status = "waiting" if self.runner_serialized else "running"
         session.active_job = job
         self.broker.open(session_id, "main", name="main", parent=None)
         session.active = asyncio.create_task(
@@ -128,6 +141,9 @@ class ConversationInputController:
                 for input_id, known_id in tuple(session.input_ids.items()):
                     if known_id == expired_id:
                         session.input_ids.pop(input_id, None)
+                for input_id, (_, known_id) in tuple(session.steer_ids.items()):
+                    if known_id == expired_id:
+                        session.steer_ids.pop(input_id, None)
             session.active = None
             session.active_job = None
             self._start_next(job.session_id)
@@ -137,8 +153,13 @@ class ConversationInputController:
             raise ValueError("Nonblocking user input is disabled.")
         session = self._session(session_id)
         if input_id is not None and input_id in session.steer_ids:
-            return session.steer_ids[input_id]
-        if session.active is None:
+            return session.steer_ids[input_id][0]
+        if (
+            session.active is None
+            or session.active_job is None
+            or session.active_job.status != "running"
+            or session.external_task is not None
+        ):
             raise ValueError("No active turn to steer.")
         projected_steering = self.broker.pending_user_steering_count(session_id) + 1
         batch_size = self.broker.config.max_deliveries_per_step
@@ -147,7 +168,8 @@ class ConversationInputController:
             raise ValueError("Queued turn limit reached; wait before steering this turn.")
         message_id = self.broker.send_user(session_id, text).id
         if input_id is not None:
-            session.steer_ids[input_id] = message_id
+            assert session.active_job is not None
+            session.steer_ids[input_id] = (message_id, session.active_job.id)
         return message_id
 
     def stop(self, session_id: str) -> None:
@@ -165,9 +187,31 @@ class ConversationInputController:
         session = self._session(session_id)
         return {
             "active_job_id": session.active_job.id if session.active_job else None,
+            "external_active": session.external_task is not None,
             "queued_job_ids": [job.id for job in session.queue],
             "paused": session.paused,
         }
+
+    def turn_started(self, session_id: str) -> None:
+        """Record the task that acquired the main-turn lock."""
+        session = self._session(session_id)
+        task = asyncio.current_task()
+        if task is session.active:
+            if session.active_job is not None:
+                session.active_job.status = "running"
+        else:
+            session.external_task = task
+
+    def turn_finished(self, session_id: str) -> None:
+        """Release an external turn before starting queued controller work."""
+        session = self._session(session_id)
+        task = asyncio.current_task()
+        if task is session.active:
+            if session.active_job is not None and session.active_job.status == "running":
+                session.active_job.status = "finishing"
+        elif task is session.external_task:
+            session.external_task = None
+            self._start_next(session_id)
 
     def get(self, session_id: str, job_id: str) -> InputJob:
         try:

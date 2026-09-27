@@ -193,6 +193,32 @@ async def test_tui_keeps_prompt_enabled_and_accepts_steering_during_run() -> Non
 
 
 @pytest.mark.anyio
+async def test_tui_queue_command_strips_prefix_while_paused() -> None:
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import MessagingConfig, UserInputConfig
+    from chainagents.turns.controller import ConversationInputController
+
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions = SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, MessageBroker(MessagingConfig(enabled=True))
+    )
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt", PromptTextArea)
+        event = SimpleNamespace(stop=lambda: None, text_area=prompt)
+        prompt.load_text("/stop")
+        await app.on_prompt_submitted(event)
+        prompt.load_text("/queue inspect the tests")
+        await app.on_prompt_submitted(event)
+        queued_id = runtime.user_input.status(app.thread_id)["queued_job_ids"][0]
+        assert runtime.user_input.get(app.thread_id, queued_id).payload == "inspect the tests"
+        await pilot.pause()
+
+
+@pytest.mark.anyio
 async def test_run_tui_leaves_app_stderr_visible(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

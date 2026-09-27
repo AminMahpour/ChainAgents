@@ -405,7 +405,7 @@ async def interactive_repl(
                         except ValueError as exc:
                             print(str(exc), file=stderr)
                         continue
-                submitted = stripped.removeprefix("/queue ") if active else prompt
+                submitted = stripped.removeprefix("/queue ") if stripped.startswith("/queue ") else prompt
 
                 async def run_queued(item: tuple[str, bool]) -> None:
                     text, include_photos = item
