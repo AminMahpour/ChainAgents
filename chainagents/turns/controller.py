@@ -35,6 +35,7 @@ class _Conversation:
     external_task: asyncio.Task[Any] | None = None
     external_waiters: set[asyncio.Task[Any]] = field(default_factory=set)
     paused: bool = False
+    closing: bool = False
     jobs: dict[str, InputJob] = field(default_factory=dict)
     input_ids: dict[str, str] = field(default_factory=dict)
     steer_ids: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -72,12 +73,23 @@ class ConversationInputController:
         *,
         followup_factory: Callable[[str], Any],
         input_id: str | None = None,
+        require_idle: bool = False,
     ) -> InputJob:
         if not self.config.enabled:
             raise ValueError("Nonblocking user input is disabled.")
         session = self._session(session_id)
         if input_id is not None and input_id in session.input_ids:
             return session.jobs[session.input_ids[input_id]]
+        if session.closing:
+            raise ValueError("Conversation is closing.")
+        if require_idle and (
+            session.paused
+            or session.active is not None
+            or session.external_task is not None
+            or session.external_waiters
+            or session.queue
+        ):
+            raise ValueError("Choose steer or queue while a conversation is busy or paused.")
         if len(session.queue) + self._reserved_followups(session_id) >= self.config.max_queued_turns:
             raise ValueError("Queued turn limit reached.")
         job = InputJob(uuid.uuid4().hex, session_id, payload, run, followup_factory)
@@ -92,8 +104,10 @@ class ConversationInputController:
         session = self._session(session_id)
         if (
             session.paused
+            or session.closing
             or session.active is not None
             or session.external_task is not None
+            or session.external_waiters
             or not session.queue
         ):
             return
@@ -161,7 +175,9 @@ class ConversationInputController:
         if input_id is not None and input_id in session.steer_ids:
             return session.steer_ids[input_id][0]
         if (
-            session.active is None
+            session.closing
+            or session.paused
+            or session.active is None
             or session.active_job is None
             or session.active_job.status != "running"
             or session.external_task is not None
@@ -190,7 +206,7 @@ class ConversationInputController:
 
     def resume(self, session_id: str) -> None:
         session = self._sessions.get(session_id)
-        if session is None:
+        if session is None or session.closing:
             return
         session.paused = False
         self._start_next(session_id)
@@ -206,7 +222,7 @@ class ConversationInputController:
             }
         return {
             "active_job_id": session.active_job.id if session.active_job else None,
-            "external_active": session.external_task is not None,
+            "external_active": session.external_task is not None or bool(session.external_waiters),
             "queued_job_ids": [job.id for job in session.queue],
             "paused": session.paused,
         }
@@ -218,7 +234,7 @@ class ConversationInputController:
     def turn_waiting(self, session_id: str) -> bool:
         """Track an external turn before it can wait for the shared lock."""
         session = self._session(session_id)
-        if session.paused:
+        if session.paused or session.closing:
             return False
         task = asyncio.current_task()
         if task is not None and task is not session.active:
@@ -230,13 +246,14 @@ class ConversationInputController:
         session = self._sessions.get(session_id)
         if session is not None:
             session.external_waiters.discard(asyncio.current_task())
+            self._start_next(session_id)
 
     def turn_started(self, session_id: str) -> bool:
         """Record the task that acquired the main-turn lock."""
         session = self._session(session_id)
         task = asyncio.current_task()
         session.external_waiters.discard(task)
-        if session.paused:
+        if session.paused or session.closing:
             return False
         if task is session.active:
             if session.active_job is not None:
@@ -283,6 +300,7 @@ class ConversationInputController:
         session = self._sessions.get(session_id)
         if session is None:
             return
+        session.closing = True
         session.paused = True
         current_task = asyncio.current_task()
         for task in tuple(session.external_waiters):

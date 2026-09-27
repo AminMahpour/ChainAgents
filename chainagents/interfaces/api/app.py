@@ -707,7 +707,30 @@ def create_app(
         if not active_runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
         controller = active_runtime.user_input
-        session_id = payload.thread_id
+        session_id = _required_text(payload.thread_id, "thread_id")
+        def existing_turn() -> dict[str, Any] | None:
+            if not payload.input_id:
+                return None
+            existing = controller.find_input_id(session_id, payload.input_id)
+            if existing is None:
+                return None
+            return {"turn_id": existing.id, "thread_id": session_id, "status": existing.status}
+
+        def ensure_idle() -> None:
+            if payload.mode != "turn":
+                return
+            status = controller.status(session_id)
+            if (
+                status["active_job_id"] is not None
+                or status["external_active"]
+                or status["paused"]
+                or status["queued_job_ids"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Choose steer or queue while a conversation is busy or paused.",
+                )
+
         if payload.mode == "steer":
             if payload.history or payload.attachments:
                 raise HTTPException(status_code=422, detail="Steering accepts text only.")
@@ -718,17 +741,21 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             return {"status": "sent", "message_id": message_id, "thread_id": session_id}
-        if payload.input_id:
-            existing = controller.find_input_id(session_id, payload.input_id)
-            if existing is not None:
-                return {"turn_id": existing.id, "thread_id": session_id, "status": existing.status}
-        if payload.mode == "turn":
-            status = controller.status(session_id)
-            if status["active_job_id"] is not None or status["external_active"]:
-                raise HTTPException(status_code=409, detail="Choose steer or queue while a turn is active.")
-        context = await _prepare_run_context(
-            active_runtime, payload, has_current_images=bool(payload.attachments)
-        )
+        if existing := existing_turn():
+            return existing
+        ensure_idle()
+        try:
+            context = await _prepare_run_context(
+                active_runtime, payload,
+                has_current_images=bool(payload.attachments),
+                clone_branch=False,
+            )
+        except Exception:
+            if existing := existing_turn():
+                return existing
+            raise
+        if existing := existing_turn():
+            return existing
         if context.command_error:
             raise HTTPException(status_code=context.command_error_status, detail=context.command_error)
         if payload.attachments:
@@ -749,6 +776,9 @@ def create_app(
                     raise RuntimeError(_safe_backend_error(exc)) from exc
                 if checkpoint is not None:
                     raise ValueError("History cannot be replayed into an existing stateful thread.")
+            current = await _clone_branch_rag_before_commands(active_runtime, current)
+            if current.command_error:
+                raise ValueError(current.command_error)
             renderer = _WarningCollector()
             result = await TurnRunner(active_runtime).run(_turn_request(current), renderer)
             return {
@@ -766,14 +796,9 @@ def create_app(
             context, prompt="", history=(), selected_command=None,
             source_thread_id=None, image_parts=(), image_names=(), prompt_note="",
         )
-        if payload.input_id:
-            existing = controller.find_input_id(session_id, payload.input_id)
-            if existing is not None:
-                return {"turn_id": existing.id, "thread_id": session_id, "status": existing.status}
-        if payload.mode == "turn":
-            status = controller.status(session_id)
-            if status["active_job_id"] is not None or status["external_active"]:
-                raise HTTPException(status_code=409, detail="Choose steer or queue while a turn is active.")
+        if existing := existing_turn():
+            return existing
+        ensure_idle()
         try:
             job = controller.submit(
                 session_id,
@@ -781,6 +806,7 @@ def create_app(
                 run_queued,
                 followup_factory=lambda text: replace(followup_base, prompt=text),
                 input_id=payload.input_id,
+                require_idle=payload.mode == "turn",
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -791,7 +817,7 @@ def create_app(
         runtime = _runtime_from_request(request)
         if not runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
-        return runtime.user_input.status(thread_id)
+        return runtime.user_input.status(_required_text(thread_id, "thread_id"))
 
     @app.get("/api/agent/turns/{thread_id}/{turn_id}")
     async def get_conversation_turn(thread_id: str, turn_id: str, request: Request) -> dict[str, Any]:
@@ -799,7 +825,7 @@ def create_app(
         if not runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
         try:
-            job = runtime.user_input.get(thread_id, turn_id)
+            job = runtime.user_input.get(_required_text(thread_id, "thread_id"), turn_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"turn_id": job.id, "status": job.status, "result": job.result, "error": job.error}
@@ -810,7 +836,7 @@ def create_app(
         if not runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
         try:
-            job = runtime.user_input.get(thread_id, turn_id)
+            job = runtime.user_input.get(_required_text(thread_id, "thread_id"), turn_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -833,6 +859,7 @@ def create_app(
         runtime = _runtime_from_request(request)
         if not runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        thread_id = _required_text(thread_id, "thread_id")
         if not runtime.user_input.has_session(thread_id):
             return runtime.user_input.status(thread_id)
         runtime.user_input.stop(thread_id)
@@ -843,6 +870,7 @@ def create_app(
         runtime = _runtime_from_request(request)
         if not runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
+        thread_id = _required_text(thread_id, "thread_id")
         runtime.user_input.resume(thread_id)
         return runtime.user_input.status(thread_id)
 
@@ -1461,8 +1489,9 @@ async def _prepare_run_context(
     request: AgentRunRequest,
     *,
     has_current_images: bool = False,
+    clone_branch: bool = True,
 ) -> AgentRunContext:
-    """Validate one request and reserve branch RAG scope before the turn runs.
+    """Validate one request and optionally reserve its branch RAG scope.
 
     Native commands are resolved later by the shared ``TurnRunner``.
     """
@@ -1473,7 +1502,9 @@ async def _prepare_run_context(
         context.model_name,
         has_images=has_current_images or _history_contains_images(request.history),
     )
-    return await _clone_branch_rag_before_commands(runtime, context)
+    if clone_branch:
+        return await _clone_branch_rag_before_commands(runtime, context)
+    return context
 
 
 async def _clone_branch_rag_before_commands(

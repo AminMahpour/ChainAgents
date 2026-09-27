@@ -395,6 +395,56 @@ def test_stop_cancels_external_turn_waiting_for_same_lock(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_external_lock_waiters_count_as_busy():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        assert controller.turn_waiting("s") is True
+        assert controller.status("s")["external_active"] is True
+        controller.turn_wait_finished("s")
+        assert controller.status("s")["external_active"] is False
+
+    asyncio.run(exercise())
+
+
+def test_resume_cannot_restart_queued_job_during_close():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        running = asyncio.Event()
+        unwinding = asyncio.Event()
+        finish_unwind = asyncio.Event()
+        queued_started = asyncio.Event()
+
+        async def run(value):
+            if value == "active":
+                running.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    unwinding.set()
+                    await finish_unwind.wait()
+                    raise
+            queued_started.set()
+
+        controller.submit("s", "active", run, followup_factory=lambda text: text)
+        queued = controller.submit("s", "queued", run, followup_factory=lambda text: text)
+        await running.wait()
+        closing = asyncio.create_task(controller.close_session("s"))
+        await unwinding.wait()
+        controller.resume("s")
+        assert controller.status("s")["paused"] is True
+        finish_unwind.set()
+        await closing
+        await asyncio.sleep(0)
+        assert not queued_started.is_set()
+        assert queued.status == "cancelled"
+
+    asyncio.run(exercise())
+
+
 def test_resume_unknown_thread_does_not_create_session():
     controller = ConversationInputController(
         UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
