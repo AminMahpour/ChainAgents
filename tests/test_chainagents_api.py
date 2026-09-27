@@ -2269,6 +2269,130 @@ async def test_input_endpoint_rejects_turn_during_legacy_run_and_queues_next(mon
     assert steering.status_code == 409
 
 
+@pytest.mark.anyio
+async def test_input_turn_rechecks_busy_state_after_async_preparation(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    original_prepare = chainagents_api._prepare_run_context
+    preparing = asyncio.Event()
+    release_prepare = asyncio.Event()
+    release_active = asyncio.Event()
+
+    async def delayed_prepare(*args, **kwargs):
+        preparing.set()
+        await release_prepare.wait()
+        return await original_prepare(*args, **kwargs)
+
+    async def active_run(_payload):
+        await release_active.wait()
+
+    monkeypatch.setattr(chainagents_api, "_prepare_run_context", delayed_prepare)
+    app = chainagents_api.create_app(runtime=runtime)
+    try:
+        async with app.router.lifespan_context(app), AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            pending = asyncio.create_task(client.post("/api/agent/input", json={
+                "prompt": "late", "thread_id": "thread-1", "mode": "turn",
+            }))
+            await preparing.wait()
+            runtime.user_input.submit(
+                "thread-1", "active", active_run, followup_factory=lambda text: text
+            )
+            release_prepare.set()
+            response = await pending
+            assert response.status_code == 409
+    finally:
+        release_active.set()
+        await runtime.user_input.wait_idle("thread-1")
+
+
+@pytest.mark.anyio
+async def test_queued_history_replay_rechecks_checkpoint_when_job_starts(monkeypatch) -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(enabled=True)
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+    runtime.user_input.stop("branch-thread")
+    calls = []
+
+    async def run(_runner, request, _renderer):
+        calls.append(request.prompt)
+        runtime.checkpointer.existing_threads.add(request.thread_id)
+        return TurnResult(status="completed", prompt=request.prompt, response="ok")
+
+    monkeypatch.setattr(TurnRunner, "_run", run)
+    app = chainagents_api.create_app(runtime=runtime)
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        base = {
+            "thread_id": "branch-thread", "source_thread_id": "source-thread",
+            "history": [{"role": "user", "content": "earlier"}], "mode": "queue",
+        }
+        first = await client.post("/api/agent/input", json={**base, "prompt": "first"})
+        second = await client.post("/api/agent/input", json={**base, "prompt": "second"})
+        assert first.status_code == second.status_code == 202
+        runtime.user_input.resume("branch-thread")
+        await runtime.user_input.wait_idle("branch-thread")
+        result = await client.get(
+            f"/api/agent/turns/branch-thread/{second.json()['turn_id']}"
+        )
+    assert calls == ["first"]
+    assert result.json()["status"] == "failed"
+    assert "History cannot be replayed" in result.json()["error"]
+
+
+@pytest.mark.anyio
+async def test_turn_events_finish_after_result_is_evicted() -> None:
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions.user_input = UserInputConfig(
+        enabled=True, max_completed_turns=1
+    )
+    runtime.message_broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(
+        runtime.config.extensions.user_input, runtime.message_broker
+    )
+
+    release_first = asyncio.Event()
+
+    async def run(value):
+        if value == "first":
+            await release_first.wait()
+        return value
+
+    first = runtime.user_input.submit(
+        "thread-1", "first", run, followup_factory=lambda text: text
+    )
+    await asyncio.sleep(0)
+    app = chainagents_api.create_app(runtime=runtime)
+    app.state.runtime = runtime
+    endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", None) == "/api/agent/turns/{thread_id}/{turn_id}/events"
+    )
+    response = await endpoint("thread-1", first.id, SimpleNamespace(app=app))
+    lines = response.body_iterator
+    status = json.loads(await anext(lines))
+    assert status["status"] == "running"
+    release_first.set()
+    await runtime.user_input.wait_idle("thread-1")
+    runtime.user_input.submit(
+        "thread-1", "second", run, followup_factory=lambda text: text
+    )
+    await runtime.user_input.wait_idle("thread-1")
+    next_status = json.loads(await anext(lines))
+    assert next_status["status"] == "completed"
+    result = json.loads(await anext(lines))
+    assert result == {"type": "result", "turn_id": first.id, "result": "first", "error": None}
+
+
 def test_nonblocking_input_rejects_current_images_for_text_only_model() -> None:
     runtime = _FakeRuntime(_FakeAgent([]))
     runtime.config.extensions.user_input = UserInputConfig(enabled=True)

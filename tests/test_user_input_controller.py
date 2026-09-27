@@ -1,4 +1,5 @@
 import asyncio
+from contextvars import ContextVar
 
 import pytest
 from types import SimpleNamespace
@@ -7,6 +8,32 @@ from chainagents.turns.controller import ConversationInputController
 from chainagents.turns.runner import TurnRequest, TurnRunner
 from chainagents.runtime.messaging import MessageBroker
 from chainagents.runtime.types import MessagingConfig, UserInputConfig
+
+
+def test_queued_job_keeps_its_submitter_context():
+    async def exercise():
+        marker: ContextVar[str] = ContextVar("submitter")
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        release = asyncio.Event()
+        seen = []
+
+        async def run(label):
+            seen.append((label, marker.get()))
+            if label == "first":
+                await release.wait()
+
+        marker.set("first submitter")
+        controller.submit("s", "first", run, followup_factory=lambda text: text)
+        await asyncio.sleep(0)
+        marker.set("second submitter")
+        controller.submit("s", "second", run, followup_factory=lambda text: text)
+        release.set()
+        await controller.wait_idle("s")
+        assert seen == [("first", "first submitter"), ("second", "second submitter")]
+
+    asyncio.run(exercise())
 
 
 def test_queue_runs_one_turn_at_a_time_and_stop_pauses_until_resume():

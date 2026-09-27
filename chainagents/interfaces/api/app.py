@@ -738,6 +738,12 @@ def create_app(
             )
 
         async def run_queued(current: AgentRunContext) -> dict[str, Any]:
+            if current.history and active_runtime.config.agent_state == "stateful":
+                checkpoint = await active_runtime.checkpointer.aget_tuple(
+                    {"configurable": {"thread_id": current.thread_id}}
+                )
+                if checkpoint is not None:
+                    raise ValueError("History cannot be replayed into an existing stateful thread.")
             renderer = _WarningCollector()
             result = await TurnRunner(active_runtime).run(_turn_request(current), renderer)
             return {
@@ -755,6 +761,14 @@ def create_app(
             context, prompt="", history=(), selected_command=None,
             source_thread_id=None, image_parts=(), image_names=(), prompt_note="",
         )
+        if payload.input_id:
+            existing = controller.find_input_id(session_id, payload.input_id)
+            if existing is not None:
+                return {"turn_id": existing.id, "thread_id": session_id, "status": existing.status}
+        if payload.mode == "turn":
+            status = controller.status(session_id)
+            if status["active_job_id"] is not None or status["external_active"]:
+                raise HTTPException(status_code=409, detail="Choose steer or queue while a turn is active.")
         try:
             job = controller.submit(
                 session_id,
@@ -791,17 +805,17 @@ def create_app(
         if not runtime.config.extensions.user_input.enabled:
             raise HTTPException(status_code=404, detail="Nonblocking input is disabled.")
         try:
-            runtime.user_input.get(thread_id, turn_id)
+            job = runtime.user_input.get(thread_id, turn_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         async def lines() -> AsyncGenerator[str, None]:
             previous = ""
             while True:
-                job = runtime.user_input.get(thread_id, turn_id)
                 if job.status != previous:
-                    yield json.dumps({"type": "status", "turn_id": turn_id, "status": job.status}) + "\n"
                     previous = job.status
+                    yield json.dumps({"type": "status", "turn_id": turn_id, "status": previous}) + "\n"
+                    continue
                 if job.status in {"completed", "failed", "cancelled"}:
                     yield json.dumps({"type": "result", "turn_id": turn_id, "result": job.result, "error": job.error}) + "\n"
                     return

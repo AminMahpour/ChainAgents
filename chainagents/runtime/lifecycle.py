@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from weakref import WeakValueDictionary
 
 from deepagents.backends import StoreBackend
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -93,7 +94,7 @@ class AgentRuntime:
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
         self._agents: dict[AgentCacheKey, object] = {}
-        self._turn_locks: dict[str, asyncio.Lock] = {}
+        self._turn_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._mcp_pool = MCPSessionPool(lambda: self.config.extensions)
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
@@ -792,7 +793,6 @@ class AgentRuntime:
             async with self.background_tasks.closing_session(thread_id):
                 await self.user_input.close_session(thread_id)
                 self.message_broker.close_session(thread_id)
-                self._turn_locks.pop(thread_id, None)
                 errors: list[BaseException] = []
                 try:
                     await self.large_tool_result_artifacts.close_session(thread_id)

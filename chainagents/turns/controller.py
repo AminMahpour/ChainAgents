@@ -6,6 +6,7 @@ import asyncio
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
+from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,6 +21,7 @@ class InputJob:
     payload: Any
     run: Callable[[Any], Awaitable[Any]]
     followup_factory: Callable[[str], Any]
+    context: Context = field(default_factory=copy_context, repr=False)
     status: str = "queued"
     result: Any = None
     error: str | None = None
@@ -99,7 +101,7 @@ class ConversationInputController:
         session.active_job = job
         self.broker.open(session_id, "main", name="main", parent=None)
         session.active = asyncio.create_task(
-            self._run(job), name=f"agent-turn-{job.id}"
+            self._run(job), name=f"agent-turn-{job.id}", context=job.context
         )
 
     async def _run(self, job: InputJob) -> None:
@@ -129,6 +131,7 @@ class ConversationInputController:
                     job.followup_factory(notes),
                     job.run,
                     job.followup_factory,
+                    context=job.context.copy(),
                 )
                 session.jobs[followup.id] = followup
                 session.queue.appendleft(followup)
