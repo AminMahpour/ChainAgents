@@ -415,11 +415,33 @@ async def test_cancelled_turn_closes_steps_and_marks_task_list_stopped() -> None
 
     await bridge.start()
     await bridge._stream_reasoning("main-agent", "thinking")
+    await bridge._stream_response("Incomplete reply")
     await bridge.cancel()
 
     assert _Step.instances[0].end is not None
     assert task_list.status == "Stopped"
     assert all(task.status != _TaskStatus.RUNNING for task in task_list.tasks)
+    assert [message.content for message in _Message.instances] == [
+        "Incomplete reply",
+        "Run stopped before completion. The reply may be incomplete; please retry.",
+    ]
+    assert _Message.instances[-1].author == "System"
+
+
+@pytest.mark.anyio
+async def test_cancelled_streamed_reply_is_finalized_for_persistence() -> None:
+    bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
+
+    await bridge._stream_response("Incomplete reply")
+    response_message = bridge.response_message
+    assert response_message is not None
+    assert response_message.update_count == 0
+
+    await bridge.cancel()
+
+    assert response_message.tokens == ["Incomplete reply"]
+    assert response_message.update_count == 1
+    assert _Message.instances[-1].author == "System"
 
 
 @pytest.mark.anyio

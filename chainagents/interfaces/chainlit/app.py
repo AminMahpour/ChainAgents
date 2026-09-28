@@ -94,6 +94,7 @@ QUEUE_INPUT_ACTION = "queue_busy_input"
 STOP_INPUT_ACTION = "stop_active_input"
 RESUME_INPUT_ACTION = "resume_queued_input"
 SESSION_ACTIVE_TURN_KEY = "active_agent_turn"
+SESSION_DISCONNECT_CLEANUP_KEY = "pending_disconnect_cleanup"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
 REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
 def load_chainlit_auth_users(
@@ -1368,22 +1369,17 @@ async def save_reflection_lesson(
 
 @cl.on_chat_end
 async def on_chat_end() -> None:
-    """Clean up runtime resources when the Chainlit chat ends."""
-    with suppress(Exception):
-        setattr(cl.context.session, SESSION_INPUT_DRAFTS_KEY, {})
+    """Clean up a cleared chat or an expired disconnected session."""
+    try:
+        session = cl.context.session
+    except Exception:
+        session = None
     active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
-    if isinstance(active, asyncio.Task) and active is not asyncio.current_task():
-        active.cancel()
-        with suppress(asyncio.CancelledError):
-            await active
     notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
-    if isinstance(notifier, AsyncTaskNotifier):
-        notifier.cancel()
     local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
-    if isinstance(local_notifier, LocalBackgroundTaskNotifier):
-        await local_notifier.aclose()
-
     runtime = AgentRuntime.current()
+    thread_id: str | None = None
+    mcp_session_id: str | None = None
     if runtime is not None:
         raw_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
         thread_id = (
@@ -1391,7 +1387,54 @@ async def on_chat_end() -> None:
             if isinstance(raw_settings, dict)
             else ""
         ) or current_chainlit_thread_id()
-        await runtime.close_conversation(
-            thread_id=thread_id or None,
-            mcp_session_id=current_mcp_session_id() or None,
-        )
+        mcp_session_id = current_mcp_session_id() or None
+
+    async def close_chat() -> None:
+        with suppress(Exception):
+            setattr(session, SESSION_INPUT_DRAFTS_KEY, {})
+        tasks = {active, getattr(session, "current_task", None)}
+        for task in tasks:
+            if (
+                isinstance(task, asyncio.Task)
+                and task is not asyncio.current_task()
+                and not task.done()
+            ):
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        if isinstance(notifier, AsyncTaskNotifier):
+            notifier.cancel()
+        if isinstance(local_notifier, LocalBackgroundTaskNotifier):
+            await local_notifier.aclose()
+        if runtime is not None:
+            await runtime.close_conversation(
+                thread_id=thread_id or None,
+                mcp_session_id=mcp_session_id,
+            )
+
+    previous_cleanup = getattr(session, SESSION_DISCONNECT_CLEANUP_KEY, None)
+    if isinstance(previous_cleanup, asyncio.Task) and not previous_cleanup.done():
+        previous_cleanup.cancel()
+
+    if session is None or getattr(session, "to_clear", False) or not getattr(session, "socket_id", None):
+        await close_chat()
+        return
+
+    # Chainlit retains disconnected sessions for this timeout and changes the
+    # socket ID when a browser reconnects to the same session.
+    disconnected_socket_id = session.socket_id
+
+    async def close_after_timeout() -> None:
+        await asyncio.sleep(chainlit_config.project.session_timeout)
+        if session.socket_id != disconnected_socket_id:
+            return
+        try:
+            await close_chat()
+        except Exception:
+            logger.exception("Failed to clean up an expired Chainlit session")
+
+    setattr(
+        session,
+        SESSION_DISCONNECT_CLEANUP_KEY,
+        asyncio.create_task(close_after_timeout()),
+    )

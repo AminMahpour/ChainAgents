@@ -743,10 +743,21 @@ class ChainlitEventBridge:
             await self.run_task_list.finish()
 
     async def cancel(self) -> None:
-        """Close the visible steps and task panel of a cancelled turn."""
+        """Show any partial reply and make cancellation visible to the user."""
         await self._close_all_open_steps()
         if self.run_task_list is not None:
             await self.run_task_list.cancel()
+        if self.response_buffer:
+            if self.response_message is None:
+                self.response_message = await cl.Message(content=self.response_buffer).send()
+                self.pending_response_stream = ""
+            else:
+                await self._flush_response_stream()
+                await self.response_message.update()
+        await cl.Message(
+            content="Run stopped before completion. The reply may be incomplete; please retry.",
+            author="System",
+        ).send()
 
     async def fail(
         self,
