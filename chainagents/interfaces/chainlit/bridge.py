@@ -743,10 +743,24 @@ class ChainlitEventBridge:
             await self.run_task_list.finish()
 
     async def cancel(self) -> None:
-        """Close the visible steps and task panel of a cancelled turn."""
+        """Show any partial reply and make cancellation visible to the user."""
         await self._close_all_open_steps()
         if self.run_task_list is not None:
             await self.run_task_list.cancel()
+        if self.response_buffer:
+            if self.response_message is None:
+                self.response_message = await cl.Message(content=self.response_buffer).send()
+                self.pending_response_stream = ""
+            else:
+                # A cancelled stream_token may have appended its token already,
+                # or not yet. Persist the canonical buffer without replaying it.
+                self.pending_response_stream = ""
+                self.response_message.content = self.response_buffer
+                await self.response_message.update()
+        await cl.Message(
+            content="Run stopped before completion. The reply may be incomplete; please retry.",
+            author="System",
+        ).send()
 
     async def fail(
         self,
@@ -1030,7 +1044,8 @@ class ChainlitEventBridge:
         self.pending_response_stream += delta
         if not self.chronological_ui_enabled:
             if self.response_message is None:
-                self.response_message = await cl.Message(content="").send()
+                self.response_message = cl.Message(content="")
+                await self.response_message.send()
             await self._flush_response_stream()
 
     async def _send_final_response_message(
