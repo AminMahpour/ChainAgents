@@ -65,6 +65,77 @@ async def test_socket_disconnect_keeps_turn_and_resources_for_reconnect(monkeypa
 
 
 @pytest.mark.anyio
+async def test_reconnect_replays_output_emitted_while_socket_was_disconnected(
+    monkeypatch,
+):
+    delivered: list[tuple[str, object]] = []
+    lost: list[tuple[str, object]] = []
+
+    async def old_emit(event: str, data: object) -> None:
+        lost.append((event, data))
+
+    async def new_emit(event: str, data: object) -> None:
+        delivered.append((event, data))
+
+    session = SimpleNamespace(socket_id="socket-1", to_clear=False, emit=old_emit)
+    closed: list[tuple[str | None, str | None]] = []
+    active = asyncio.create_task(asyncio.Event().wait())
+    _set_chat_session(monkeypatch, session=session, active=active, closed=closed)
+    monkeypatch.setattr(main.chainlit_config.project, "session_timeout", 0.01)
+
+    def restore(sid, session_id, emit_fn, emit_call_fn, environ, user=None):
+        assert sid == "socket-2"
+        assert session_id == "session-1"
+        session.socket_id = sid
+        session.emit = emit_fn
+        return True
+
+    async def connection_successful(sid):
+        assert sid == "socket-2"
+        await session.emit("task_end", {})
+
+    monkeypatch.setattr(main, "_chainlit_restore_existing_session", restore)
+    monkeypatch.setattr(main, "_chainlit_connection_successful", connection_successful)
+    monkeypatch.setattr(
+        main.chainlit_socket.WebsocketSession,
+        "get_by_id",
+        lambda _session_id: session,
+    )
+    monkeypatch.setattr(
+        main.chainlit_socket.WebsocketSession,
+        "get",
+        lambda _sid: session,
+    )
+
+    try:
+        await main.on_chat_end()
+        await session.emit("new_message", {"id": "reply", "output": "answer"})
+        assert lost == []
+
+        assert main._restore_session_with_output_replay(
+            "socket-2", "session-1", new_emit, None, {}
+        )
+        await session.emit("action", {"forId": "reply", "label": "Download"})
+        await main._connection_successful_with_output_replay("socket-2")
+        await asyncio.wait_for(
+            getattr(session, main.SESSION_DISCONNECT_CLEANUP_KEY), timeout=1
+        )
+
+        assert delivered == [
+            ("new_message", {"id": "reply", "output": "answer"}),
+            ("action", {"forId": "reply", "label": "Download"}),
+            ("task_end", {}),
+        ]
+        assert session.emit is new_emit
+        assert not hasattr(session, main.SESSION_DISCONNECTED_OUTPUT_KEY)
+        assert closed == []
+    finally:
+        active.cancel()
+        with suppress(asyncio.CancelledError):
+            await active
+
+
+@pytest.mark.anyio
 async def test_expired_disconnected_session_stops_turn_and_closes_resources(
     monkeypatch,
 ):

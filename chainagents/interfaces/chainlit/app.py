@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
 import secrets
+from collections import deque
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext, suppress
 from typing import Any
@@ -83,6 +85,7 @@ from chainagents.exports.response import (
 )
 
 logger = logging.getLogger(__name__)
+chainlit_socket: Any = importlib.import_module("chainlit.socket")
 
 SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
@@ -95,8 +98,75 @@ STOP_INPUT_ACTION = "stop_active_input"
 RESUME_INPUT_ACTION = "resume_queued_input"
 SESSION_ACTIVE_TURN_KEY = "active_agent_turn"
 SESSION_DISCONNECT_CLEANUP_KEY = "pending_disconnect_cleanup"
+SESSION_DISCONNECTED_OUTPUT_KEY = "pending_disconnected_output"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
 REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
+
+
+class DisconnectedOutput:
+    """Keep socket events emitted while a Chainlit session is disconnected."""
+
+    def __init__(self) -> None:
+        self.events: deque[tuple[str, Any]] = deque()
+        self.live_emit: Any = None
+
+    async def queue(self, event: str, data: Any) -> None:
+        self.events.append((event, data))
+
+    def reconnect(self, session: Any) -> None:
+        # Chainlit replaces emit during session restoration. Keep queuing until
+        # its connection_successful handler has finished initializing the UI.
+        self.live_emit = session.emit
+        session.emit = self.queue
+
+    async def flush(self, session: Any) -> None:
+        if self.live_emit is None:
+            return
+        while self.events:
+            event, data = self.events[0]
+            await self.live_emit(event, data)
+            self.events.popleft()
+        session.emit = self.live_emit
+        delattr(session, SESSION_DISCONNECTED_OUTPUT_KEY)
+
+
+_chainlit_restore_existing_session = chainlit_socket.restore_existing_session
+_chainlit_connection_successful = chainlit_socket.connection_successful
+
+
+def _restore_session_with_output_replay(
+    sid: str,
+    session_id: str,
+    emit_fn: Any,
+    emit_call_fn: Any,
+    environ: Any,
+    user: Any = None,
+) -> bool:
+    restored = _chainlit_restore_existing_session(
+        sid, session_id, emit_fn, emit_call_fn, environ, user=user
+    )
+    if restored:
+        session = chainlit_socket.WebsocketSession.get_by_id(session_id)
+        pending = getattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, None)
+        if isinstance(pending, DisconnectedOutput):
+            pending.reconnect(session)
+    return restored
+
+
+async def _connection_successful_with_output_replay(sid: str) -> None:
+    await _chainlit_connection_successful(sid)
+    session = chainlit_socket.WebsocketSession.get(sid)
+    pending = getattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, None)
+    if isinstance(pending, DisconnectedOutput):
+        await pending.flush(session)
+
+
+chainlit_socket.restore_existing_session = _restore_session_with_output_replay
+chainlit_socket.sio.on(
+    "connection_successful", handler=_connection_successful_with_output_replay
+)
+
+
 def load_chainlit_auth_users(
     *,
     raw_users: str | None = None,
@@ -1421,6 +1491,14 @@ async def on_chat_end() -> None:
     if session is None or getattr(session, "to_clear", False) or not getattr(session, "socket_id", None):
         await close_chat()
         return
+
+    if callable(getattr(session, "emit", None)):
+        socket_session: Any = session
+        pending_output = getattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, None)
+        if not isinstance(pending_output, DisconnectedOutput):
+            pending_output = DisconnectedOutput()
+            setattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, pending_output)
+        socket_session.emit = pending_output.queue
 
     # Chainlit retains disconnected sessions for this timeout and changes the
     # socket ID when a browser reconnects to the same session.
