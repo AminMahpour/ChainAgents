@@ -733,6 +733,77 @@ async def test_tool_call_step_rekeys_when_real_id_replaces_synthetic_id() -> Non
 
 
 @pytest.mark.anyio
+async def test_nested_tool_result_keeps_named_chainlit_step_and_task() -> None:
+    task_list = _TaskList()
+    bridge = ChainlitEventBridge(
+        prompt="review it",
+        run_task_list=RunTaskList(task_list),  # type: ignore[arg-type]
+    )
+    namespace = ("tools:parent-task-id", "tools:child-task-id")
+    metadata = {"lc_agent_name": "reviewer"}
+
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    namespace,
+                    "messages",
+                    (
+                        _ToolCallChunkToken(
+                            {"id": "call-review", "name": "read_file", "args": "{}"}
+                        ),
+                        metadata,
+                    ),
+                )
+            },
+        },
+    )
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    namespace,
+                    "messages",
+                    (
+                        _ToolMessage(tool_call_id="call-review", content="reviewed"),
+                        metadata,
+                    ),
+                )
+            },
+        },
+    )
+    await _feed(
+        bridge,
+        {
+            "event": "on_chain_stream",
+            "data": {
+                "chunk": (
+                    namespace,
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [
+                                _ToolMessage(
+                                    tool_call_id="call-review", content="reviewed"
+                                )
+                            ]
+                        }
+                    },
+                )
+            },
+        },
+    )
+
+    assert [step.name for step in _Step.instances] == ["reviewer · read_file"]
+    assert [task.title for task in task_list.tasks] == ["reviewer: read_file"]
+    assert task_list.tasks[0].status == _TaskStatus.DONE
+
+
+@pytest.mark.anyio
 async def test_response_stream_buffers_fast_chunks_until_finish(monkeypatch) -> None:
     """Verify that response stream buffers fast chunks until finish.
 

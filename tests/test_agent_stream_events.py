@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import ClassVar
 
 
-from chainagents.events.stream import AgentStreamEvent, AgentStreamEventAdapter
-from langchain_core.messages import HumanMessageChunk
+from chainagents.events.stream import (
+    AgentStreamEvent,
+    AgentStreamEventAdapter,
+    langgraph_part_from_event_chunk,
+)
+from deepagents import create_deep_agent
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage, HumanMessageChunk
 
 
 class _Token:
@@ -250,6 +257,212 @@ def test_adapter_accumulates_tool_call_arguments_and_deduplicates_results() -> N
         )
     ]
     assert duplicate_result == []
+
+
+def test_adapter_deduplicates_named_nested_result_across_stream_modes() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+    namespace = ("tools:parent-task-id", "tools:child-task-id")
+
+    named = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                namespace,
+                "messages",
+                (_ToolMessage("content"), {"lc_agent_name": "reviewer"}),
+            )
+        )
+    )
+    repeated = adapter.events_from_raw_event(
+        _raw_event(
+            (namespace, "updates", {"tools": {"messages": [_ToolMessage("content")]}})
+        )
+    )
+
+    assert named == [
+        AgentStreamEvent(
+            kind="tool_result",
+            source="reviewer",
+            tool_call_id="call-1",
+            tool_name="read_file",
+            tool_result="content",
+            status="success",
+        )
+    ]
+    assert repeated == []
+
+
+def test_adapter_reuses_named_source_for_update_only_result() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+    namespace = ("tools:parent-task-id", "tools:child-task-id")
+
+    call = adapter.events_from_raw_event(
+        _raw_event(
+            (
+                namespace,
+                "messages",
+                (
+                    _ToolCallChunkToken({"id": "call-1", "name": "read_file"}),
+                    {"lc_agent_name": "reviewer"},
+                ),
+            )
+        )
+    )
+    result = adapter.events_from_raw_event(
+        _raw_event(
+            (namespace, "updates", {"tools": {"messages": [_ToolMessage("content")]}})
+        )
+    )
+
+    assert [event.source for event in call] == ["reviewer"]
+    assert result == [
+        AgentStreamEvent(
+            kind="tool_result",
+            source="reviewer",
+            tool_call_id="call-1",
+            tool_name="read_file",
+            tool_result="content",
+            status="success",
+        )
+    ]
+
+
+def test_adapter_keeps_equal_tool_call_ids_in_separate_namespaces() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+    namespaces = (("tools:first-task",), ("tools:second-task",))
+
+    results = [
+        adapter.events_from_raw_event(
+            _raw_event(
+                (
+                    namespace,
+                    "messages",
+                    (_ToolMessage("content"), {"lc_agent_name": "worker"}),
+                )
+            )
+        )
+        for namespace in namespaces
+    ]
+
+    assert [event.source for batch in results for event in batch] == [
+        "worker",
+        "worker",
+    ]
+
+
+def test_adapter_uses_distinct_run_local_labels_without_agent_metadata() -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+    namespaces = (("tools:first-task",), ("tools:second-task",))
+
+    results = [
+        adapter.events_from_raw_event(
+            _raw_event(
+                (
+                    namespace,
+                    "updates",
+                    {"tools": {"messages": [_ToolMessage("content")]}},
+                )
+            )
+        )
+        for namespace in namespaces
+    ]
+
+    assert [event.source for batch in results for event in batch] == [
+        "subagent 1",
+        "subagent 2",
+    ]
+
+
+def test_adapter_labels_real_nested_deepagents_tool_once() -> None:
+    class ToolAwareFakeModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    def delegate(target: str, call_id: str) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "task",
+                    "args": {"description": "do the work", "subagent_type": target},
+                    "id": call_id,
+                }
+            ],
+        )
+
+    def leaf_action(value: str) -> str:
+        """Return a leaf result."""
+        return value
+
+    leaf = create_deep_agent(
+        model=ToolAwareFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "leaf_action",
+                            "args": {"value": "ok"},
+                            "id": "leaf-call",
+                        }
+                    ],
+                ),
+                AIMessage(content="leaf done"),
+            ]
+        ),
+        tools=[leaf_action],
+        name="leaf",
+    )
+    parent = create_deep_agent(
+        model=ToolAwareFakeModel(
+            responses=[
+                delegate("leaf", "parent-call"),
+                AIMessage(content="parent done"),
+            ]
+        ),
+        subagents=[{"name": "leaf", "description": "leaf", "runnable": leaf}],
+        name="parent",
+    )
+    main = create_deep_agent(
+        model=ToolAwareFakeModel(
+            responses=[delegate("parent", "main-call"), AIMessage(content="main done")]
+        ),
+        subagents=[{"name": "parent", "description": "parent", "runnable": parent}],
+        name="main",
+    )
+
+    async def collect() -> tuple[list[AgentStreamEvent], list[tuple[str, ...]]]:
+        adapter = AgentStreamEventAdapter(prompt="go")
+        events: list[AgentStreamEvent] = []
+        leaf_namespaces: list[tuple[str, ...]] = []
+        async for raw in main.astream_events(
+            {"messages": [{"role": "user", "content": "go"}]},
+            version="v2",
+            stream_mode=["messages", "updates", "custom"],
+            subgraphs=True,
+        ):
+            if raw.get("event") != "on_chain_stream" or raw.get("parent_ids"):
+                continue
+            part = langgraph_part_from_event_chunk(raw.get("data", {}).get("chunk"))
+            if (
+                part is not None
+                and part["type"] == "updates"
+                and "tools" in part["data"]
+            ):
+                namespace = part["ns"]
+                if len(namespace) == 2:
+                    leaf_namespaces.append(namespace)
+            events.extend(adapter.events_from_raw_event(raw))
+        return events, leaf_namespaces
+
+    events, leaf_namespaces = asyncio.run(collect())
+    assert leaf_namespaces and all(
+        segment.startswith("tools:") for segment in leaf_namespaces[0]
+    )
+    assert [
+        event.source
+        for event in events
+        if event.kind == "tool_result" and event.tool_name == "leaf_action"
+    ] == ["leaf"]
 
 
 def test_adapter_reuses_tool_call_index_after_completed_result() -> None:

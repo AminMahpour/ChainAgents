@@ -143,7 +143,7 @@ def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
     labels: list[str] = []
     for segment in ns:
         if segment.startswith("tools:"):
-            labels.append(f"subagent {segment.split(':', 1)[1]}")
+            labels.append("subagent")
             continue
         labels.append(segment.split(":", 1)[0])
     return " / ".join(labels)
@@ -230,7 +230,31 @@ class AgentStreamEventAdapter:
         self.tool_call_ids_by_index: dict[tuple[str, str], str] = {}
         self.previous_tool_call_ids: dict[str, str] = {}
         self.tool_call_started: set[str] = set()
-        self.completed_tool_results: set[tuple[str, str, str]] = set()
+        self.agent_names_by_namespace: dict[tuple[str, ...], str] = {}
+        self.unnamed_sources_by_namespace: dict[tuple[str, ...], str] = {}
+        self.completed_tool_results: set[tuple[tuple[str, ...], str, str]] = set()
+
+    def _source_for_namespace(
+        self, ns: tuple[str, ...], metadata: dict[str, Any] | None = None
+    ) -> str:
+        """Keep an agent's display name across stream modes for one run."""
+        agent_name = (metadata or {}).get("lc_agent_name")
+        if agent_name:
+            source = str(agent_name)
+            self.agent_names_by_namespace[ns] = source
+            return source
+        cached_source = self.agent_names_by_namespace.get(ns)
+        if cached_source is not None:
+            return cached_source
+        if not ns:
+            return "main-agent"
+        if any(segment.startswith("tools:") for segment in ns):
+            if ns not in self.unnamed_sources_by_namespace:
+                self.unnamed_sources_by_namespace[ns] = (
+                    f"subagent {len(self.unnamed_sources_by_namespace) + 1}"
+                )
+            return self.unnamed_sources_by_namespace[ns]
+        return namespace_label(ns, {})
 
     def events_from_raw_event(self, event: dict[str, Any]) -> list[AgentStreamEvent]:
         """Return normalized events from one raw LangGraph stream event."""
@@ -272,7 +296,7 @@ class AgentStreamEventAdapter:
             return []
         metadata = metadata if isinstance(metadata, dict) else {}
         ns = tuple(part.get("ns", ()))
-        source = namespace_label(ns, metadata)
+        source = self._source_for_namespace(ns, metadata)
         is_main_source = not ns
         events: list[AgentStreamEvent] = []
 
@@ -287,7 +311,7 @@ class AgentStreamEventAdapter:
             events.append(self._tool_call_event(source, chunk))
 
         if getattr(token, "type", None) == "tool":
-            event = self._tool_result_event(source, token)
+            event = self._tool_result_event(ns, source, token)
             return events + ([event] if event is not None else [])
 
         content_text = stringify_content(getattr(token, "content", ""))
@@ -300,7 +324,7 @@ class AgentStreamEventAdapter:
 
     def _events_from_update_chunk(self, part: dict[str, Any]) -> list[AgentStreamEvent]:
         ns = tuple(part.get("ns", ()))
-        source = namespace_label(ns, {"lc_agent_name": None})
+        source = self._source_for_namespace(ns)
         data_by_node = part.get("data")
         if not isinstance(data_by_node, dict):
             return []
@@ -325,7 +349,7 @@ class AgentStreamEventAdapter:
 
             for message in messages_from_node_data(data):
                 if getattr(message, "type", None) == "tool":
-                    event = self._tool_result_event(source, message)
+                    event = self._tool_result_event(ns, source, message)
                     if event is not None:
                         events.append(event)
         return events
@@ -481,6 +505,7 @@ class AgentStreamEventAdapter:
 
     def _tool_result_event(
         self,
+        ns: tuple[str, ...],
         source: str,
         tool_message: Any,
     ) -> AgentStreamEvent | None:
@@ -488,7 +513,7 @@ class AgentStreamEventAdapter:
         status = str(getattr(tool_message, "status", "") or "done")
         content = stringify_content(getattr(tool_message, "content", ""))
         result_key = self._tool_result_key(
-            source=source,
+            ns=ns,
             name=name,
             tool_message=tool_message,
             content=content,
@@ -515,19 +540,19 @@ class AgentStreamEventAdapter:
     @staticmethod
     def _tool_result_key(
         *,
-        source: str,
+        ns: tuple[str, ...],
         name: str,
         tool_message: Any,
         content: str,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[tuple[str, ...], str, str]:
         stable_id = str(
             getattr(tool_message, "tool_call_id", None)
             or getattr(tool_message, "id", None)
             or ""
         ).strip()
         if stable_id:
-            return (source, "id", stable_id)
-        return (source, name, content)
+            return (ns, "id", stable_id)
+        return (ns, name, content)
 
     def _clear_tool_call_state(self, call_id: str) -> None:
         """Clear streamed tool-call buffers after the matching result arrives."""
