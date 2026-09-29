@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import weakref
 from pathlib import Path
@@ -442,6 +443,66 @@ async def test_cancelled_streamed_reply_is_finalized_for_persistence() -> None:
     assert response_message.tokens == ["Incomplete reply"]
     assert response_message.update_count == 1
     assert _Message.instances[-1].author == "System"
+
+
+@pytest.mark.anyio
+async def test_cancel_does_not_replay_token_from_interrupted_stream(monkeypatch) -> None:
+    entered_stream = asyncio.Event()
+    streamed_tokens: list[str] = []
+
+    async def interrupted_stream(self: _Message, token: str) -> None:
+        self.content += token
+        streamed_tokens.append(token)
+        if len(streamed_tokens) == 1:
+            entered_stream.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(_Message, "stream_token", interrupted_stream)
+    bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
+
+    streaming_task = asyncio.create_task(bridge._stream_response("Incomplete reply"))
+    await asyncio.wait_for(entered_stream.wait(), timeout=1)
+    streaming_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await streaming_task
+
+    response_message = bridge.response_message
+    assert response_message is not None
+    assert response_message.content == "Incomplete reply"
+    await bridge.cancel()
+
+    assert response_message.content == "Incomplete reply"
+    assert streamed_tokens == ["Incomplete reply"]
+    assert response_message.update_count == 1
+
+
+@pytest.mark.anyio
+async def test_cancel_keeps_buffered_reply_if_stream_stops_before_append(
+    monkeypatch,
+) -> None:
+    entered_stream = asyncio.Event()
+
+    async def interrupted_stream(self: _Message, token: str) -> None:
+        entered_stream.set()
+        await asyncio.Event().wait()
+        self.content += token
+
+    monkeypatch.setattr(_Message, "stream_token", interrupted_stream)
+    bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
+
+    streaming_task = asyncio.create_task(bridge._stream_response("Incomplete reply"))
+    await asyncio.wait_for(entered_stream.wait(), timeout=1)
+    streaming_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await streaming_task
+
+    response_message = bridge.response_message
+    assert response_message is not None
+    assert response_message.content == ""
+    await bridge.cancel()
+
+    assert response_message.content == "Incomplete reply"
+    assert response_message.update_count == 1
 
 
 @pytest.mark.anyio

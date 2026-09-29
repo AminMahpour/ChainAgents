@@ -752,7 +752,10 @@ class ChainlitEventBridge:
                 self.response_message = await cl.Message(content=self.response_buffer).send()
                 self.pending_response_stream = ""
             else:
-                await self._flush_response_stream()
+                # A cancelled stream_token may have appended its token already,
+                # or not yet. Persist the canonical buffer without replaying it.
+                self.pending_response_stream = ""
+                self.response_message.content = self.response_buffer
                 await self.response_message.update()
         await cl.Message(
             content="Run stopped before completion. The reply may be incomplete; please retry.",

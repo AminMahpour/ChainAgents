@@ -133,6 +133,58 @@ async def test_expired_session_closes_notifiers_created_after_disconnect(monkeyp
 
 
 @pytest.mark.anyio
+async def test_expired_session_closes_notifiers_if_chainlit_deletes_session_state(
+    monkeypatch,
+):
+    class _Notifier:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _LocalNotifier:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    session = SimpleNamespace(socket_id="socket-1", to_clear=False)
+    closed: list[tuple[str | None, str | None]] = []
+    values = {}
+    notifier = _Notifier()
+    local_notifier = _LocalNotifier()
+
+    async def turn():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            values.clear()  # Chainlit's timeout can delete user_session here.
+            raise
+
+    active = asyncio.create_task(turn())
+    values = _set_chat_session(
+        monkeypatch, session=session, active=active, closed=closed
+    )
+    monkeypatch.setattr(main, "AsyncTaskNotifier", _Notifier)
+    monkeypatch.setattr(main, "LocalBackgroundTaskNotifier", _LocalNotifier)
+    monkeypatch.setattr(main.chainlit_config.project, "session_timeout", 0)
+
+    await main.on_chat_end()
+    values[main.SESSION_ASYNC_TASK_NOTIFIER_KEY] = notifier
+    values[main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY] = local_notifier
+    await asyncio.wait_for(
+        getattr(session, main.SESSION_DISCONNECT_CLEANUP_KEY), timeout=1
+    )
+
+    assert active.cancelled()
+    assert notifier.cancelled
+    assert local_notifier.closed
+    assert closed == [("runtime-thread", "mcp-session")]
+
+
+@pytest.mark.anyio
 async def test_explicit_chat_clear_stops_turn_immediately(monkeypatch):
     session = SimpleNamespace(socket_id="socket-1", to_clear=True)
     setattr(session, main.SESSION_INPUT_DRAFTS_KEY, {"draft-1": "pending"})

@@ -1391,6 +1391,12 @@ async def on_chat_end() -> None:
         with suppress(Exception):
             setattr(session, SESSION_INPUT_DRAFTS_KEY, {})
         tasks = {active, getattr(session, "current_task", None)}
+        # Snapshot current watchers before awaiting a cancelled turn: Chainlit's
+        # own timeout may remove user_session while cancellation renders UI.
+        notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
+        local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+        if isinstance(notifier, AsyncTaskNotifier):
+            notifier.cancel()
         for task in tasks:
             if (
                 isinstance(task, asyncio.Task)
@@ -1400,10 +1406,6 @@ async def on_chat_end() -> None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
-        notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
-        if isinstance(notifier, AsyncTaskNotifier):
-            notifier.cancel()
-        local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
         if isinstance(local_notifier, LocalBackgroundTaskNotifier):
             await local_notifier.aclose()
         if runtime is not None:
