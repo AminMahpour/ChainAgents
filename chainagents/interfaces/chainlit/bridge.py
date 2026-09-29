@@ -1044,7 +1044,8 @@ class ChainlitEventBridge:
         self.pending_response_stream += delta
         if not self.chronological_ui_enabled:
             if self.response_message is None:
-                self.response_message = await cl.Message(content="").send()
+                self.response_message = cl.Message(content="")
+                await self.response_message.send()
             await self._flush_response_stream()
 
     async def _send_final_response_message(

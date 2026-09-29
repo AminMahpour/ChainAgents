@@ -506,6 +506,37 @@ async def test_cancel_keeps_buffered_reply_if_stream_stops_before_append(
 
 
 @pytest.mark.anyio
+async def test_cancel_updates_placeholder_if_its_send_is_interrupted(monkeypatch) -> None:
+    entered_send = asyncio.Event()
+    original_send = _Message.send
+
+    async def interrupted_send(self: _Message) -> _Message:
+        if self.author is None and self.content == "":
+            self.send_count += 1
+            entered_send.set()
+            await asyncio.Event().wait()
+        return await original_send(self)
+
+    monkeypatch.setattr(_Message, "send", interrupted_send)
+    bridge = ChainlitEventBridge(prompt="hello", chronological_ui_enabled=False)
+
+    streaming_task = asyncio.create_task(bridge._stream_response("Incomplete reply"))
+    await asyncio.wait_for(entered_send.wait(), timeout=1)
+    placeholder = _Message.instances[0]
+    streaming_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await streaming_task
+
+    await bridge.cancel()
+
+    assistant_messages = [message for message in _Message.instances if message.author is None]
+    assert assistant_messages == [placeholder]
+    assert bridge.response_message is placeholder
+    assert placeholder.content == "Incomplete reply"
+    assert placeholder.update_count == 1
+
+
+@pytest.mark.anyio
 async def test_final_response_attaches_the_runner_generated_files(monkeypatch) -> None:
     """The bridge attaches exactly the generated files the runner resolved."""
     captured: dict[str, Any] = {}
