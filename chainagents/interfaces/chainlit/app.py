@@ -1375,8 +1375,6 @@ async def on_chat_end() -> None:
     except Exception:
         session = None
     active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
-    notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
-    local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
     runtime = AgentRuntime.current()
     thread_id: str | None = None
     mcp_session_id: str | None = None
@@ -1402,8 +1400,10 @@ async def on_chat_end() -> None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
+        notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
         if isinstance(notifier, AsyncTaskNotifier):
             notifier.cancel()
+        local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
         if isinstance(local_notifier, LocalBackgroundTaskNotifier):
             await local_notifier.aclose()
         if runtime is not None:

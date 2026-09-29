@@ -28,6 +28,7 @@ def _set_chat_session(monkeypatch, *, session, active, closed):
         lambda: SimpleNamespace(close_conversation=close_conversation),
     )
     monkeypatch.setattr(main, "current_mcp_session_id", lambda: "mcp-session")
+    return values
 
 
 @pytest.mark.anyio
@@ -80,6 +81,54 @@ async def test_expired_disconnected_session_stops_turn_and_closes_resources(
     )
 
     assert active.cancelled()
+    assert closed == [("runtime-thread", "mcp-session")]
+
+
+@pytest.mark.anyio
+async def test_expired_session_closes_notifiers_created_after_disconnect(monkeypatch):
+    class _Notifier:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _LocalNotifier:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    session = SimpleNamespace(socket_id="socket-1", to_clear=False)
+    closed: list[tuple[str | None, str | None]] = []
+    finish_turn = asyncio.Event()
+    values = {}
+    notifier = _Notifier()
+    local_notifier = _LocalNotifier()
+
+    async def turn():
+        await finish_turn.wait()
+        values[main.SESSION_ASYNC_TASK_NOTIFIER_KEY] = notifier
+        values[main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY] = local_notifier
+
+    active = asyncio.create_task(turn())
+    values = _set_chat_session(
+        monkeypatch, session=session, active=active, closed=closed
+    )
+    monkeypatch.setattr(main, "AsyncTaskNotifier", _Notifier)
+    monkeypatch.setattr(main, "LocalBackgroundTaskNotifier", _LocalNotifier)
+    monkeypatch.setattr(main.chainlit_config.project, "session_timeout", 0.1)
+
+    await main.on_chat_end()
+    finish_turn.set()
+    await asyncio.wait_for(active, timeout=1)
+    await asyncio.wait_for(
+        getattr(session, main.SESSION_DISCONNECT_CLEANUP_KEY), timeout=1
+    )
+
+    assert notifier.cancelled
+    assert local_notifier.closed
     assert closed == [("runtime-thread", "mcp-session")]
 
 
