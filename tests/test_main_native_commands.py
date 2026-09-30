@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import main
@@ -691,6 +692,13 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
     monkeypatch.setattr(main, "coerce_settings", lambda *args, **kwargs: settings)
     monkeypatch.setattr(main.cl, "user_session", user_session)
     monkeypatch.setattr(main, "publish_modes", publish_modes)
+    manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", manager)
+    await manager.lease(
+        runtime=runtime,
+        owner_id=main._conversation_owner_id(),
+        scope_id="thread-old",
+    )
     monkeypatch.setattr(
         main,
         "start_local_background_notifier",
@@ -699,11 +707,15 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
 
     await main.on_settings_update({"thread_id": "thread-new"})
 
-    assert lifecycle_events == [
-        "close:thread-old:actual-session",
-        "start:thread-new:False:True",
-    ]
+    assert lifecycle_events == ["start:thread-new:False:True"]
     assert session_data[main.SESSION_SETTINGS_KEY]["thread_id"] == "thread-new"
+    assert session_data[main.SESSION_MCP_SESSION_ID_KEY] == "thread-new"
+    await asyncio.sleep(0.03)
+    assert lifecycle_events == [
+        "start:thread-new:False:True",
+        "close:thread-old:thread-old",
+    ]
+    await manager.aclose()
 
 
 @pytest.mark.anyio
@@ -1206,19 +1218,25 @@ async def test_runtime_command_uses_selected_skill_command_input() -> None:
     assert "User request:\ninspect this diff" in result.prompt
 
 
-def test_chat_end_releases_session_and_current_thread(monkeypatch):
-    """The stored MCP ID and runtime thread can differ from Chainlit's thread."""
+@pytest.mark.anyio
+async def test_chat_end_releases_scope_after_idle_retention(monkeypatch):
+    """The effective thread scopes stateful MCP resources after chat end."""
     import asyncio
     released = []
     async def close_conversation(**kwargs):
         released.append(kwargs)
     runtime = SimpleNamespace(close_conversation=close_conversation)
-    monkeypatch.setattr(main.AgentRuntime, 'current', lambda: runtime)
+    session = SimpleNamespace(id="websocket-session", to_clear=True, socket_id="socket-1")
+    monkeypatch.setattr(main.cl, 'context', SimpleNamespace(session=session))
     data = {
-        main.SESSION_MCP_SESSION_ID_KEY: 'actual-session',
+        main.SESSION_MCP_SESSION_ID_KEY: 'runtime-thread',
         main.SESSION_SETTINGS_KEY: {'thread_id': 'runtime-thread'},
     }
     monkeypatch.setattr(main.cl, 'user_session', SimpleNamespace(get=data.get))
-    monkeypatch.setattr(main, 'current_chainlit_thread_id', lambda: 'chainlit-thread')
-    asyncio.run(main.on_chat_end())
-    assert released == [{'thread_id': 'runtime-thread', 'mcp_session_id': 'actual-session'}]
+    manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", manager)
+    await manager.lease(runtime=runtime, owner_id=session.id, scope_id="runtime-thread")
+    await main.on_chat_end()
+    assert released == []
+    await asyncio.sleep(0.03)
+    assert released == [{'thread_id': 'runtime-thread', 'mcp_session_id': 'runtime-thread'}]

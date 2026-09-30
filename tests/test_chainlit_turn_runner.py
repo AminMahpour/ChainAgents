@@ -124,6 +124,9 @@ class _Runtime:
         self.agent_requests += 1
         return self.agent
 
+    async def close_conversation(self, *, thread_id, mcp_session_id):
+        return None
+
     def resolve_chainlit_command(self, _name: str):
         return None
 

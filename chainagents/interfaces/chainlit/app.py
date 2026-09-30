@@ -11,6 +11,7 @@ import secrets
 from collections import deque
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from typing import Any
 
 from chainagents.util.langchain_warnings import install_langchain_warning_filters
@@ -27,6 +28,7 @@ from chainagents.interfaces.chainlit.async_tasks import (
     async_subagent_url_override,
 )
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
+from chainagents.interfaces.chainlit.lifetime import ConversationScopeLeaseManager
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
 from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
 from chainagents.interfaces.chainlit.settings import (
@@ -34,6 +36,7 @@ from chainagents.interfaces.chainlit.settings import (
     SESSION_SETTINGS_KEY,
     build_chat_settings,
     coerce_settings,
+    current_chainlit_session_id,
     current_chainlit_thread_id,
     current_mcp_session_id,
     default_reasoning_level_for_model,
@@ -43,7 +46,7 @@ from chainagents.interfaces.chainlit.settings import (
     resolve_reasoning_level_for_message,
     settings_payload,  # noqa: F401
     settings_reasoning_level_is_explicit,
-    store_mcp_session_id,
+    store_mcp_session_id,  # noqa: F401
     store_settings,
 )
 from chainagents.interfaces.chainlit.uploads import (
@@ -99,8 +102,191 @@ RESUME_INPUT_ACTION = "resume_queued_input"
 SESSION_ACTIVE_TURN_KEY = "active_agent_turn"
 SESSION_DISCONNECT_CLEANUP_KEY = "pending_disconnect_cleanup"
 SESSION_DISCONNECTED_OUTPUT_KEY = "pending_disconnected_output"
+SESSION_RESUME_WARMUP_KEY = "pending_resume_warmup"
+SESSION_RECONNECT_RECOVERY_KEY = "pending_reconnect_recovery"
+SESSION_RECONNECT_RECOVERY_TASK_KEY = "pending_reconnect_recovery_task"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
 REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
+conversation_scopes = ConversationScopeLeaseManager(idle_seconds=600, max_idle=4)
+
+
+@dataclass(frozen=True)
+class _ReconnectRecovery:
+    disconnected_socket_id: str
+    runtime: AgentRuntime | None
+    raw_settings: dict[str, Any] | None
+    async_notifier: Any
+    local_notifier: Any
+
+
+def _conversation_owner_id(session: Any | None = None) -> str:
+    """Identify a Chainlit tab independently of its reconnecting socket."""
+    session_id = current_chainlit_session_id()
+    if session_id:
+        return session_id
+    if session is None:
+        with suppress(Exception):
+            session = cl.context.session
+    return f"chainlit-session-{id(session if session is not None else cl.user_session)}"
+
+
+def _cancel_resume_warmup(session: Any | None) -> asyncio.Task[None] | None:
+    """Stop a pending resume warm-up before its session is retargeted or closed."""
+    task = getattr(session, SESSION_RESUME_WARMUP_KEY, None)
+    if isinstance(task, asyncio.Task) and not task.done():
+        task.cancel()
+        return task
+    return None
+
+
+def _start_resume_warmup(
+    *, runtime: AgentRuntime, settings: AppSettings, mcp_session_id: str
+) -> None:
+    """Restore async-subagent polling after the resume callback returns."""
+    try:
+        session = cl.context.session
+    except Exception:
+        return
+    _cancel_resume_warmup(session)
+
+    async def warm_up() -> None:
+        try:
+            url_override = async_subagent_url_override()
+            agent = await runtime.get_agent(
+                settings.reasoning_level,
+                model_name=settings.model_name,
+                reasoning_level_is_explicit=settings_reasoning_level_is_explicit(
+                    runtime.config,
+                    settings,
+                    settings.model_name,
+                ),
+                thread_id=settings.thread_id,
+                async_subagent_url_override=url_override,
+                mcp_session_id=mcp_session_id,
+            )
+            current = asyncio.current_task()
+            if (
+                current is None
+                or current.cancelling()
+                or getattr(session, SESSION_RESUME_WARMUP_KEY, None) is not current
+            ):
+                return
+            notifier = get_async_task_notifier(
+                agent=agent,
+                runtime=runtime,
+                url_override=url_override,
+            )
+            if notifier is not None:
+                await notifier.schedule_from_state(thread_id=settings.thread_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to restore async tasks for Chainlit thread %s", settings.thread_id)
+
+    setattr(session, SESSION_RESUME_WARMUP_KEY, asyncio.create_task(warm_up()))
+
+
+def _schedule_reconnect_recovery(session: Any) -> None:
+    """Restore a reused Chainlit session after expired-socket cleanup raced it."""
+    recovery = getattr(session, SESSION_RECONNECT_RECOVERY_KEY, None)
+    if not isinstance(recovery, _ReconnectRecovery):
+        return
+    if getattr(session, "to_clear", False):
+        delattr(session, SESSION_RECONNECT_RECOVERY_KEY)
+        return
+    if getattr(session, "socket_id", None) == recovery.disconnected_socket_id:
+        return
+    existing = getattr(session, SESSION_RECONNECT_RECOVERY_TASK_KEY, None)
+    if isinstance(existing, asyncio.Task) and not existing.done():
+        return
+
+    async def recover() -> None:
+        try:
+            cleanup = getattr(session, SESSION_DISCONNECT_CLEANUP_KEY, None)
+            if (
+                isinstance(cleanup, asyncio.Task)
+                and cleanup is not asyncio.current_task()
+                and not cleanup.done()
+            ):
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+            if (
+                getattr(session, SESSION_RECONNECT_RECOVERY_KEY, None) is recovery
+                and not getattr(session, "to_clear", False)
+                and not isinstance(
+                    getattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, None),
+                    DisconnectedOutput,
+                )
+                and getattr(session, "socket_id", None)
+                != recovery.disconnected_socket_id
+            ):
+                await _restore_reconnected_observers(session, recovery)
+        except Exception:
+            logger.exception("Failed to restore observers after Chainlit reconnect")
+
+    setattr(
+        session,
+        SESSION_RECONNECT_RECOVERY_TASK_KEY,
+        asyncio.create_task(recover()),
+    )
+
+
+async def _restore_reconnected_observers(
+    session: Any, recovery: _ReconnectRecovery
+) -> None:
+    runtime = AgentRuntime.current() or recovery.runtime
+    if runtime is None:
+        return
+    extensions = runtime.config.extensions
+    raw_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
+    if not isinstance(raw_settings, dict):
+        raw_settings = recovery.raw_settings
+    settings = coerce_settings(
+        raw_settings,
+        default_model_name=runtime.config.model_name,
+        available_models=runtime.config.model_choices,
+        runtime_config=runtime.config,
+        show_reasoning_stream_default=extensions.chainlit_reasoning_steps_enabled,
+        show_tool_calls_default=extensions.chainlit_tool_steps_enabled,
+    )
+    await conversation_scopes.lease(
+        runtime=runtime,
+        owner_id=_conversation_owner_id(session),
+        scope_id=settings.thread_id,
+        retain_idle=getattr(extensions, "mcp_stateful", True),
+    )
+
+    current_local = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+    if current_local is recovery.local_notifier:
+        cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, None)
+        current_local = None
+    if (
+        current_local is None
+        and extensions.background_subagents.enabled
+    ):
+        await start_local_background_notifier(
+            runtime=runtime,
+            session_id=settings.thread_id,
+            reasoning_steps_enabled=settings.show_reasoning_stream,
+            tool_steps_enabled=settings.show_tool_calls,
+        )
+
+    current_async = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
+    if current_async is recovery.async_notifier:
+        cl.user_session.set(SESSION_ASYNC_TASK_NOTIFIER_KEY, None)
+        current_async = None
+    if current_async is None and extensions.async_subagents:
+        _start_resume_warmup(
+            runtime=runtime,
+            settings=settings,
+            mcp_session_id=settings.thread_id,
+        )
+    if getattr(session, SESSION_RECONNECT_RECOVERY_KEY, None) is recovery:
+        delattr(session, SESSION_RECONNECT_RECOVERY_KEY)
 
 
 class DisconnectedOutput:
@@ -159,6 +345,7 @@ async def _connection_successful_with_output_replay(sid: str) -> None:
     pending = getattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, None)
     if isinstance(pending, DisconnectedOutput):
         await pending.flush(session)
+    _schedule_reconnect_recovery(session)
 
 
 chainlit_socket.restore_existing_session = _restore_session_with_output_replay
@@ -511,7 +698,6 @@ async def on_chat_start() -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
-    store_mcp_session_id()
     await publish_native_commands(runtime)
     extensions = runtime.config.extensions
     settings = AppSettings(
@@ -530,6 +716,12 @@ async def on_chat_start() -> None:
     )
     await run_task_list.show_ready()
     store_settings(settings)
+    await conversation_scopes.lease(
+        runtime=runtime,
+        owner_id=_conversation_owner_id(),
+        scope_id=settings.thread_id,
+        retain_idle=getattr(extensions, "mcp_stateful", True),
+    )
     await start_local_background_notifier(
         runtime=runtime,
         session_id=settings.thread_id,
@@ -566,7 +758,7 @@ async def on_chat_start() -> None:
         1 for command in runtime.chainlit_commands if command.target == "skill"
     )
     mcp_session_mode_line = (
-        "- MCP session mode: stateful for this Chainlit session; cleaned up when the session ends\n"
+        "- MCP session mode: stateful for this conversation; idle resources expire after 10 minutes\n"
         if extensions.mcp_stateful
         else "- MCP session mode: stateless; a new MCP session is created for each tool call\n"
     )
@@ -624,7 +816,6 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     runtime = await get_runtime_or_notify()
     if runtime is None:
         return
-    mcp_session_id = store_mcp_session_id()
     await publish_native_commands(runtime)
 
     extensions = runtime.config.extensions
@@ -632,6 +823,9 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     raw_settings = (
         metadata.get(SESSION_SETTINGS_KEY) if isinstance(metadata, dict) else None
     )
+    raw_settings = dict(raw_settings) if isinstance(raw_settings, dict) else {}
+    if not raw_settings.get("thread_id") and thread.get("id"):
+        raw_settings["thread_id"] = thread["id"]
     settings = coerce_settings(
         raw_settings,
         default_model_name=runtime.config.model_name,
@@ -639,6 +833,13 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         runtime_config=runtime.config,
         show_reasoning_stream_default=extensions.chainlit_reasoning_steps_enabled,
         show_tool_calls_default=extensions.chainlit_tool_steps_enabled,
+    )
+    store_settings(settings)
+    await conversation_scopes.lease(
+        runtime=runtime,
+        owner_id=_conversation_owner_id(),
+        scope_id=settings.thread_id,
+        retain_idle=getattr(extensions, "mcp_stateful", True),
     )
     await start_local_background_notifier(
         runtime=runtime,
@@ -651,7 +852,6 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         tool_steps_enabled=settings.show_tool_calls,
     )
     await run_task_list.show_ready()
-    store_settings(settings)
     await _restore_saved_response_actions(thread, runtime)
     await publish_modes(
         settings,
@@ -664,27 +864,12 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         available_models=runtime.config.model_choices,
         model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     ).send()
-    async_url_override = async_subagent_url_override()
-    agent = await runtime.get_agent(
-        settings.reasoning_level,
-        model_name=settings.model_name,
-        reasoning_level_is_explicit=settings_reasoning_level_is_explicit(
-            runtime.config,
-            settings,
-            settings.model_name,
-        ),
-        thread_id=settings.thread_id,
-        async_subagent_url_override=async_url_override,
-        mcp_session_id=mcp_session_id,
-    )
-    async_task_notifier = get_async_task_notifier(
-        agent=agent,
-        runtime=runtime,
-        url_override=async_url_override,
-    )
-    if async_task_notifier is not None:
-        with suppress(Exception):
-            await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
+    if extensions.async_subagents:
+        _start_resume_warmup(
+            runtime=runtime,
+            settings=settings,
+            mcp_session_id=settings.thread_id,
+        )
 
 
 async def _restore_saved_response_actions(
@@ -719,17 +904,39 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         ),
         show_tool_calls_default=runtime.config.extensions.chainlit_tool_steps_enabled,
     )
+    previous_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
+    previous_thread_id = (
+        str(previous_settings.get("thread_id") or "").strip()
+        if isinstance(previous_settings, dict)
+        else ""
+    )
+    try:
+        session = cl.context.session
+    except Exception:
+        session = None
+    warmup = _cancel_resume_warmup(session)
+    if warmup is not None:
+        with suppress(asyncio.CancelledError):
+            await warmup
+    if previous_thread_id and previous_thread_id != settings.thread_id:
+        async_notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
+        if isinstance(async_notifier, AsyncTaskNotifier):
+            async_notifier.cancel()
+            cl.user_session.set(SESSION_ASYNC_TASK_NOTIFIER_KEY, None)
     local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
     if (
         isinstance(local_notifier, LocalBackgroundTaskNotifier)
         and local_notifier.session_id != settings.thread_id
     ):
         await local_notifier.aclose()
-        await runtime.close_conversation(
-            thread_id=local_notifier.session_id,
-            mcp_session_id=current_mcp_session_id() or None,
-        )
+        cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, None)
     store_settings(settings)
+    await conversation_scopes.lease(
+        runtime=runtime,
+        owner_id=_conversation_owner_id(session),
+        scope_id=settings.thread_id,
+        retain_idle=getattr(runtime.config.extensions, "mcp_stateful", True),
+    )
     if (
         not isinstance(local_notifier, LocalBackgroundTaskNotifier)
         or local_notifier.session_id != settings.thread_id
@@ -757,6 +964,12 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
         reasoning_mode_enabled=runtime.config.extensions.chainlit_reasoning_mode_enabled,
     )
+    if warmup is not None and getattr(runtime.config.extensions, "async_subagents", ()):
+        _start_resume_warmup(
+            runtime=runtime,
+            settings=settings,
+            mcp_session_id=settings.thread_id,
+        )
 
 
 @cl.action_callback(DOWNLOAD_MARKDOWN_ACTION)
@@ -1325,29 +1538,39 @@ async def _run_agent_turn(
         resolve_commands=resolve_commands,
     )
     renderer = ChainlitTurnRenderer(build_bridge, prompt=agent_prompt)
-    result = await TurnRunner(runtime, sanitize_errors=False).run(request, renderer)
+    turn_owner_id = f"turn:{secrets.token_hex(16)}"
+    await conversation_scopes.lease(
+        runtime=runtime,
+        owner_id=turn_owner_id,
+        scope_id=settings.thread_id,
+        retain_idle=False,
+    )
+    try:
+        result = await TurnRunner(runtime, sanitize_errors=False).run(request, renderer)
 
-    if result.reflection is not None:
-        # A failed turn has already reported its error; never raise a second one.
-        with suppress(Exception) if result.status == "failed" else nullcontext():
-            await ask_to_save_reflection_lesson(
+        if result.reflection is not None:
+            # A failed turn has already reported its error; never raise a second one.
+            with suppress(Exception) if result.status == "failed" else nullcontext():
+                await ask_to_save_reflection_lesson(
+                    runtime=runtime,
+                    settings=settings,
+                    proposal=result.reflection,
+                    reasoning_level=effective_reasoning_level,
+                    model_name=effective_model_name,
+                    async_url_override=async_url_override,
+                    mcp_session_id=mcp_session_id,
+                )
+        if result.status == "completed" and result.agent is not None:
+            async_task_notifier = get_async_task_notifier(
+                agent=result.agent,
                 runtime=runtime,
-                settings=settings,
-                proposal=result.reflection,
-                reasoning_level=effective_reasoning_level,
-                model_name=effective_model_name,
-                async_url_override=async_url_override,
-                mcp_session_id=mcp_session_id,
+                url_override=async_url_override,
             )
-    if result.status == "completed" and result.agent is not None:
-        async_task_notifier = get_async_task_notifier(
-            agent=result.agent,
-            runtime=runtime,
-            url_override=async_url_override,
-        )
-        if async_task_notifier is not None:
-            with suppress(Exception):
-                await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
+            if async_task_notifier is not None:
+                with suppress(Exception):
+                    await async_task_notifier.schedule_from_state(thread_id=settings.thread_id)
+    finally:
+        await conversation_scopes.release(turn_owner_id)
 
 
 def reflection_actions(*, retry: bool = False) -> list[cl.Action]:
@@ -1445,28 +1668,23 @@ async def on_chat_end() -> None:
     except Exception:
         session = None
     active = cl.user_session.get(SESSION_ACTIVE_TURN_KEY)
+    owner_id = _conversation_owner_id(session)
+    raw_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
+    raw_settings = dict(raw_settings) if isinstance(raw_settings, dict) else None
     runtime = AgentRuntime.current()
-    thread_id: str | None = None
-    mcp_session_id: str | None = None
-    if runtime is not None:
-        raw_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
-        thread_id = (
-            str(raw_settings.get("thread_id") or "").strip()
-            if isinstance(raw_settings, dict)
-            else ""
-        ) or current_chainlit_thread_id()
-        mcp_session_id = current_mcp_session_id() or None
 
-    async def close_chat() -> None:
-        with suppress(Exception):
-            setattr(session, SESSION_INPUT_DRAFTS_KEY, {})
+    async def close_chat(*, expected_socket_id: str | None = None) -> None:
         tasks = {active, getattr(session, "current_task", None)}
         # Snapshot current watchers before awaiting a cancelled turn: Chainlit's
         # own timeout may remove user_session while cancellation renders UI.
         notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
         local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
-        if isinstance(notifier, AsyncTaskNotifier):
-            notifier.cancel()
+        def still_disconnected() -> bool:
+            return expected_socket_id is None or (
+                getattr(session, "socket_id", None) == expected_socket_id
+            )
+        if not still_disconnected():
+            return
         for task in tasks:
             if (
                 isinstance(task, asyncio.Task)
@@ -1476,13 +1694,38 @@ async def on_chat_end() -> None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
+        if not still_disconnected():
+            return
+        resume_warmup = _cancel_resume_warmup(session)
+        if resume_warmup is not None:
+            with suppress(asyncio.CancelledError):
+                await resume_warmup
+        if not still_disconnected():
+            return
+        if expected_socket_id is not None:
+            setattr(
+                session,
+                SESSION_RECONNECT_RECOVERY_KEY,
+                _ReconnectRecovery(
+                    disconnected_socket_id=expected_socket_id,
+                    runtime=runtime,
+                    raw_settings=raw_settings,
+                    async_notifier=notifier,
+                    local_notifier=local_notifier,
+                ),
+            )
+        if isinstance(notifier, AsyncTaskNotifier):
+            notifier.cancel()
         if isinstance(local_notifier, LocalBackgroundTaskNotifier):
             await local_notifier.aclose()
-        if runtime is not None:
-            await runtime.close_conversation(
-                thread_id=thread_id or None,
-                mcp_session_id=mcp_session_id,
-            )
+        if not still_disconnected():
+            _schedule_reconnect_recovery(session)
+            return
+        with suppress(Exception):
+            setattr(session, SESSION_INPUT_DRAFTS_KEY, {})
+        await conversation_scopes.release(owner_id, only_if=still_disconnected)
+        if not still_disconnected():
+            _schedule_reconnect_recovery(session)
 
     previous_cleanup = getattr(session, SESSION_DISCONNECT_CLEANUP_KEY, None)
     if isinstance(previous_cleanup, asyncio.Task) and not previous_cleanup.done():
@@ -1509,7 +1752,7 @@ async def on_chat_end() -> None:
         if session.socket_id != disconnected_socket_id:
             return
         try:
-            await close_chat()
+            await close_chat(expected_socket_id=disconnected_socket_id)
         except Exception:
             logger.exception("Failed to clean up an expired Chainlit session")
 
