@@ -482,6 +482,96 @@ def test_messaging_only_turns_serialize_on_the_same_thread(monkeypatch) -> None:
     asyncio.run(exercise())
 
 
+def test_stateful_mcp_turns_serialize_on_the_same_thread(monkeypatch) -> None:
+    """Two tabs sharing a conversation do not overlap a stateful MCP transport."""
+
+    async def exercise() -> None:
+        lock = asyncio.Lock()
+        runtime = SimpleNamespace(
+            config=SimpleNamespace(
+                extensions=SimpleNamespace(
+                    messaging=SimpleNamespace(enabled=False),
+                    user_input=SimpleNamespace(enabled=False),
+                    mcp_stateful=True,
+                )
+            ),
+            turn_lock=lambda _thread_id: lock,
+        )
+        entered: list[str] = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def run(_runner, request, _renderer):
+            entered.append(request.prompt)
+            if request.prompt == "first":
+                first_started.set()
+                await release_first.wait()
+            return request.prompt
+
+        monkeypatch.setattr(TurnRunner, "_run", run)
+        first = asyncio.create_task(
+            TurnRunner(runtime).run(_request("first"), _RecordingRenderer())
+        )
+        await first_started.wait()
+        second = asyncio.create_task(
+            TurnRunner(runtime).run(_request("second"), _RecordingRenderer())
+        )
+        await asyncio.sleep(0)
+        assert entered == ["first"]
+        release_first.set()
+        assert await asyncio.gather(first, second) == ["first", "second"]
+
+    asyncio.run(exercise())
+
+
+def test_stateful_mcp_turns_serialize_across_threads_sharing_scope(monkeypatch) -> None:
+    """An explicit MCP scope cannot be used by two threads at once."""
+
+    async def exercise() -> None:
+        locks: dict[str, asyncio.Lock] = {}
+        runtime = SimpleNamespace(
+            config=SimpleNamespace(
+                extensions=SimpleNamespace(
+                    messaging=SimpleNamespace(enabled=False),
+                    user_input=SimpleNamespace(enabled=False),
+                    mcp_stateful=True,
+                )
+            ),
+            turn_lock=lambda key: locks.setdefault(key, asyncio.Lock()),
+        )
+        entered: list[str] = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def run(_runner, request, _renderer):
+            entered.append(request.prompt)
+            if request.prompt == "first":
+                first_started.set()
+                await release_first.wait()
+            return request.prompt
+
+        monkeypatch.setattr(TurnRunner, "_run", run)
+        first = asyncio.create_task(
+            TurnRunner(runtime).run(
+                _request("first", thread_id="thread-a", mcp_session_id="shared"),
+                _RecordingRenderer(),
+            )
+        )
+        await first_started.wait()
+        second = asyncio.create_task(
+            TurnRunner(runtime).run(
+                _request("second", thread_id="thread-b", mcp_session_id="shared"),
+                _RecordingRenderer(),
+            )
+        )
+        await asyncio.sleep(0)
+        assert entered == ["first"]
+        release_first.set()
+        assert await asyncio.gather(first, second) == ["first", "second"]
+
+    asyncio.run(exercise())
+
+
 def test_unsanitised_runner_keeps_real_error_text(tmp_path: Path) -> None:
     runtime = _make_runtime(tmp_path)
     runtime.command_error = RuntimeError("backend exploded")

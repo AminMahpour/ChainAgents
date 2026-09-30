@@ -1730,3 +1730,163 @@ def test_conversation_close_rebuilds_other_session_on_same_thread(runtime):
         await runtime.close()
 
     asyncio.run(exercise())
+
+
+def test_agent_builds_for_distinct_threads_can_overlap(runtime, monkeypatch):
+    """An unrelated conversation must not wait for another graph's discovery."""
+    entered = 0
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def build_main_tools(**_kwargs):
+        nonlocal entered
+        entered += 1
+        if entered == 2:
+            both_entered.set()
+        await release.wait()
+        return []
+
+    monkeypatch.setattr(runtime, "_build_main_tools", build_main_tools)
+
+    async def exercise():
+        first = asyncio.create_task(runtime.get_agent("medium", thread_id="first"))
+        second = asyncio.create_task(runtime.get_agent("medium", thread_id="second"))
+        try:
+            await asyncio.wait_for(both_entered.wait(), timeout=0.25)
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+        assert entered == 2
+
+    asyncio.run(exercise())
+
+
+def test_overlapping_agent_callers_share_discovery_failure_status(runtime):
+    """All callers of one in-flight graph see its degraded MCP result."""
+    runtime.config = replace(
+        runtime.config,
+        extensions=make_extensions_config(agent_mcp_servers=("broken",)),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+
+    async def get_tools(*, server_name):
+        nonlocal attempts
+        attempts += 1
+        entered.set()
+        await release.wait()
+        raise OSError(f"{server_name} offline")
+
+    runtime._mcp_pool._client = SimpleNamespace(get_tools=get_tools)
+
+    async def exercise():
+        first = asyncio.create_task(
+            runtime.get_agent_with_status("medium", thread_id="thread")
+        )
+        await entered.wait()
+        second = asyncio.create_task(
+            runtime.get_agent_with_status("medium", thread_id="thread")
+        )
+        await asyncio.sleep(0)
+        release.set()
+        (_, first_warnings), (_, second_warnings) = await asyncio.gather(first, second)
+        assert first_warnings == second_warnings == ("broken",)
+        assert attempts == 1
+        assert runtime._agents == {}
+
+    asyncio.run(exercise())
+
+
+def test_mcp_close_waits_for_inflight_agent_build_without_resurrection(runtime, monkeypatch):
+    """A graph built during teardown cannot repopulate the closed scope."""
+    runtime.config = replace(
+        runtime.config,
+        extensions=make_extensions_config(mcp_stateful=True),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    builds = 0
+
+    async def build_main_tools(**_kwargs):
+        nonlocal builds
+        builds += 1
+        entered.set()
+        await release.wait()
+        return []
+
+    monkeypatch.setattr(runtime, "_build_main_tools", build_main_tools)
+
+    async def exercise():
+        building = asyncio.create_task(
+            runtime.get_agent("medium", thread_id="thread", mcp_session_id="scope")
+        )
+        await entered.wait()
+        closing = asyncio.create_task(runtime.close_mcp_session("scope"))
+        await asyncio.sleep(0)
+        assert not closing.done()
+        release.set()
+        await asyncio.gather(building, closing)
+        assert not runtime._agents
+        await runtime.get_agent("medium", thread_id="thread", mcp_session_id="scope")
+        assert builds == 2
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_agent_builder_does_not_cancel_other_waiters(runtime, monkeypatch):
+    """Another caller can take over when the first graph builder disconnects."""
+    entered = asyncio.Event()
+    builds = 0
+
+    async def build_main_tools(**_kwargs):
+        nonlocal builds
+        builds += 1
+        if builds == 1:
+            entered.set()
+            await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(runtime, "_build_main_tools", build_main_tools)
+
+    async def exercise():
+        owner = asyncio.create_task(runtime.get_agent("medium", thread_id="thread"))
+        await entered.wait()
+        waiter = asyncio.create_task(runtime.get_agent("medium", thread_id="thread"))
+        await asyncio.sleep(0)
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        agent = await asyncio.wait_for(waiter, timeout=1)
+        assert agent is runtime._agents[next(iter(runtime._agents))]
+        assert builds == 2
+
+    asyncio.run(exercise())
+
+
+def test_failed_main_discovery_cancels_sibling_subagent_load(runtime, monkeypatch):
+    """A failed graph build must not leave tool discovery running after teardown."""
+    subagent_started = asyncio.Event()
+    subagent_stopped = asyncio.Event()
+
+    async def build_main_tools(**_kwargs):
+        await subagent_started.wait()
+        raise RuntimeError("main discovery failed")
+
+    async def load_subagent_tools(**_kwargs):
+        subagent_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            subagent_stopped.set()
+
+    monkeypatch.setattr(runtime, "_build_main_tools", build_main_tools)
+    monkeypatch.setattr(runtime, "_load_subagent_mcp_tools", load_subagent_tools)
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="main discovery failed"):
+            await runtime.get_agent("medium", thread_id="thread")
+        assert subagent_stopped.is_set()
+        await runtime.close_conversation(thread_id="thread")
+
+    asyncio.run(exercise())

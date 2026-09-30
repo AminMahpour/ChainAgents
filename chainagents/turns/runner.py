@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import aclosing, suppress
+from contextlib import AsyncExitStack, aclosing, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -146,13 +146,23 @@ class TurnRunner:
         """
         try:
             extensions = getattr(self.runtime.config, "extensions", None)
-            serialize_turns = any(
+            serialize_thread = any(
                 getattr(getattr(extensions, name, None), "enabled", False)
                 for name in ("messaging", "user_input")
             )
-            if serialize_turns:
+            serialize_mcp = bool(getattr(extensions, "mcp_stateful", False))
+            if serialize_thread or serialize_mcp:
                 turn_lock = getattr(self.runtime, "turn_lock", None)
                 if callable(turn_lock):
+                    lock_keys = [request.thread_id]
+                    if serialize_mcp:
+                        mcp_scope = str(request.mcp_session_id or "").strip() or request.thread_id
+                        lock_keys.append(f"\0mcp:{mcp_scope}")
+                    locks: list[asyncio.Lock] = []
+                    for key in sorted(set(lock_keys)):
+                        lock = turn_lock(key)
+                        if lock not in locks:
+                            locks.append(lock)
                     controller = (
                         getattr(self.runtime, "user_input", None)
                         if getattr(getattr(extensions, "user_input", None), "enabled", False)
@@ -161,7 +171,9 @@ class TurnRunner:
                     if controller is not None and not controller.turn_waiting(request.thread_id):
                         return await self._paused_result(request, renderer)
                     try:
-                        async with turn_lock(request.thread_id):
+                        async with AsyncExitStack() as stack:
+                            for lock in locks:
+                                await stack.enter_async_context(lock)
                             if controller is not None and not controller.turn_started(request.thread_id):
                                 return await self._paused_result(request, renderer)
                             try:

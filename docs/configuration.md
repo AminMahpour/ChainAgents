@@ -88,7 +88,11 @@ mcp_servers = ["docs"]
 
 Individual subagents can instead attach servers through their own
 `mcp_servers` list. MCP sessions are managed by
-`chainagents.runtime.mcp_sessions`.
+`chainagents.runtime.mcp_sessions`. With `[mcp].stateful = true`, Chainlit
+shares a conversation's MCP scope across saved-chat resumes. After its last
+session leaves, that scope stays available for 10 minutes; at most four idle
+conversation scopes are retained. Server discovery runs concurrently while
+preserving each agent's configured tool order.
 
 ## Subagents
 

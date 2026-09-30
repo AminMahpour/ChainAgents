@@ -48,15 +48,15 @@ def current_chainlit_session_id() -> str:
     return str(getattr(session, "id", None) or "").strip()
 
 
-def store_mcp_session_id() -> str:
-    """Store MCP session ID.
+def store_mcp_session_id(thread_id: str | None = None) -> str:
+    """Store the effective conversation thread as the stateful MCP scope.
 
     Returns:
         The stored value.
     """
-    session_id = current_chainlit_session_id() or current_chainlit_thread_id()
-    cl.user_session.set(SESSION_MCP_SESSION_ID_KEY, session_id)
-    return session_id
+    scope_id = str(thread_id or "").strip() or current_chainlit_thread_id()
+    cl.user_session.set(SESSION_MCP_SESSION_ID_KEY, scope_id)
+    return scope_id
 
 
 def current_mcp_session_id() -> str:
@@ -65,6 +65,11 @@ def current_mcp_session_id() -> str:
     Returns:
         The current MCP session ID.
     """
+    settings = cl.user_session.get(SESSION_SETTINGS_KEY)
+    if isinstance(settings, dict):
+        thread_id = str(settings.get("thread_id") or "").strip()
+        if thread_id:
+            return thread_id
     session_id = str(cl.user_session.get(SESSION_MCP_SESSION_ID_KEY) or "").strip()
     if session_id:
         return session_id
@@ -96,6 +101,7 @@ def store_settings(settings: AppSettings) -> None:
         settings: The settings value.
     """
     cl.user_session.set(SESSION_SETTINGS_KEY, settings_payload(settings))
+    store_mcp_session_id(settings.thread_id)
 
 
 def resolve_model_name(

@@ -1287,7 +1287,9 @@ Notes:
 - If one MCP server cannot load tools, the agent continues with tools from healthy servers and retries the failed server on the next run. The affected run shows an MCP warning in Chainlit, CLI/TUI, and API output. Tool invocation errors are returned to the model as recoverable tool errors.
 - Relative `cwd` values are resolved from the location of `deepagent.toml`.
 - `tool_name_prefix = true` is recommended when multiple MCP servers expose overlapping tool names.
-- `stateful = true` keeps MCP sessions open per LangGraph thread while the app process is running.
+- `stateful = true` keeps MCP sessions open per conversation scope while the app process is running. Chainlit uses the effective thread ID, so reopening a saved chat reuses its MCP tools and transport. Turns on the same thread run in order when stateful MCP is enabled.
+- After the last Chainlit session leaves a conversation, its resources remain available for 10 minutes. At most four idle conversations are retained; the oldest idle scope is closed when a fifth becomes idle. Active conversations are never evicted by this limit.
+- MCP servers are discovered concurrently, and each `(scope, server)` discovery is shared by callers already waiting for it. Failed servers remain retryable on a later run.
 - `stateful = false` recreates the MCP session for every tool call.
 
 Current scope of this config support:
@@ -1319,7 +1321,7 @@ the sections above for optional MCP and subagent examples.
 - When `DATABASE_URL` is unset, thread IDs only persist while the process stays alive.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.
 - When `[agent].state = "stateless"`, thread IDs still identify requests and MCP/RAG scopes, but the agent graph does not checkpoint conversation state, receive a LangGraph store, or expose `/memories/`.
-- MCP stateful sessions are process-local. They survive tool calls in the same thread, but not an app restart.
+- MCP stateful sessions are process-local. They survive tool calls and saved-chat navigation in the same Chainlit thread until idle eviction, but not an app restart.
 - On startup, the UI shows how many skill sources, MCP servers, custom subagents, and async subagents were loaded from `deepagent.toml`.
 
 

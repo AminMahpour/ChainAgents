@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import AsyncExitStack
+from collections.abc import Awaitable
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -73,6 +74,24 @@ async def agent_with_mcp_status(
     return await runtime.get_agent(reasoning_level, **kwargs), ()
 
 
+async def _gather_or_cancel(*operations: Awaitable[Any]) -> list[Any]:
+    """Stop sibling discovery and await cleanup if any branch fails."""
+    tasks = [asyncio.ensure_future(operation) for operation in operations]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        cleanup = asyncio.gather(*tasks, return_exceptions=True)
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
+
+
 class AgentRuntime:
     """Own configured agents, MCP sessions, persistence handles, and RAG state."""
 
@@ -94,6 +113,12 @@ class AgentRuntime:
         self._exit_stack = AsyncExitStack()
         self._agent_lock = asyncio.Lock()
         self._agents: dict[AgentCacheKey, object] = {}
+        self._agent_builds: dict[
+            AgentCacheKey, asyncio.Future[tuple[Any, tuple[str, ...]]]
+        ] = {}
+        self._closing_agent_threads: dict[str, asyncio.Future[None]] = {}
+        self._closing_agent_scopes: dict[str, asyncio.Future[None]] = {}
+        self._closing_all_agents: asyncio.Future[None] | None = None
         self._turn_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._mcp_pool = MCPSessionPool(lambda: self.config.extensions)
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
@@ -398,20 +423,96 @@ class AgentRuntime:
         registry = {
             subagent.name: subagent for subagent in self.config.extensions.subagents
         }
-        tools_by_path: dict[tuple[str, ...], list[Any]] = {}
+        requests: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
 
-        async def load(subagent: SubagentConfig, agent_path: tuple[str, ...]) -> None:
-            tools_by_path[agent_path] = await self._get_mcp_tools(
-                subagent.mcp_servers,
-                thread_id=thread_id,
-                mcp_session_id=mcp_session_id,
-            )
+        def collect(subagent: SubagentConfig, agent_path: tuple[str, ...]) -> None:
+            requests.append((agent_path, subagent.mcp_servers))
             for child in runtime_graph.nested_child_subagents(subagent, registry):
-                await load(child, (*agent_path, child.name))
+                collect(child, (*agent_path, child.name))
 
         for subagent in self.config.extensions.subagents:
-            await load(subagent, (subagent.name,))
-        return tools_by_path
+            collect(subagent, (subagent.name,))
+        loaded = await _gather_or_cancel(
+            *(
+                self._get_mcp_tools(
+                    server_names,
+                    thread_id=thread_id,
+                    mcp_session_id=mcp_session_id,
+                )
+                for _, server_names in requests
+            )
+        )
+        return {
+            agent_path: tools
+            for (agent_path, _), tools in zip(requests, loaded, strict=True)
+        }
+
+    def _agent_close_barrier(
+        self, cache_key: AgentCacheKey
+    ) -> asyncio.Future[None] | None:
+        if self._closing_all_agents is not None:
+            return self._closing_all_agents
+        if cache_key.thread_id is not None:
+            barrier = self._closing_agent_threads.get(cache_key.thread_id)
+            if barrier is not None:
+                return barrier
+        if cache_key.mcp_scope is not None:
+            return self._closing_agent_scopes.get(cache_key.mcp_scope)
+        return None
+
+    @asynccontextmanager
+    async def _block_agent_builds(
+        self, *, thread_id: str | None = None, mcp_scope: str | None = None,
+        all_agents: bool = False,
+    ):
+        """Hold new graph builds outside resource teardown, without blocking others."""
+        if not (all_agents or thread_id or mcp_scope):
+            raise ValueError("An agent build barrier requires a target.")
+        while True:
+            async with self._agent_lock:
+                if all_agents:
+                    current = (
+                        self._closing_all_agents
+                        or next(iter(self._closing_agent_threads.values()), None)
+                        or next(iter(self._closing_agent_scopes.values()), None)
+                    )
+                elif thread_id is not None:
+                    current = self._closing_all_agents or self._closing_agent_threads.get(thread_id)
+                else:
+                    current = self._closing_all_agents or self._closing_agent_scopes.get(mcp_scope or "")
+                if current is None:
+                    barrier = asyncio.get_running_loop().create_future()
+                    if all_agents:
+                        self._closing_all_agents = barrier
+                    elif thread_id is not None:
+                        self._closing_agent_threads[thread_id] = barrier
+                    else:
+                        self._closing_agent_scopes[mcp_scope or ""] = barrier
+                    active = [
+                        future for key, future in self._agent_builds.items()
+                        if all_agents
+                        or (thread_id is not None and key.thread_id == thread_id)
+                        or (mcp_scope is not None and key.mcp_scope == mcp_scope)
+                    ]
+                    break
+            await asyncio.shield(current)
+        try:
+            if active:
+                await asyncio.gather(
+                    *(asyncio.shield(future) for future in active),
+                    return_exceptions=True,
+                )
+            yield
+        finally:
+            async with self._agent_lock:
+                if all_agents and self._closing_all_agents is barrier:
+                    self._closing_all_agents = None
+                elif thread_id is not None and self._closing_agent_threads.get(thread_id) is barrier:
+                    self._closing_agent_threads.pop(thread_id)
+                elif mcp_scope is not None and self._closing_agent_scopes.get(mcp_scope) is barrier:
+                    self._closing_agent_scopes.pop(mcp_scope)
+                if not barrier.done():
+                    barrier.set_result(None)
 
     async def get_agent(
         self,
@@ -436,6 +537,27 @@ class AgentRuntime:
         Returns:
             The configured agent for a specific runtime context.
         """
+        agent, _ = await self._get_agent_and_mcp_status(
+            reasoning_level,
+            model_name=model_name,
+            reasoning_level_is_explicit=reasoning_level_is_explicit,
+            thread_id=thread_id,
+            async_subagent_url_override=async_subagent_url_override,
+            mcp_session_id=mcp_session_id,
+        )
+        return agent
+
+    async def _get_agent_and_mcp_status(
+        self,
+        reasoning_level: ReasoningLevel,
+        *,
+        model_name: str | None = None,
+        reasoning_level_is_explicit: bool = False,
+        thread_id: str | None = None,
+        async_subagent_url_override: str | None = None,
+        mcp_session_id: str | None = None,
+    ) -> tuple[Any, tuple[str, ...]]:
+        """Singleflight graph construction by cache key, including failure status."""
         selected_model = (
             str(model_name or self.config.model_name).strip()
             or self.config.model_name
@@ -466,74 +588,119 @@ class AgentRuntime:
             async_subagent_url_override=async_subagent_url_override,
             mcp_scope=mcp_scope,
         )
-        async with self._agent_lock:
-            agent = self._agents.get(cache_key)
-            if agent is None:
-                self._mcp_pool.discovery_failed = False
-                raw_main_tools = await self._build_main_tools(
+        while True:
+            async with self._agent_lock:
+                barrier = self._agent_close_barrier(cache_key)
+                if barrier is None:
+                    cached = self._agents.get(cache_key)
+                    if cached is not None:
+                        return cached, ()
+                    build = self._agent_builds.get(cache_key)
+                    owns_build = build is None
+                    if build is None:
+                        build = asyncio.get_running_loop().create_future()
+                        self._agent_builds[cache_key] = build
+            if barrier is not None:
+                await asyncio.shield(barrier)
+                continue
+            assert build is not None
+            if not owns_build:
+                try:
+                    return await asyncio.shield(build)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise
+                    # The original builder left; the surviving caller can
+                    # retry after its transport cleanup has completed.
+                    async with self._agent_lock:
+                        if build.cancelled() and self._agent_builds.get(cache_key) is build:
+                            self._agent_builds.pop(cache_key)
+                    continue
+            break
+
+        assert build is not None
+        warnings: set[str] = set()
+        token = runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.set(warnings)
+        try:
+            raw_main_tools, subagent_mcp_tools = await _gather_or_cancel(
+                self._build_main_tools(
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
-                )
-                subagent_mcp_tools = await self._load_subagent_mcp_tools(
+                ),
+                self._load_subagent_mcp_tools(
                     thread_id=thread_id,
                     mcp_session_id=mcp_session_id,
-                )
-                stateful = self.config.agent_state == "stateful"
-                agent_kwargs = runtime_graph.build_agent_kwargs(
-                    self.config,
-                    tools=raw_main_tools,
-                    model_profile=selected_model_profile,
-                    reasoning_level=effective_reasoning_level,
-                    reasoning_level_is_explicit=reasoning_level_is_explicit,
-                    system_prompt=SYSTEM_PROMPT,
-                    custom_instruction=self.config.extensions.custom_instruction,
-                    rag_enabled=self._rag_service is not None,
-                    project_root=self.project_root,
-                    artifact_registry=self.large_tool_result_artifacts,
-                    include_async_subagents=True,
-                    model_name=selected_model,
-                    async_subagent_url_override=async_subagent_url_override,
-                    subagent_mcp_tools=subagent_mcp_tools,
-                    build_model=lambda level, profile: self._build_model(
-                        level,
-                        model_profile=profile,
-                    ),
-                    store=self.store if stateful else None,
-                    checkpointer=self.checkpointer if stateful else None,
-                    background_manager=(
-                        self.background_tasks
-                        if self.config.extensions.background_subagents.enabled
-                        else None
-                    ),
-                    session_id=thread_id,
-                    langsmith_tracing=self.langsmith_tracing,
-                    messaging_broker=self.message_broker,
-                )
-                agent = runtime_middleware.create_deep_agent_with_configured_summarization(
-                    self.config,
-                    **agent_kwargs,
-                )
-                agent = runtime_background_tasks.scope_background_session_invocation(
-                    agent,
-                    self.background_tasks,
-                    artifact_registry=self.large_tool_result_artifacts,
-                    fixed_session_id=thread_id,
-                )
-                if not self._mcp_pool.discovery_failed:
+                ),
+            )
+            stateful = self.config.agent_state == "stateful"
+            agent_kwargs = runtime_graph.build_agent_kwargs(
+                self.config,
+                tools=raw_main_tools,
+                model_profile=selected_model_profile,
+                reasoning_level=effective_reasoning_level,
+                reasoning_level_is_explicit=reasoning_level_is_explicit,
+                system_prompt=SYSTEM_PROMPT,
+                custom_instruction=self.config.extensions.custom_instruction,
+                rag_enabled=self._rag_service is not None,
+                project_root=self.project_root,
+                artifact_registry=self.large_tool_result_artifacts,
+                include_async_subagents=True,
+                model_name=selected_model,
+                async_subagent_url_override=async_subagent_url_override,
+                subagent_mcp_tools=subagent_mcp_tools,
+                build_model=lambda level, profile: self._build_model(
+                    level,
+                    model_profile=profile,
+                ),
+                store=self.store if stateful else None,
+                checkpointer=self.checkpointer if stateful else None,
+                background_manager=(
+                    self.background_tasks
+                    if self.config.extensions.background_subagents.enabled
+                    else None
+                ),
+                session_id=thread_id,
+                langsmith_tracing=self.langsmith_tracing,
+                messaging_broker=self.message_broker,
+            )
+            agent = runtime_middleware.create_deep_agent_with_configured_summarization(
+                self.config,
+                **agent_kwargs,
+            )
+            agent = runtime_background_tasks.scope_background_session_invocation(
+                agent,
+                self.background_tasks,
+                artifact_registry=self.large_tool_result_artifacts,
+                fixed_session_id=thread_id,
+            )
+            result = agent, tuple(sorted(warnings))
+            async with self._agent_lock:
+                if not warnings:
                     self._agents[cache_key] = agent
-            return agent
+                build.set_result(result)
+            return result
+        except BaseException as exc:
+            if not build.done():
+                if isinstance(exc, asyncio.CancelledError):
+                    build.cancel()
+                else:
+                    build.set_exception(exc)
+                    # No waiters may exist. Mark the exception as observed while
+                    # retaining it for any concurrent callers of this build.
+                    build.exception()
+            raise
+        finally:
+            runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.reset(token)
+            async with self._agent_lock:
+                if self._agent_builds.get(cache_key) is build:
+                    self._agent_builds.pop(cache_key)
 
     async def get_agent_with_status(
         self, reasoning_level: ReasoningLevel, **kwargs: Any
     ) -> tuple[Any, tuple[str, ...]]:
         """Return an agent and MCP discovery failures for this build."""
-        warnings: set[str] = set()
-        token = runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.set(warnings)
-        try:
-            agent = await self.get_agent(reasoning_level, **kwargs)
-        finally:
-            runtime_mcp_sessions._MCP_DISCOVERY_WARNINGS.reset(token)
-        return agent, tuple(sorted(warnings))
+        return await self._get_agent_and_mcp_status(reasoning_level, **kwargs)
 
     async def rebuild_rag_index(self) -> RagStatus:
         """Rebuild RAG index.
@@ -749,7 +916,7 @@ class AgentRuntime:
 
     async def _clear_agent_cache(self) -> None:
         """Clear cached agents after runtime tool state changes."""
-        async with self._agent_lock:
+        async with self._block_agent_builds(all_agents=True), self._agent_lock:
             self._agents.clear()
 
     async def close_mcp_session(self, mcp_session_id: str | None) -> None:
@@ -762,15 +929,14 @@ class AgentRuntime:
         if mcp_scope is None:
             return
 
-        async with self._agent_lock:
-            self._agents = {
-                key: agent
-                for key, agent in self._agents.items()
-                if key.mcp_scope != mcp_scope
-            }
-            owners = await self._mcp_pool.evict_scope(mcp_scope)
-
-        await self._mcp_pool.close_owner_entries(owners)
+        async with self._block_agent_builds(mcp_scope=mcp_scope):
+            async with self._agent_lock:
+                self._agents = {
+                    key: agent
+                    for key, agent in self._agents.items()
+                    if key.mcp_scope != mcp_scope
+                }
+            await self._mcp_pool.evict_scope_and_close(mcp_scope)
 
     async def close_conversation(
         self, *, thread_id: str | None, mcp_session_id: str | None = None
@@ -790,7 +956,10 @@ class AgentRuntime:
     ) -> None:
         """Complete conversation teardown independently of its caller."""
         if thread_id:
-            async with self.background_tasks.closing_session(thread_id):
+            async with (
+                self._block_agent_builds(thread_id=thread_id),
+                self.background_tasks.closing_session(thread_id),
+            ):
                 await self.user_input.close_session(thread_id)
                 self.message_broker.close_session(thread_id)
                 errors: list[BaseException] = []
@@ -822,11 +991,10 @@ class AgentRuntime:
 
     async def close_all_mcp_sessions(self) -> None:
         """Close all MCP sessions."""
-        async with self._agent_lock:
-            owners = await self._mcp_pool.evict_all()
-            self._agents.clear()
-
-        await self._mcp_pool.close_owner_entries(owners)
+        async with self._block_agent_builds(all_agents=True):
+            async with self._agent_lock:
+                self._agents.clear()
+            await self._mcp_pool.evict_all_and_close()
 
     async def close(self) -> None:
         """Close the agent runtime."""
