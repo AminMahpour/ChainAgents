@@ -123,6 +123,7 @@ class _DetachedConversation:
     foreground_tasks: set[asyncio.Task[Any]]
     cleared_sessions: dict[str, Any]
     task: asyncio.Task[None] | None = None
+    accepting_work: bool = True
 
 
 def _unfinished_foreground_tasks(*tasks: Any) -> set[asyncio.Task[Any]]:
@@ -140,7 +141,11 @@ async def _conversation_has_work(
     if _unfinished_foreground_tasks(*foreground_tasks):
         return True
     busy = getattr(runtime, "conversation_busy", None)
-    return bool(await busy(thread_id)) if callable(busy) else False
+    return (
+        bool(await busy(thread_id, include_paused_queue=False))
+        if callable(busy)
+        else False
+    )
 
 
 async def _retain_missed_background_notices(
@@ -161,7 +166,12 @@ async def _retain_conversation_until_idle(
     """Hold one runtime lease while work outlives its Chainlit tab."""
     key = (id(runtime), thread_id)
     existing = _detached_conversations.get(key)
-    if existing is not None and existing.task is not None and not existing.task.done():
+    if (
+        existing is not None
+        and existing.accepting_work
+        and existing.task is not None
+        and not existing.task.done()
+    ):
         existing.foreground_tasks.update(foreground_tasks)
         if cleared_session is not None and getattr(cleared_session, "id", None):
             existing.cleared_sessions[cleared_session.id] = cleared_session
@@ -195,7 +205,7 @@ async def _retain_conversation_until_idle(
                         await asyncio.gather(*pending, return_exceptions=True)
                     wait_idle = getattr(runtime, "wait_conversation_idle", None)
                     if callable(wait_idle):
-                        await wait_idle(thread_id)
+                        await wait_idle(thread_id, include_paused_queue=False)
                     if not await _conversation_has_work(
                         runtime, thread_id, entry.foreground_tasks
                     ):
@@ -213,6 +223,9 @@ async def _retain_conversation_until_idle(
                     )
                     await asyncio.sleep(1)
         finally:
+            # A later clear needs its own lease once this owner starts releasing.
+            # The task is still pending during scope close and orphan cleanup.
+            entry.accepting_work = False
             try:
                 await entry.scopes.release(owner_id)
             finally:
@@ -228,6 +241,12 @@ async def _retain_conversation_until_idle(
                     chainlit_user_sessions.pop(cleared.id, None)
 
     entry.task = asyncio.create_task(release_when_idle())
+
+
+@dataclass(frozen=True)
+class _PendingLocalReconciliation:
+    notifier: LocalBackgroundTaskNotifier
+    restored_message_ids: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -465,12 +484,17 @@ async def _connection_successful_with_output_replay(sid: str) -> None:
     pending = getattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, None)
     if isinstance(pending, DisconnectedOutput):
         await pending.flush(session)
-    local_notifier = getattr(session, SESSION_PENDING_LOCAL_RECONCILIATION_KEY, None)
-    if isinstance(local_notifier, LocalBackgroundTaskNotifier):
+    local_reconciliation = getattr(
+        session, SESSION_PENDING_LOCAL_RECONCILIATION_KEY, None
+    )
+    if isinstance(local_reconciliation, _PendingLocalReconciliation):
         delattr(session, SESSION_PENDING_LOCAL_RECONCILIATION_KEY)
+        local_notifier = local_reconciliation.notifier
         if cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY) is local_notifier:
             try:
-                await local_notifier.reconcile_terminal_tasks()
+                await local_notifier.reconcile_terminal_tasks(
+                    restored_message_ids=local_reconciliation.restored_message_ids
+                )
             except Exception:
                 logger.exception("Failed to reconcile local background tasks after resume")
     _schedule_reconnect_recovery(session)
@@ -999,8 +1023,15 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     ).send()
     local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
     if isinstance(local_notifier, LocalBackgroundTaskNotifier):
+        restored_message_ids = frozenset(
+            str(step["id"])
+            for step in thread.get("steps", [])
+            if isinstance(step, dict) and step.get("id")
+        )
         setattr(
-            cl.context.session, SESSION_PENDING_LOCAL_RECONCILIATION_KEY, local_notifier
+            cl.context.session,
+            SESSION_PENDING_LOCAL_RECONCILIATION_KEY,
+            _PendingLocalReconciliation(local_notifier, restored_message_ids),
         )
     if extensions.async_subagents:
         _start_resume_warmup(
@@ -1089,7 +1120,7 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         and local_notifier.session_id != settings.thread_id
     ):
         if old_thread_busy:
-            local_notifier.cancel()
+            await local_notifier.aclose_for_handoff()
         else:
             await local_notifier.aclose()
         cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, None)
@@ -1896,7 +1927,7 @@ async def on_chat_end() -> None:
             notifier.cancel()
         if isinstance(local_notifier, LocalBackgroundTaskNotifier):
             if preserve_work:
-                local_notifier.cancel()
+                await local_notifier.aclose_for_handoff()
             else:
                 await local_notifier.aclose()
         if not still_disconnected():

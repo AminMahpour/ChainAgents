@@ -154,6 +154,63 @@ def test_conversation_busy_tracks_input_and_nonterminal_background_work(runtime)
     asyncio.run(exercise())
 
 
+def test_detached_idle_wait_ignores_paused_queue_but_tracks_background_work(runtime):
+    runtime.user_input.config = UserInputConfig(enabled=True)
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        async def run_input(_payload):
+            return None
+
+        runtime.user_input.stop("thread")
+        queued = runtime.user_input.submit(
+            "thread", "queued", run_input, followup_factory=lambda text: text
+        )
+        assert await runtime.conversation_busy("thread") is True
+        assert await runtime.conversation_busy(
+            "thread", include_paused_queue=False
+        ) is False
+        await asyncio.wait_for(
+            runtime.wait_conversation_idle(
+                "thread", include_paused_queue=False
+            ),
+            timeout=1,
+        )
+        assert queued.status == "queued"
+
+        release_background = asyncio.Event()
+
+        async def run_background(task_id):
+            await release_background.wait()
+            return task_id
+
+        await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="work",
+            agent_path=("worker",),
+            runner=run_background,
+        )
+        assert await runtime.conversation_busy(
+            "thread", include_paused_queue=False
+        ) is True
+        idle_wait = asyncio.create_task(
+            runtime.wait_conversation_idle(
+                "thread", include_paused_queue=False
+            )
+        )
+        await asyncio.sleep(0)
+        assert not idle_wait.done()
+        release_background.set()
+        await asyncio.wait_for(idle_wait, timeout=1)
+        assert queued.status == "queued"
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
 def test_conversation_busy_rechecks_input_started_during_background_lookup(
     runtime, monkeypatch
 ):

@@ -261,8 +261,8 @@ class ConversationInputController:
         """Return whether this conversation has existing turn state."""
         return session_id in self._sessions
 
-    def busy(self, session_id: str) -> bool:
-        """Return whether a conversation has active, waiting, or queued input."""
+    def busy(self, session_id: str, *, include_paused_queue: bool = True) -> bool:
+        """Return active input and, by default, queued input awaiting Resume."""
         session = self._sessions.get(session_id)
         return bool(
             session is not None
@@ -270,15 +270,19 @@ class ConversationInputController:
                 session.active is not None
                 or session.external_task is not None
                 or session.external_waiters
-                or session.queue
+                or (session.queue and (include_paused_queue or not session.paused))
             )
         )
 
-    async def wait_drained(self, session_id: str) -> None:
-        """Wait for all input work, including paused queues and external turns."""
+    async def wait_drained(
+        self, session_id: str, *, include_paused_queue: bool = True
+    ) -> None:
+        """Wait for active input and, by default, queued input awaiting Resume."""
         while True:
             session = self._sessions.get(session_id)
-            if session is None or not self.busy(session_id):
+            if session is None or not self.busy(
+                session_id, include_paused_queue=include_paused_queue
+            ):
                 return
             # No await separates the state check from clearing the signal, so a
             # subsequent transition cannot be missed by the waiter.

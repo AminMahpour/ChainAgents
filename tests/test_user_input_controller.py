@@ -153,6 +153,84 @@ def test_wait_drained_waits_for_paused_queued_turn_until_resume():
     asyncio.run(exercise())
 
 
+def test_detached_drain_ignores_paused_queue_but_waits_for_resumed_turn():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def run(_payload):
+            started.set()
+            await release.wait()
+
+        controller.stop("s")
+        job = controller.submit(
+            "s", "queued", run, followup_factory=lambda text: text
+        )
+        assert controller.busy("s") is True
+        assert controller.busy("s", include_paused_queue=False) is False
+        await asyncio.wait_for(
+            controller.wait_drained("s", include_paused_queue=False), timeout=1
+        )
+        assert job.status == "queued"
+
+        controller.resume("s")
+        await started.wait()
+        assert controller.busy("s", include_paused_queue=False) is True
+        drained = asyncio.create_task(
+            controller.wait_drained("s", include_paused_queue=False)
+        )
+        await asyncio.sleep(0)
+        assert not drained.done()
+        release.set()
+        await asyncio.wait_for(drained, timeout=1)
+        assert job.status == "completed"
+
+    asyncio.run(exercise())
+
+
+def test_detached_drain_waits_for_cancelled_active_turn_before_paused_queue():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        first_started = asyncio.Event()
+        release_cancellation = asyncio.Event()
+
+        async def run(payload):
+            if payload == "first":
+                first_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    await release_cancellation.wait()
+
+        first = controller.submit(
+            "s", "first", run, followup_factory=lambda text: text
+        )
+        await first_started.wait()
+        second = controller.submit(
+            "s", "second", run, followup_factory=lambda text: text
+        )
+        controller.stop("s")
+        assert controller.busy("s", include_paused_queue=False) is True
+        drained = asyncio.create_task(
+            controller.wait_drained("s", include_paused_queue=False)
+        )
+        await asyncio.sleep(0)
+        assert not drained.done()
+
+        release_cancellation.set()
+        await asyncio.wait_for(drained, timeout=1)
+        assert first.status == "cancelled"
+        assert second.status == "queued"
+        assert controller.busy("s", include_paused_queue=False) is False
+
+    asyncio.run(exercise())
+
+
 def test_wait_drained_waits_for_external_turn_and_waiter():
     async def exercise():
         controller = ConversationInputController(

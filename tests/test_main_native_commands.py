@@ -728,12 +728,16 @@ async def test_settings_thread_switch_preserves_busy_old_background_work(
             self.cancelled = False
             self.closed = False
             self.detached = False
+            self.handed_off = False
 
         def detach(self):
             self.detached = True
 
         def cancel(self):
             self.cancelled = True
+
+        async def aclose_for_handoff(self):
+            self.handed_off = True
 
         async def aclose(self):
             self.closed = True
@@ -745,12 +749,14 @@ async def test_settings_thread_switch_preserves_busy_old_background_work(
         assert thread_id == mcp_session_id
         closed.append(thread_id)
 
-    async def conversation_busy(thread_id):
+    async def conversation_busy(thread_id, *, include_paused_queue):
         assert thread_id == "thread-old"
+        assert not include_paused_queue
         return not finish_background.is_set()
 
-    async def wait_conversation_idle(thread_id):
+    async def wait_conversation_idle(thread_id, *, include_paused_queue):
         assert thread_id == "thread-old"
+        assert not include_paused_queue
         await finish_background.wait()
 
     runtime = SimpleNamespace(
@@ -804,7 +810,8 @@ async def test_settings_thread_switch_preserves_busy_old_background_work(
     await main.on_settings_update({"thread_id": "thread-new"})
 
     assert notifier.detached
-    assert notifier.cancelled
+    assert notifier.handed_off
+    assert not notifier.cancelled
     assert not notifier.closed
     assert closed == []
     finish_background.set()
@@ -844,7 +851,8 @@ async def test_settings_switch_hands_off_just_finished_background_notice(
         await background.close_session(thread_id)
         closed.set()
 
-    async def conversation_busy(_thread_id):
+    async def conversation_busy(_thread_id, *, include_paused_queue):
+        assert not include_paused_queue
         return False
 
     runtime = SimpleNamespace(

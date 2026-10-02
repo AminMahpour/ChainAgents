@@ -6,8 +6,9 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field, replace
 from typing import Any
 from weakref import WeakKeyDictionary
@@ -48,6 +49,16 @@ def format_local_task_result(snapshot: BackgroundTaskSnapshot) -> str:
     return content
 
 
+def _local_notice_message_id(session_id: str, task_id: str) -> str:
+    """Use one stable Chainlit step ID for every tab's copy of a notice."""
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"chainagents://background-notice/{session_id}/{task_id}",
+        )
+    )
+
+
 @dataclass
 class _LocalToolActivityState:
     """Identity and Chainlit step for one streamed background tool call."""
@@ -74,6 +85,7 @@ class _LocalCompletionState:
     """Completion notices already sent for one manager and conversation."""
 
     notified_task_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    notice_messages: OrderedDict[str, cl.Message] = field(default_factory=OrderedDict)
     retained_snapshots: OrderedDict[str, BackgroundTaskSnapshot] = field(
         default_factory=OrderedDict
     )
@@ -179,6 +191,7 @@ class LocalBackgroundTaskNotifier:
         self.activity_states: dict[str, _LocalTaskActivityState] = {}
         self.task: asyncio.Task[None] | None = None
         self._completion_state: _LocalCompletionState | None = None
+        self._delivered_task_ids: OrderedDict[str, None] = OrderedDict()
 
     def start(self) -> None:
         """Subscribe and start consuming completion events."""
@@ -200,10 +213,14 @@ class LocalBackgroundTaskNotifier:
         self.reasoning_steps_enabled = reasoning_steps_enabled
         self.tool_steps_enabled = tool_steps_enabled
 
-    async def reconcile_terminal_tasks(self) -> None:
+    async def reconcile_terminal_tasks(
+        self, *, restored_message_ids: Collection[str] | None = None
+    ) -> None:
         """Send retained terminal notices missed before this subscription began.
 
         Call after ``start`` so a task finishing during the list is also queued.
+        When resuming a saved thread, pass the IDs from its restored steps so
+        notices sent after that history snapshot are emitted to this tab too.
         """
         if self.queue is None and self.activity_queue is None:
             raise RuntimeError(
@@ -220,7 +237,9 @@ class LocalBackgroundTaskNotifier:
             if snapshot.status not in TERMINAL_BACKGROUND_TASK_STATUSES:
                 continue
             try:
-                await self._send_terminal_notice(snapshot)
+                await self._send_terminal_notice(
+                    snapshot, restored_message_ids=restored_message_ids
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -229,29 +248,64 @@ class LocalBackgroundTaskNotifier:
                     snapshot.task_id,
                 )
 
-    async def _send_terminal_notice(self, snapshot: BackgroundTaskSnapshot) -> None:
+    async def _send_terminal_notice(
+        self,
+        snapshot: BackgroundTaskSnapshot,
+        *,
+        live_event: bool = False,
+        restored_message_ids: Collection[str] | None = None,
+    ) -> None:
         state = _local_completion_state(self.manager, self.session_id)
         async with state.send_lock:
-            if snapshot.task_id in state.notified_task_ids:
+            notice_id = _local_notice_message_id(self.session_id, snapshot.task_id)
+            if (
+                snapshot.task_id in self._delivered_task_ids
+                or (
+                    restored_message_ids is not None
+                    and notice_id in restored_message_ids
+                )
+                or (
+                    restored_message_ids is None
+                    and not live_event
+                    and snapshot.task_id in state.notified_task_ids
+                )
+            ):
                 state.retained_snapshots.pop(snapshot.task_id, None)
                 return
             if not self._attached or not self._delivery_allowed():
                 _retain_terminal_snapshot(state, snapshot)
                 return
-            await cl.Message(
-                content=format_local_task_result(snapshot),
-                author="Background subagent",
-            ).send()
+            # A Chainlit Message persists on its first send, then emits through
+            # the current notifier's session on each subsequent send. Reuse it
+            # so two live tabs see the notice without duplicate history rows.
+            message = state.notice_messages.get(snapshot.task_id)
+            if message is None:
+                message = cl.Message(
+                    content=format_local_task_result(snapshot),
+                    author="Background subagent",
+                )
+                message.id = notice_id
+                state.notice_messages[snapshot.task_id] = message
+            state.notice_messages.move_to_end(snapshot.task_id)
+            max_notified = (
+                self.manager.config.max_tasks_per_session + SUBSCRIBER_QUEUE_MAXSIZE
+            )
+            while (
+                len(state.notice_messages)
+                > max_notified + MAX_RETAINED_NOTICES_PER_SESSION
+            ):
+                state.notice_messages.popitem(last=False)
+            await message.send()
             # Chainlit can mark this session for clearing while send awaits.
             # An emission to the old socket is not a notice visible on resume.
             if not self._attached or not self._delivery_allowed():
                 _retain_terminal_snapshot(state, snapshot)
                 return
+            self._delivered_task_ids[snapshot.task_id] = None
             state.notified_task_ids[snapshot.task_id] = None
             state.retained_snapshots.pop(snapshot.task_id, None)
-            max_notified = (
-                self.manager.config.max_tasks_per_session + SUBSCRIBER_QUEUE_MAXSIZE
-            )
+            while len(self._delivered_task_ids) > max_notified:
+                self._delivered_task_ids.popitem(last=False)
             while len(state.notified_task_ids) > max_notified:
                 state.notified_task_ids.popitem(last=False)
 
@@ -261,7 +315,7 @@ class LocalBackgroundTaskNotifier:
         while True:
             snapshot = await self.queue.get()
             try:
-                await self._send_terminal_notice(snapshot)
+                await self._send_terminal_notice(snapshot, live_event=True)
             except Exception:
                 logger.exception(
                     "Failed to send local background task notice for %s.",
@@ -558,7 +612,7 @@ class LocalBackgroundTaskNotifier:
                 activity.task_id,
             )
         self.activity_states.pop(activity.task_id, None)
-        await self._send_terminal_notice(snapshot)
+        await self._send_terminal_notice(snapshot, live_event=True)
 
     async def _close_activity_state(
         self,
@@ -610,8 +664,7 @@ class LocalBackgroundTaskNotifier:
             if sessions is not None:
                 _trim_completion_sessions(sessions)
 
-    async def aclose(self) -> None:
-        """Stop notifications and best-effort close all rendered activity steps."""
+    async def _close(self, *, parent_output: str) -> None:
         self._unsubscribe()
         consumer = self.task
         self.task = None
@@ -623,13 +676,44 @@ class LocalBackgroundTaskNotifier:
                 pass
             except Exception:
                 logger.exception("Local background task notifier stopped unexpectedly.")
+        terminal: dict[str, BackgroundTaskSnapshot] = {}
+        try:
+            terminal = {
+                snapshot.task_id: snapshot
+                for snapshot in await self.manager.list(self.session_id)
+                if snapshot.status in TERMINAL_BACKGROUND_TASK_STATUSES
+            }
+        except Exception:
+            logger.exception(
+                "Failed to inspect local background task status while closing steps."
+            )
+        if terminal:
+            completion_state = _local_completion_state(self.manager, self.session_id)
+            async with completion_state.send_lock:
+                for snapshot in terminal.values():
+                    if snapshot.task_id not in completion_state.notified_task_ids:
+                        _retain_terminal_snapshot(completion_state, snapshot)
         for task_id, state in tuple(self.activity_states.items()):
+            snapshot = terminal.get(task_id)
             await self._close_activity_state(
                 task_id,
                 state,
-                parent_output="Stopped",
+                parent_output=(
+                    f"Finished with status: {snapshot.status}"
+                    if snapshot is not None
+                    else parent_output
+                ),
             )
         self.activity_states.clear()
+
+    async def aclose(self) -> None:
+        """Stop notifications and best-effort close all rendered activity steps."""
+        await self._close(parent_output="Stopped")
+
+    async def aclose_for_handoff(self) -> None:
+        """End visible steps while leaving their background jobs running."""
+        self.detach()
+        await self._close(parent_output="Continues in background")
 
     def cancel(self) -> None:
         """Stop notifications without changing the underlying jobs."""

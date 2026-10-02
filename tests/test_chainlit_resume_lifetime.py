@@ -41,11 +41,11 @@ def test_mcp_scope_follows_conversation_and_custom_thread(monkeypatch) -> None:
 async def test_resume_without_async_subagents_never_builds_agent(monkeypatch) -> None:
     """A saved chat replays local completions without building an async agent."""
     settings = main.AppSettings(model_name="test", reasoning_level="medium", thread_id="saved-chat")
-    reconciled: list[str] = []
+    reconciled: list[object] = []
 
     class _LocalNotifier:
-        async def reconcile_terminal_tasks(self):
-            reconciled.append("saved-chat")
+        async def reconcile_terminal_tasks(self, *, restored_message_ids):
+            reconciled.append(("saved-chat", restored_message_ids))
 
     async def unexpected_get_agent(*_args, **_kwargs):
         raise AssertionError("resume should not build an agent without async subagents")
@@ -95,7 +95,13 @@ async def test_resume_without_async_subagents_never_builds_agent(monkeypatch) ->
     monkeypatch.setattr(main, "get_run_task_list", lambda **_kwargs: asyncio.sleep(0, result=SimpleNamespace(show_ready=noop)))
     monkeypatch.setattr(main, "build_chat_settings", lambda *_args, **_kwargs: SimpleNamespace(send=noop))
 
-    await main.on_chat_resume({"id": "saved-chat", "metadata": {}})
+    await main.on_chat_resume(
+        {
+            "id": "saved-chat",
+            "metadata": {},
+            "steps": [{"id": "known-notice", "type": "assistant_message"}],
+        }
+    )
 
     assert values[main.SESSION_MCP_SESSION_ID_KEY] == "saved-chat"
     assert reconciled == []
@@ -110,7 +116,10 @@ async def test_resume_without_async_subagents_never_builds_agent(monkeypatch) ->
         main.chainlit_socket.WebsocketSession, "get", lambda _sid: session
     )
     await main._connection_successful_with_output_replay("socket-2")
-    assert reconciled == ["resume_thread", "saved-chat"]
+    assert reconciled == [
+        "resume_thread",
+        ("saved-chat", frozenset({"known-notice"})),
+    ]
 
 
 @pytest.mark.anyio
