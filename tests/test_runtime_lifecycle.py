@@ -22,6 +22,7 @@ from chainagents.runtime.background_tasks import (
     create_background_task_tools,
 )
 from chainagents.runtime.types import BackgroundSubagentConfig
+from chainagents.runtime.types import UserInputConfig
 from langchain.tools import ToolRuntime
 from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
@@ -102,6 +103,143 @@ def test_runtime_background_tasks_share_the_artifact_registry(runtime):
         runtime.background_tasks.artifact_registry
         is runtime.large_tool_result_artifacts
     )
+
+
+def test_conversation_busy_tracks_input_and_nonterminal_background_work(runtime):
+    runtime.user_input.config = UserInputConfig(enabled=True)
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        release_input = asyncio.Event()
+        input_started = asyncio.Event()
+
+        async def run_input(_payload):
+            input_started.set()
+            await release_input.wait()
+
+        assert await runtime.conversation_busy("thread") is False
+        runtime.user_input.submit(
+            "thread", "first", run_input, followup_factory=lambda text: text
+        )
+        await input_started.wait()
+        assert await runtime.conversation_busy("thread") is True
+        assert await runtime.conversation_busy("other") is False
+
+        release_input.set()
+        await runtime.user_input.wait_idle("thread")
+        assert await runtime.conversation_busy("thread") is False
+
+        release_background = asyncio.Event()
+
+        async def run_background(task_id):
+            await release_background.wait()
+            return task_id
+
+        await runtime.background_tasks.spawn(
+            session_id="thread",
+            agent_name="worker",
+            description="work",
+            agent_path=("worker",),
+            runner=run_background,
+        )
+        assert await runtime.conversation_busy("thread") is True
+        assert await runtime.conversation_busy("other") is False
+        release_background.set()
+        await runtime.background_tasks.wait_session("thread")
+        assert await runtime.conversation_busy("thread") is False
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_conversation_busy_rechecks_input_started_during_background_lookup(
+    runtime, monkeypatch
+):
+    runtime.user_input.config = UserInputConfig(enabled=True)
+
+    async def exercise():
+        lookup_started = asyncio.Event()
+        release_lookup = asyncio.Event()
+        release_input = asyncio.Event()
+        original_list = runtime.background_tasks.list
+
+        async def delayed_list(session_id):
+            lookup_started.set()
+            await release_lookup.wait()
+            return await original_list(session_id)
+
+        async def run_input(_payload):
+            await release_input.wait()
+
+        monkeypatch.setattr(runtime.background_tasks, "list", delayed_list)
+        probe = asyncio.create_task(runtime.conversation_busy("thread"))
+        await lookup_started.wait()
+        runtime.user_input.submit(
+            "thread", "new", run_input, followup_factory=lambda text: text
+        )
+        release_lookup.set()
+        assert await asyncio.wait_for(probe, timeout=1) is True
+        release_input.set()
+        await runtime.user_input.wait_idle("thread")
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_conversation_idle_wait_includes_followup_spawned_background_task(runtime):
+    runtime.user_input.config = UserInputConfig(enabled=True)
+    runtime.message_broker.config = replace(runtime.message_broker.config, enabled=True)
+    runtime.background_tasks = BackgroundTaskManager(
+        BackgroundSubagentConfig(enabled=True)
+    )
+
+    async def exercise():
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        followup_started = asyncio.Event()
+        background_started = asyncio.Event()
+        release_background = asyncio.Event()
+
+        async def run_background(task_id):
+            background_started.set()
+            await release_background.wait()
+            return task_id
+
+        async def run_input(payload):
+            if payload == "first":
+                first_started.set()
+                await release_first.wait()
+            else:
+                assert payload == "followup:late note"
+                await runtime.background_tasks.spawn(
+                    session_id="thread",
+                    agent_name="worker",
+                    description="follow-up work",
+                    agent_path=("worker",),
+                    runner=run_background,
+                )
+                followup_started.set()
+
+        runtime.user_input.submit(
+            "thread", "first", run_input,
+            followup_factory=lambda text: f"followup:{text}",
+        )
+        await first_started.wait()
+        runtime.message_broker.send_user("thread", "late note")
+        idle_wait = asyncio.create_task(runtime.wait_conversation_idle("thread"))
+        release_first.set()
+        await asyncio.wait_for(followup_started.wait(), timeout=1)
+        await asyncio.wait_for(background_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not idle_wait.done()
+        release_background.set()
+        await asyncio.wait_for(idle_wait, timeout=1)
+        assert await runtime.conversation_busy("thread") is False
+        await runtime.close()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("stateful", [False, True])

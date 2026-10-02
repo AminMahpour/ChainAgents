@@ -39,8 +39,13 @@ def test_mcp_scope_follows_conversation_and_custom_thread(monkeypatch) -> None:
 
 @pytest.mark.anyio
 async def test_resume_without_async_subagents_never_builds_agent(monkeypatch) -> None:
-    """A saved chat with no async notifier is ready before MCP graph creation."""
+    """A saved chat replays local completions without building an async agent."""
     settings = main.AppSettings(model_name="test", reasoning_level="medium", thread_id="saved-chat")
+    reconciled: list[str] = []
+
+    class _LocalNotifier:
+        async def reconcile_terminal_tasks(self):
+            reconciled.append("saved-chat")
 
     async def unexpected_get_agent(*_args, **_kwargs):
         raise AssertionError("resume should not build an agent without async subagents")
@@ -52,7 +57,7 @@ async def test_resume_without_async_subagents_never_builds_agent(monkeypatch) ->
             model_choices=("test",),
             extensions=SimpleNamespace(
                 async_subagents=(),
-                background_subagents=SimpleNamespace(enabled=False),
+                background_subagents=SimpleNamespace(enabled=True),
                 chainlit_reasoning_steps_enabled=True,
                 chainlit_tool_steps_enabled=True,
                 chainlit_model_mode_enabled=False,
@@ -74,7 +79,11 @@ async def test_resume_without_async_subagents_never_builds_agent(monkeypatch) ->
 
     monkeypatch.setattr(main, "get_runtime_or_notify", lambda: asyncio.sleep(0, result=runtime))
     monkeypatch.setattr(main, "publish_native_commands", noop)
-    monkeypatch.setattr(main, "start_local_background_notifier", noop)
+    async def start_local_background_notifier(**_kwargs):
+        values[main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY] = _LocalNotifier()
+
+    monkeypatch.setattr(main, "start_local_background_notifier", start_local_background_notifier)
+    monkeypatch.setattr(main, "LocalBackgroundTaskNotifier", _LocalNotifier)
     monkeypatch.setattr(main, "publish_modes", noop)
     monkeypatch.setattr(main, "_restore_saved_response_actions", noop)
     def coerce_saved_settings(raw_settings, **_kwargs):
@@ -89,6 +98,19 @@ async def test_resume_without_async_subagents_never_builds_agent(monkeypatch) ->
     await main.on_chat_resume({"id": "saved-chat", "metadata": {}})
 
     assert values[main.SESSION_MCP_SESSION_ID_KEY] == "saved-chat"
+    assert reconciled == []
+
+    session = main.cl.context.session
+
+    async def connection_successful(_sid):
+        reconciled.append("resume_thread")
+
+    monkeypatch.setattr(main, "_chainlit_connection_successful", connection_successful)
+    monkeypatch.setattr(
+        main.chainlit_socket.WebsocketSession, "get", lambda _sid: session
+    )
+    await main._connection_successful_with_output_replay("socket-2")
+    assert reconciled == ["resume_thread", "saved-chat"]
 
 
 @pytest.mark.anyio

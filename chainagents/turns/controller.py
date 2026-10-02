@@ -40,6 +40,7 @@ class _Conversation:
     input_ids: dict[str, str] = field(default_factory=dict)
     steer_ids: dict[str, tuple[str, str]] = field(default_factory=dict)
     completed: deque[str] = field(default_factory=deque)
+    changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 class ConversationInputController:
@@ -98,6 +99,7 @@ class ConversationInputController:
             session.input_ids[input_id] = job.id
         session.queue.append(job)
         self._start_next(session_id)
+        session.changed.set()
         return job
 
     def _start_next(self, session_id: str) -> None:
@@ -190,6 +192,7 @@ class ConversationInputController:
         session.active = None
         session.active_job = None
         self._start_next(job.session_id)
+        session.changed.set()
 
     def steer(self, session_id: str, text: str, *, input_id: str | None = None) -> str:
         if not self.config.enabled:
@@ -228,6 +231,7 @@ class ConversationInputController:
             session.external_task.cancel()
         if session.active is not None:
             session.active.cancel()
+        session.changed.set()
 
     def resume(self, session_id: str) -> None:
         session = self._sessions.get(session_id)
@@ -235,6 +239,7 @@ class ConversationInputController:
             return
         session.paused = False
         self._start_next(session_id)
+        session.changed.set()
 
     def status(self, session_id: str) -> dict[str, Any]:
         session = self._sessions.get(session_id)
@@ -256,6 +261,30 @@ class ConversationInputController:
         """Return whether this conversation has existing turn state."""
         return session_id in self._sessions
 
+    def busy(self, session_id: str) -> bool:
+        """Return whether a conversation has active, waiting, or queued input."""
+        session = self._sessions.get(session_id)
+        return bool(
+            session is not None
+            and (
+                session.active is not None
+                or session.external_task is not None
+                or session.external_waiters
+                or session.queue
+            )
+        )
+
+    async def wait_drained(self, session_id: str) -> None:
+        """Wait for all input work, including paused queues and external turns."""
+        while True:
+            session = self._sessions.get(session_id)
+            if session is None or not self.busy(session_id):
+                return
+            # No await separates the state check from clearing the signal, so a
+            # subsequent transition cannot be missed by the waiter.
+            session.changed.clear()
+            await session.changed.wait()
+
     def turn_waiting(self, session_id: str) -> bool:
         """Track an external turn before it can wait for the shared lock."""
         session = self._session(session_id)
@@ -264,6 +293,7 @@ class ConversationInputController:
         task = asyncio.current_task()
         if task is not None and task is not session.active:
             session.external_waiters.add(task)
+            session.changed.set()
         return True
 
     def turn_wait_finished(self, session_id: str) -> None:
@@ -272,6 +302,7 @@ class ConversationInputController:
         if session is not None:
             session.external_waiters.discard(asyncio.current_task())
             self._start_next(session_id)
+            session.changed.set()
 
     def turn_started(self, session_id: str) -> bool:
         """Record the task that acquired the main-turn lock."""
@@ -285,6 +316,7 @@ class ConversationInputController:
                 session.active_job.status = "running"
         else:
             session.external_task = task
+        session.changed.set()
         return True
 
     def turn_finished(self, session_id: str) -> None:
@@ -299,6 +331,7 @@ class ConversationInputController:
         elif task is session.external_task:
             session.external_task = None
             self._start_next(session_id)
+        session.changed.set()
 
     def get(self, session_id: str, job_id: str) -> InputJob:
         try:
@@ -350,6 +383,7 @@ class ConversationInputController:
             job.payload = None
         session.queue.clear()
         self._sessions.pop(session_id, None)
+        session.changed.set()
 
     async def close_all(self) -> None:
         for session_id in tuple(self._sessions):

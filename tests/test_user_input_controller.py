@@ -126,6 +126,77 @@ def test_late_steering_becomes_followup_before_queued_turn():
     asyncio.run(exercise())
 
 
+def test_wait_drained_waits_for_paused_queued_turn_until_resume():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        controller.stop("s")
+        assert controller.busy("s") is False
+        ran = asyncio.Event()
+
+        async def run(_payload):
+            ran.set()
+
+        controller.submit("s", "queued", run, followup_factory=lambda text: text)
+        assert controller.busy("s") is True
+        waiter = asyncio.create_task(controller.wait_drained("s"))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert not ran.is_set()
+
+        controller.resume("s")
+        await asyncio.wait_for(waiter, timeout=1)
+        assert ran.is_set()
+        assert controller.busy("s") is False
+
+    asyncio.run(exercise())
+
+
+def test_wait_drained_waits_for_external_turn_and_waiter():
+    async def exercise():
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True), MessageBroker(MessagingConfig(enabled=True))
+        )
+        external_started = asyncio.Event()
+        release_external = asyncio.Event()
+        waiter_started = asyncio.Event()
+        release_waiter = asyncio.Event()
+
+        async def external_turn():
+            assert controller.turn_started("s") is True
+            external_started.set()
+            await release_external.wait()
+            controller.turn_finished("s")
+
+        async def waiting_turn():
+            assert controller.turn_waiting("s") is True
+            waiter_started.set()
+            await release_waiter.wait()
+            controller.turn_wait_finished("s")
+
+        external = asyncio.create_task(external_turn())
+        waiting = asyncio.create_task(waiting_turn())
+        await external_started.wait()
+        await waiter_started.wait()
+        assert controller.busy("s") is True
+        drained = asyncio.create_task(controller.wait_drained("s"))
+        await asyncio.sleep(0)
+        assert not drained.done()
+
+        release_external.set()
+        await external
+        await asyncio.sleep(0)
+        assert not drained.done()
+
+        release_waiter.set()
+        await waiting
+        await asyncio.wait_for(drained, timeout=1)
+        assert controller.busy("s") is False
+
+    asyncio.run(exercise())
+
+
 def test_agent_message_does_not_wake_idle_main_as_user_followup():
     async def exercise():
         broker = MessageBroker(MessagingConfig(enabled=True))
