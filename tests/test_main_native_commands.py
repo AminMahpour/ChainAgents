@@ -719,6 +719,219 @@ async def test_settings_update_resubscribes_background_notifier_for_new_thread(
 
 
 @pytest.mark.anyio
+async def test_settings_thread_switch_preserves_busy_old_background_work(
+    monkeypatch,
+) -> None:
+    class _LocalNotifier:
+        def __init__(self):
+            self.session_id = "thread-old"
+            self.cancelled = False
+            self.closed = False
+            self.detached = False
+            self.handed_off = False
+
+        def detach(self):
+            self.detached = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        async def aclose_for_handoff(self):
+            self.handed_off = True
+
+        async def aclose(self):
+            self.closed = True
+
+    finish_background = asyncio.Event()
+    closed: list[str] = []
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        assert thread_id == mcp_session_id
+        closed.append(thread_id)
+
+    async def conversation_busy(thread_id, *, include_paused_queue):
+        assert thread_id == "thread-old"
+        assert not include_paused_queue
+        return not finish_background.is_set()
+
+    async def wait_conversation_idle(thread_id, *, include_paused_queue):
+        assert thread_id == "thread-old"
+        assert not include_paused_queue
+        await finish_background.wait()
+
+    runtime = SimpleNamespace(
+        close_conversation=close_conversation,
+        conversation_busy=conversation_busy,
+        wait_conversation_idle=wait_conversation_idle,
+        config=SimpleNamespace(
+            model_name="test",
+            model_choices=("test",),
+            extensions=SimpleNamespace(
+                mcp_stateful=False,
+                background_subagents=SimpleNamespace(enabled=True),
+                chainlit_reasoning_steps_enabled=True,
+                chainlit_tool_steps_enabled=True,
+                chainlit_model_mode_enabled=False,
+                chainlit_reasoning_mode_enabled=False,
+            ),
+        ),
+    )
+    session = SimpleNamespace(id="tab-a", thread_id="thread-old")
+    notifier = _LocalNotifier()
+    values = {
+        main.SESSION_SETTINGS_KEY: {"thread_id": "thread-old"},
+        main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY: notifier,
+    }
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=session))
+    monkeypatch.setattr(
+        main.cl,
+        "user_session",
+        SimpleNamespace(get=values.get, set=values.__setitem__),
+    )
+    monkeypatch.setattr(main, "LocalBackgroundTaskNotifier", _LocalNotifier)
+    monkeypatch.setattr(main, "get_runtime_or_notify", lambda: asyncio.sleep(0, result=runtime))
+    monkeypatch.setattr(
+        main,
+        "coerce_settings",
+        lambda *_args, **_kwargs: AppSettings(
+            model_name="test", reasoning_level="medium", thread_id="thread-new"
+        ),
+    )
+    monkeypatch.setattr(main, "publish_modes", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(
+        main, "start_local_background_notifier", lambda **_kwargs: asyncio.sleep(0)
+    )
+    manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", manager)
+    await manager.lease(
+        runtime=runtime, owner_id=session.id, scope_id="thread-old", retain_idle=False
+    )
+
+    await main.on_settings_update({"thread_id": "thread-new"})
+
+    assert notifier.detached
+    assert notifier.handed_off
+    assert not notifier.cancelled
+    assert not notifier.closed
+    assert closed == []
+    finish_background.set()
+    await asyncio.sleep(0.03)
+    assert closed == ["thread-old"]
+    await manager.aclose()
+
+
+@pytest.mark.anyio
+async def test_settings_switch_hands_off_just_finished_background_notice(
+    monkeypatch,
+) -> None:
+    from chainagents.interfaces.chainlit import async_tasks
+    from chainagents.runtime.background_tasks import BackgroundTaskManager
+    from chainagents.runtime.types import BackgroundSubagentConfig
+
+    background = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
+
+    async def runner(_task_id):
+        return "finished"
+
+    spawned = await background.spawn(
+        session_id="thread-old",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        runner=runner,
+    )
+    await background.wait_session("thread-old")
+    closed = asyncio.Event()
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        assert thread_id == mcp_session_id
+        if thread_id == "thread-new":
+            return
+        assert thread_id == "thread-old"
+        await background.close_session(thread_id)
+        closed.set()
+
+    async def conversation_busy(_thread_id, *, include_paused_queue):
+        assert not include_paused_queue
+        return False
+
+    runtime = SimpleNamespace(
+        background_tasks=background,
+        close_conversation=close_conversation,
+        conversation_busy=conversation_busy,
+        config=SimpleNamespace(
+            model_name="test",
+            model_choices=("test",),
+            extensions=SimpleNamespace(
+                mcp_stateful=False,
+                background_subagents=SimpleNamespace(enabled=True),
+                chainlit_reasoning_steps_enabled=True,
+                chainlit_tool_steps_enabled=True,
+                chainlit_model_mode_enabled=False,
+                chainlit_reasoning_mode_enabled=False,
+            ),
+        ),
+    )
+    session = SimpleNamespace(id="tab-a", thread_id="thread-old")
+    old_notifier = main.LocalBackgroundTaskNotifier(
+        manager=background, session_id="thread-old"
+    )
+    values = {
+        main.SESSION_SETTINGS_KEY: {"thread_id": "thread-old"},
+        main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY: old_notifier,
+    }
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=session))
+    monkeypatch.setattr(
+        main.cl,
+        "user_session", SimpleNamespace(get=values.get, set=values.__setitem__)
+    )
+    monkeypatch.setattr(main, "get_runtime_or_notify", lambda: asyncio.sleep(0, result=runtime))
+    monkeypatch.setattr(
+        main,
+        "coerce_settings",
+        lambda *_args, **_kwargs: AppSettings(
+            model_name="test", reasoning_level="medium", thread_id="thread-new"
+        ),
+    )
+    monkeypatch.setattr(main, "publish_modes", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(
+        main, "start_local_background_notifier", lambda **_kwargs: asyncio.sleep(0)
+    )
+    scopes = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", scopes)
+    await scopes.lease(
+        runtime=runtime, owner_id=session.id, scope_id="thread-old", retain_idle=False
+    )
+    sent: list[str] = []
+
+    class _Message:
+        def __init__(self, *, content, author):
+            assert author == "Background subagent"
+            self.content = content
+
+        async def send(self):
+            sent.append(self.content)
+
+    monkeypatch.setattr(async_tasks.cl, "Message", _Message)
+
+    try:
+        await main.on_settings_update({"thread_id": "thread-new"})
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        assert await background.list("thread-old") == []
+        resumed = main.LocalBackgroundTaskNotifier(
+            manager=background, session_id="thread-old"
+        )
+        resumed.start()
+        await resumed.reconcile_terminal_tasks()
+        assert len(sent) == 1
+        assert f"Task ID: `{spawned.task_id}`" in sent[0]
+        await resumed.aclose()
+    finally:
+        await scopes.aclose()
+        await background.close()
+
+
+@pytest.mark.anyio
 async def test_settings_update_changes_background_step_visibility(monkeypatch) -> None:
     """An existing background notifier follows the chat's current switches."""
     settings = AppSettings(

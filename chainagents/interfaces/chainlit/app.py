@@ -21,11 +21,13 @@ install_langchain_warning_filters()
 import chainlit as cl
 from chainlit.config import config as chainlit_config
 from chainlit.types import ThreadDict
+from chainlit.user_session import user_sessions as chainlit_user_sessions
 
 from chainagents.interfaces.chainlit.async_tasks import (
     AsyncTaskNotifier,
     LocalBackgroundTaskNotifier,
     async_subagent_url_override,
+    retain_missed_local_task_results,
 )
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.lifetime import ConversationScopeLeaseManager
@@ -105,9 +107,146 @@ SESSION_DISCONNECTED_OUTPUT_KEY = "pending_disconnected_output"
 SESSION_RESUME_WARMUP_KEY = "pending_resume_warmup"
 SESSION_RECONNECT_RECOVERY_KEY = "pending_reconnect_recovery"
 SESSION_RECONNECT_RECOVERY_TASK_KEY = "pending_reconnect_recovery_task"
+SESSION_PENDING_LOCAL_RECONCILIATION_KEY = "pending_local_reconciliation"
 REFLECTION_SAVE_ACTION = "save_reflection_lesson"
 REFLECTION_DISMISS_ACTION = "dismiss_reflection_lesson"
 conversation_scopes = ConversationScopeLeaseManager(idle_seconds=600, max_idle=4)
+_detached_conversations: dict[tuple[int, str], _DetachedConversation] = {}
+
+
+@dataclass
+class _DetachedConversation:
+    runtime: AgentRuntime
+    scopes: ConversationScopeLeaseManager
+    thread_id: str
+    owner_id: str
+    foreground_tasks: set[asyncio.Task[Any]]
+    cleared_sessions: dict[str, Any]
+    task: asyncio.Task[None] | None = None
+    accepting_work: bool = True
+
+
+def _unfinished_foreground_tasks(*tasks: Any) -> set[asyncio.Task[Any]]:
+    current = asyncio.current_task()
+    return {
+        task
+        for task in tasks
+        if isinstance(task, asyncio.Task) and task is not current and not task.done()
+    }
+
+
+async def _conversation_has_work(
+    runtime: AgentRuntime, thread_id: str, foreground_tasks: set[asyncio.Task[Any]]
+) -> bool:
+    if _unfinished_foreground_tasks(*foreground_tasks):
+        return True
+    busy = getattr(runtime, "conversation_busy", None)
+    return (
+        bool(await busy(thread_id, include_paused_queue=False))
+        if callable(busy)
+        else False
+    )
+
+
+async def _retain_missed_background_notices(
+    runtime: AgentRuntime, thread_id: str
+) -> None:
+    background_tasks = getattr(runtime, "background_tasks", None)
+    if background_tasks is not None:
+        await retain_missed_local_task_results(background_tasks, thread_id)
+
+
+async def _retain_conversation_until_idle(
+    runtime: AgentRuntime,
+    thread_id: str,
+    foreground_tasks: set[asyncio.Task[Any]],
+    *,
+    cleared_session: Any | None = None,
+) -> None:
+    """Hold one runtime lease while work outlives its Chainlit tab."""
+    key = (id(runtime), thread_id)
+    existing = _detached_conversations.get(key)
+    if (
+        existing is not None
+        and existing.accepting_work
+        and existing.task is not None
+        and not existing.task.done()
+    ):
+        existing.foreground_tasks.update(foreground_tasks)
+        if cleared_session is not None and getattr(cleared_session, "id", None):
+            existing.cleared_sessions[cleared_session.id] = cleared_session
+        return
+
+    owner_id = f"detached:{secrets.token_hex(16)}"
+    extensions = getattr(getattr(runtime, "config", None), "extensions", None)
+    await conversation_scopes.lease(
+        runtime=runtime,
+        owner_id=owner_id,
+        scope_id=thread_id,
+        retain_idle=getattr(extensions, "mcp_stateful", True),
+    )
+    cleared_sessions = (
+        {cleared_session.id: cleared_session}
+        if cleared_session is not None and getattr(cleared_session, "id", None)
+        else {}
+    )
+    entry = _DetachedConversation(
+        runtime, conversation_scopes, thread_id, owner_id,
+        foreground_tasks, cleared_sessions,
+    )
+    _detached_conversations[key] = entry
+
+    async def release_when_idle() -> None:
+        try:
+            while True:
+                try:
+                    pending = _unfinished_foreground_tasks(*entry.foreground_tasks)
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    wait_idle = getattr(runtime, "wait_conversation_idle", None)
+                    if callable(wait_idle):
+                        await wait_idle(thread_id, include_paused_queue=False)
+                    if not await _conversation_has_work(
+                        runtime, thread_id, entry.foreground_tasks
+                    ):
+                        await _retain_missed_background_notices(runtime, thread_id)
+                        if not await _conversation_has_work(
+                            runtime, thread_id, entry.foreground_tasks
+                        ):
+                            break
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Failed to wait for conversation %s to become idle", thread_id
+                    )
+                    await asyncio.sleep(1)
+        finally:
+            # A later clear needs its own lease once this owner starts releasing.
+            # The task is still pending during scope close and orphan cleanup.
+            entry.accepting_work = False
+            try:
+                await entry.scopes.release(owner_id)
+            finally:
+                if _detached_conversations.get(key) is entry:
+                    _detached_conversations.pop(key, None)
+            # Chainlit removes the old user_session after on_chat_end returns.
+            # Preserved turns can re-create it, so discard that orphan only
+            # after Chainlit has deleted the WebsocketSession itself.
+            for cleared in entry.cleared_sessions.values():
+                while chainlit_socket.WebsocketSession.get_by_id(cleared.id) is cleared:  # noqa: ASYNC110
+                    await asyncio.sleep(0.05)
+                if chainlit_socket.WebsocketSession.get_by_id(cleared.id) is None:
+                    chainlit_user_sessions.pop(cleared.id, None)
+
+    entry.task = asyncio.create_task(release_when_idle())
+
+
+@dataclass(frozen=True)
+class _PendingLocalReconciliation:
+    notifier: LocalBackgroundTaskNotifier
+    restored_message_ids: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -345,6 +484,19 @@ async def _connection_successful_with_output_replay(sid: str) -> None:
     pending = getattr(session, SESSION_DISCONNECTED_OUTPUT_KEY, None)
     if isinstance(pending, DisconnectedOutput):
         await pending.flush(session)
+    local_reconciliation = getattr(
+        session, SESSION_PENDING_LOCAL_RECONCILIATION_KEY, None
+    )
+    if isinstance(local_reconciliation, _PendingLocalReconciliation):
+        delattr(session, SESSION_PENDING_LOCAL_RECONCILIATION_KEY)
+        local_notifier = local_reconciliation.notifier
+        if cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY) is local_notifier:
+            try:
+                await local_notifier.reconcile_terminal_tasks(
+                    restored_message_ids=local_reconciliation.restored_message_ids
+                )
+            except Exception:
+                logger.exception("Failed to reconcile local background tasks after resume")
     _schedule_reconnect_recovery(session)
 
 
@@ -682,11 +834,16 @@ async def start_local_background_notifier(
         await existing.aclose()
     if not runtime.config.extensions.background_subagents.enabled:
         return
+    try:
+        session = cl.context.session
+    except Exception:
+        session = None
     notifier = LocalBackgroundTaskNotifier(
         manager=runtime.background_tasks,
         session_id=session_id,
         reasoning_steps_enabled=reasoning_steps_enabled,
         tool_steps_enabled=tool_steps_enabled,
+        delivery_allowed=lambda: not getattr(session, "to_clear", False),
     )
     notifier.start()
     cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, notifier)
@@ -864,6 +1021,18 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         available_models=runtime.config.model_choices,
         model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     ).send()
+    local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+    if isinstance(local_notifier, LocalBackgroundTaskNotifier):
+        restored_message_ids = frozenset(
+            str(step["id"])
+            for step in thread.get("steps", [])
+            if isinstance(step, dict) and step.get("id")
+        )
+        setattr(
+            cl.context.session,
+            SESSION_PENDING_LOCAL_RECONCILIATION_KEY,
+            _PendingLocalReconciliation(local_notifier, restored_message_ids),
+        )
     if extensions.async_subagents:
         _start_resume_warmup(
             runtime=runtime,
@@ -914,10 +1083,32 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         session = cl.context.session
     except Exception:
         session = None
+    if previous_thread_id and previous_thread_id != settings.thread_id:
+        old_local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+        if (
+            isinstance(old_local_notifier, LocalBackgroundTaskNotifier)
+            and old_local_notifier.session_id == previous_thread_id
+        ):
+            old_local_notifier.detach()
     warmup = _cancel_resume_warmup(session)
     if warmup is not None:
         with suppress(asyncio.CancelledError):
             await warmup
+    old_thread_busy = False
+    if previous_thread_id and previous_thread_id != settings.thread_id:
+        foreground_tasks = _unfinished_foreground_tasks(
+            cl.user_session.get(SESSION_ACTIVE_TURN_KEY),
+            getattr(session, "current_task", None),
+        )
+        old_thread_busy = await _conversation_has_work(
+            runtime, previous_thread_id, foreground_tasks
+        )
+        if old_thread_busy:
+            await _retain_conversation_until_idle(
+                runtime, previous_thread_id, foreground_tasks
+            )
+        else:
+            await _retain_missed_background_notices(runtime, previous_thread_id)
     if previous_thread_id and previous_thread_id != settings.thread_id:
         async_notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
         if isinstance(async_notifier, AsyncTaskNotifier):
@@ -928,7 +1119,10 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
         isinstance(local_notifier, LocalBackgroundTaskNotifier)
         and local_notifier.session_id != settings.thread_id
     ):
-        await local_notifier.aclose()
+        if old_thread_busy:
+            await local_notifier.aclose_for_handoff()
+        else:
+            await local_notifier.aclose()
         cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, None)
     store_settings(settings)
     await conversation_scopes.lease(
@@ -958,6 +1152,10 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
             reasoning_steps_enabled=settings.show_reasoning_stream,
             tool_steps_enabled=settings.show_tool_calls,
         )
+    if previous_thread_id and previous_thread_id != settings.thread_id:
+        current_local = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+        if isinstance(current_local, LocalBackgroundTaskNotifier):
+            await current_local.reconcile_terminal_tasks()
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1003,6 +1201,9 @@ def _claim_active_turn() -> bool:
 
 def _release_active_turn() -> None:
     """Release the session turn only when owned by this task."""
+    with suppress(Exception):
+        if getattr(cl.context.session, "to_clear", False):
+            return
     if cl.user_session.get(SESSION_ACTIVE_TURN_KEY) is asyncio.current_task():
         cl.user_session.set(SESSION_ACTIVE_TURN_KEY, None)
 
@@ -1672,8 +1873,15 @@ async def on_chat_end() -> None:
     raw_settings = cl.user_session.get(SESSION_SETTINGS_KEY)
     raw_settings = dict(raw_settings) if isinstance(raw_settings, dict) else None
     runtime = AgentRuntime.current()
+    thread_id = (
+        str(raw_settings.get("thread_id") or "").strip()
+        if raw_settings is not None
+        else str(getattr(session, "thread_id", "") or "").strip()
+    )
 
-    async def close_chat(*, expected_socket_id: str | None = None) -> None:
+    async def close_chat(
+        *, expected_socket_id: str | None = None, preserve_work: bool = False
+    ) -> None:
         tasks = {active, getattr(session, "current_task", None)}
         # Snapshot current watchers before awaiting a cancelled turn: Chainlit's
         # own timeout may remove user_session while cancellation renders UI.
@@ -1685,15 +1893,16 @@ async def on_chat_end() -> None:
             )
         if not still_disconnected():
             return
-        for task in tasks:
-            if (
-                isinstance(task, asyncio.Task)
-                and task is not asyncio.current_task()
-                and not task.done()
-            ):
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
+        if not preserve_work:
+            for task in tasks:
+                if (
+                    isinstance(task, asyncio.Task)
+                    and task is not asyncio.current_task()
+                    and not task.done()
+                ):
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
         if not still_disconnected():
             return
         resume_warmup = _cancel_resume_warmup(session)
@@ -1717,7 +1926,10 @@ async def on_chat_end() -> None:
         if isinstance(notifier, AsyncTaskNotifier):
             notifier.cancel()
         if isinstance(local_notifier, LocalBackgroundTaskNotifier):
-            await local_notifier.aclose()
+            if preserve_work:
+                await local_notifier.aclose_for_handoff()
+            else:
+                await local_notifier.aclose()
         if not still_disconnected():
             _schedule_reconnect_recovery(session)
             return
@@ -1732,7 +1944,24 @@ async def on_chat_end() -> None:
         previous_cleanup.cancel()
 
     if session is None or getattr(session, "to_clear", False) or not getattr(session, "socket_id", None):
-        await close_chat()
+        foreground_tasks = _unfinished_foreground_tasks(
+            active, getattr(session, "current_task", None)
+        )
+        preserve_work = bool(
+            runtime is not None
+            and thread_id
+            and await _conversation_has_work(runtime, thread_id, foreground_tasks)
+        )
+        if preserve_work and runtime is not None:
+            await _retain_conversation_until_idle(
+                runtime,
+                thread_id,
+                foreground_tasks,
+                cleared_session=session if getattr(session, "to_clear", False) else None,
+            )
+        elif runtime is not None and thread_id:
+            await _retain_missed_background_notices(runtime, thread_id)
+        await close_chat(preserve_work=preserve_work)
         return
 
     if callable(getattr(session, "emit", None)):

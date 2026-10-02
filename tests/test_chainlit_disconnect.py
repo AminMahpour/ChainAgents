@@ -268,20 +268,376 @@ async def test_expired_session_closes_notifiers_if_chainlit_deletes_session_stat
 
 
 @pytest.mark.anyio
-async def test_explicit_chat_clear_stops_turn_immediately(monkeypatch):
+async def test_explicit_chat_clear_keeps_busy_turn_until_it_finishes(monkeypatch):
     session = SimpleNamespace(socket_id="socket-1", to_clear=True)
     setattr(session, main.SESSION_INPUT_DRAFTS_KEY, {"draft-1": "pending"})
     closed: list[tuple[str | None, str | None]] = []
-    active = asyncio.create_task(asyncio.Event().wait())
+    finish_turn = asyncio.Event()
+    active = asyncio.create_task(finish_turn.wait())
     await _set_chat_session(monkeypatch, session=session, active=active, closed=closed)
+
+    try:
+        await main.on_chat_end()
+
+        assert not active.done()
+        assert closed == []
+        assert getattr(session, main.SESSION_INPUT_DRAFTS_KEY) == {}
+
+        finish_turn.set()
+        await asyncio.wait_for(active, timeout=1)
+        await asyncio.sleep(0.03)
+        assert closed == [("runtime-thread", "runtime-thread")]
+    finally:
+        if not active.done():
+            active.cancel()
+            with suppress(asyncio.CancelledError):
+                await active
+
+
+@pytest.mark.anyio
+async def test_explicit_chat_clear_of_idle_thread_releases_scope(monkeypatch):
+    session = SimpleNamespace(socket_id="socket-1", to_clear=True)
+    closed: list[tuple[str | None, str | None]] = []
+    await _set_chat_session(monkeypatch, session=session, active=None, closed=closed)
 
     await main.on_chat_end()
 
-    assert active.cancelled()
-    assert closed == []
     await asyncio.sleep(0.03)
     assert closed == [("runtime-thread", "runtime-thread")]
-    assert getattr(session, main.SESSION_INPUT_DRAFTS_KEY) == {}
+
+
+@pytest.mark.anyio
+async def test_explicit_clear_does_not_detach_only_a_paused_input_queue(monkeypatch):
+    session = SimpleNamespace(socket_id="socket-1", to_clear=True)
+    closed: list[tuple[str | None, str | None]] = []
+    await _set_chat_session(monkeypatch, session=session, active=None, closed=closed)
+    runtime = session._test_runtime
+
+    async def conversation_busy(thread_id, *, include_paused_queue):
+        assert thread_id == "runtime-thread"
+        # Stop has paused a queued input, with no active turn to preserve.
+        return include_paused_queue
+
+    async def wait_conversation_idle(_thread_id, *, include_paused_queue):
+        raise AssertionError("A paused-only queue must not start a detached waiter")
+
+    runtime.conversation_busy = conversation_busy
+    runtime.wait_conversation_idle = wait_conversation_idle
+
+    await main.on_chat_end()
+
+    await asyncio.sleep(0.03)
+    assert closed == [("runtime-thread", "runtime-thread")]
+    assert (id(runtime), "runtime-thread") not in main._detached_conversations
+
+
+@pytest.mark.anyio
+async def test_explicit_clear_detaches_background_observer_until_work_finishes(
+    monkeypatch,
+):
+    class _LocalNotifier:
+        def __init__(self):
+            self.cancelled = False
+            self.closed = False
+            self.handed_off = False
+
+        def cancel(self):
+            self.cancelled = True
+
+        async def aclose_for_handoff(self):
+            self.handed_off = True
+
+        async def aclose(self):
+            self.closed = True
+
+    session = SimpleNamespace(socket_id="socket-1", to_clear=True)
+    closed: list[tuple[str | None, str | None]] = []
+    values = await _set_chat_session(
+        monkeypatch, session=session, active=None, closed=closed
+    )
+    background_finished = asyncio.Event()
+
+    async def conversation_busy(thread_id, *, include_paused_queue):
+        assert thread_id == "runtime-thread"
+        assert not include_paused_queue
+        return not background_finished.is_set()
+
+    async def wait_conversation_idle(thread_id, *, include_paused_queue):
+        assert thread_id == "runtime-thread"
+        assert not include_paused_queue
+        await background_finished.wait()
+
+    session._test_runtime.conversation_busy = conversation_busy
+    session._test_runtime.wait_conversation_idle = wait_conversation_idle
+    notifier = _LocalNotifier()
+    values[main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY] = notifier
+    monkeypatch.setattr(main, "LocalBackgroundTaskNotifier", _LocalNotifier)
+
+    await main.on_chat_end()
+
+    assert notifier.handed_off
+    assert not notifier.cancelled
+    assert not notifier.closed
+    assert closed == []
+
+    background_finished.set()
+    await asyncio.sleep(0.03)
+    assert closed == [("runtime-thread", "runtime-thread")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("finish_before_clear", [False, True])
+async def test_stateless_clear_replays_background_completion_after_scope_closes(
+    monkeypatch, finish_before_clear,
+):
+    from chainagents.interfaces.chainlit import async_tasks
+    from chainagents.runtime.background_tasks import BackgroundTaskManager
+    from chainagents.runtime.types import BackgroundSubagentConfig
+
+    manager = BackgroundTaskManager(BackgroundSubagentConfig(enabled=True))
+    finish_background = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def runner(_task_id):
+        await finish_background.wait()
+        return "finished"
+
+    spawned = await manager.spawn(
+        session_id="runtime-thread",
+        agent_name="researcher",
+        description="research",
+        agent_path=("researcher",),
+        runner=runner,
+    )
+
+    async def conversation_busy(thread_id, *, include_paused_queue):
+        assert not include_paused_queue
+        snapshots = await manager.list(thread_id)
+        return any(snapshot.status not in {"success", "error", "cancelled"}
+                   for snapshot in snapshots)
+
+    async def wait_conversation_idle(thread_id, *, include_paused_queue):
+        assert not include_paused_queue
+        await manager.wait_session(thread_id)
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        assert thread_id == mcp_session_id == "runtime-thread"
+        await manager.close_session(thread_id)
+        closed.set()
+
+    runtime = SimpleNamespace(
+        background_tasks=manager,
+        conversation_busy=conversation_busy,
+        wait_conversation_idle=wait_conversation_idle,
+        close_conversation=close_conversation,
+        config=SimpleNamespace(extensions=SimpleNamespace(mcp_stateful=False)),
+    )
+    session = SimpleNamespace(id="cleared-tab", socket_id="socket-1", to_clear=True)
+    values = {main.SESSION_SETTINGS_KEY: {"thread_id": "runtime-thread"}}
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=session))
+    monkeypatch.setattr(
+        main.cl, "user_session", SimpleNamespace(get=values.get, set=values.__setitem__)
+    )
+    monkeypatch.setattr(main.AgentRuntime, "current", lambda: runtime)
+    scope_manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", scope_manager)
+    await scope_manager.lease(
+        runtime=runtime, owner_id=session.id, scope_id="runtime-thread", retain_idle=False
+    )
+    sent: list[str] = []
+
+    class _Message:
+        def __init__(self, *, content, author):
+            assert author == "Background subagent"
+            self.content = content
+
+        async def send(self):
+            sent.append(self.content)
+
+    monkeypatch.setattr(async_tasks.cl, "Message", _Message)
+
+    try:
+        if finish_before_clear:
+            finish_background.set()
+            await manager.wait_session("runtime-thread")
+        await main.on_chat_end()
+        if not finish_before_clear:
+            finish_background.set()
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        assert await manager.list("runtime-thread") == []
+
+        resumed = async_tasks.LocalBackgroundTaskNotifier(
+            manager=manager, session_id="runtime-thread"
+        )
+        resumed.start()
+        await resumed.reconcile_terminal_tasks()
+        assert len(sent) == 1
+        assert f"Task ID: `{spawned.task_id}`" in sent[0]
+        await resumed.aclose()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.anyio
+async def test_new_detached_work_gets_lease_while_prior_release_finishes(monkeypatch):
+    """A prior detached waiter must not consume a newer tab's lease request."""
+    closed = asyncio.Event()
+    close_while_busy = False
+    finish_new_turn = asyncio.Event()
+    finish_first_release = asyncio.Event()
+    first_release_started = asyncio.Event()
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        nonlocal close_while_busy
+        assert thread_id == mcp_session_id == "runtime-thread"
+        close_while_busy = not finish_new_turn.is_set()
+        closed.set()
+
+    async def conversation_busy(_thread_id, *, include_paused_queue):
+        assert not include_paused_queue
+        return False
+
+    async def wait_conversation_idle(_thread_id, *, include_paused_queue):
+        assert not include_paused_queue
+        return None
+
+    runtime = SimpleNamespace(
+        close_conversation=close_conversation,
+        conversation_busy=conversation_busy,
+        wait_conversation_idle=wait_conversation_idle,
+        config=SimpleNamespace(extensions=SimpleNamespace(mcp_stateful=False)),
+    )
+    manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", manager)
+    release = manager.release
+
+    async def delay_first_detached_release(owner_id, **kwargs):
+        await release(owner_id, **kwargs)
+        if owner_id.startswith("detached:") and not first_release_started.is_set():
+            first_release_started.set()
+            await finish_first_release.wait()
+
+    monkeypatch.setattr(manager, "release", delay_first_detached_release)
+    await manager.lease(
+        runtime=runtime, owner_id="tab-a", scope_id="runtime-thread", retain_idle=False
+    )
+    await main._retain_conversation_until_idle(runtime, "runtime-thread", set())
+    await manager.lease(
+        runtime=runtime, owner_id="tab-b", scope_id="runtime-thread", retain_idle=False
+    )
+    await manager.release("tab-a")
+    await asyncio.wait_for(first_release_started.wait(), timeout=1)
+
+    new_turn = asyncio.create_task(finish_new_turn.wait())
+    await main._retain_conversation_until_idle(runtime, "runtime-thread", {new_turn})
+    await manager.release("tab-b")
+    closed_before_turn_finished = closed.is_set()
+
+    finish_new_turn.set()
+    finish_first_release.set()
+    await asyncio.wait_for(new_turn, timeout=1)
+    await asyncio.wait_for(closed.wait(), timeout=1)
+    assert not closed_before_turn_finished
+    assert not close_while_busy
+    await manager.aclose()
+
+
+@pytest.mark.anyio
+async def test_cleared_turn_reattached_by_new_tab_keeps_conversation_open(monkeypatch):
+    session = SimpleNamespace(socket_id="socket-1", to_clear=True)
+    closed: list[tuple[str | None, str | None]] = []
+    finish_turn = asyncio.Event()
+    active = asyncio.create_task(finish_turn.wait())
+    await _set_chat_session(monkeypatch, session=session, active=active, closed=closed)
+
+    try:
+        await main.on_chat_end()
+        await main.conversation_scopes.lease(
+            runtime=session._test_runtime,
+            owner_id="new-tab",
+            scope_id="runtime-thread",
+        )
+        finish_turn.set()
+        await asyncio.wait_for(active, timeout=1)
+        await asyncio.sleep(0.03)
+
+        assert closed == []
+        await main.conversation_scopes.release("new-tab")
+        await asyncio.sleep(0.03)
+        assert closed == [("runtime-thread", "runtime-thread")]
+    finally:
+        if not active.done():
+            active.cancel()
+            with suppress(asyncio.CancelledError):
+                await active
+
+
+@pytest.mark.anyio
+async def test_cleared_turn_does_not_resurrect_deleted_chainlit_user_session(
+    monkeypatch,
+):
+    from chainlit import user_session as real_user_session
+    from chainlit.user_session import user_sessions
+    import importlib
+
+    chainlit_user_session_module = importlib.import_module("chainlit.user_session")
+
+    session = SimpleNamespace(
+        id="cleared-session-test",
+        thread_id="runtime-thread",
+        socket_id="socket-1",
+        to_clear=True,
+        user_env={},
+        chat_settings={},
+        user=None,
+        chat_profile=None,
+        client_type="webapp",
+    )
+    finish_turn = asyncio.Event()
+
+    async def turn():
+        await finish_turn.wait()
+        main._release_active_turn()
+        real_user_session.get("late-turn-state")
+
+    active = asyncio.create_task(turn())
+    user_sessions[session.id] = {
+        main.SESSION_ACTIVE_TURN_KEY: active,
+        main.SESSION_SETTINGS_KEY: {"thread_id": "runtime-thread"},
+    }
+    monkeypatch.setattr(main.cl, "context", SimpleNamespace(session=session))
+    monkeypatch.setattr(
+        chainlit_user_session_module, "context", SimpleNamespace(session=session)
+    )
+    monkeypatch.setattr(main.cl, "user_session", real_user_session)
+    closed = []
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        closed.append((thread_id, mcp_session_id))
+
+    runtime = SimpleNamespace(close_conversation=close_conversation)
+    monkeypatch.setattr(main.AgentRuntime, "current", lambda: runtime)
+    manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", manager)
+    await manager.lease(
+        runtime=runtime, owner_id=session.id, scope_id="runtime-thread"
+    )
+
+    try:
+        await main.on_chat_end()
+        user_sessions.pop(session.id)
+        finish_turn.set()
+        await asyncio.wait_for(active, timeout=1)
+        await asyncio.sleep(0.03)
+
+        assert session.id not in user_sessions
+        assert closed == [("runtime-thread", "runtime-thread")]
+    finally:
+        user_sessions.pop(session.id, None)
+        if not active.done():
+            active.cancel()
+            with suppress(asyncio.CancelledError):
+                await active
 
 
 @pytest.mark.anyio

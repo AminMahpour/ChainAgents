@@ -1322,6 +1322,7 @@ the sections above for optional MCP and subagent examples.
 - When `DATABASE_URL` is set, durable state is available through LangGraph thread IDs. You can reuse a thread ID from the chat settings panel to continue the same checkpointed thread.
 - When `[agent].state = "stateless"`, thread IDs still identify requests and MCP/RAG scopes, but the agent graph does not checkpoint conversation state, receive a LangGraph store, or expose `/memories/`.
 - MCP stateful sessions are process-local. They survive tool calls and saved-chat navigation in the same Chainlit thread until idle eviction, but not an app restart.
+- Switching between saved Chainlit chats keeps active turns and local background subagents running. Returning during the same app process restores recent terminal background-task notices that finished while the chat was away. Idle conversation resources still follow the configured retention window.
 - On startup, the UI shows how many skill sources, MCP servers, custom subagents, and async subagents were loaded from `deepagent.toml`.
 
 
