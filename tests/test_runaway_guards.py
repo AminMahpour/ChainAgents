@@ -256,28 +256,43 @@ def _cortex_payload(model: str, messages: list[Any]) -> dict[str, Any]:
     )._get_request_payload(messages)
 
 
-def _turn() -> list[Any]:
+def _turn(assistant_text: str = "Listing the workspace.") -> list[Any]:
     return [
         SystemMessage(content="static system prompt"),
         HumanMessage(content="list files"),
-        *_call_pair(1, {"path": "/workspace"}, "README.md"),
+        AIMessage(
+            content=assistant_text,
+            tool_calls=[{"id": "call-1", "name": "ls", "args": {"path": "/workspace"}}],
+        ),
+        ToolMessage(content="README.md", tool_call_id="call-1", name="ls"),
     ]
 
 
-def test_cortex_claude_payload_marks_system_and_newest_message() -> None:
+def _marked_roles(messages: list[dict[str, Any]]) -> list[str]:
+    return [
+        message["role"]
+        for message in messages
+        if isinstance(message.get("content"), list)
+        and any("cache_control" in part for part in message["content"])
+    ]
+
+
+def test_cortex_claude_payload_marks_system_and_newest_assistant_turn() -> None:
     messages = _cortex_payload("claude-sonnet-4-5", _turn())["messages"]
 
     ephemeral = {"type": "ephemeral"}
     assert messages[0]["content"][-1]["cache_control"] == ephemeral
     assert messages[-1]["role"] == "tool"
-    assert messages[-1]["content"][-1]["cache_control"] == ephemeral
-    marked = [
-        message
-        for message in messages
-        if isinstance(message.get("content"), list)
-        and any("cache_control" in part for part in message["content"])
-    ]
-    assert len(marked) == 2
+    assert "cache_control" not in str(messages[-1])
+    assert messages[-2]["content"][-1]["cache_control"] == ephemeral
+    assert _marked_roles(messages) == ["system", "assistant"]
+
+
+def test_cortex_claude_payload_never_marks_tool_results() -> None:
+    messages = _cortex_payload("claude-sonnet-4-5", _turn(assistant_text=""))["messages"]
+
+    assert "tool" not in _marked_roles(messages)
+    assert _marked_roles(messages) == ["system", "user"]
 
 
 def test_cortex_non_claude_payload_has_no_cache_control() -> None:

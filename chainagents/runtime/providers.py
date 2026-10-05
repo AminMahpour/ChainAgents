@@ -69,6 +69,11 @@ def _openai_compatible_reasoning_delta(chunk: dict[str, Any]) -> Any:
 
 
 _EPHEMERAL_CACHE_CONTROL = {"type": "ephemeral"}
+# Cortex silently drops a breakpoint placed on a tool result. An agent loop
+# ends nearly every turn on one, so honouring that placement would cache
+# nothing beyond the system prompt. The newest assistant turn is the furthest
+# point Cortex does accept, and it covers all but the final tool result.
+UNCACHEABLE_BREAKPOINT_ROLES = frozenset({"tool"})
 
 
 def _add_cache_breakpoint(message: dict[str, Any]) -> bool:
@@ -96,8 +101,8 @@ def _add_prompt_cache_breakpoints(messages: list[Any]) -> None:
 
     Snowflake Cortex only caches Claude prompts covered by an explicit
     ``cache_control`` breakpoint. The system breakpoint caches the static
-    prefix; the one on the newest message lets the next turn, which only
-    appends, reuse the whole transcript.
+    prefix; the rolling one goes on the newest message whose role Cortex
+    honours, so the next turn, which only appends, reuses the transcript.
     """
     for message in messages:
         if isinstance(message, dict) and message.get("role") in {"system", "developer"}:
@@ -105,6 +110,8 @@ def _add_prompt_cache_breakpoints(messages: list[Any]) -> None:
             break
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("role") in {"system", "developer"}:
+            continue
+        if message.get("role") in UNCACHEABLE_BREAKPOINT_ROLES:
             continue
         if _add_cache_breakpoint(message):
             break
