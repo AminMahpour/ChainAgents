@@ -119,6 +119,9 @@ class _BackgroundTaskRecord:
     cancelling: bool = False
     # Number of callers blocked on this record; pins it against eviction.
     waiters: int = 0
+    # Live stream events published for this task; reported by the heartbeat.
+    activity_events: int = 0
+    started_at: float | None = None
 
     def snapshot(self) -> BackgroundTaskSnapshot:
         return BackgroundTaskSnapshot(

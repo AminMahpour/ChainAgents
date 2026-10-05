@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextvars
+import logging
 import time
 import uuid
 import weakref
@@ -39,9 +40,17 @@ from chainagents.runtime.background_tasks.queues import (
 )
 from chainagents.runtime.types import BackgroundSubagentConfig
 
+logger = logging.getLogger(__name__)
+
+# Background runs produce no console output of their own, so a long-running
+# task is reported periodically to keep runaways visible in the logs.
+BACKGROUND_TASK_HEARTBEAT_SECONDS = 300.0
+
 
 class BackgroundTaskManager:
     """Own process-local background subagent jobs for all conversations."""
+
+    heartbeat_interval: float = BACKGROUND_TASK_HEARTBEAT_SECONDS
 
     def __init__(
         self,
@@ -326,12 +335,25 @@ class BackgroundTaskManager:
             and record.artifact_handle is not None
             else None
         )
+        heartbeat: asyncio.Task[None] | None = None
         try:
             async with self._lock:
                 if record.status == "pending":
                     record.status = "running"
+                    record.started_at = time.time()
                 elif record.status in TERMINAL_BACKGROUND_TASK_STATUSES:
                     return
+            logger.info(
+                "Background task %s started: agent=%s session=%s description=%r",
+                record.task_id,
+                record.agent_name,
+                record.session_id,
+                _truncate(record.description),
+            )
+            heartbeat = asyncio.create_task(
+                self._heartbeat(record),
+                name=f"chainagents-heartbeat-{record.task_id}",
+            )
             result = await runner(record.task_id)
         except asyncio.CancelledError:
             cleanup_error = await self._cleanup_record(record)
@@ -361,12 +383,30 @@ class BackgroundTaskManager:
             else:
                 await self._finish(record, status="success", result=str(result))
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
             if artifact_token is not None and self.artifact_registry is not None:
                 self.artifact_registry.reset(artifact_token)
             _CURRENT_BACKGROUND_SESSION_GENERATION.reset(generation_token)
             _CURRENT_BACKGROUND_INVOCATION_PATH.reset(owner_token)
             _CURRENT_BACKGROUND_SESSION_ID.reset(session_token)
             _CURRENT_BACKGROUND_TASK_ID.reset(task_token)
+
+    async def _heartbeat(self, record: _BackgroundTaskRecord) -> None:
+        """Warn periodically while a background task is still running."""
+        while True:
+            await asyncio.sleep(self.heartbeat_interval)
+            if record.status in TERMINAL_BACKGROUND_TASK_STATUSES:
+                return
+            logger.warning(
+                "Background task %s is still running after %.0fs: agent=%s "
+                "session=%s events=%d",
+                record.task_id,
+                time.time() - (record.started_at or record.created_at),
+                record.agent_name,
+                record.session_id,
+                record.activity_events,
+            )
 
     async def _cleanup_record(self, record: _BackgroundTaskRecord) -> str | None:
         async with self._lock:
@@ -422,7 +462,7 @@ class BackgroundTaskManager:
             record.status = status
             record.result = result
             record.error = error
-            record.completed_at = time.time()
+            record.completed_at = completed_at = time.time()
             if record.completion is not None:
                 record.completion.set()
             snapshot = record.snapshot()
@@ -430,6 +470,18 @@ class BackgroundTaskManager:
             activity_subscribers = tuple(
                 self._activity_subscribers.get(record.session_id, ())
             )
+        log = logger.warning if status == "error" else logger.info
+        log(
+            "Background task %s finished: status=%s agent=%s session=%s "
+            "duration=%.1fs events=%d%s",
+            record.task_id,
+            status,
+            record.agent_name,
+            record.session_id,
+            completed_at - (record.started_at or record.created_at),
+            record.activity_events,
+            f" error={_truncate(error)}" if error else "",
+        )
         for completion_queue in subscribers:
             _put_evicting_oldest(completion_queue, snapshot)
         terminal_activity = BackgroundTaskActivity(
@@ -452,6 +504,7 @@ class BackgroundTaskManager:
             record = self._records.get(task_id)
             if record is None:
                 return
+            record.activity_events += 1
             subscribers = tuple(self._activity_subscribers.get(record.session_id, ()))
             activity = BackgroundTaskActivity(
                 task_id=record.task_id,
@@ -915,3 +968,11 @@ class BackgroundTaskManager:
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+
+
+def _truncate(text: str, limit: int = 200) -> str:
+    """Return one log-friendly line of at most ``limit`` characters."""
+    single_line = " ".join(text.split())
+    if len(single_line) <= limit:
+        return single_line
+    return f"{single_line[: limit - 3]}..."

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import json
 import logging
 import threading
 from collections.abc import Awaitable, Callable
@@ -17,6 +18,7 @@ from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langgraph.errors import GraphBubbleUp, GraphRecursionError
 from langgraph.types import Command
 
 import chainagents.runtime.backends as runtime_backends
@@ -34,6 +36,17 @@ logger = logging.getLogger("chainagents.runtime.core")
 
 _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
 _TOKEN_LIMIT_RETRY_MARKER = "chainagents_token_limit_retry"
+
+# Exceptions that must propagate instead of becoming retryable tool errors:
+# cancellation, LangGraph control flow (interrupts, parent commands), and an
+# exhausted step budget. Swallowing a GraphRecursionError would let a parent
+# delegate again with a fresh budget.
+NON_RECOVERABLE_TOOL_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.CancelledError,
+    GraphBubbleUp,
+    GraphRecursionError,
+)
+REPEATED_TOOL_RESULT_LIMIT = 10
 
 
 class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -95,6 +108,110 @@ class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
         return {"messages": replacement, "jump_to": "model"}
 
 
+_OFFLOADED_TOOL_RESULT_PREFIX = "Tool result too large, the result of this tool call "
+
+
+def _tool_message_text(content: Any) -> str | None:
+    """Return a stable string form of ToolMessage content for comparison.
+
+    Returns None for a result DeepAgents offloaded to a file: its stub keeps
+    only a head/tail preview, so equal stubs do not prove equal results.
+    """
+    text = content if isinstance(content, str) else json.dumps(
+        content, sort_keys=True, default=str
+    )
+    if text.startswith(_OFFLOADED_TOOL_RESULT_PREFIX):
+        return None
+    return text
+
+
+# Synthetic HumanMessages that are not a new user turn: media DeepAgents'
+# read_file appends after its result, and the token-limit retry notice.
+_SYNTHETIC_HUMAN_MESSAGE_MARKERS = ("read_file_media_result", _TOKEN_LIMIT_RETRY_MARKER)
+
+
+def _is_user_turn(message: Any) -> bool:
+    """Return whether ``message`` starts a new user turn."""
+    return isinstance(message, HumanMessage) and not any(
+        message.additional_kwargs.get(marker) for marker in _SYNTHETIC_HUMAN_MESSAGE_MARKERS
+    )
+
+
+class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
+    """End a run stuck calling one tool with identical arguments and results.
+
+    The guard reads message history instead of holding instance state, so one
+    instance is safe across concurrent runs. Only the current turn (messages
+    after the latest human message) is inspected, and repeats count even when
+    interleaved with other calls. The count for a tool and its arguments
+    restarts whenever the result changes, so polling that eventually reports
+    a new status is treated as progress, as is the same result for different
+    arguments.
+    """
+
+    def __init__(self, *, limit: int = REPEATED_TOOL_RESULT_LIMIT) -> None:
+        super().__init__()
+        self.limit = limit
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
+        messages = state.get("messages") or []
+        turn_start = 0
+        for index in range(len(messages) - 1, -1, -1):
+            if _is_user_turn(messages[index]):
+                turn_start = index + 1
+                break
+
+        call_args: dict[str, tuple[str, str]] = {}
+        # Latest result and its run length for each (tool, arguments) pair.
+        streaks: dict[tuple[str, str], tuple[str | None, int]] = {}
+        for message in messages[turn_start:]:
+            if isinstance(message, AIMessage):
+                for tool_call in message.tool_calls:
+                    call_id = tool_call.get("id")
+                    if call_id:
+                        call_args[call_id] = (
+                            str(tool_call.get("name") or ""),
+                            json.dumps(tool_call.get("args"), sort_keys=True, default=str),
+                        )
+                continue
+            if not isinstance(message, ToolMessage):
+                continue
+            call = call_args.get(message.tool_call_id)
+            if call is None:
+                continue
+            result = _tool_message_text(message.content)
+            if result is None:
+                # An offloaded result cannot be compared; leave the streak as is.
+                continue
+            previous_result, previous_count = streaks.get(call, (None, 0))
+            count = previous_count + 1 if previous_result == result else 1
+            streaks[call] = (result, count)
+            if count < self.limit:
+                continue
+            tool_name, arguments = call
+            logger.warning(
+                "Stopping a non-converging run: %s was called %d times with "
+                "arguments %s and returned the same result each time.",
+                tool_name,
+                count,
+                arguments[:200],
+            )
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            f"Stopped: `{tool_name}` was called {count} times with "
+                            "identical arguments and returned the same result each time, "
+                            "so the run was not making progress."
+                        )
+                    )
+                ],
+                "jump_to": "end",
+            }
+        return None
+
+
 class DisableSubagentDelegationMiddleware(AgentMiddleware[Any, Any, Any]):
     """Replace DeepAgents' implicit subagent middleware with an empty slot.
 
@@ -131,13 +248,23 @@ def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
 class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
     """Wrap tool execution with workspace path mapping and recoverable errors."""
 
-    def __init__(self, *, project_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        project_root: Path | None = None,
+        virtual_filesystem_tools: bool = True,
+    ) -> None:
         """Initialize the tool execution resilience middleware instance.
 
         Args:
             project_root: Project root used to resolve local paths.
+            virtual_filesystem_tools: Whether the filesystem tools' backend
+                routes ``/workspace/`` itself. When it does not (for example
+                a plain non-virtual filesystem backend), their ``/workspace/``
+                paths are mapped to real paths like any other tool's.
         """
         self.project_root = (project_root or runtime_constants.PROJECT_ROOT).resolve()
+        self.virtual_filesystem_tools = virtual_filesystem_tools
 
     def _map_workspace_path_args(self, request: ToolCallRequest) -> None:
         """Map virtual workspace paths inside tool-call arguments.
@@ -146,7 +273,18 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             request: The request value.
         """
         args = request.tool_call.get("args")
-        mapped_args = runtime_backends.map_workspace_paths_in_tool_args(args, self.project_root)
+        tool_name = str(request.tool_call.get("name") or "")
+        if (
+            self.virtual_filesystem_tools
+            and tool_name in runtime_backends.BACKEND_FILESYSTEM_TOOLS
+        ):
+            mapped_args = runtime_backends.map_backend_tool_paths_to_virtual(
+                args, self.project_root
+            )
+        else:
+            mapped_args = runtime_backends.map_workspace_paths_in_tool_args(
+                args, self.project_root
+            )
         if mapped_args is not args:
             request.tool_call["args"] = mapped_args
 
@@ -204,7 +342,7 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         try:
             self._map_workspace_path_args(request)
             return handler(request)
-        except asyncio.CancelledError:
+        except NON_RECOVERABLE_TOOL_EXCEPTIONS:
             raise
         except Exception as exc:
             return self._error_tool_message(request, exc)
@@ -226,7 +364,7 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         try:
             self._map_workspace_path_args(request)
             return await handler(request)
-        except asyncio.CancelledError:
+        except NON_RECOVERABLE_TOOL_EXCEPTIONS:
             raise
         except Exception as exc:
             return self._error_tool_message(request, exc)
@@ -495,6 +633,10 @@ def create_deep_agent_with_configured_summarization(
                 existing = profile.materialize_extra_middleware()
                 if not any(isinstance(item, TokenLimitedToolCallMiddleware) for item in existing):
                     existing.append(TokenLimitedToolCallMiddleware())
+                if not any(
+                    isinstance(item, RepeatedToolResultGuardMiddleware) for item in existing
+                ):
+                    existing.append(RepeatedToolResultGuardMiddleware())
                 return existing
 
             return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
@@ -553,5 +695,11 @@ def build_agent_middleware(
     )
     middleware.append(filesystem_middleware)
     middleware.append(TokenLimitedToolCallMiddleware())
-    middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
+    middleware.append(RepeatedToolResultGuardMiddleware())
+    middleware.append(
+        ToolExecutionResilienceMiddleware(
+            project_root=project_root,
+            virtual_filesystem_tools=runtime_backends.backend_routes_workspace(backend),
+        )
+    )
     return middleware
