@@ -134,6 +134,13 @@ class UserInputConfig:
 
 
 @dataclass(frozen=True)
+class ClarificationConfig:
+    """Let the main agent pause to ask the user a clarifying question."""
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AsyncSubagentConfig:
     """Describe an async subagent that runs through the Agent Protocol.
 
@@ -349,6 +356,7 @@ class ExtensionsConfig:
     background_subagents: BackgroundSubagentConfig = BackgroundSubagentConfig()
     messaging: MessagingConfig = MessagingConfig()
     user_input: UserInputConfig = UserInputConfig()
+    clarification: ClarificationConfig = ClarificationConfig()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
     chainlit_response_actions: tuple[ChainlitResponseActionConfig, ...] = ()
@@ -381,6 +389,7 @@ class ExtensionsConfig:
             or self.background_subagents.enabled
             or self.messaging.enabled
             or self.user_input.enabled
+            or self.clarification.enabled
             or self.chainlit_commands
             or self.chainlit_starters
             or self.chainlit_response_actions

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from langgraph.types import Command
+
 from chainagents.commands.native import (
     RuntimeCommandResult,
     dumps_tool_result,
@@ -29,6 +31,10 @@ from chainagents.exports.generated_files import (
     generated_file_paths_from_tool_result,
 )
 from chainagents.interfaces.uploads import prompt_with_images
+from chainagents.runtime.clarification import (
+    PendingClarification,
+    pending_clarifications,
+)
 from chainagents.runtime.constants import ReasoningLevel
 from chainagents.runtime.lifecycle import agent_with_mcp_status, mcp_outage_warning
 from chainagents.runtime.reflection import ReflectionCollector, ReflectionProposal
@@ -39,7 +45,9 @@ from chainagents.turns.renderer import TurnRenderer
 logger = logging.getLogger(__name__)
 
 DEFAULT_BACKEND_ERROR = "Agent operation failed. Please retry."
-TurnStatus = Literal["completed", "skipped", "command_error", "failed"]
+TurnStatus = Literal[
+    "completed", "skipped", "command_error", "failed", "awaiting_input"
+]
 
 
 @dataclass(frozen=True)
@@ -100,7 +108,9 @@ class TurnResult:
 
     ``status`` is ``completed`` (agent run or MCP-tool command succeeded),
     ``skipped`` (a command resolved to a blank prompt without images, so no
-    agent ran), ``command_error`` or ``failed`` (the agent run raised).
+    agent ran), ``command_error``, ``failed`` (the agent run raised) or
+    ``awaiting_input`` (the agent paused to ask ``clarifications``; the next
+    turn on the thread answers them).
     """
 
     status: TurnStatus
@@ -112,11 +122,12 @@ class TurnResult:
     generated_files: list[GeneratedFileDescriptor] = field(default_factory=list)
     reflection: ReflectionProposal | None = None
     agent: Any | None = None
+    clarifications: list[PendingClarification] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         """Return whether the turn ended without a command or agent error."""
-        return self.status in {"completed", "skipped"}
+        return self.status in {"completed", "skipped", "awaiting_input"}
 
 
 class TurnRunner:
@@ -344,14 +355,35 @@ class TurnRunner:
                         text=mcp_outage_warning(mcp_failures),
                     )
                 )
+            config = self._run_config(request)
+            # A paused run is answered by this turn's prompt rather than
+            # receiving it as a new message.
+            resume = await self._pending_clarifications(agent, config)
             await renderer.on_agent_start(prompt)
-            async with aclosing(self._agent_events(agent, request, prompt)) as events:
+            async with aclosing(
+                self._agent_events(agent, request, prompt, config, resume=resume)
+            ) as events:
                 async for event in events:
                     collector.record_event(event)
                     tracker.record(event)
                     if event.kind == "response_delta":
                         response_parts.append(event.text)
                     await renderer.on_event(event)
+            result.clarifications = await self._pending_clarifications(agent, config)
+            for clarification in result.clarifications:
+                await renderer.on_event(
+                    AgentStreamEvent(
+                        kind="clarification_requested",
+                        source="main-agent",
+                        text=clarification.question,
+                        ui_props={
+                            "options": list(clarification.options),
+                            "interrupt_id": clarification.interrupt_id,
+                        },
+                    )
+                )
+            if result.clarifications:
+                result.status = "awaiting_input"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -365,14 +397,38 @@ class TurnRunner:
         await self._finish(result, collector, tracker.paths, renderer)
         return result
 
+    def _run_config(self, request: TurnRequest) -> dict[str, Any]:
+        config = build_langgraph_run_config(
+            self.runtime.config,
+            thread_id=request.thread_id,
+            langsmith_tracing=getattr(self.runtime, "langsmith_tracing", None),
+        )
+        config.update(request.run_config_extras)
+        return config
+
+    async def _pending_clarifications(
+        self, agent: Any, config: dict[str, Any]
+    ) -> list[PendingClarification]:
+        """Return the clarification questions the thread's run is paused on."""
+        if not _clarification_enabled(self.runtime):
+            return []
+        get_state = getattr(agent, "aget_state", None)
+        if get_state is None:
+            return []
+        state = await get_state(config)
+        return pending_clarifications(getattr(state, "interrupts", ()))
+
     async def _agent_events(
         self,
         agent: Any,
         request: TurnRequest,
         prompt: str,
+        config: dict[str, Any],
+        *,
+        resume: list[PendingClarification] | None = None,
     ) -> AsyncGenerator[AgentStreamEvent, None]:
         """Stream normalized events for one agent run, always closing the stream."""
-        payload = {
+        payload: Any = {
             "messages": [
                 *request.history,
                 {
@@ -385,12 +441,10 @@ class TurnRunner:
                 },
             ]
         }
-        config = build_langgraph_run_config(
-            self.runtime.config,
-            thread_id=request.thread_id,
-            langsmith_tracing=getattr(self.runtime, "langsmith_tracing", None),
-        )
-        config.update(request.run_config_extras)
+        if resume:
+            payload = Command(
+                resume={pending.interrupt_id: prompt for pending in resume}
+            )
         adapter = AgentStreamEventAdapter(prompt=prompt)
         stream = agent.astream_events(
             payload,
@@ -426,7 +480,9 @@ class TurnRunner:
             )
         if result.generated_files:
             await renderer.on_generated_files(result.generated_files)
-        result.reflection = collector.build_proposal()
+        # A paused run has not answered yet, so there is nothing to reflect on.
+        if result.status != "awaiting_input":
+            result.reflection = collector.build_proposal()
         if result.reflection is not None:
             await renderer.on_reflection(result.reflection)
         if result.error is not None:
@@ -502,3 +558,12 @@ def safe_command_validation_error(exc: ValueError) -> str:
     ):
         return "Command arguments must be valid JSON."
     return safe_backend_error(exc, "Command arguments could not be validated.")
+
+
+def _clarification_enabled(runtime: Any) -> bool:
+    """Return whether the runtime's main agent can pause for a clarification."""
+    config = getattr(runtime, "config", None)
+    clarification = getattr(getattr(config, "extensions", None), "clarification", None)
+    return bool(getattr(clarification, "enabled", False)) and (
+        getattr(config, "agent_state", "stateful") == "stateful"
+    )

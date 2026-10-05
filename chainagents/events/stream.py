@@ -16,6 +16,7 @@ StreamEventKind = Literal[
     "mcp_status",
     "ui_message",
     "ui_remove",
+    "clarification_requested",
 ]
 
 LANGGRAPH_STREAM_MODES = {

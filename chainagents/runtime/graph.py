@@ -16,6 +16,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.artifacts as runtime_artifacts
 import chainagents.runtime.background_tasks as runtime_background_tasks
+import chainagents.runtime.clarification as runtime_clarification
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.middleware as runtime_middleware
@@ -804,6 +805,15 @@ def stateful_agent_memory_files(config: RuntimeConfig) -> list[str] | None:
     return list(config.extensions.agent_memory_files)
 
 
+def clarification_available(config: RuntimeConfig) -> bool:
+    """Return whether the main agent gets the ``ask_user`` tool.
+
+    Resuming a paused run needs a checkpointer, so stateless runtimes never
+    get the tool even when ``agent.clarification`` is enabled.
+    """
+    return config.extensions.clarification.enabled and config.agent_state == "stateful"
+
+
 def build_main_tools(
     config: RuntimeConfig,
     *,
@@ -926,6 +936,9 @@ def build_agent_kwargs(
         if config.extensions.messaging.enabled:
             runtime_messaging.validate_agent_message_tool_names(main_tools)
             main_tools.extend(runtime_messaging.create_agent_message_tools(messaging_broker, fixed_session_id=session_id))
+    clarification_enabled = clarification_available(config)
+    if clarification_enabled:
+        middleware.append(runtime_clarification.ClarificationMiddleware())
     context = _SubagentBuildContext.create(
         config,
         backend=backend,
@@ -978,6 +991,11 @@ def build_agent_kwargs(
                 project_root=project_root,
             ),
             rag_enabled=rag_enabled,
+        )
+        + (
+            f"\n\n{runtime_clarification.CLARIFICATION_SYSTEM_PROMPT}"
+            if clarification_enabled
+            else ""
         ),
         "middleware": middleware,
         "backend": backend,
