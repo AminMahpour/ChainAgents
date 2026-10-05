@@ -3941,7 +3941,7 @@ def test_token_limit_detection_requires_explicit_provider_report(metadata) -> No
 def test_tool_execution_middleware_maps_workspace_path_tool_args(
     tmp_path: Path,
 ) -> None:
-    """Verify that tool execution middleware maps workspace path tool args.
+    """Verify non-filesystem tools (e.g. MCP) get real paths for /workspace args.
 
     Args:
         tmp_path: Path to the tmp.
@@ -3950,11 +3950,11 @@ def test_tool_execution_middleware_maps_workspace_path_tool_args(
     request = ToolCallRequest(
         tool_call={
             "id": "call-1",
-            "name": "read_file",
+            "name": "repo_read_file",
             "args": {"path": "/workspace/skills/reviewer/SKILL.md"},
             "type": "tool_call",
         },
-        tool=SimpleNamespace(name="read_file"),
+        tool=SimpleNamespace(name="repo_read_file"),
         state={},
         runtime=SimpleNamespace(),
     )
@@ -3973,7 +3973,7 @@ def test_tool_execution_middleware_maps_workspace_path_tool_args(
         }
         return ToolMessage(
             content="ok",
-            name="read_file",
+            name="repo_read_file",
             tool_call_id="call-1",
             status="success",
         )
