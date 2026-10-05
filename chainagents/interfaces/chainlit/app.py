@@ -1684,8 +1684,8 @@ async def answer_clarification(action: cl.Action) -> None:
             await action.remove()
         await cl.Message(
             content=(
-                "This option has expired. If a question is still open, "
-                "type your answer instead."
+                "This option has expired. If a question is still open, use "
+                "the buttons on its latest message or type your answer."
             ),
             author="System",
         ).send()
