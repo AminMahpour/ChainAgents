@@ -95,13 +95,20 @@ class ConversationInputController:
             or session.queue
         ):
             raise ValueError("Choose steer or queue while a conversation is busy or paused.")
-        if len(session.queue) + self._reserved_followups(session_id) >= self.config.max_queued_turns:
+        answers_question = session.awaiting_answer and session.answer_job_id is None
+        # The held queue cannot drain until the question is answered, so the
+        # answer is admitted even when the queue is full.
+        if (
+            not answers_question
+            and len(session.queue) + self._reserved_followups(session_id)
+            >= self.config.max_queued_turns
+        ):
             raise ValueError("Queued turn limit reached.")
         job = InputJob(uuid.uuid4().hex, session_id, payload, run, followup_factory)
         session.jobs[job.id] = job
         if input_id is not None:
             session.input_ids[input_id] = job.id
-        if session.awaiting_answer and session.answer_job_id is None:
+        if answers_question:
             # The first input after a clarifying question is its answer, so it
             # runs ahead of turns that were queued before the question.
             session.answer_job_id = job.id

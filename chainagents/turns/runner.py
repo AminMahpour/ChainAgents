@@ -337,6 +337,7 @@ class TurnRunner:
         )
         tracker = _GeneratedPathTracker()
         response_parts: list[str] = []
+        resume: list[PendingClarification] = []
         try:
             agent, mcp_failures = await agent_with_mcp_status(
                 self.runtime,
@@ -373,7 +374,6 @@ class TurnRunner:
                     )
                     await renderer.on_complete(refused)
                     return refused
-                self._input_controller_call("clarification_answered", request.thread_id)
             await renderer.on_agent_start(prompt)
             async with aclosing(
                 self._agent_events(agent, request, prompt, config, resume=resume)
@@ -400,9 +400,15 @@ class TurnRunner:
             if result.clarifications:
                 result.status = "awaiting_input"
                 self._input_controller_call("clarification_requested", request.thread_id)
+            elif resume:
+                # Release turns queued behind the question only once the resumed
+                # run has actually consumed the answer.
+                self._input_controller_call("clarification_answered", request.thread_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if resume:
+                await self._release_hold_if_answered(agent, config, request.thread_id)
             # A sanitised proposal may cross the network, so omit backend text.
             collector.mark_run_failed(
                 RuntimeError("Agent operation failed.") if self.sanitize_errors else exc
@@ -431,6 +437,18 @@ class TurnRunner:
         callback = getattr(controller, method, None)
         if callable(callback):
             callback(thread_id)
+
+    async def _release_hold_if_answered(
+        self, agent: Any, config: dict[str, Any], thread_id: str
+    ) -> None:
+        """After a failed resume, keep queued turns held while the question is open."""
+        try:
+            still_pending = await self._pending_clarifications(agent, config)
+        except Exception:
+            logger.exception("Could not re-check a pending clarification after a failure.")
+            return
+        if not still_pending:
+            self._input_controller_call("clarification_answered", thread_id)
 
     async def _pending_clarifications(
         self, agent: Any, config: dict[str, Any]

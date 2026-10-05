@@ -981,6 +981,10 @@ def build_agent_kwargs(
         if background_subagents
         else []
     )
+    if clarification_enabled:
+        runtime_clarification.validate_ask_user_tool_name(
+            [*main_tools, *background_tools]
+        )
     agent_kwargs: dict[str, Any] = {
         "model": model,
         "tools": [*main_tools, *background_tools] or None,

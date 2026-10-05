@@ -715,3 +715,119 @@ def test_chainlit_option_buttons_expire_once_answered(monkeypatch) -> None:
 
     assert (first, stale) == (True, False)
     assert removed == ["api", "cli"]
+
+
+# --- second review round ------------------------------------------------------
+
+
+def test_answer_is_admitted_when_the_queue_is_full() -> None:
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import MessagingConfig, UserInputConfig
+    from chainagents.turns.controller import ConversationInputController
+
+    async def exercise() -> list[str]:
+        controller = ConversationInputController(
+            UserInputConfig(enabled=True, max_queued_turns=1),
+            MessageBroker(MessagingConfig(enabled=True)),
+        )
+        gate = asyncio.Event()
+        started: list[str] = []
+
+        async def run(text: str) -> None:
+            started.append(text)
+            if text == "request":
+                await gate.wait()
+                controller.clarification_requested("s")
+            elif text == "answer":
+                controller.clarification_answered("s")
+
+        controller.submit("s", "request", run, followup_factory=lambda t: t)
+        await asyncio.sleep(0)
+        controller.submit("s", "queued", run, followup_factory=lambda t: t)
+        gate.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        controller.submit("s", "answer", run, followup_factory=lambda t: t)
+        with pytest.raises(ValueError, match="Queued turn limit"):
+            controller.submit("s", "extra", run, followup_factory=lambda t: t)
+        await controller.wait_idle("s")
+        return started
+
+    assert asyncio.run(exercise()) == ["request", "answer", "queued"]
+
+
+class _FailingStartRenderer(_Renderer):
+    async def on_agent_start(self, prompt: str) -> None:
+        raise RuntimeError("renderer broke")
+
+
+class _Controller:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def clarification_requested(self, thread_id: str) -> None:
+        self.calls.append("requested")
+
+    def clarification_answered(self, thread_id: str) -> None:
+        self.calls.append("answered")
+
+
+def _runtime_with_controller(tmp_path: Path, agent: Any) -> tuple[_Runtime, _Controller]:
+    runtime = _Runtime(agent, tmp_path)
+    controller = _Controller()
+    runtime.user_input = controller  # type: ignore[attr-defined]
+    runtime.config.extensions.user_input = SimpleNamespace(enabled=False)
+    return runtime, controller
+
+
+def test_hold_is_kept_when_a_resume_fails_before_running(tmp_path: Path) -> None:
+    agent = _clarifying_agent([])
+    runtime, controller = _runtime_with_controller(tmp_path, agent)
+
+    async def exercise():
+        await TurnRunner(runtime).run(_request("Review the code"), _Renderer())
+        # Enable the controller only for the resume so the turn lock is not needed.
+        runtime.config.extensions.user_input = SimpleNamespace(enabled=True)
+        runtime.turn_lock = lambda key: asyncio.Lock()  # type: ignore[attr-defined]
+        runtime.config.extensions.mcp_stateful = False
+        controller.turn_waiting = lambda thread_id: True  # type: ignore[attr-defined]
+        controller.turn_started = lambda thread_id: True  # type: ignore[attr-defined]
+        controller.turn_finished = lambda thread_id: None  # type: ignore[attr-defined]
+        controller.turn_wait_finished = lambda thread_id: None  # type: ignore[attr-defined]
+        result = await TurnRunner(runtime).run(_request("cli"), _FailingStartRenderer())
+        state = await agent.aget_state({"configurable": {"thread_id": "thread-1"}})
+        return result, state
+
+    result, state = asyncio.run(exercise())
+
+    assert result.status == "failed"
+    assert pending_clarifications(state.interrupts)
+    assert "answered" not in controller.calls
+
+
+def test_hold_is_released_after_a_successful_resume(tmp_path: Path) -> None:
+    agent = _clarifying_agent([])
+    runtime, controller = _runtime_with_controller(tmp_path, agent)
+    runtime.config.extensions.user_input = SimpleNamespace(enabled=True)
+    runtime.turn_lock = lambda key: asyncio.Lock()  # type: ignore[attr-defined]
+    runtime.config.extensions.mcp_stateful = False
+    controller.turn_waiting = lambda thread_id: True  # type: ignore[attr-defined]
+    controller.turn_started = lambda thread_id: True  # type: ignore[attr-defined]
+    controller.turn_finished = lambda thread_id: None  # type: ignore[attr-defined]
+    controller.turn_wait_finished = lambda thread_id: None  # type: ignore[attr-defined]
+
+    async def exercise() -> None:
+        await TurnRunner(runtime).run(_request("Review the code"), _Renderer())
+        await TurnRunner(runtime).run(_request("cli"), _Renderer())
+
+    asyncio.run(exercise())
+
+    assert controller.calls == ["requested", "answered"]
+
+
+def test_configured_ask_user_tool_name_is_rejected() -> None:
+    from chainagents.runtime.clarification import validate_ask_user_tool_name
+
+    with pytest.raises(ValueError, match="reserved name 'ask_user'"):
+        validate_ask_user_tool_name([SimpleNamespace(name="ask_user")])
+    validate_ask_user_tool_name([SimpleNamespace(name="docs_ask_user")])

@@ -98,6 +98,24 @@ class ClarificationMiddleware(AgentMiddleware[Any, Any, Any]):
         return {"messages": [_keep_only_tool_call(message, asks[0])]}
 
 
+def validate_ask_user_tool_name(existing_tools: Any) -> None:
+    """Reject a configured tool that would share the reserved ``ask_user`` name.
+
+    ``ClarificationMiddleware`` recognizes calls by name, so a configured
+    tool named ``ask_user`` would be shadowed or turned into a pause.
+    """
+    for candidate in existing_tools or ():
+        name = str(
+            getattr(candidate, "name", None) or getattr(candidate, "__name__", "")
+        ).strip()
+        if name == ASK_USER_TOOL_NAME:
+            raise ValueError(
+                f"A configured tool uses the reserved name '{ASK_USER_TOOL_NAME}', "
+                "which agent.clarification needs. Rename or prefix the configured "
+                "tool, or disable agent.clarification."
+            )
+
+
 def pending_clarifications(interrupts: Any) -> list[PendingClarification]:
     """Return the clarification questions among a state's pending interrupts."""
     pending: list[PendingClarification] = []
