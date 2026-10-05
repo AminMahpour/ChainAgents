@@ -187,6 +187,8 @@ class CliEventRenderer(BaseTurnRenderer):
         """Print a failed or unknown native command to stderr."""
         if exc.unknown:
             print(f"Unknown command /{exc.command_name}.", file=self.stderr)
+        elif not exc.command_name:
+            print(exc.message, file=self.stderr)
         else:
             print(f"Command /{exc.command_name} failed: {exc.message}", file=self.stderr)
 
@@ -231,8 +233,10 @@ class CliEventRenderer(BaseTurnRenderer):
         """Print the agent's clarifying question and numbered options."""
         if self.json_output:
             return
-        self._close_reasoning_line()
-        self._end_streamed_response_line()
+        # Show any preamble before the question; clearing the buffer keeps
+        # on_complete from printing it again after the question.
+        self._finish_response()
+        self.response_buffer = ""
         lines = [event.text]
         options = event.ui_props.get("options") or []
         lines.extend(f"  {index}. {option}" for index, option in enumerate(options, 1))

@@ -159,7 +159,9 @@ class TurnRunner:
             extensions = getattr(self.runtime.config, "extensions", None)
             serialize_thread = any(
                 getattr(getattr(extensions, name, None), "enabled", False)
-                for name in ("messaging", "user_input")
+                # Checking for and resuming a pending clarification must be
+                # atomic per thread.
+                for name in ("messaging", "user_input", "clarification")
             )
             serialize_mcp = bool(getattr(extensions, "mcp_stateful", False))
             if serialize_thread or serialize_mcp:
@@ -359,6 +361,19 @@ class TurnRunner:
             # A paused run is answered by this turn's prompt rather than
             # receiving it as a new message.
             resume = await self._pending_clarifications(agent, config)
+            if resume:
+                refusal = _clarification_refusal(request, command_result)
+                if refusal is not None:
+                    await renderer.on_command_error(refusal, refusal.status)
+                    refused = TurnResult(
+                        status="command_error",
+                        prompt=request.prompt,
+                        command_error=refusal,
+                        agent=agent,
+                    )
+                    await renderer.on_complete(refused)
+                    return refused
+                self._input_controller_call("clarification_answered", request.thread_id)
             await renderer.on_agent_start(prompt)
             async with aclosing(
                 self._agent_events(agent, request, prompt, config, resume=resume)
@@ -384,6 +399,7 @@ class TurnRunner:
                 )
             if result.clarifications:
                 result.status = "awaiting_input"
+                self._input_controller_call("clarification_requested", request.thread_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -405,6 +421,16 @@ class TurnRunner:
         )
         config.update(request.run_config_extras)
         return config
+
+    def _input_controller_call(self, method: str, thread_id: str) -> None:
+        """Tell the user-input controller, when enabled, about a clarification."""
+        extensions = getattr(self.runtime.config, "extensions", None)
+        if not getattr(getattr(extensions, "user_input", None), "enabled", False):
+            return
+        controller = getattr(self.runtime, "user_input", None)
+        callback = getattr(controller, method, None)
+        if callable(callback):
+            callback(thread_id)
 
     async def _pending_clarifications(
         self, agent: Any, config: dict[str, Any]
@@ -561,6 +587,39 @@ def safe_command_validation_error(exc: ValueError) -> str:
     ):
         return "Command arguments must be valid JSON."
     return safe_backend_error(exc, "Command arguments could not be validated.")
+
+
+def _clarification_refusal(
+    request: TurnRequest, command_result: RuntimeCommandResult | None
+) -> TurnCommandError | None:
+    """Return why this turn cannot answer a pending clarifying question.
+
+    Only plain user text answers a question: an expanded command or a
+    configured action is its own request, and attachments cannot be carried in
+    a tool result for every provider, so they are refused rather than dropped.
+    """
+    if command_result is not None:
+        return TurnCommandError(
+            "A clarifying question is pending. Answer it before running "
+            f"`/{command_result.command_name}`.",
+            # An empty name renders the message alone; it names the command.
+            command_name="",
+            status=409,
+        )
+    if not request.resolve_commands:
+        return TurnCommandError(
+            "A clarifying question is pending. Answer it before running this action.",
+            command_name="",
+            status=409,
+        )
+    if request.content_parts:
+        return TurnCommandError(
+            "A clarifying question is pending. Answer it with text only; send "
+            "attachments in a later message.",
+            command_name="",
+            status=409,
+        )
+    return None
 
 
 def clarification_answer(text: str, pending: PendingClarification) -> str:

@@ -649,6 +649,10 @@ class TuiRenderer(BaseTurnRenderer):
             self.app._append_tool_entry(f"unknown command /{exc.command_name}")
             self.app._set_status(f"Unknown command /{exc.command_name}.")
             return
+        if not exc.command_name:
+            self.app._append_tool_entry(exc.message)
+            self.app._set_status(exc.message)
+            return
         self.app._append_tool_entry(
             f"command /{exc.command_name} failed: {exc.message}"
         )

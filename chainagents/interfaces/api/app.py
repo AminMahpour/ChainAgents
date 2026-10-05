@@ -1339,7 +1339,13 @@ class NdjsonRenderer(BaseTurnRenderer):
 
     async def on_complete(self, result: TurnResult) -> None:
         if result.ok:
-            await self._emit(_done_payload(self.context, status=result.status))
+            await self._emit(
+                _done_payload(
+                    self.context,
+                    status=result.status,
+                    clarifications=_clarifications_payload(result),
+                )
+            )
 
 
 class _WarningCollector(BaseTurnRenderer):
@@ -1404,9 +1410,12 @@ def _reflection_proposal_payload(
 
 
 def _done_payload(
-    context: AgentRunContext, *, status: str = "completed"
+    context: AgentRunContext,
+    *,
+    status: str = "completed",
+    clarifications: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build the terminal stream event; a paused turn adds its status."""
+    """Build the terminal stream event; a paused turn adds its questions."""
     payload: dict[str, Any] = {
         "kind": "done",
         "thread_id": context.thread_id,
@@ -1415,6 +1424,7 @@ def _done_payload(
     }
     if status == "awaiting_input":
         payload["status"] = status
+        payload["clarifications"] = clarifications or []
     return payload
 
 
@@ -1676,6 +1686,9 @@ def _event_payload(event: AgentStreamEvent, context: AgentRunContext) -> dict[st
     if event.kind not in {"ui_message", "ui_remove"}:
         for key in ("ui_id", "ui_name", "ui_props", "ui_metadata"):
             payload.pop(key, None)
+    if event.kind == "clarification_requested":
+        payload["options"] = list(event.ui_props.get("options") or [])
+        payload["interrupt_id"] = event.ui_props.get("interrupt_id")
     payload.update(
         {
             "thread_id": context.thread_id,

@@ -36,6 +36,7 @@ from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enab
 from chainagents.interfaces.chainlit.renderer import (
     CLARIFICATION_ANSWER_ACTION,
     ChainlitTurnRenderer,
+    expire_clarification_actions,
 )
 from chainagents.interfaces.chainlit.settings import (
     SESSION_MCP_SESSION_ID_KEY,  # noqa: F401
@@ -1637,11 +1638,21 @@ chainlit_config.code.on_message = _guarded_chainlit_message_callback
 @cl.action_callback(CLARIFICATION_ANSWER_ACTION)
 async def answer_clarification(action: cl.Action) -> None:
     """Send a clarification option as the user's answer, like a typed reply."""
-    answer = str((action.payload or {}).get("answer") or "").strip()
+    payload = action.payload or {}
+    answer = str(payload.get("answer") or "").strip()
     if not answer:
         return
-    with suppress(Exception):
-        await action.remove()
+    if not await expire_clarification_actions(str(payload.get("interrupt_id") or "")):
+        with suppress(Exception):
+            await action.remove()
+        await cl.Message(
+            content=(
+                "This option has expired. If a question is still open, "
+                "type your answer instead."
+            ),
+            author="System",
+        ).send()
+        return
     message = cl.Message(content=answer, author="User", type="user_message")
     await message.send()
     await _guarded_chainlit_message_callback(message)

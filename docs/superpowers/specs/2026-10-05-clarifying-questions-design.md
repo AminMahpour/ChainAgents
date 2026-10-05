@@ -156,6 +156,18 @@ prompt:
 
 ## Error handling and edge cases
 
+- Only plain user text answers a pending question. Expanded slash commands,
+  configured actions (`resolve_commands=False`), and replies with attachments
+  are refused with a 409 command error and leave the question pending.
+- With `[agent.user_input]`, the controller holds turns queued before the
+  question; the first input submitted afterwards runs first as the answer.
+- `ClarificationMiddleware.after_model` drops other tool calls emitted in the
+  same message as `ask_user`, since tool calls in one message run concurrently.
+- Clarification turns take the per-thread turn lock, so checking for and
+  resuming a pending question is atomic.
+- Chainlit option buttons carry the interrupt id and expire once the question
+  is answered or the next agent run starts.
+
 - In-memory checkpointer: a pending question is lost on restart; the next
   message starts a normal turn. Postgres persists it across restarts.
 - Stateless runtime: tool not registered (see Configuration).
