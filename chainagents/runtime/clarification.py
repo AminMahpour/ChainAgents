@@ -15,6 +15,10 @@ from chainagents.runtime.background_tasks.context import current_background_task
 ASK_USER_TOOL_NAME = "ask_user"
 CLARIFICATION_INTERRUPT_KIND = "clarification"
 MAX_CLARIFICATION_OPTIONS = 6
+# Checkpoint write channel LangGraph records interrupts on. Its constant is
+# private since LangGraph 1.0; test_pending_questions_are_read_from_the_
+# checkpointer fails if the channel name ever changes.
+_INTERRUPT_WRITE_CHANNEL = "__interrupt__"
 CLARIFICATION_SYSTEM_PROMPT = (
     "Clarifying questions:\n"
     "- If a request is ambiguous in ways that would change what subagents do "
@@ -114,6 +118,26 @@ def validate_ask_user_tool_name(existing_tools: Any) -> None:
                 "which agent.clarification needs. Rename or prefix the configured "
                 "tool, or disable agent.clarification."
             )
+
+
+async def pending_clarifications_from_checkpointer(
+    checkpointer: Any, thread_id: str
+) -> list[PendingClarification]:
+    """Read a thread's pending questions straight from its latest checkpoint.
+
+    This avoids building the agent (models, MCP sessions) just to learn
+    whether a reopened conversation is waiting on an answer.
+    """
+    checkpoint = await checkpointer.aget_tuple(
+        {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    )
+    if checkpoint is None:
+        return []
+    interrupts: list[Any] = []
+    for write in checkpoint.pending_writes or ():
+        if len(write) >= 3 and write[1] == _INTERRUPT_WRITE_CHANNEL and isinstance(write[2], (list, tuple)):
+            interrupts.extend(write[2])
+    return pending_clarifications(interrupts)
 
 
 def pending_clarifications(interrupts: Any) -> list[PendingClarification]:

@@ -78,6 +78,9 @@ class TurnRequest:
     mcp_session_id: str | None = None
     run_config_extras: Mapping[str, Any] = field(default_factory=dict)
     resolve_commands: bool = True
+    # A literal answer to a pending clarifying question (for example a clicked
+    # option): never parsed as a command or mapped from an option number.
+    clarification_answer: bool = False
 
 
 class TurnCommandError(Exception):
@@ -227,7 +230,7 @@ class TurnRunner:
                 raw_text=request.prompt,
                 selected_command=request.selected_command,
             )
-            if request.resolve_commands
+            if request.resolve_commands and not request.clarification_answer
             else None
         )
         if parsed is not None:
@@ -362,6 +365,21 @@ class TurnRunner:
             # A paused run is answered by this turn's prompt rather than
             # receiving it as a new message.
             resume = await self._pending_clarifications(agent, config)
+            if request.clarification_answer and not resume:
+                stale = TurnCommandError(
+                    "That question was already answered.",
+                    command_name="",
+                    status=409,
+                )
+                await renderer.on_command_error(stale, stale.status)
+                result = TurnResult(
+                    status="command_error",
+                    prompt=request.prompt,
+                    command_error=stale,
+                    agent=agent,
+                )
+                await renderer.on_complete(result)
+                return result
             if resume:
                 refusal = _clarification_refusal(request, command_result)
                 if refusal is not None:
@@ -385,6 +403,10 @@ class TurnRunner:
                         response_parts.append(event.text)
                     await renderer.on_event(event)
             result.clarifications = await self._pending_clarifications(agent, config)
+            if result.clarifications:
+                # Hold queued turns before any renderer code runs, so a failing
+                # renderer cannot let an older queued turn become the answer.
+                self._input_controller_call("clarification_requested", request.thread_id)
             for clarification in result.clarifications:
                 await renderer.on_event(
                     AgentStreamEvent(
@@ -399,7 +421,6 @@ class TurnRunner:
                 )
             if result.clarifications:
                 result.status = "awaiting_input"
-                self._input_controller_call("clarification_requested", request.thread_id)
             elif resume:
                 # Release turns queued behind the question only once the resumed
                 # run has actually consumed the answer.
@@ -488,7 +509,11 @@ class TurnRunner:
         if resume:
             payload = Command(
                 resume={
-                    pending.interrupt_id: clarification_answer(prompt, pending)
+                    pending.interrupt_id: (
+                        prompt
+                        if request.clarification_answer
+                        else clarification_answer(prompt, pending)
+                    )
                     for pending in resume
                 }
             )
@@ -624,13 +649,14 @@ def _clarification_refusal(
             command_name="",
             status=409,
         )
-    if not request.resolve_commands:
+    if not request.resolve_commands and not request.clarification_answer:
         return TurnCommandError(
             "A clarifying question is pending. Answer it before running this action.",
             command_name="",
             status=409,
         )
-    if request.content_parts:
+    # Images arrive as content parts and documents as a prompt note.
+    if request.content_parts or request.image_names or request.prompt_note:
         return TurnCommandError(
             "A clarifying question is pending. Answer it with text only; send "
             "attachments in a later message.",
@@ -641,8 +667,14 @@ def _clarification_refusal(
 
 
 def clarification_answer(text: str, pending: PendingClarification) -> str:
-    """Return the answer for ``pending``, mapping a bare option number to it."""
+    """Return the answer for ``pending``, mapping a bare option number to it.
+
+    Text that exactly matches an option is that option, so a numeric option
+    such as ``"2"`` is never remapped to the second option.
+    """
     stripped = text.strip()
+    if stripped in pending.options:
+        return stripped
     if stripped.isdigit() and 1 <= int(stripped) <= len(pending.options):
         return pending.options[int(stripped) - 1]
     return text

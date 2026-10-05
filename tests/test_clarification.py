@@ -831,3 +831,150 @@ def test_configured_ask_user_tool_name_is_rejected() -> None:
     with pytest.raises(ValueError, match="reserved name 'ask_user'"):
         validate_ask_user_tool_name([SimpleNamespace(name="ask_user")])
     validate_ask_user_tool_name([SimpleNamespace(name="docs_ask_user")])
+
+
+# --- third review round -------------------------------------------------------
+
+
+def test_exact_option_text_wins_over_option_numbers() -> None:
+    from chainagents.turns.runner import clarification_answer
+
+    pending = _pending(options=("2", "4", "8"))
+
+    assert clarification_answer("2", pending) == "2"
+    assert clarification_answer("3", pending) == "8"
+
+
+def _answer_request(prompt: str, **kwargs: Any) -> TurnRequest:
+    return TurnRequest(
+        prompt=prompt,
+        thread_id="thread-1",
+        model_name="fake",
+        reasoning_level="medium",
+        **kwargs,
+    )
+
+
+def test_literal_answer_skips_commands_and_number_mapping(tmp_path: Path) -> None:
+    agent = _clarifying_agent([])
+    runtime = _Runtime(agent, tmp_path)
+
+    async def exercise():
+        await TurnRunner(runtime).run(_request("Review the code"), _Renderer())
+        result = await TurnRunner(runtime).run(
+            _answer_request("/1", clarification_answer=True), _Renderer()
+        )
+        state = await agent.aget_state({"configurable": {"thread_id": "thread-1"}})
+        return result, state
+
+    result, state = asyncio.run(exercise())
+
+    assert result.status == "completed"
+    answers = [
+        m.content
+        for m in state.values["messages"]
+        if isinstance(m, ToolMessage) and m.tool_call_id == "call-ask"
+    ]
+    assert answers == ["/1"]
+
+
+def test_literal_answer_without_a_pending_question_is_refused(tmp_path: Path) -> None:
+    runtime = _Runtime(_clarifying_agent([]), tmp_path)
+
+    result = asyncio.run(
+        TurnRunner(runtime).run(_answer_request("api", clarification_answer=True), _Renderer())
+    )
+
+    assert result.status == "command_error"
+    assert result.command_error is not None
+    assert "already answered" in result.command_error.message
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"prompt_note": "Uploaded notes.pdf to the workspace knowledge index."},
+        {"image_names": ("photo.png",)},
+    ],
+)
+def test_reply_with_documents_or_image_names_is_refused(
+    tmp_path: Path, extra: dict[str, Any]
+) -> None:
+    agent = _clarifying_agent([])
+    runtime = _Runtime(agent, tmp_path)
+
+    async def exercise():
+        await TurnRunner(runtime).run(_request("Review the code"), _Renderer())
+        result = await TurnRunner(runtime).run(_answer_request("cli", **extra), _Renderer())
+        state = await agent.aget_state({"configurable": {"thread_id": "thread-1"}})
+        return result, state
+
+    result, state = asyncio.run(exercise())
+
+    assert result.status == "command_error"
+    assert pending_clarifications(state.interrupts)
+
+
+class _FailingQuestionRenderer(_Renderer):
+    async def on_event(self, event):
+        if event.kind == "clarification_requested":
+            raise RuntimeError("renderer broke")
+        await super().on_event(event)
+
+
+def test_hold_is_registered_before_the_question_is_rendered(tmp_path: Path) -> None:
+    agent = _clarifying_agent([])
+    runtime, controller = _runtime_with_controller(tmp_path, agent)
+    runtime.config.extensions.user_input = SimpleNamespace(enabled=True)
+    runtime.turn_lock = lambda key: asyncio.Lock()  # type: ignore[attr-defined]
+    runtime.config.extensions.mcp_stateful = False
+    controller.turn_waiting = lambda thread_id: True  # type: ignore[attr-defined]
+    controller.turn_started = lambda thread_id: True  # type: ignore[attr-defined]
+    controller.turn_finished = lambda thread_id: None  # type: ignore[attr-defined]
+    controller.turn_wait_finished = lambda thread_id: None  # type: ignore[attr-defined]
+
+    result = asyncio.run(
+        TurnRunner(runtime).run(_request("Review the code"), _FailingQuestionRenderer())
+    )
+
+    assert result.status == "failed"
+    assert controller.calls == ["requested"]
+
+
+def test_pending_questions_are_read_from_the_checkpointer(tmp_path: Path) -> None:
+    from chainagents.runtime.clarification import pending_clarifications_from_checkpointer
+
+    checkpointer = MemorySaver()
+
+    def task(description: str) -> str:
+        """Delegate work to a subagent."""
+        return "report"
+
+    model = _ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "ask_user", "args": {"question": "Which?", "options": ["a"]}, "id": "c1"}
+                ],
+            )
+        ]
+    )
+    agent = create_agent(
+        model, tools=[task], middleware=[ClarificationMiddleware()], checkpointer=checkpointer
+    )
+
+    async def exercise():
+        await agent.ainvoke(
+            {"messages": [{"role": "user", "content": "go"}]},
+            {"configurable": {"thread_id": "t"}},
+        )
+        return (
+            await pending_clarifications_from_checkpointer(checkpointer, "t"),
+            await pending_clarifications_from_checkpointer(checkpointer, "missing"),
+        )
+
+    pending, missing = asyncio.run(exercise())
+
+    assert [(p.question, p.options) for p in pending] == [("Which?", ("a",))]
+    assert missing == []

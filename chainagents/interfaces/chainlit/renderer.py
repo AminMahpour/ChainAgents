@@ -62,6 +62,28 @@ def clarification_message(event: AgentStreamEvent) -> cl.Message:
     )
 
 
+async def send_clarification_questions(events: list[AgentStreamEvent]) -> None:
+    """Send each question with its option buttons and track them as pending."""
+    pending = cl.user_session.get(SESSION_PENDING_CLARIFICATIONS_KEY) or {}
+    for event in events:
+        message = clarification_message(event)
+        await message.send()
+        pending[str(event.ui_props.get("interrupt_id") or "")] = list(message.actions)
+    cl.user_session.set(SESSION_PENDING_CLARIFICATIONS_KEY, pending)
+
+
+def clarification_event(
+    question: str, options: tuple[str, ...], interrupt_id: str
+) -> AgentStreamEvent:
+    """Build the stream event for a pending question read from a checkpoint."""
+    return AgentStreamEvent(
+        kind="clarification_requested",
+        source="main-agent",
+        text=question,
+        ui_props={"options": list(options), "interrupt_id": interrupt_id},
+    )
+
+
 def native_command_output_message(result: RuntimeCommandResult) -> str:
     """Return the System message content for an MCP-tool native command."""
     return (
@@ -150,14 +172,7 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
         if result.status == "awaiting_input":
             if self.bridge is not None:
                 await self.bridge.finish(self.generated_files)
-            pending = cl.user_session.get(SESSION_PENDING_CLARIFICATIONS_KEY) or {}
-            for event in self.clarifications:
-                message = clarification_message(event)
-                await message.send()
-                pending[str(event.ui_props.get("interrupt_id") or "")] = list(
-                    message.actions
-                )
-            cl.user_session.set(SESSION_PENDING_CLARIFICATIONS_KEY, pending)
+            await send_clarification_questions(self.clarifications)
             return
         if result.status != "completed":
             return
