@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import json
 import logging
 import threading
 from collections.abc import Awaitable, Callable
@@ -17,6 +18,7 @@ from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langgraph.errors import GraphBubbleUp, GraphRecursionError
 from langgraph.types import Command
 
 import chainagents.runtime.backends as runtime_backends
@@ -34,6 +36,17 @@ logger = logging.getLogger("chainagents.runtime.core")
 
 _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK = threading.RLock()
 _TOKEN_LIMIT_RETRY_MARKER = "chainagents_token_limit_retry"
+
+# Exceptions that must propagate instead of becoming retryable tool errors:
+# cancellation, LangGraph control flow (interrupts, parent commands), and an
+# exhausted step budget. Swallowing a GraphRecursionError would let a parent
+# delegate again with a fresh budget.
+NON_RECOVERABLE_TOOL_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.CancelledError,
+    GraphBubbleUp,
+    GraphRecursionError,
+)
+REPEATED_TOOL_RESULT_LIMIT = 10
 
 
 class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -93,6 +106,80 @@ class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
             )
         )
         return {"messages": replacement, "jump_to": "model"}
+
+
+def _tool_message_text(content: Any) -> str:
+    """Return a stable string form of ToolMessage content for comparison."""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, sort_keys=True, default=str)
+
+
+class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
+    """End a run stuck calling one tool with identical arguments and results.
+
+    The guard reads message history instead of holding instance state, so one
+    instance is safe across concurrent runs. Only the current turn (messages
+    after the latest human message) is inspected, and repeats count even when
+    interleaved with other calls. The same arguments with a changing result,
+    or the same result for different arguments, are treated as progress.
+    """
+
+    def __init__(self, *, limit: int = REPEATED_TOOL_RESULT_LIMIT) -> None:
+        super().__init__()
+        self.limit = limit
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
+        messages = state.get("messages") or []
+        turn_start = 0
+        for index in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[index], HumanMessage):
+                turn_start = index + 1
+                break
+
+        call_args: dict[str, tuple[str, str]] = {}
+        counts: dict[tuple[str, str, str], int] = {}
+        for message in messages[turn_start:]:
+            if isinstance(message, AIMessage):
+                for tool_call in message.tool_calls:
+                    call_id = tool_call.get("id")
+                    if call_id:
+                        call_args[call_id] = (
+                            str(tool_call.get("name") or ""),
+                            json.dumps(tool_call.get("args"), sort_keys=True, default=str),
+                        )
+                continue
+            if not isinstance(message, ToolMessage):
+                continue
+            call = call_args.get(message.tool_call_id)
+            if call is None:
+                continue
+            key = (*call, _tool_message_text(message.content))
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] < self.limit:
+                continue
+            tool_name, arguments = call
+            logger.warning(
+                "Stopping a non-converging run: %s was called %d times with "
+                "arguments %s and returned the same result each time.",
+                tool_name,
+                counts[key],
+                arguments[:200],
+            )
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            f"Stopped: `{tool_name}` was called {counts[key]} times with "
+                            "identical arguments and returned the same result each time, "
+                            "so the run was not making progress."
+                        )
+                    )
+                ],
+                "jump_to": "end",
+            }
+        return None
 
 
 class DisableSubagentDelegationMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -204,7 +291,7 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         try:
             self._map_workspace_path_args(request)
             return handler(request)
-        except asyncio.CancelledError:
+        except NON_RECOVERABLE_TOOL_EXCEPTIONS:
             raise
         except Exception as exc:
             return self._error_tool_message(request, exc)
@@ -226,7 +313,7 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         try:
             self._map_workspace_path_args(request)
             return await handler(request)
-        except asyncio.CancelledError:
+        except NON_RECOVERABLE_TOOL_EXCEPTIONS:
             raise
         except Exception as exc:
             return self._error_tool_message(request, exc)
@@ -495,6 +582,10 @@ def create_deep_agent_with_configured_summarization(
                 existing = profile.materialize_extra_middleware()
                 if not any(isinstance(item, TokenLimitedToolCallMiddleware) for item in existing):
                     existing.append(TokenLimitedToolCallMiddleware())
+                if not any(
+                    isinstance(item, RepeatedToolResultGuardMiddleware) for item in existing
+                ):
+                    existing.append(RepeatedToolResultGuardMiddleware())
                 return existing
 
             return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
@@ -553,5 +644,6 @@ def build_agent_middleware(
     )
     middleware.append(filesystem_middleware)
     middleware.append(TokenLimitedToolCallMiddleware())
+    middleware.append(RepeatedToolResultGuardMiddleware())
     middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
     return middleware

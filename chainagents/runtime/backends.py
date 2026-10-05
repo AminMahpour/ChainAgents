@@ -185,6 +185,15 @@ def build_deepagent_backend(
             virtual_mode=True,
         ),
     }
+    # Tool middleware rewrites `/workspace/...` arguments to real local paths
+    # before the backend sees them, so the real project root needs its own
+    # route. Matching is longest-prefix-first, so the artifact and output
+    # routes above still win for their subdirectories.
+    project_root_prefix = f"{Path(resolved_project_root).resolve().as_posix().rstrip('/')}/"
+    routes.setdefault(
+        project_root_prefix,
+        FilesystemBackend(root_dir=str(resolved_project_root), virtual_mode=True),
+    )
     if include_memories:
         routes["/memories/"] = StoreBackend(
             namespace=lambda _runtime: (memory_namespace,)

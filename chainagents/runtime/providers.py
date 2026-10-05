@@ -68,6 +68,48 @@ def _openai_compatible_reasoning_delta(chunk: dict[str, Any]) -> Any:
     return None
 
 
+_EPHEMERAL_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _add_cache_breakpoint(message: dict[str, Any]) -> bool:
+    """Mark the last content part of a Chat Completions message as cacheable.
+
+    String content is converted to a single text part so it can carry the
+    Anthropic ``cache_control`` field. Returns whether a breakpoint was set.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        if not content:
+            return False
+        message["content"] = [
+            {"type": "text", "text": content, "cache_control": dict(_EPHEMERAL_CACHE_CONTROL)}
+        ]
+        return True
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1]["cache_control"] = dict(_EPHEMERAL_CACHE_CONTROL)
+        return True
+    return False
+
+
+def _add_prompt_cache_breakpoints(messages: list[Any]) -> None:
+    """Cache the static system prefix and the transcript up to the newest message.
+
+    Snowflake Cortex only caches Claude prompts covered by an explicit
+    ``cache_control`` breakpoint. The system breakpoint caches the static
+    prefix; the one on the newest message lets the next turn, which only
+    appends, reuse the whole transcript.
+    """
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") in {"system", "developer"}:
+            _add_cache_breakpoint(message)
+            break
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") in {"system", "developer"}:
+            continue
+        if _add_cache_breakpoint(message):
+            break
+
+
 class _ToolCallChunkIndexRepair:
     """Repair a provider stream that reuses one index for distinct tool calls."""
 
@@ -335,6 +377,10 @@ class SnowflakeCortexChatOpenAI(OpenAICompatibleChatOpenAI):
 
         if pending_ids:
             raise ValueError("incomplete tool-call batch at payload end")
+        # The cache_control syntax is Anthropic-specific; Cortex rejects or
+        # ignores it for other model families.
+        if "claude" in str(payload.get("model") or self.model_name or "").lower():
+            _add_prompt_cache_breakpoints(rewritten_messages)
         payload["messages"] = rewritten_messages
         return payload
 

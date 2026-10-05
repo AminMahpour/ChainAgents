@@ -96,8 +96,8 @@ SYSTEM_PROMPT = f"""
 You are a local workspace deep agent running inside a Chainlit UI.
 
 Workspace contract:
-- Use `/workspace/` for real project files. This route maps to `{PROJECT_ROOT}`.
-- Write downloadable generated files under `/workspace/.files/outputs/`, which maps to `{PROJECT_ROOT / GENERATED_OUTPUTS_DIRECTORY}`.
+- Use `/workspace/` for real project files. Always address project files through `/workspace/` paths.
+- Write downloadable generated files under `/workspace/.files/outputs/`.
 {SYSTEM_PROMPT_MEMORY_LINE}
 - Use any other absolute path only for ephemeral scratch work.
 
