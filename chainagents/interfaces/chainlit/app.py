@@ -33,7 +33,10 @@ from chainagents.interfaces.chainlit.async_tasks import (
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.lifetime import ConversationScopeLeaseManager
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
-from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
+from chainagents.interfaces.chainlit.renderer import (
+    CLARIFICATION_ANSWER_ACTION,
+    ChainlitTurnRenderer,
+)
 from chainagents.interfaces.chainlit.settings import (
     SESSION_MCP_SESSION_ID_KEY,  # noqa: F401
     SESSION_SETTINGS_KEY,
@@ -1629,6 +1632,19 @@ async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
 
 
 chainlit_config.code.on_message = _guarded_chainlit_message_callback
+
+
+@cl.action_callback(CLARIFICATION_ANSWER_ACTION)
+async def answer_clarification(action: cl.Action) -> None:
+    """Send a clarification option as the user's answer, like a typed reply."""
+    answer = str((action.payload or {}).get("answer") or "").strip()
+    if not answer:
+        return
+    with suppress(Exception):
+        await action.remove()
+    message = cl.Message(content=answer, author="User", type="user_message")
+    await message.send()
+    await _guarded_chainlit_message_callback(message)
 
 
 async def _handle_message(

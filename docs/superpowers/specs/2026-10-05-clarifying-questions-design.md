@@ -1,7 +1,7 @@
 # Clarifying Questions Before Delegation — Design
 
 Date: 2026-10-05
-Status: Approved design, pending spec review
+Status: Implemented
 
 ## Goal
 
@@ -75,13 +75,12 @@ ask_user(question: str, options: list[str] | None = None) -> str
 - Empty `question` returns an error string; `options` is optional, trimmed,
   de-duplicated, capped at 6 entries.
 
-Registration (`chainagents/runtime/graph.py`): appended to `main_tools` after
-the inheritance copy taken for subagents — the same placement as the messaging
-tools — so compiled subagents do not receive it. Leaf subagent specs without
-explicit tools would otherwise inherit `create_deep_agent`'s full `tools` list
-(which includes `ask_user`), so when the tool is registered, each such leaf spec
-is given an explicit `tools` list equal to the inheritance copy. Verified by
-test.
+Registration (`chainagents/runtime/graph.py`): the tool is attached through a
+`ClarificationMiddleware` appended to the main agent's middleware only.
+DeepAgents copies the main agent's `tools` argument into subagents that declare
+no tools of their own (including the built-in general-purpose subagent), but
+never middleware tools, so attaching the tool through middleware keeps it
+main-agent only without rewriting subagent tool lists. Verified by test.
 
 ### 2. Prompt guidance
 
@@ -127,16 +126,21 @@ prompt:
   free-text reply also works. On `awaiting_input`, do not send the
   final-response message or the reflection prompt.
 - **CLI** (`interfaces/cli/render.py`, `app.py`): print the question and a
-  numbered option list. In the REPL, the next line is the answer; a bare number
-  selects that option. One-shot mode prints the question and exits 0 with a
-  note to answer in the REPL with the same thread id. JSON output includes the
-  question and `status: "awaiting_input"`.
+  numbered option list. The next prompt on the thread is the answer. A paused
+  turn exits 0 with a note to answer with the next prompt on the same thread
+  (across processes this needs the Postgres checkpointer). JSON output includes
+  `status: "awaiting_input"` and the pending `clarifications`.
+- A bare option number (for example `2`) is mapped to that option by the
+  runner, so every interface supports it.
 - **TUI** (`interfaces/tui/app.py`): show the question and options, set the
   status line to "Waiting for your answer", and re-enable the prompt box. A
   bare number selects an option.
 - **HTTP API** (`interfaces/api/app.py`): the event passes through the generic
-  `_event_payload`; the `done` payload carries `status: "awaiting_input"`.
-  Posting the next input to the same thread resumes it. No new endpoint.
+  `_event_payload`. Only for a paused turn, the stream's `done` payload adds
+  `status: "awaiting_input"` and `/api/agent/invoke` adds `status` and
+  `clarifications`, so existing payloads are unchanged. `/api/agent/input`
+  results include `clarifications`. Posting the next input to the same thread
+  resumes it. No new endpoint.
 
 ## Data flow
 

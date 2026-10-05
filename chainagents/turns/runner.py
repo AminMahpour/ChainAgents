@@ -443,7 +443,10 @@ class TurnRunner:
         }
         if resume:
             payload = Command(
-                resume={pending.interrupt_id: prompt for pending in resume}
+                resume={
+                    pending.interrupt_id: clarification_answer(prompt, pending)
+                    for pending in resume
+                }
             )
         adapter = AgentStreamEventAdapter(prompt=prompt)
         stream = agent.astream_events(
@@ -558,6 +561,14 @@ def safe_command_validation_error(exc: ValueError) -> str:
     ):
         return "Command arguments must be valid JSON."
     return safe_backend_error(exc, "Command arguments could not be validated.")
+
+
+def clarification_answer(text: str, pending: PendingClarification) -> str:
+    """Return the answer for ``pending``, mapping a bare option number to it."""
+    stripped = text.strip()
+    if stripped.isdigit() and 1 <= int(stripped) <= len(pending.options):
+        return pending.options[int(stripped) - 1]
+    return text
 
 
 def _clarification_enabled(runtime: Any) -> bool:

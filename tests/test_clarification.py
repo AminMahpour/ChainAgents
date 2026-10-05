@@ -314,3 +314,111 @@ def test_runner_ignores_interrupts_when_clarification_is_disabled(tmp_path: Path
 
     assert result.status == "completed"
     assert result.clarifications == []
+
+
+# --- interfaces ---------------------------------------------------------------
+
+
+def _pending(options: tuple[str, ...] = ("api", "cli")):
+    from chainagents.runtime.clarification import PendingClarification
+
+    return PendingClarification(interrupt_id="i1", question="Which module?", options=options)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("2", "cli"), (" 1 ", "api"), ("3", "3"), ("0", "0"), ("the cli one", "the cli one")],
+)
+def test_bare_option_number_selects_that_option(text: str, expected: str) -> None:
+    from chainagents.turns.runner import clarification_answer
+
+    assert clarification_answer(text, _pending()) == expected
+
+
+def _question_event():
+    from chainagents.events.stream import AgentStreamEvent
+
+    return AgentStreamEvent(
+        kind="clarification_requested",
+        source="main-agent",
+        text="Which module?",
+        ui_props={"options": ["api", "cli"], "interrupt_id": "i1"},
+    )
+
+
+def test_cli_renderer_prints_question_and_numbered_options() -> None:
+    import io
+
+    from chainagents.interfaces.cli.render import CliEventRenderer
+    from chainagents.turns.runner import TurnResult
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    renderer = CliEventRenderer(
+        stdout=stdout,
+        stderr=stderr,
+        stream=True,
+        json_output=False,
+        show_reasoning=False,
+        show_tools=False,
+    )
+
+    async def exercise() -> None:
+        await renderer.on_event(_question_event())
+        await renderer.on_complete(TurnResult(status="awaiting_input", prompt="x"))
+
+    asyncio.run(exercise())
+
+    output = stdout.getvalue()
+    assert "Which module?" in output
+    assert "1. api" in output and "2. cli" in output
+
+
+def test_cli_json_renderer_skips_the_question_panel() -> None:
+    import io
+
+    from chainagents.interfaces.cli.render import CliEventRenderer
+
+    stdout = io.StringIO()
+    renderer = CliEventRenderer(
+        stdout=stdout,
+        stderr=io.StringIO(),
+        stream=False,
+        json_output=True,
+        show_reasoning=False,
+        show_tools=False,
+    )
+
+    asyncio.run(renderer.on_event(_question_event()))
+
+    assert stdout.getvalue() == ""
+
+
+def test_api_payloads_report_a_paused_turn_only_when_paused() -> None:
+    from chainagents.interfaces.api.app import _clarifications_payload, _done_payload
+    from chainagents.turns.runner import TurnResult
+
+    context = SimpleNamespace(thread_id="t", model_name="m", reasoning_level="medium")
+    result = TurnResult(status="awaiting_input", prompt="x", clarifications=[_pending()])
+
+    assert "status" not in _done_payload(context)  # type: ignore[arg-type]
+    assert _done_payload(context, status="awaiting_input")["status"] == "awaiting_input"  # type: ignore[arg-type]
+    assert _clarifications_payload(result) == [
+        {"interrupt_id": "i1", "question": "Which module?", "options": ["api", "cli"]}
+    ]
+
+
+def test_chainlit_question_message_offers_one_action_per_option(monkeypatch) -> None:
+    from chainagents.interfaces.chainlit import renderer as chainlit_renderer
+    from chainagents.interfaces.chainlit.renderer import (
+        CLARIFICATION_ANSWER_ACTION,
+        clarification_message,
+    )
+
+    monkeypatch.setattr(chainlit_renderer.cl, "Message", SimpleNamespace)
+    message = clarification_message(_question_event())
+
+    assert message.content.startswith("Which module?")
+    assert [(a.name, a.label, a.payload) for a in message.actions] == [
+        (CLARIFICATION_ANSWER_ACTION, "api", {"answer": "api"}),
+        (CLARIFICATION_ANSWER_ACTION, "cli", {"answer": "cli"}),
+    ]

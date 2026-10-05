@@ -631,6 +631,13 @@ class TuiRenderer(BaseTurnRenderer):
             app._append_tool_entry(
                 f"{event.source} summarization {event.status}: {event.text}"
             )
+        elif event.kind == "clarification_requested":
+            options = event.ui_props.get("options") or []
+            lines = [event.text]
+            lines.extend(f"{index}. {option}" for index, option in enumerate(options, 1))
+            if options:
+                lines.append("Reply with a number or your own answer.")
+            await app._append_conversation("Question", "\n".join(lines))
 
     async def on_command_result(self, result: RuntimeCommandResult) -> None:
         """Show MCP-tool command output in the tools pane."""
@@ -669,6 +676,8 @@ class TuiRenderer(BaseTurnRenderer):
         command = result.command_result
         if command is not None and command.target == "mcp_tool":
             self.app._set_status(f"Command /{command.command_name} finished.")
+        elif result.status == "awaiting_input":
+            self.app._set_status("Waiting for your answer.")
         else:
             self.app._set_status("Ready.")
 

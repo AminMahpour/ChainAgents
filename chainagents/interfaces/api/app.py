@@ -231,6 +231,10 @@ class AgentRunResponse(BaseModel):
     model: str
     reasoning: ReasoningLevel
     warnings: list[str] = Field(default_factory=list)
+    # Set only when the agent paused to ask ``clarifications``
+    # (status "awaiting_input"); the next input on the thread answers them.
+    status: str | None = None
+    clarifications: list[dict[str, Any]] | None = None
 
 
 class RuntimeStatusResponse(BaseModel):
@@ -669,7 +673,11 @@ def create_app(
             media_type="application/pdf",
         )
 
-    @app.post("/api/agent/invoke", response_model=AgentRunResponse)
+    @app.post(
+        "/api/agent/invoke",
+        response_model=AgentRunResponse,
+        response_model_exclude_none=True,
+    )
     async def invoke_agent(
         payload: AgentRunRequest,
         request: Request,
@@ -693,12 +701,15 @@ def create_app(
         if result.error is not None:
             raise _agent_error(result.error) from result.error
 
+        paused = result.status == "awaiting_input"
         return AgentRunResponse(
             response=result.response,
             thread_id=context.thread_id,
             model=context.model_name,
             reasoning=context.reasoning_level,
             warnings=renderer.warnings,
+            status="awaiting_input" if paused else None,
+            clarifications=_clarifications_payload(result) if paused else None,
         )
 
     @app.post("/api/agent/input", status_code=202)
@@ -793,6 +804,7 @@ def create_app(
                 "response": result.response,
                 "warnings": renderer.warnings,
                 "error": error,
+                "clarifications": _clarifications_payload(result),
             }
 
         followup_base = replace(
@@ -1327,7 +1339,7 @@ class NdjsonRenderer(BaseTurnRenderer):
 
     async def on_complete(self, result: TurnResult) -> None:
         if result.ok:
-            await self._emit(_done_payload(self.context))
+            await self._emit(_done_payload(self.context, status=result.status))
 
 
 class _WarningCollector(BaseTurnRenderer):
@@ -1391,14 +1403,31 @@ def _reflection_proposal_payload(
     }
 
 
-def _done_payload(context: AgentRunContext) -> dict[str, Any]:
-    """Build the terminal stream event."""
-    return {
+def _done_payload(
+    context: AgentRunContext, *, status: str = "completed"
+) -> dict[str, Any]:
+    """Build the terminal stream event; a paused turn adds its status."""
+    payload: dict[str, Any] = {
         "kind": "done",
         "thread_id": context.thread_id,
         "model": context.model_name,
         "reasoning": context.reasoning_level,
     }
+    if status == "awaiting_input":
+        payload["status"] = status
+    return payload
+
+
+def _clarifications_payload(result: TurnResult) -> list[dict[str, Any]]:
+    """Describe the questions a paused turn is waiting on."""
+    return [
+        {
+            "interrupt_id": item.interrupt_id,
+            "question": item.question,
+            "options": list(item.options),
+        }
+        for item in result.clarifications
+    ]
 
 
 def _attachment_status_payload(result: RagUploadResult) -> dict[str, Any]:

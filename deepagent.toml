@@ -120,6 +120,12 @@ enabled = false
 max_queued_turns = 20
 max_completed_turns = 100
 
+[agent.clarification]
+# Let the main agent pause and ask one clarifying question before delegating
+# ambiguous work to subagents. Your next message on the thread answers it.
+# Requires agent.state = "stateful".
+enabled = false
+
 [agent.reflection]
 enabled = false
 memory_file = "/memories/AGENTS.md"

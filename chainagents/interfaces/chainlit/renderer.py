@@ -15,6 +15,27 @@ from chainagents.exports.response import generated_file_elements
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge
 from chainagents.turns import BaseTurnRenderer, TurnCommandError, TurnResult
 
+CLARIFICATION_ANSWER_ACTION = "chainagents_clarification_answer"
+
+
+def clarification_message(event: AgentStreamEvent) -> cl.Message:
+    """Return the message asking the user a clarifying question."""
+    options = [str(option) for option in event.ui_props.get("options") or []]
+    content = event.text
+    if options:
+        content += "\n\nPick an option or type your own answer."
+    return cl.Message(
+        content=content,
+        actions=[
+            cl.Action(
+                name=CLARIFICATION_ANSWER_ACTION,
+                payload={"answer": option},
+                label=option,
+            )
+            for option in options
+        ],
+    )
+
 
 def native_command_output_message(result: RuntimeCommandResult) -> str:
     """Return the System message content for an MCP-tool native command."""
@@ -50,6 +71,7 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
         self.bridge: ChainlitEventBridge | None = None
         self.command_result: RuntimeCommandResult | None = None
         self.generated_files: list[GeneratedFileDescriptor] = []
+        self.clarifications: list[AgentStreamEvent] = []
 
     async def on_agent_start(self, prompt: str) -> None:
         await self._start_bridge(prompt)
@@ -57,6 +79,10 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
     async def on_event(self, event: AgentStreamEvent) -> None:
         if event.kind == "mcp_status":
             await cl.Message(content=event.text).send()
+            return
+        if event.kind == "clarification_requested":
+            # Asked after the partial response is finished, in on_complete.
+            self.clarifications.append(event)
             return
         # The runner calls on_agent_start before any other stream event.
         assert self.bridge is not None
@@ -92,6 +118,12 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
             )
 
     async def on_complete(self, result: TurnResult) -> None:
+        if result.status == "awaiting_input":
+            if self.bridge is not None:
+                await self.bridge.finish(self.generated_files)
+            for event in self.clarifications:
+                await clarification_message(event).send()
+            return
         if result.status != "completed":
             return
         if self.command_result is not None:

@@ -176,6 +176,8 @@ class CliEventRenderer(BaseTurnRenderer):
             self._complete_tool_event(event)
         elif event.kind == "summarization_status":
             self._stream_summarization_status(event)
+        elif event.kind == "clarification_requested":
+            self._print_clarification(event)
 
     async def on_command_result(self, result: RuntimeCommandResult) -> None:
         """Print MCP-tool command output as raw JSON on stdout."""
@@ -193,7 +195,7 @@ class CliEventRenderer(BaseTurnRenderer):
         if result.status == "command_error":
             return
         command_output = is_command_output(result)
-        if result.status == "completed" and not command_output:
+        if result.status in {"completed", "awaiting_input"} and not command_output:
             self._finish_response()
         else:
             self._close_reasoning_line()
@@ -224,6 +226,25 @@ class CliEventRenderer(BaseTurnRenderer):
             return
         if self.response_buffer:
             self.stdout_console.print(Text(self.response_buffer, style="bright_white"))
+
+    def _print_clarification(self, event: AgentStreamEvent) -> None:
+        """Print the agent's clarifying question and numbered options."""
+        if self.json_output:
+            return
+        self._close_reasoning_line()
+        self._end_streamed_response_line()
+        lines = [event.text]
+        options = event.ui_props.get("options") or []
+        lines.extend(f"  {index}. {option}" for index, option in enumerate(options, 1))
+        if options:
+            lines.append("Reply with a number or your own answer.")
+        self.stdout_console.print(
+            cli_panel(
+                Text("\n".join(lines), style="bright_white"),
+                title="Question",
+                border_style="yellow",
+            )
+        )
 
     def _end_streamed_response_line(self) -> None:
         """Terminate partially streamed stdout text with a newline."""

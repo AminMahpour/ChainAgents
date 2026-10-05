@@ -264,6 +264,11 @@ async def run_agent_prompt(
         return 2 if result.command_error.unknown else 1
     if result.status == "failed":
         return 1
+    if result.status == "awaiting_input" and not args.json_output:
+        print(
+            f"Answer with your next prompt on thread '{thread_id}' to continue.",
+            file=stderr,
+        )
     if result.status == "skipped" or is_command_output(result) or not args.json_output:
         return 0
 
@@ -277,6 +282,16 @@ async def run_agent_prompt(
         payload["reflection_proposal"] = result.reflection.to_payload()
     if result.generated_files:
         payload["generated_files"] = generated_file_paths(result)
+    if result.status == "awaiting_input":
+        payload["status"] = "awaiting_input"
+        payload["clarifications"] = [
+            {
+                "interrupt_id": item.interrupt_id,
+                "question": item.question,
+                "options": list(item.options),
+            }
+            for item in result.clarifications
+        ]
     if emit_json:
         print(json.dumps(payload, indent=2, sort_keys=True), file=stdout)
         return 0
