@@ -108,11 +108,23 @@ class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
         return {"messages": replacement, "jump_to": "model"}
 
 
+_OFFLOADED_TOOL_RESULT_PREFIX = "Tool result too large, the result of this tool call "
+
+
 def _tool_message_text(content: Any) -> str:
-    """Return a stable string form of ToolMessage content for comparison."""
-    if isinstance(content, str):
-        return content
-    return json.dumps(content, sort_keys=True, default=str)
+    """Return a stable string form of ToolMessage content for comparison.
+
+    DeepAgents replaces a large result with a stub whose first line names the
+    tool-call id and a per-call file path, so identical large results would
+    never compare equal. The rest of the stub previews the original content,
+    so the first line is dropped before comparing.
+    """
+    text = content if isinstance(content, str) else json.dumps(
+        content, sort_keys=True, default=str
+    )
+    if text.startswith(_OFFLOADED_TOOL_RESULT_PREFIX):
+        return text.partition("\n")[2]
+    return text
 
 
 class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -121,8 +133,10 @@ class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
     The guard reads message history instead of holding instance state, so one
     instance is safe across concurrent runs. Only the current turn (messages
     after the latest human message) is inspected, and repeats count even when
-    interleaved with other calls. The same arguments with a changing result,
-    or the same result for different arguments, are treated as progress.
+    interleaved with other calls. The count for a tool and its arguments
+    restarts whenever the result changes, so polling that eventually reports
+    a new status is treated as progress, as is the same result for different
+    arguments.
     """
 
     def __init__(self, *, limit: int = REPEATED_TOOL_RESULT_LIMIT) -> None:
@@ -139,7 +153,8 @@ class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
                 break
 
         call_args: dict[str, tuple[str, str]] = {}
-        counts: dict[tuple[str, str, str], int] = {}
+        # Latest result and its run length for each (tool, arguments) pair.
+        streaks: dict[tuple[str, str], tuple[str, int]] = {}
         for message in messages[turn_start:]:
             if isinstance(message, AIMessage):
                 for tool_call in message.tool_calls:
@@ -155,23 +170,25 @@ class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
             call = call_args.get(message.tool_call_id)
             if call is None:
                 continue
-            key = (*call, _tool_message_text(message.content))
-            counts[key] = counts.get(key, 0) + 1
-            if counts[key] < self.limit:
+            result = _tool_message_text(message.content)
+            previous_result, previous_count = streaks.get(call, (None, 0))
+            count = previous_count + 1 if previous_result == result else 1
+            streaks[call] = (result, count)
+            if count < self.limit:
                 continue
             tool_name, arguments = call
             logger.warning(
                 "Stopping a non-converging run: %s was called %d times with "
                 "arguments %s and returned the same result each time.",
                 tool_name,
-                counts[key],
+                count,
                 arguments[:200],
             )
             return {
                 "messages": [
                     AIMessage(
                         content=(
-                            f"Stopped: `{tool_name}` was called {counts[key]} times with "
+                            f"Stopped: `{tool_name}` was called {count} times with "
                             "identical arguments and returned the same result each time, "
                             "so the run was not making progress."
                         )
@@ -233,7 +250,15 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
             request: The request value.
         """
         args = request.tool_call.get("args")
-        mapped_args = runtime_backends.map_workspace_paths_in_tool_args(args, self.project_root)
+        tool_name = str(request.tool_call.get("name") or "")
+        if tool_name in runtime_backends.BACKEND_FILESYSTEM_TOOLS:
+            mapped_args = runtime_backends.map_backend_tool_paths_to_virtual(
+                args, self.project_root
+            )
+        else:
+            mapped_args = runtime_backends.map_workspace_paths_in_tool_args(
+                args, self.project_root
+            )
         if mapped_args is not args:
             request.tool_call["args"] = mapped_args
 

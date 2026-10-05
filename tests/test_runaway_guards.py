@@ -28,49 +28,75 @@ from chainagents.runtime.types import BackgroundSubagentConfig
 # --- /workspace path mapping ------------------------------------------------
 
 
-def _mapped(path: str, project_root: Path) -> str:
+def _mapped(path: str, project_root: Path, *, tool: str = "ls", key: str = "path") -> str:
     middleware = ToolExecutionResilienceMiddleware(project_root=project_root)
     request = ToolCallRequest(
-        tool_call={"id": "c", "name": "ls", "args": {"path": path}, "type": "tool_call"},
-        tool=SimpleNamespace(name="ls"),
+        tool_call={"id": "c", "name": tool, "args": {key: path}, "type": "tool_call"},
+        tool=SimpleNamespace(name=tool),
         state={},
         runtime=SimpleNamespace(),
     )
     middleware._map_workspace_path_args(request)
-    return request.tool_call["args"]["path"]
+    return request.tool_call["args"][key]
 
 
 @pytest.mark.parametrize("path", ["/workspace", "/workspace/", "/workspace/skills"])
-def test_mapped_workspace_paths_reach_the_real_filesystem(tmp_path: Path, path: str) -> None:
+def test_filesystem_tool_workspace_paths_reach_the_real_filesystem(
+    tmp_path: Path, path: str
+) -> None:
     (tmp_path / "skills" / "reviewer").mkdir(parents=True)
     (tmp_path / "skills" / "reviewer" / "SKILL.md").write_text("skill")
     (tmp_path / "README.md").write_text("readme")
     backend = build_deepagent_backend(project_root=tmp_path, include_memories=False)
 
-    for candidate in (path, _mapped(path, tmp_path)):
-        result = backend.ls(candidate)
-        assert result.entries, f"{candidate} listed no entries"
+    mapped = _mapped(path, tmp_path)
+
+    assert mapped == path
+    assert backend.ls(mapped).entries
 
 
-def test_mapped_skill_file_is_readable(tmp_path: Path) -> None:
+def test_real_project_paths_map_back_to_workspace_for_filesystem_tools(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "skills").mkdir()
     (tmp_path / "skills" / "SKILL.md").write_text("skill body")
     backend = build_deepagent_backend(project_root=tmp_path, include_memories=False)
+    root = tmp_path.resolve()
 
-    result = backend.read(_mapped("/workspace/skills/SKILL.md", tmp_path))
+    mapped = _mapped(str(root / "skills" / "SKILL.md"), tmp_path, tool="read_file", key="file_path")
 
+    assert mapped == "/workspace/skills/SKILL.md"
+    result = backend.read(mapped)
     assert result.error is None
     assert "skill body" in str(result.file_data)
+    assert _mapped(str(root), tmp_path) == "/workspace/"
 
 
-def test_project_root_route_does_not_shadow_outputs_route(tmp_path: Path) -> None:
+def test_routed_real_paths_keep_their_real_form(tmp_path: Path) -> None:
+    outputs = tmp_path.resolve() / ".files" / "outputs" / "report.md"
+
+    assert _mapped(str(outputs), tmp_path, tool="read_file", key="file_path") == str(outputs)
+
+
+def test_non_filesystem_tools_still_get_real_paths(tmp_path: Path) -> None:
+    mapped = _mapped("/workspace/skills/SKILL.md", tmp_path, tool="mcp_read", key="path")
+
+    assert mapped == str(tmp_path.resolve() / "skills" / "SKILL.md")
+
+
+def test_project_root_is_routed_only_through_workspace(tmp_path: Path) -> None:
+    # A root-wide glob or grep queries every route, so a second route onto the
+    # project root would return each file twice and expose the real path.
     backend = build_deepagent_backend(project_root=tmp_path, include_memories=False)
     root = tmp_path.resolve().as_posix()
 
-    routed, key = backend._get_backend_and_key(f"{root}/.files/outputs/report.md")
+    project_routes = [
+        prefix for prefix, route in backend.routes.items()
+        if Path(getattr(route, "cwd", "") or "/nonexistent").resolve() == tmp_path.resolve()
+    ]
 
-    assert routed is backend.routes[f"{root}/.files/outputs/"]
-    assert key == "/report.md"
+    assert project_routes == ["/workspace/"]
+    assert f"{root}/" not in backend.routes
 
 
 def test_system_prompt_does_not_disclose_the_project_root() -> None:
@@ -176,6 +202,40 @@ def test_guard_ignores_repeats_from_earlier_turns() -> None:
     messages = [*earlier, AIMessage(content="Stopped."), HumanMessage(content="try again")]
 
     assert _guard(messages) is None
+
+
+def test_guard_restarts_the_count_when_the_result_changes() -> None:
+    results = ["pending"] * 5 + ["running"] + ["pending"] * 5
+    messages = _history([_call_pair(i, {"id": "job"}, r) for i, r in enumerate(results)])
+
+    assert _guard(messages) is None
+
+
+def test_guard_still_stops_ten_unchanged_results_after_a_change() -> None:
+    results = ["running"] + ["pending"] * 10
+    messages = _history([_call_pair(i, {"id": "job"}, r) for i, r in enumerate(results)])
+
+    assert _guard(messages) is not None
+
+
+def _offloaded(call_id: str, sample: str) -> str:
+    return (
+        f"Tool result too large, the result of this tool call {call_id} was saved "
+        f"in the filesystem at this path: /large_tool_results/{call_id}\n\n"
+        f"You can read the result from the filesystem.\n\n{sample}\n"
+    )
+
+
+def test_guard_compares_offloaded_results_by_content() -> None:
+    pairs = [_call_pair(i, {"q": "all"}, _offloaded(f"call-{i}", "same rows")) for i in range(10)]
+
+    assert _guard(_history(pairs)) is not None
+
+
+def test_guard_treats_different_offloaded_content_as_progress() -> None:
+    pairs = [_call_pair(i, {"q": "all"}, _offloaded(f"call-{i}", f"rows {i}")) for i in range(10)]
+
+    assert _guard(_history(pairs)) is None
 
 
 def test_agent_middleware_includes_the_repeat_guard(tmp_path: Path) -> None:

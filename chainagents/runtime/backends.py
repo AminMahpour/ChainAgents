@@ -126,6 +126,70 @@ def map_workspace_paths_in_tool_args(args: Any, project_root: Path | None = None
     return mapped
 
 
+# DeepAgents filesystem tools resolve paths through the composite backend,
+# which already routes `/workspace/`. Their arguments must stay virtual:
+# rewriting them to real paths would fall through to the empty state backend.
+BACKEND_FILESYSTEM_TOOLS = frozenset({"ls", "read_file", "write_file", "edit_file", "glob", "grep", "delete"})
+BACKEND_FILESYSTEM_PATH_ARG_KEYS = {"path", "file_path"}
+
+
+def _map_local_tool_path_value(value: Any, project_root: Path) -> Any:
+    """Map one real project path value back to its virtual workspace path."""
+    if isinstance(value, str):
+        return local_project_path_to_virtual(value, project_root)
+    if isinstance(value, list):
+        return [_map_local_tool_path_value(item, project_root) for item in value]
+    return value
+
+
+def map_backend_tool_paths_to_virtual(args: Any, project_root: Path | None = None) -> Any:
+    """Rewrite real project paths in a filesystem tool's args to `/workspace/`.
+
+    Args:
+        args: Parsed tool-call arguments.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The mapped arguments, or ``args`` itself when nothing changed.
+    """
+    if not isinstance(args, dict):
+        return args
+    root = (project_root or runtime_constants.PROJECT_ROOT).resolve()
+    mapped = dict(args)
+    changed = False
+    for key, value in args.items():
+        if str(key).lower() in BACKEND_FILESYSTEM_PATH_ARG_KEYS:
+            mapped[key] = _map_local_tool_path_value(value, root)
+            changed = changed or mapped[key] != value
+    return mapped if changed else args
+
+
+def local_project_path_to_virtual(path_value: str, project_root: Path | None = None) -> str:
+    """Convert a real path inside the project into a `/workspace/` path.
+
+    Paths under the artifact and output directories keep their real form,
+    because the backend routes those real prefixes directly.
+
+    Args:
+        path_value: The path value value.
+        project_root: Project root used to resolve local paths.
+
+    Returns:
+        The virtual workspace path, or ``path_value`` unchanged.
+    """
+    normalized = path_value.strip().replace("\\", "/")
+    root = (project_root or runtime_constants.PROJECT_ROOT).resolve()
+    root_text = root.as_posix().rstrip("/")
+    if normalized != root_text and not normalized.startswith(f"{root_text}/"):
+        return path_value
+    for routed_root in (deepagent_artifacts_root(root), generated_outputs_root(root)):
+        routed_text = routed_root.as_posix().rstrip("/")
+        if normalized == routed_text or normalized.startswith(f"{routed_text}/"):
+            return path_value
+    relative = normalized.removeprefix(root_text).lstrip("/")
+    return f"/workspace/{relative}" if relative else "/workspace/"
+
+
 def virtual_workspace_path_to_local(path_value: str, project_root: Path | None = None) -> str:
     """Convert a virtual workspace path into a local filesystem path.
 
@@ -185,15 +249,6 @@ def build_deepagent_backend(
             virtual_mode=True,
         ),
     }
-    # Tool middleware rewrites `/workspace/...` arguments to real local paths
-    # before the backend sees them, so the real project root needs its own
-    # route. Matching is longest-prefix-first, so the artifact and output
-    # routes above still win for their subdirectories.
-    project_root_prefix = f"{Path(resolved_project_root).resolve().as_posix().rstrip('/')}/"
-    routes.setdefault(
-        project_root_prefix,
-        FilesystemBackend(root_dir=str(resolved_project_root), virtual_mode=True),
-    )
     if include_memories:
         routes["/memories/"] = StoreBackend(
             namespace=lambda _runtime: (memory_namespace,)
