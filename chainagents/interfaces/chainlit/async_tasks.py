@@ -34,6 +34,7 @@ DEFAULT_AGENT_PROTOCOL_URL = "http://127.0.0.1:2024"
 TERMINAL_STATUSES = {"success", "error", "cancelled", "interrupted", "timeout"}
 MAX_STORED_SESSIONS = 128
 MAX_RETAINED_NOTICES_PER_SESSION = 256
+MAX_TAB_NOTICE_IDS = 1024
 MISSED_NOTICE_RETENTION_SECONDS = 24 * 60 * 60
 logger = logging.getLogger("chainagents.interfaces.chainlit.async_tasks")
 
@@ -179,6 +180,7 @@ class LocalBackgroundTaskNotifier:
         reasoning_steps_enabled: bool = True,
         tool_steps_enabled: bool = True,
         delivery_allowed: Callable[[], bool] | None = None,
+        tab_notice_ids: dict[str, None] | None = None,
     ) -> None:
         self.manager = manager
         self.session_id = session_id
@@ -192,6 +194,8 @@ class LocalBackgroundTaskNotifier:
         self.task: asyncio.Task[None] | None = None
         self._completion_state: _LocalCompletionState | None = None
         self._delivered_task_ids: OrderedDict[str, None] = OrderedDict()
+        # Notice IDs shown in this Chainlit tab, shared by its later notifiers.
+        self.tab_notice_ids = tab_notice_ids if tab_notice_ids is not None else {}
 
     def start(self) -> None:
         """Subscribe and start consuming completion events."""
@@ -302,6 +306,10 @@ class LocalBackgroundTaskNotifier:
                 _retain_terminal_snapshot(state, snapshot)
                 return
             self._delivered_task_ids[snapshot.task_id] = None
+            self.tab_notice_ids.pop(notice_id, None)
+            self.tab_notice_ids[notice_id] = None
+            while len(self.tab_notice_ids) > MAX_TAB_NOTICE_IDS:
+                del self.tab_notice_ids[next(iter(self.tab_notice_ids))]
             state.notified_task_ids[snapshot.task_id] = None
             state.retained_snapshots.pop(snapshot.task_id, None)
             while len(self._delivered_task_ids) > max_notified:

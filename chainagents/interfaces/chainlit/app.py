@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 from collections import deque
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext, suppress
@@ -95,6 +96,7 @@ chainlit_socket: Any = importlib.import_module("chainlit.socket")
 SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY = "local_background_task_notifier"
+SESSION_LOCAL_NOTICE_IDS_KEY = "local_background_notice_ids"
 SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
 SESSION_INPUT_DRAFTS_KEY = "pending_input_drafts"
 STEER_INPUT_ACTION = "steer_busy_input"
@@ -213,7 +215,14 @@ async def _retain_conversation_until_idle(
                         if not await _conversation_has_work(
                             runtime, thread_id, entry.foreground_tasks
                         ):
-                            break
+                            # A clear can add work while the busy query awaits.
+                            # Stop accepting first, then recheck synchronously.
+                            entry.accepting_work = False
+                            if not _unfinished_foreground_tasks(
+                                *entry.foreground_tasks
+                            ):
+                                break
+                            entry.accepting_work = True
                     await asyncio.sleep(0.05)
                 except asyncio.CancelledError:
                     raise
@@ -239,6 +248,14 @@ async def _retain_conversation_until_idle(
                     await asyncio.sleep(0.05)
                 if chainlit_socket.WebsocketSession.get_by_id(cleared.id) is None:
                     chainlit_user_sessions.pop(cleared.id, None)
+                    # Generated elements sent after Chainlit deleted the session
+                    # re-create its files dir. The data layer keeps durable
+                    # copies; this session-local copy can never be served.
+                    files_dir = getattr(cleared, "files_dir", None)
+                    if files_dir is not None:
+                        await asyncio.to_thread(
+                            shutil.rmtree, files_dir, ignore_errors=True
+                        )
 
     entry.task = asyncio.create_task(release_when_idle())
 
@@ -838,12 +855,17 @@ async def start_local_background_notifier(
         session = cl.context.session
     except Exception:
         session = None
+    tab_notice_ids = cl.user_session.get(SESSION_LOCAL_NOTICE_IDS_KEY)
+    if not isinstance(tab_notice_ids, dict):
+        tab_notice_ids = {}
+        cl.user_session.set(SESSION_LOCAL_NOTICE_IDS_KEY, tab_notice_ids)
     notifier = LocalBackgroundTaskNotifier(
         manager=runtime.background_tasks,
         session_id=session_id,
         reasoning_steps_enabled=reasoning_steps_enabled,
         tool_steps_enabled=tool_steps_enabled,
         delivery_allowed=lambda: not getattr(session, "to_clear", False),
+        tab_notice_ids=tab_notice_ids,
     )
     notifier.start()
     cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, notifier)
@@ -1155,7 +1177,11 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
     if previous_thread_id and previous_thread_id != settings.thread_id:
         current_local = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
         if isinstance(current_local, LocalBackgroundTaskNotifier):
-            await current_local.reconcile_terminal_tasks()
+            # A settings switch restores no history into this tab, so only
+            # notices this tab already showed count as visible.
+            await current_local.reconcile_terminal_tasks(
+                restored_message_ids=frozenset(current_local.tab_notice_ids)
+            )
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1379,7 +1405,7 @@ async def run_response_action(action: cl.Action) -> None:
                 reasoning_level_is_explicit=settings_reasoning_level_is_explicit(
                     runtime.config, settings, settings.model_name
                 ),
-                mcp_session_id=current_mcp_session_id(),
+                mcp_session_id=settings.thread_id,
                 resolve_commands=False,
                 display_prompt=prompt if is_followup else "",
                 export_label="" if is_followup else resolved.label,
@@ -1625,7 +1651,13 @@ async def _handle_message(
         available_models=runtime.config.model_choices,
         model_mode_enabled=runtime.config.extensions.chainlit_model_mode_enabled,
     )
-    mcp_session_id = current_mcp_session_id()
+    # A queued turn can start after the tab switched threads; its captured
+    # settings, not the live session, name the conversation's MCP scope.
+    mcp_session_id = (
+        settings_override.thread_id
+        if settings_override is not None
+        else current_mcp_session_id()
+    )
     await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,

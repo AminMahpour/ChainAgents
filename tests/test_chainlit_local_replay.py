@@ -770,3 +770,59 @@ def test_idle_close_retains_terminal_notice_without_rendered_activity(
         await manager.close()
 
     asyncio.run(exercise())
+
+
+def test_settings_switch_replays_notice_another_tab_already_showed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        manager = _manager()
+        task_id = await _finish(manager, "session-a")
+        sent: list[tuple[str, str]] = []
+        current_tab: ContextVar[str] = ContextVar("current_tab")
+
+        class Message:
+            def __init__(self, *, content: str, author: str) -> None:
+                self.content = content
+
+            async def send(self) -> None:
+                sent.append((current_tab.get(), self.content))
+
+        monkeypatch.setattr(
+            "chainagents.interfaces.chainlit.async_tasks.cl.Message", Message
+        )
+        current_tab.set("tab-a")
+        tab_a = LocalBackgroundTaskNotifier(manager=manager, session_id="session-a")
+        tab_a.start()
+        await tab_a.reconcile_terminal_tasks()
+        assert [tab for tab, _ in sent] == ["tab-a"]
+
+        # Tab B switched to this thread through settings: no history restored.
+        current_tab.set("tab-b")
+        tab_b_ids: dict[str, None] = {}
+        tab_b = LocalBackgroundTaskNotifier(
+            manager=manager, session_id="session-a", tab_notice_ids=tab_b_ids
+        )
+        tab_b.start()
+        await tab_b.reconcile_terminal_tasks(
+            restored_message_ids=frozenset(tab_b.tab_notice_ids)
+        )
+        assert [tab for tab, _ in sent] == ["tab-a", "tab-b"]
+        assert f"Task ID: `{task_id}`" in sent[-1][1]
+        await tab_b.aclose()
+
+        # Switching back to it in the same tab must not repeat the notice.
+        again = LocalBackgroundTaskNotifier(
+            manager=manager, session_id="session-a", tab_notice_ids=tab_b_ids
+        )
+        again.start()
+        await again.reconcile_terminal_tasks(
+            restored_message_ids=frozenset(again.tab_notice_ids)
+        )
+        assert len(sent) == 2
+
+        await again.aclose()
+        await tab_a.aclose()
+        await manager.close()
+
+    asyncio.run(exercise())

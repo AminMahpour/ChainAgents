@@ -845,3 +845,100 @@ async def test_reconnect_after_timeout_cleanup_restores_only_live_tab_lease(
     assert (owner_id in main.conversation_scopes._owner_scopes) is not cleared
     assert closed == []
     await main.conversation_scopes.aclose()
+
+
+@pytest.mark.anyio
+async def test_work_added_during_final_busy_check_keeps_detached_lease(monkeypatch):
+    """A clear racing the waiter's last busy query must not lose its turn."""
+    closed = asyncio.Event()
+    close_while_busy = False
+    finish_new_turn = asyncio.Event()
+    busy_query_started = asyncio.Event()
+    answer_busy_query = asyncio.Event()
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        nonlocal close_while_busy
+        close_while_busy = not finish_new_turn.is_set()
+        closed.set()
+
+    busy_queries = 0
+
+    async def conversation_busy(_thread_id, *, include_paused_queue):
+        nonlocal busy_queries
+        busy_queries += 1
+        # The second query is the final check after retaining missed notices.
+        if busy_queries == 2:
+            busy_query_started.set()
+            await answer_busy_query.wait()
+        return False
+
+    async def wait_conversation_idle(_thread_id, *, include_paused_queue):
+        return None
+
+    runtime = SimpleNamespace(
+        close_conversation=close_conversation,
+        conversation_busy=conversation_busy,
+        wait_conversation_idle=wait_conversation_idle,
+        config=SimpleNamespace(extensions=SimpleNamespace(mcp_stateful=False)),
+    )
+    manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", manager)
+    await manager.lease(
+        runtime=runtime, owner_id="tab-a", scope_id="runtime-thread", retain_idle=False
+    )
+    await main._retain_conversation_until_idle(runtime, "runtime-thread", set())
+    await asyncio.wait_for(busy_query_started.wait(), timeout=1)
+
+    new_turn = asyncio.create_task(finish_new_turn.wait())
+    await main._retain_conversation_until_idle(runtime, "runtime-thread", {new_turn})
+    await manager.release("tab-a")
+    answer_busy_query.set()
+    await asyncio.sleep(0.05)
+    closed_before_turn_finished = closed.is_set()
+
+    finish_new_turn.set()
+    await asyncio.wait_for(new_turn, timeout=1)
+    await asyncio.wait_for(closed.wait(), timeout=1)
+    assert not closed_before_turn_finished
+    assert not close_while_busy
+    await manager.aclose()
+
+
+@pytest.mark.anyio
+async def test_cleared_session_files_recreated_by_preserved_turn_are_removed(
+    monkeypatch, tmp_path
+):
+    """A preserved turn's late file element must not leak a deleted session dir."""
+    files_dir = tmp_path / "cleared-session-files"
+    cleared = SimpleNamespace(id="cleared-files-session", files_dir=files_dir)
+    finish_turn = asyncio.Event()
+
+    async def turn():
+        await finish_turn.wait()
+        # Chainlit's persist_file re-creates the deleted session's directory.
+        files_dir.mkdir()
+        (files_dir / "report.pdf").write_bytes(b"pdf")
+
+    async def close_conversation(*, thread_id, mcp_session_id):
+        return None
+
+    runtime = SimpleNamespace(
+        close_conversation=close_conversation,
+        config=SimpleNamespace(extensions=SimpleNamespace(mcp_stateful=False)),
+    )
+    manager = main.ConversationScopeLeaseManager(idle_seconds=0.01, max_idle=4)
+    monkeypatch.setattr(main, "conversation_scopes", manager)
+    monkeypatch.setattr(
+        main.chainlit_socket.WebsocketSession, "get_by_id", lambda _id: None
+    )
+    active = asyncio.create_task(turn())
+
+    await main._retain_conversation_until_idle(
+        runtime, "runtime-thread", {active}, cleared_session=cleared
+    )
+    entry = main._detached_conversations[(id(runtime), "runtime-thread")]
+    finish_turn.set()
+    await asyncio.wait_for(entry.task, timeout=1)
+
+    assert not files_dir.exists()
+    await manager.aclose()

@@ -526,3 +526,45 @@ async def test_saved_response_actions_are_sent_for_original_message(monkeypatch)
     assert sent == [
         ("saved", "Markdown"), ("saved", "PDF"), ("saved", "Summarize")
     ]
+
+
+@pytest.mark.anyio
+async def test_queued_turn_uses_mcp_scope_of_its_submitted_thread(monkeypatch) -> None:
+    """A queued old-thread turn must not run against the new thread's MCP scope."""
+    session = Session()
+    session.set(main.SESSION_SETTINGS_KEY, {"thread_id": "thread-new"})
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            model_name="m", model_choices=("m",),
+            extensions=SimpleNamespace(
+                chainlit_reasoning_mode_enabled=False,
+                chainlit_model_mode_enabled=False,
+            ),
+        ),
+    )
+    seen: list[tuple[str, str | None]] = []
+
+    async def get_runtime():
+        return runtime
+
+    async def run_agent_turn(**kwargs):
+        seen.append((kwargs["settings"].thread_id, kwargs["mcp_session_id"]))
+
+    async def get_run_task_list(**_kwargs):
+        return None
+
+    monkeypatch.setattr(main.cl, "user_session", session)
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(main, "_run_agent_turn", run_agent_turn)
+    monkeypatch.setattr(main, "get_run_task_list", get_run_task_list)
+    monkeypatch.setattr(
+        main, "settings_reasoning_level_is_explicit", lambda *_args: False
+    )
+    snapshot = main.AppSettings(
+        model_name="m", reasoning_level="medium", thread_id="thread-old"
+    )
+    message = SimpleNamespace(content="queued", elements=[], command=None)
+
+    await main._handle_message(message, settings_override=snapshot)
+
+    assert seen == [("thread-old", "thread-old")]
