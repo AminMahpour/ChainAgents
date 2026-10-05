@@ -133,6 +133,12 @@ BACKEND_FILESYSTEM_TOOLS = frozenset({"ls", "read_file", "write_file", "edit_fil
 BACKEND_FILESYSTEM_PATH_ARG_KEYS = {"path", "file_path"}
 
 
+def backend_routes_workspace(backend: Any) -> bool:
+    """Return whether ``backend`` resolves virtual ``/workspace/`` paths itself."""
+    routes = getattr(backend, "routes", None)
+    return isinstance(routes, dict) and "/workspace/" in routes
+
+
 def _map_local_tool_path_value(value: Any, project_root: Path) -> Any:
     """Map one real project path value back to its virtual workspace path."""
     if isinstance(value, str):

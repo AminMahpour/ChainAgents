@@ -111,20 +111,30 @@ class TokenLimitedToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
 _OFFLOADED_TOOL_RESULT_PREFIX = "Tool result too large, the result of this tool call "
 
 
-def _tool_message_text(content: Any) -> str:
+def _tool_message_text(content: Any) -> str | None:
     """Return a stable string form of ToolMessage content for comparison.
 
-    DeepAgents replaces a large result with a stub whose first line names the
-    tool-call id and a per-call file path, so identical large results would
-    never compare equal. The rest of the stub previews the original content,
-    so the first line is dropped before comparing.
+    Returns None for a result DeepAgents offloaded to a file: its stub keeps
+    only a head/tail preview, so equal stubs do not prove equal results.
     """
     text = content if isinstance(content, str) else json.dumps(
         content, sort_keys=True, default=str
     )
     if text.startswith(_OFFLOADED_TOOL_RESULT_PREFIX):
-        return text.partition("\n")[2]
+        return None
     return text
+
+
+# Synthetic HumanMessages that are not a new user turn: media DeepAgents'
+# read_file appends after its result, and the token-limit retry notice.
+_SYNTHETIC_HUMAN_MESSAGE_MARKERS = ("read_file_media_result", _TOKEN_LIMIT_RETRY_MARKER)
+
+
+def _is_user_turn(message: Any) -> bool:
+    """Return whether ``message`` starts a new user turn."""
+    return isinstance(message, HumanMessage) and not any(
+        message.additional_kwargs.get(marker) for marker in _SYNTHETIC_HUMAN_MESSAGE_MARKERS
+    )
 
 
 class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -148,13 +158,13 @@ class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
         messages = state.get("messages") or []
         turn_start = 0
         for index in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[index], HumanMessage):
+            if _is_user_turn(messages[index]):
                 turn_start = index + 1
                 break
 
         call_args: dict[str, tuple[str, str]] = {}
         # Latest result and its run length for each (tool, arguments) pair.
-        streaks: dict[tuple[str, str], tuple[str, int]] = {}
+        streaks: dict[tuple[str, str], tuple[str | None, int]] = {}
         for message in messages[turn_start:]:
             if isinstance(message, AIMessage):
                 for tool_call in message.tool_calls:
@@ -171,6 +181,9 @@ class RepeatedToolResultGuardMiddleware(AgentMiddleware[Any, Any, Any]):
             if call is None:
                 continue
             result = _tool_message_text(message.content)
+            if result is None:
+                # An offloaded result cannot be compared; leave the streak as is.
+                continue
             previous_result, previous_count = streaks.get(call, (None, 0))
             count = previous_count + 1 if previous_result == result else 1
             streaks[call] = (result, count)
@@ -235,13 +248,23 @@ def summarize_tool_exception(exc: Exception, *, limit: int = 400) -> str:
 class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
     """Wrap tool execution with workspace path mapping and recoverable errors."""
 
-    def __init__(self, *, project_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        project_root: Path | None = None,
+        virtual_filesystem_tools: bool = True,
+    ) -> None:
         """Initialize the tool execution resilience middleware instance.
 
         Args:
             project_root: Project root used to resolve local paths.
+            virtual_filesystem_tools: Whether the filesystem tools' backend
+                routes ``/workspace/`` itself. When it does not (for example
+                a plain non-virtual filesystem backend), their ``/workspace/``
+                paths are mapped to real paths like any other tool's.
         """
         self.project_root = (project_root or runtime_constants.PROJECT_ROOT).resolve()
+        self.virtual_filesystem_tools = virtual_filesystem_tools
 
     def _map_workspace_path_args(self, request: ToolCallRequest) -> None:
         """Map virtual workspace paths inside tool-call arguments.
@@ -251,7 +274,10 @@ class ToolExecutionResilienceMiddleware(AgentMiddleware[Any, Any, Any]):
         """
         args = request.tool_call.get("args")
         tool_name = str(request.tool_call.get("name") or "")
-        if tool_name in runtime_backends.BACKEND_FILESYSTEM_TOOLS:
+        if (
+            self.virtual_filesystem_tools
+            and tool_name in runtime_backends.BACKEND_FILESYSTEM_TOOLS
+        ):
             mapped_args = runtime_backends.map_backend_tool_paths_to_virtual(
                 args, self.project_root
             )
@@ -670,5 +696,10 @@ def build_agent_middleware(
     middleware.append(filesystem_middleware)
     middleware.append(TokenLimitedToolCallMiddleware())
     middleware.append(RepeatedToolResultGuardMiddleware())
-    middleware.append(ToolExecutionResilienceMiddleware(project_root=project_root))
+    middleware.append(
+        ToolExecutionResilienceMiddleware(
+            project_root=project_root,
+            virtual_filesystem_tools=runtime_backends.backend_routes_workspace(backend),
+        )
+    )
     return middleware

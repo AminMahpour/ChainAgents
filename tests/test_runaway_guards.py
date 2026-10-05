@@ -78,6 +78,26 @@ def test_routed_real_paths_keep_their_real_form(tmp_path: Path) -> None:
     assert _mapped(str(outputs), tmp_path, tool="read_file", key="file_path") == str(outputs)
 
 
+def test_filesystem_tools_get_real_paths_without_a_workspace_route(tmp_path: Path) -> None:
+    from deepagents.backends import FilesystemBackend
+
+    middleware = build_agent_middleware(
+        backend=FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False),
+        project_root=tmp_path,
+    )
+    resilience = next(m for m in middleware if isinstance(m, ToolExecutionResilienceMiddleware))
+    request = ToolCallRequest(
+        tool_call={"id": "c", "name": "ls", "args": {"path": "/workspace/skills"}, "type": "tool_call"},
+        tool=SimpleNamespace(name="ls"),
+        state={},
+        runtime=SimpleNamespace(),
+    )
+
+    resilience._map_workspace_path_args(request)
+
+    assert request.tool_call["args"]["path"] == str(tmp_path.resolve() / "skills")
+
+
 def test_non_filesystem_tools_still_get_real_paths(tmp_path: Path) -> None:
     mapped = _mapped("/workspace/skills/SKILL.md", tmp_path, tool="mcp_read", key="path")
 
@@ -226,16 +246,29 @@ def _offloaded(call_id: str, sample: str) -> str:
     )
 
 
-def test_guard_compares_offloaded_results_by_content() -> None:
-    pairs = [_call_pair(i, {"q": "all"}, _offloaded(f"call-{i}", "same rows")) for i in range(10)]
-
-    assert _guard(_history(pairs)) is not None
-
-
-def test_guard_treats_different_offloaded_content_as_progress() -> None:
-    pairs = [_call_pair(i, {"q": "all"}, _offloaded(f"call-{i}", f"rows {i}")) for i in range(10)]
+def test_guard_does_not_count_offloaded_results() -> None:
+    # Offloaded stubs keep only a head/tail preview, so equal stubs do not
+    # prove equal results.
+    pairs = [_call_pair(i, {"q": "all"}, _offloaded(f"call-{i}", "same rows")) for i in range(12)]
 
     assert _guard(_history(pairs)) is None
+
+
+def test_offloaded_results_do_not_break_a_streak() -> None:
+    results = ["same"] * 5 + [_offloaded("call-x", "rows")] + ["same"] * 5
+    messages = _history([_call_pair(i, {"q": "all"}, r) for i, r in enumerate(results)])
+
+    assert _guard(messages) is not None
+
+
+@pytest.mark.parametrize("marker", ["read_file_media_result", "chainagents_token_limit_retry"])
+def test_synthetic_human_messages_do_not_start_a_new_turn(marker: str) -> None:
+    messages: list[Any] = [HumanMessage(content="look around")]
+    for i in range(10):
+        messages.extend(_call_pair(i, {"file_path": "/workspace/clip.mp4"}, "video", "read_file"))
+        messages.append(HumanMessage(content="media", additional_kwargs={marker: True}))
+
+    assert _guard(messages) is not None
 
 
 def test_agent_middleware_includes_the_repeat_guard(tmp_path: Path) -> None:
