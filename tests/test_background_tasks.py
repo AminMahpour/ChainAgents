@@ -4806,7 +4806,7 @@ def test_chainlit_local_notifier_async_close_resumes_interrupted_terminal_close(
         assert reasoning.end is not None
         assert parent.update_attempts == 1
         assert parent.end is not None
-        assert parent.output == "Stopped"
+        assert parent.output == "Finished with status: success"
         assert notifier.activity_states == {}
         await manager.close()
 

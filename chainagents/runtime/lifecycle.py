@@ -292,6 +292,36 @@ class AgentRuntime:
         """Serialize main agent turns from all interfaces in one conversation."""
         return self._turn_locks.setdefault(thread_id, asyncio.Lock())
 
+    async def conversation_busy(
+        self, thread_id: str, *, include_paused_queue: bool = True
+    ) -> bool:
+        """Report input or background work, optionally excluding a paused queue."""
+        if self.user_input.busy(
+            thread_id, include_paused_queue=include_paused_queue
+        ):
+            return True
+        tasks = await self.background_tasks.list(thread_id)
+        return self.user_input.busy(
+            thread_id, include_paused_queue=include_paused_queue
+        ) or any(
+            task.status not in runtime_background_tasks.TERMINAL_BACKGROUND_TASK_STATUSES
+            for task in tasks
+        )
+
+    async def wait_conversation_idle(
+        self, thread_id: str, *, include_paused_queue: bool = True
+    ) -> None:
+        """Wait for input and background work, optionally excluding a paused queue."""
+        while True:
+            await self.user_input.wait_drained(
+                thread_id, include_paused_queue=include_paused_queue
+            )
+            await self.background_tasks.wait_session(thread_id)
+            if not await self.conversation_busy(
+                thread_id, include_paused_queue=include_paused_queue
+            ):
+                return
+
     @property
     def checkpointer(self) -> AsyncPostgresSaver | MemorySaver:
         """Return the initialized LangGraph checkpointer.
