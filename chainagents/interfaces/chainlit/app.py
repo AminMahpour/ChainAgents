@@ -430,6 +430,13 @@ async def _restore_reconnected_observers(
             reasoning_steps_enabled=settings.show_reasoning_stream,
             tool_steps_enabled=settings.show_tool_calls,
         )
+        restarted_local = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+        if isinstance(restarted_local, LocalBackgroundTaskNotifier):
+            # Cleanup retained notices that finished between the old notifier's
+            # close and this subscription; the tab still shows what it saw.
+            await restarted_local.reconcile_terminal_tasks(
+                restored_message_ids=frozenset(restarted_local.tab_notice_ids)
+            )
 
     current_async = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
     if current_async is recovery.async_notifier:

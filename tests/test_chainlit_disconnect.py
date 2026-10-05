@@ -724,6 +724,11 @@ async def test_reconnect_during_notifier_close_restores_observers(monkeypatch):
             self.blocking = blocking
             self.closed = False
             self.session_id = "runtime-thread"
+            self.tab_notice_ids = {"shown-notice": None}
+            self.reconciled: list[frozenset[str]] = []
+
+        async def reconcile_terminal_tasks(self, *, restored_message_ids):
+            self.reconciled.append(restored_message_ids)
 
         async def aclose(self):
             if self.blocking:
@@ -788,6 +793,8 @@ async def test_reconnect_during_notifier_close_restores_observers(monkeypatch):
     assert old_async.cancelled
     assert old_local.closed
     assert values[main.SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY] is new_local
+    # Notices retained during cleanup replay, except those this tab showed.
+    assert new_local.reconciled == [frozenset({"shown-notice"})]
     assert values[main.SESSION_ASYNC_TASK_NOTIFIER_KEY] is new_async
     assert closed == []
     await main.conversation_scopes.aclose()
