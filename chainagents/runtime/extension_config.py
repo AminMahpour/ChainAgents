@@ -20,6 +20,7 @@ from chainagents.runtime.types import (
     BATCH_RESULT_FORMATS,
     BatchResultFormat,
     BackgroundSubagentConfig,
+    ClarificationConfig,
     MessagingConfig,
     UserInputConfig,
     AsyncSubagentConfig,
@@ -57,6 +58,12 @@ def normalize_messaging_config(value: Any) -> MessagingConfig:
 
 def normalize_user_input_config(value: Any) -> UserInputConfig:
     return _normalize_opt_in_config(value, name="user_input", defaults=UserInputConfig())
+
+
+def normalize_clarification_config(value: Any) -> ClarificationConfig:
+    return _normalize_opt_in_config(
+        value, name="clarification", defaults=ClarificationConfig()
+    )
 
 
 def normalize_background_subagent_config(value: Any) -> BackgroundSubagentConfig:
@@ -700,6 +707,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     )
     messaging = normalize_messaging_config(agent_section.get("messaging"))
     user_input = normalize_user_input_config(agent_section.get("user_input"))
+    clarification = normalize_clarification_config(agent_section.get("clarification"))
     agent_reflection = normalize_reflection_config(
         agent_section.get("reflection"),
         agent_state=agent_state,
@@ -974,6 +982,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         background_subagents=background_subagents,
         messaging=messaging,
         user_input=user_input,
+        clarification=clarification,
         chainlit_commands=tuple(chainlit_commands),
         chainlit_starters=tuple(chainlit_starters),
         chainlit_response_actions=tuple(chainlit_response_actions),

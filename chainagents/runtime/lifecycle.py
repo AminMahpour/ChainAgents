@@ -416,6 +416,12 @@ class AgentRuntime:
         if self.config.agent_state == "stateless":
             self._store = None
             self._checkpointer = None
+            if self.config.extensions.clarification.enabled:
+                logger.warning(
+                    "agent.clarification is enabled but agent.state is stateless; "
+                    "ask_user is disabled because a paused run cannot be resumed "
+                    "without a checkpointer."
+                )
         elif not self.config.database_url:
             self._store = InMemoryStore()
             self._checkpointer = MemorySaver()

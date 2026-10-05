@@ -15,6 +15,74 @@ from chainagents.exports.response import generated_file_elements
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge
 from chainagents.turns import BaseTurnRenderer, TurnCommandError, TurnResult
 
+CLARIFICATION_ANSWER_ACTION = "chainagents_clarification_answer"
+# Maps each pending question's interrupt id to its option actions, so a stale
+# button can be rejected and siblings removed once the question is answered.
+SESSION_PENDING_CLARIFICATIONS_KEY = "chainagents_pending_clarifications"
+
+
+async def expire_clarification_actions(interrupt_id: str | None = None) -> bool:
+    """Remove the option buttons of one pending question, or of all of them.
+
+    Returns whether ``interrupt_id`` (when given) was still pending.
+    """
+    pending = cl.user_session.get(SESSION_PENDING_CLARIFICATIONS_KEY) or {}
+    if interrupt_id is None:
+        expired = list(pending.values())
+        pending = {}
+    elif interrupt_id in pending:
+        expired = [pending.pop(interrupt_id)]
+    else:
+        return False
+    cl.user_session.set(SESSION_PENDING_CLARIFICATIONS_KEY, pending)
+    for actions in expired:
+        for action in actions:
+            with suppress(Exception):
+                await action.remove()
+    return True
+
+
+def clarification_message(event: AgentStreamEvent) -> cl.Message:
+    """Return the message asking the user a clarifying question."""
+    options = [str(option) for option in event.ui_props.get("options") or []]
+    interrupt_id = str(event.ui_props.get("interrupt_id") or "")
+    content = event.text
+    if options:
+        content += "\n\nPick an option or type your own answer."
+    return cl.Message(
+        content=content,
+        actions=[
+            cl.Action(
+                name=CLARIFICATION_ANSWER_ACTION,
+                payload={"answer": option, "interrupt_id": interrupt_id},
+                label=option,
+            )
+            for option in options
+        ],
+    )
+
+
+async def send_clarification_questions(events: list[AgentStreamEvent]) -> None:
+    """Send each question with its option buttons and track them as pending."""
+    pending = cl.user_session.get(SESSION_PENDING_CLARIFICATIONS_KEY) or {}
+    for event in events:
+        message = clarification_message(event)
+        await message.send()
+        pending[str(event.ui_props.get("interrupt_id") or "")] = list(message.actions)
+    cl.user_session.set(SESSION_PENDING_CLARIFICATIONS_KEY, pending)
+
+
+def clarification_event(
+    question: str, options: tuple[str, ...], interrupt_id: str
+) -> AgentStreamEvent:
+    """Build the stream event for a pending question read from a checkpoint."""
+    return AgentStreamEvent(
+        kind="clarification_requested",
+        source="main-agent",
+        text=question,
+        ui_props={"options": list(options), "interrupt_id": interrupt_id},
+    )
+
 
 def native_command_output_message(result: RuntimeCommandResult) -> str:
     """Return the System message content for an MCP-tool native command."""
@@ -50,13 +118,20 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
         self.bridge: ChainlitEventBridge | None = None
         self.command_result: RuntimeCommandResult | None = None
         self.generated_files: list[GeneratedFileDescriptor] = []
+        self.clarifications: list[AgentStreamEvent] = []
 
     async def on_agent_start(self, prompt: str) -> None:
+        # Any agent run answers or supersedes the questions asked before it.
+        await expire_clarification_actions()
         await self._start_bridge(prompt)
 
     async def on_event(self, event: AgentStreamEvent) -> None:
         if event.kind == "mcp_status":
             await cl.Message(content=event.text).send()
+            return
+        if event.kind == "clarification_requested":
+            # Asked after the partial response is finished, in on_complete.
+            self.clarifications.append(event)
             return
         # The runner calls on_agent_start before any other stream event.
         assert self.bridge is not None
@@ -71,6 +146,8 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
                 f"{exc.message}\n"
                 "Use a configured command from startup or send a normal prompt."
             )
+        elif not exc.command_name:
+            content = exc.message
         else:
             content = f"Native command `/{exc.command_name}` failed: {exc.message}"
         await cl.Message(author="System", content=content).send()
@@ -92,6 +169,11 @@ class ChainlitTurnRenderer(BaseTurnRenderer):
             )
 
     async def on_complete(self, result: TurnResult) -> None:
+        if result.status == "awaiting_input":
+            if self.bridge is not None:
+                await self.bridge.finish(self.generated_files)
+            await send_clarification_questions(self.clarifications)
+            return
         if result.status != "completed":
             return
         if self.command_result is not None:

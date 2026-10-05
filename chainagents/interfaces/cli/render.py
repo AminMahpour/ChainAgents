@@ -176,6 +176,8 @@ class CliEventRenderer(BaseTurnRenderer):
             self._complete_tool_event(event)
         elif event.kind == "summarization_status":
             self._stream_summarization_status(event)
+        elif event.kind == "clarification_requested":
+            self._print_clarification(event)
 
     async def on_command_result(self, result: RuntimeCommandResult) -> None:
         """Print MCP-tool command output as raw JSON on stdout."""
@@ -185,6 +187,8 @@ class CliEventRenderer(BaseTurnRenderer):
         """Print a failed or unknown native command to stderr."""
         if exc.unknown:
             print(f"Unknown command /{exc.command_name}.", file=self.stderr)
+        elif not exc.command_name:
+            print(exc.message, file=self.stderr)
         else:
             print(f"Command /{exc.command_name} failed: {exc.message}", file=self.stderr)
 
@@ -193,7 +197,7 @@ class CliEventRenderer(BaseTurnRenderer):
         if result.status == "command_error":
             return
         command_output = is_command_output(result)
-        if result.status == "completed" and not command_output:
+        if result.status in {"completed", "awaiting_input"} and not command_output:
             self._finish_response()
         else:
             self._close_reasoning_line()
@@ -224,6 +228,27 @@ class CliEventRenderer(BaseTurnRenderer):
             return
         if self.response_buffer:
             self.stdout_console.print(Text(self.response_buffer, style="bright_white"))
+
+    def _print_clarification(self, event: AgentStreamEvent) -> None:
+        """Print the agent's clarifying question and numbered options."""
+        if self.json_output:
+            return
+        # Show any preamble before the question; clearing the buffer keeps
+        # on_complete from printing it again after the question.
+        self._finish_response()
+        self.response_buffer = ""
+        lines = [event.text]
+        options = event.ui_props.get("options") or []
+        lines.extend(f"  {index}. {option}" for index, option in enumerate(options, 1))
+        if options:
+            lines.append("Reply with a number or your own answer.")
+        self.stdout_console.print(
+            cli_panel(
+                Text("\n".join(lines), style="bright_white"),
+                title="Question",
+                border_style="yellow",
+            )
+        )
 
     def _end_streamed_response_line(self) -> None:
         """Terminate partially streamed stdout text with a newline."""

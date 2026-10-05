@@ -33,7 +33,16 @@ from chainagents.interfaces.chainlit.async_tasks import (
 from chainagents.interfaces.chainlit.bridge import ChainlitEventBridge, RunTaskList
 from chainagents.interfaces.chainlit.lifetime import ConversationScopeLeaseManager
 from chainagents.interfaces.chainlit.persistence import chainlit_data_layer_enabled, create_chainlit_data_layer
-from chainagents.interfaces.chainlit.renderer import ChainlitTurnRenderer
+from chainagents.interfaces.chainlit.renderer import (
+    CLARIFICATION_ANSWER_ACTION,
+    ChainlitTurnRenderer,
+    clarification_event,
+    expire_clarification_actions,
+    send_clarification_questions,
+)
+from chainagents.runtime.clarification import (
+    pending_clarifications_from_checkpointer,
+)
 from chainagents.interfaces.chainlit.settings import (
     SESSION_MCP_SESSION_ID_KEY,  # noqa: F401
     SESSION_SETTINGS_KEY,
@@ -1039,6 +1048,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
     )
     await run_task_list.show_ready()
     await _restore_saved_response_actions(thread, runtime)
+    await _restore_pending_clarifications(runtime, settings)
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1631,6 +1641,67 @@ async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
 chainlit_config.code.on_message = _guarded_chainlit_message_callback
 
 
+CLARIFICATION_ANSWER_METADATA_KEY = "chainagents_clarification_answer"
+
+
+def message_is_clarification_answer(message: Any) -> bool:
+    """Return whether a message carries a clicked clarification option."""
+    metadata = getattr(message, "metadata", None)
+    return isinstance(metadata, dict) and bool(metadata.get(CLARIFICATION_ANSWER_METADATA_KEY))
+
+
+async def _restore_pending_clarifications(
+    runtime: AgentRuntime, settings: AppSettings
+) -> None:
+    """Re-ask questions a reopened chat is still waiting on, with live buttons."""
+    clarification = getattr(runtime.config.extensions, "clarification", None)
+    if not getattr(clarification, "enabled", False) or runtime.config.agent_state != "stateful":
+        return
+    try:
+        pending = await pending_clarifications_from_checkpointer(
+            runtime.checkpointer, settings.thread_id
+        )
+    except Exception:
+        logger.exception("Failed to restore pending clarifications for %s", settings.thread_id)
+        return
+    await send_clarification_questions(
+        [
+            clarification_event(item.question, item.options, item.interrupt_id)
+            for item in pending
+        ]
+    )
+
+
+@cl.action_callback(CLARIFICATION_ANSWER_ACTION)
+async def answer_clarification(action: cl.Action) -> None:
+    """Send a clarification option as the user's answer, like a typed reply."""
+    payload = action.payload or {}
+    answer = str(payload.get("answer") or "").strip()
+    if not answer:
+        return
+    if not await expire_clarification_actions(str(payload.get("interrupt_id") or "")):
+        with suppress(Exception):
+            await action.remove()
+        await cl.Message(
+            content=(
+                "This option has expired. If a question is still open, use "
+                "the buttons on its latest message or type your answer."
+            ),
+            author="System",
+        ).send()
+        return
+    message = cl.Message(
+        content=answer,
+        author="User",
+        type="user_message",
+        # A clicked option is a literal answer: it must not be parsed as a
+        # command or remapped as an option number.
+        metadata={CLARIFICATION_ANSWER_METADATA_KEY: True},
+    )
+    await message.send()
+    await _guarded_chainlit_message_callback(message)
+
+
 async def _handle_message(
     message: cl.Message, *, settings_override: AppSettings | None = None
 ) -> None:
@@ -1717,6 +1788,7 @@ async def _handle_message(
         uploaded_image_parts=uploaded_image_parts,
         uploaded_image_names=uploaded_image_names,
         prompt_note=prompt_note,
+        clarification_answer=message_is_clarification_answer(message),
     )
 
 
@@ -1736,6 +1808,7 @@ async def _run_agent_turn(
     resolve_commands: bool = True,
     display_prompt: str | None = None,
     export_label: str = "",
+    clarification_answer: bool = False,
 ) -> None:
     """Run one ordinary or response-action turn through the shared runner.
 
@@ -1776,6 +1849,7 @@ async def _run_agent_turn(
         async_subagent_url=async_url_override,
         mcp_session_id=mcp_session_id,
         resolve_commands=resolve_commands,
+        clarification_answer=clarification_answer,
     )
     renderer = ChainlitTurnRenderer(build_bridge, prompt=agent_prompt)
     turn_owner_id = f"turn:{secrets.token_hex(16)}"

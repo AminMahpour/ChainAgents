@@ -41,6 +41,10 @@ class _Conversation:
     steer_ids: dict[str, tuple[str, str]] = field(default_factory=dict)
     completed: deque[str] = field(default_factory=deque)
     changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    # Set while the agent waits on a clarifying question. Queued turns hold
+    # until the first input submitted afterwards (``answer_job_id``) has run.
+    awaiting_answer: bool = False
+    answer_job_id: str | None = None
 
 
 class ConversationInputController:
@@ -91,16 +95,45 @@ class ConversationInputController:
             or session.queue
         ):
             raise ValueError("Choose steer or queue while a conversation is busy or paused.")
-        if len(session.queue) + self._reserved_followups(session_id) >= self.config.max_queued_turns:
+        answers_question = session.awaiting_answer and session.answer_job_id is None
+        # The held queue cannot drain until the question is answered, so the
+        # answer is admitted even when the queue is full.
+        if (
+            not answers_question
+            and len(session.queue) + self._reserved_followups(session_id)
+            >= self.config.max_queued_turns
+        ):
             raise ValueError("Queued turn limit reached.")
         job = InputJob(uuid.uuid4().hex, session_id, payload, run, followup_factory)
         session.jobs[job.id] = job
         if input_id is not None:
             session.input_ids[input_id] = job.id
-        session.queue.append(job)
+        if answers_question:
+            # The first input after a clarifying question is its answer, so it
+            # runs ahead of turns that were queued before the question.
+            session.answer_job_id = job.id
+            session.queue.appendleft(job)
+        else:
+            session.queue.append(job)
         self._start_next(session_id)
         session.changed.set()
         return job
+
+    def clarification_requested(self, session_id: str) -> None:
+        """Hold queued turns until an answer submitted after the question runs."""
+        session = self._session(session_id)
+        session.awaiting_answer = True
+        session.answer_job_id = None
+        session.changed.set()
+
+    def clarification_answered(self, session_id: str) -> None:
+        """Release queued turns once the pending question has been answered."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session.awaiting_answer = False
+        session.answer_job_id = None
+        session.changed.set()
 
     def _start_next(self, session_id: str) -> None:
         session = self._session(session_id)
@@ -112,6 +145,8 @@ class ConversationInputController:
             or session.external_waiters
             or not session.queue
         ):
+            return
+        if session.awaiting_answer and session.queue[0].id != session.answer_job_id:
             return
         job = session.queue.popleft()
         job.status = "waiting" if self.runner_serialized else "running"
@@ -189,6 +224,10 @@ class ConversationInputController:
             for input_id, (_, known_id) in tuple(session.steer_ids.items()):
                 if known_id == expired_id:
                     session.steer_ids.pop(input_id, None)
+        if session.answer_job_id == job.id:
+            # The answer turn ended without answering (for example a refused
+            # command), so the next input may answer instead.
+            session.answer_job_id = None
         session.active = None
         session.active_job = None
         self._start_next(job.session_id)
@@ -262,7 +301,10 @@ class ConversationInputController:
         return session_id in self._sessions
 
     def busy(self, session_id: str, *, include_paused_queue: bool = True) -> bool:
-        """Return active input and, by default, queued input awaiting Resume."""
+        """Return active input and, by default, queued input awaiting Resume.
+
+        A queue held for a clarification answer counts like a paused queue.
+        """
         session = self._sessions.get(session_id)
         return bool(
             session is not None
@@ -270,7 +312,13 @@ class ConversationInputController:
                 session.active is not None
                 or session.external_task is not None
                 or session.external_waiters
-                or (session.queue and (include_paused_queue or not session.paused))
+                or (
+                    session.queue
+                    and (
+                        include_paused_queue
+                        or not (session.paused or session.awaiting_answer)
+                    )
+                )
             )
         )
 
