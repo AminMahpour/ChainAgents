@@ -480,7 +480,7 @@ export AWS_REGION="us-east-1"
 export AWS_PROFILE="my-profile"  # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, SSO, or an instance role
 ```
 
-- `name` is a Bedrock model ID or inference-profile ID/ARN; cross-region IDs such as `us.anthropic.…` are supported.
+- `name` is a Bedrock model ID, inference-profile ID, or a foundation-model/system inference-profile ARN; cross-region IDs such as `us.anthropic.…` are supported. Application inference-profile and provisioned-model ARNs do not reveal the underlying model, so use the model or inference-profile ID for those.
 - Credentials and region come from the standard AWS chain; `api_key` and `DEEPAGENT_MODEL_API_KEY` are not used. Bedrock API keys work through boto3's own `AWS_BEARER_TOKEN_BEDROCK` variable.
 - `base_url` or `endpoint_url` optionally overrides the Bedrock runtime endpoint, for example a VPC interface endpoint; leave both unset to use the regional default.
 - `provider = "aws_bedrock"` and `provider = "amazon_bedrock"` are accepted as aliases.

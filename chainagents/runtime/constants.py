@@ -71,6 +71,9 @@ OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
 ANTHROPIC_MESSAGES_PATH_SUFFIX = "/v1/messages"
 OPENAI_COMPATIBLE_MODEL_PROVIDERS = frozenset({"openai_compatible", "snowflake_cortex"})
 BEDROCK_PROVIDER_ALIASES = frozenset({"aws_bedrock", "amazon_bedrock"})
+BEDROCK_INFERENCE_PROFILE_PREFIXES = frozenset(
+    {"us", "us-gov", "eu", "apac", "sa", "amer", "global", "jp", "au", "ca"}
+)
 SNOWFLAKE_CORTEX_CANONICAL_TOOL_CALL_ID_RE = re.compile(r"^call_[0-9a-f]{24}$")
 SNOWFLAKE_CORTEX_BASE_PATH = "/api/v2/cortex/v1"
 SNOWFLAKE_CORTEX_CHAT_COMPLETIONS_PATH = (

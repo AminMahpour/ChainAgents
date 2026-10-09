@@ -15,6 +15,7 @@ from langchain_ollama import ChatOllama
 import chainagents.runtime.model_config as runtime_model_config
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.constants import (
+    BEDROCK_INFERENCE_PROFILE_PREFIXES,
     DEFAULT_ANTHROPIC_BASE_URL,
     DEFAULT_MODEL,
     DEFAULT_MODEL_PROVIDER,
@@ -317,6 +318,8 @@ def build_bedrock_model(
         "temperature": model_profile.temperature,
         "disable_streaming": model_profile.disable_streaming,
     }
+    if model_profile.name.startswith("arn:"):
+        kwargs.update(bedrock_arn_model_metadata(model_profile.name))
     if model_profile.base_url:
         kwargs["endpoint_url"] = model_profile.base_url
     if model_profile.max_tokens is not None:
@@ -336,6 +339,38 @@ def build_bedrock_model(
         # Claude rejects non-default sampling temperatures while thinking.
         model.temperature = None
     return model
+
+
+def bedrock_arn_model_metadata(model_arn: str) -> dict[str, str]:
+    """Derive the provider and base model langchain-aws needs for a model ARN.
+
+    langchain-aws cannot infer the model family from an ARN. Foundation-model
+    and system inference-profile ARNs end in a model ID (for example
+    ``.../inference-profile/us.anthropic.claude-sonnet-5``), so both values can
+    be read from that suffix.
+
+    Args:
+        model_arn: The Bedrock model ARN.
+
+    Returns:
+        The ``provider`` and ``base_model`` constructor arguments.
+
+    Raises:
+        ValueError: If the ARN does not end in a recognizable model ID.
+    """
+    model_id = model_arn.rsplit("/", 1)[-1]
+    parts = model_id.split(".")
+    # Cross-region inference-profile IDs carry a geography prefix (us., eu., ...).
+    if len(parts) >= 3 and parts[0] in BEDROCK_INFERENCE_PROFILE_PREFIXES:
+        parts = parts[1:]
+    if len(parts) < 2 or not parts[0] or ":" in parts[0]:
+        raise ValueError(
+            "Amazon Bedrock model ARNs must end in a model ID, such as a "
+            "foundation-model or system inference-profile ARN. For application "
+            "inference profiles or provisioned models, use the underlying "
+            "model or inference-profile ID as [model].name instead."
+        )
+    return {"provider": parts[0], "base_model": ".".join(parts)}
 
 
 def build_model_for_profile(

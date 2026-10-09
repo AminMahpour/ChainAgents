@@ -374,3 +374,63 @@ def test_configure_command_requires_model_name_for_bedrock(tmp_path: Path) -> No
     assert code == 1
     assert config_path.read_text(encoding="utf-8") == original
     assert "Amazon Bedrock requires an explicit model name" in stderr.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("model_arn", "provider", "base_model"),
+    [
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-5-5",
+            "anthropic",
+            "anthropic.claude-opus-5-5",
+        ),
+        (
+            "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
+            "amazon",
+            "amazon.nova-pro-v1:0",
+        ),
+    ],
+)
+def test_bedrock_model_arn_supplies_provider_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_arn: str,
+    provider: str,
+    base_model: str,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        f"""
+[model]
+provider = "bedrock"
+name = "{model_arn}"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert isinstance(model, ChatBedrockConverse)
+    assert model.model_id == model_arn
+    assert model.provider == provider
+    assert model.base_model_id == base_model
+
+
+def test_bedrock_opaque_model_arn_is_rejected_with_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="application inference profiles"):
+        deepagent_runtime.build_model(config, "medium")
