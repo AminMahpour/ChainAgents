@@ -6,7 +6,9 @@ import re
 from pathlib import Path
 from typing import Literal
 
-ModelProvider = Literal["ollama", "openai_compatible", "snowflake_cortex", "anthropic"]
+ModelProvider = Literal[
+    "ollama", "openai_compatible", "snowflake_cortex", "anthropic", "bedrock"
+]
 ReasoningLevel = Literal["low", "medium", "high"]
 ModelModality = Literal["text", "image"]
 DisableStreaming = bool | Literal["tool_calling"]
@@ -68,6 +70,7 @@ OPENAI_CHAT_COMPLETIONS_PATH_SUFFIX = "/chat/completions"
 OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
 ANTHROPIC_MESSAGES_PATH_SUFFIX = "/v1/messages"
 OPENAI_COMPATIBLE_MODEL_PROVIDERS = frozenset({"openai_compatible", "snowflake_cortex"})
+BEDROCK_PROVIDER_ALIASES = frozenset({"aws_bedrock", "amazon_bedrock"})
 SNOWFLAKE_CORTEX_CANONICAL_TOOL_CALL_ID_RE = re.compile(r"^call_[0-9a-f]{24}$")
 SNOWFLAKE_CORTEX_BASE_PATH = "/api/v2/cortex/v1"
 SNOWFLAKE_CORTEX_CHAT_COMPLETIONS_PATH = (

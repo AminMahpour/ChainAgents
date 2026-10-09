@@ -140,7 +140,9 @@ def load_extensions_config(config_path: str | Path | None = None) -> ExtensionsC
     return load_file_config(config_path).extensions
 
 
-_ENDPOINT_URL_PROVIDERS = frozenset({"anthropic", "snowflake_cortex", "openai_compatible"})
+_ENDPOINT_URL_PROVIDERS = frozenset(
+    {"anthropic", "bedrock", "snowflake_cortex", "openai_compatible"}
+)
 
 
 @dataclass(frozen=True)
@@ -382,6 +384,20 @@ def _validate_provider_switch(
             "DEEPAGENT_MODEL_ENDPOINT_URL or --endpoint-url with the "
             "Anthropic /v1/messages path for proxy endpoints."
         )
+    if (
+        provider_changed
+        and model_provider == "bedrock"
+        and inputs.base_url
+        and inputs.base_url_from_env
+        and not inputs.endpoint_url
+    ):
+        raise ValueError(
+            "Switching model providers to Amazon Bedrock with "
+            "DEEPAGENT_MODEL_BASE_URL is ambiguous. Remove stale "
+            "DEEPAGENT_MODEL_BASE_URL so Bedrock uses its AWS regional endpoint, "
+            "or pass --base-url or DEEPAGENT_MODEL_ENDPOINT_URL to target a "
+            "custom Bedrock runtime endpoint."
+        )
 
     if (
         model_provider in OPENAI_COMPATIBLE_MODEL_PROVIDERS
@@ -394,12 +410,15 @@ def _validate_provider_switch(
             "or set a non-empty [model].name in deepagent.toml."
         )
     if (
-        model_provider == "anthropic"
+        model_provider in {"anthropic", "bedrock"}
         and not inputs.name
         and (provider_changed or not model_defaults.name_is_explicit)
     ):
+        provider_label = (
+            "Anthropic" if model_provider == "anthropic" else "Amazon Bedrock"
+        )
         raise ValueError(
-            "Anthropic runtime must define DEEPAGENT_MODEL_NAME "
+            f"{provider_label} runtime must define DEEPAGENT_MODEL_NAME "
             "or set a non-empty [model].name in deepagent.toml."
         )
     return profile_endpoint_only_satisfies_provider_switch
@@ -466,6 +485,8 @@ def _normalize_endpoint_for_provider(
                 else "The Snowflake Cortex model base URL cannot be empty."
             ),
         )
+    if provider == "bedrock":
+        return runtime_model_config.normalize_bedrock_endpoint_url(url), ()
     if full_endpoint and provider == "anthropic":
         return runtime_model_config.normalize_anthropic_endpoint_url(
             url,
@@ -478,7 +499,7 @@ def _normalize_endpoint_for_provider(
         )
     raise ValueError(
         "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
-        "provider-switched Anthropic or OpenAI-compatible profiles."
+        "provider-switched Anthropic, Bedrock, or OpenAI-compatible profiles."
     )
 
 
@@ -491,9 +512,9 @@ def _resolve_cross_provider_endpoint(
     base_url_only = bool(inputs.base_url) and not inputs.endpoint_url
     base_url = inputs.base_url if base_url_only else None
     endpoint_query: tuple[tuple[str, str], ...] = ()
-    if base_url_only and active_provider == "snowflake_cortex":
+    if base_url_only and active_provider in {"snowflake_cortex", "bedrock"}:
         base_url, endpoint_query = _normalize_endpoint_for_provider(
-            "snowflake_cortex",
+            active_provider,
             inputs.base_url,
             full_endpoint=False,
         )
@@ -533,6 +554,13 @@ def _resolve_primary_endpoint(
             default=DEFAULT_ANTHROPIC_BASE_URL,
         )
         return base_url, model_defaults.endpoint_query if defaults_are_anthropic else ()
+    if model_provider == "bedrock":
+        # Bedrock needs no endpoint; an empty URL uses the AWS regional default.
+        defaults_are_bedrock = model_defaults.provider == "bedrock"
+        base_url = runtime_model_config.normalize_bedrock_endpoint_url(
+            inputs.base_url or (model_defaults.base_url if defaults_are_bedrock else "")
+        )
+        return base_url, ()
 
     selected_base_url = inputs.base_url or inputs.base_url_alias or model_defaults.base_url
     endpoint_query = model_defaults.endpoint_query

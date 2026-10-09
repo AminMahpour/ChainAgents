@@ -57,7 +57,16 @@ export DEEPAGENT_MODEL_API_KEY="your-openai-key"
 export ANTHROPIC_API_KEY="your-anthropic-key"
 ```
 
-**Option D: Snowflake Cortex**
+**Option D: Amazon Bedrock**
+
+Set `provider = "bedrock"` and a Bedrock model ID in `deepagent.toml`, then use your usual AWS credentials:
+
+```bash
+export AWS_REGION="us-east-1"
+export AWS_PROFILE="my-profile"   # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+```
+
+**Option E: Snowflake Cortex**
 
 Snowflake Cortex requires a key. Set a Snowflake PAT (or use the generic key,
 TOML `api_key`, or the CLI `--api-key` override):
@@ -90,13 +99,14 @@ Try one of these prompts:
 | **LM Studio** | Free | Depends on hardware | Full privacy | Start local server |
 | **OpenAI** | Pay-per-token | Fast | Data sent to OpenAI | Set `DEEPAGENT_MODEL_API_KEY` |
 | **Anthropic** | Pay-per-token | Fast | Data sent to Anthropic | Set `ANTHROPIC_API_KEY` |
+| **Amazon Bedrock** | Pay-per-token | Fast | Data sent to Amazon Bedrock in your AWS account | AWS credentials + `AWS_REGION` |
 | **Snowflake Cortex** | Snowflake usage | Fast | Data sent to Snowflake | Set `SNOWFLAKE_PAT` |
 
 To switch providers, edit `deepagent.toml`:
 
 ```toml
 [model]
-provider = "ollama"        # or "openai_compatible" or "anthropic"
+provider = "ollama"        # or "openai_compatible", "anthropic", or "bedrock"
 name = "gpt-oss:20b"       # change model name
 base_url = "http://127.0.0.1:11434"   # for Ollama or LM Studio
 ```

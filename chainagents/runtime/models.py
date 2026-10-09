@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import inspect
 import os
+import warnings
 from collections.abc import Mapping
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
+from langchain_aws import ChatBedrockConverse
 from langchain_ollama import ChatOllama
 
 import chainagents.runtime.model_config as runtime_model_config
@@ -226,6 +228,9 @@ def build_model(
             kwargs["num_predict"] = resolved_profile.max_tokens
         return ChatOllama(**kwargs)
 
+    if resolved_profile.provider == "bedrock":
+        return build_bedrock_model(resolved_profile, reasoning_level)
+
     api_key = model_api_key_for_profile(config, resolved_profile)
     if resolved_profile.provider == "anthropic":
         if not api_key:
@@ -288,6 +293,49 @@ def build_model(
     if default_query:
         kwargs["default_query"] = default_query
     return OpenAICompatibleChatOpenAI(**kwargs)
+
+
+def build_bedrock_model(
+    model_profile: ModelDefaults,
+    reasoning_level: ReasoningLevel,
+) -> ChatBedrockConverse:
+    """Build an Amazon Bedrock Converse model.
+
+    Credentials and region come from the standard AWS chain (environment,
+    shared config and profiles, SSO, or instance roles), so no API key is
+    passed here.
+
+    Args:
+        model_profile: Resolved model profile settings.
+        reasoning_level: The reasoning level value.
+
+    Returns:
+        The constructed Bedrock model.
+    """
+    kwargs: dict[str, Any] = {
+        "model_id": model_profile.name,
+        "temperature": model_profile.temperature,
+        "disable_streaming": model_profile.disable_streaming,
+    }
+    if model_profile.base_url:
+        kwargs["endpoint_url"] = model_profile.base_url
+    if model_profile.max_tokens is not None:
+        kwargs["max_tokens"] = model_profile.max_tokens
+    if model_profile.thinking != "disabled":
+        kwargs["reasoning_effort"] = reasoning_level
+    with warnings.catch_warnings():
+        if model_profile.thinking == "auto":
+            # langchain-aws ignores reasoning_effort for models without
+            # configurable reasoning; in auto mode that is expected, not noise.
+            warnings.filterwarnings(
+                "ignore",
+                message="reasoning_effort is not supported",
+            )
+        model = ChatBedrockConverse(**kwargs)
+    if "thinking" in (model.additional_model_request_fields or {}):
+        # Claude rejects non-default sampling temperatures while thinking.
+        model.temperature = None
+    return model
 
 
 def build_model_for_profile(

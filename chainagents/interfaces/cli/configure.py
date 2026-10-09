@@ -47,6 +47,7 @@ CONFIGURE_PROMPTS = (
             "snowflake_cortex",
             "anthropic",
             "claude",
+            "bedrock",
         ),
     ),
     ConfigPrompt(
@@ -415,7 +416,7 @@ def run_configure_command(
         requires_explicit_model_name = bool(
             is_model_name
             and selected_model_provider
-            in {"openai_compatible", "snowflake_cortex", "anthropic"}
+            in {"openai_compatible", "snowflake_cortex", "anthropic", "bedrock"}
         )
         if is_model_base_url and provider_changed:
             current_value = None
