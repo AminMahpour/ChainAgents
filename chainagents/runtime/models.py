@@ -316,8 +316,13 @@ def build_bedrock_model(
     kwargs: dict[str, Any] = {
         "model_id": model_profile.name,
         "temperature": model_profile.temperature,
-        "disable_streaming": model_profile.disable_streaming,
     }
+    if model_profile.disable_streaming or "disable_streaming" in (
+        model_profile.explicit_fields | model_profile.runtime_override_fields
+    ):
+        kwargs["disable_streaming"] = model_profile.disable_streaming
+    # Otherwise langchain-aws picks the per-model default, e.g. "tool_calling"
+    # for Bedrock models that cannot stream tool use.
     if model_profile.name.startswith("arn:"):
         kwargs.update(bedrock_arn_model_metadata(model_profile.name))
     if model_profile.base_url:

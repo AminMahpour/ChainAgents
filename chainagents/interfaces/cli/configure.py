@@ -467,6 +467,7 @@ def run_configure_command(
                 removals.add(("model", "base_url"))
                 removals.add(("model", "endpoint_url"))
                 removals.add(("model", "api_key"))
+                removals.add(("model", "models"))
         if is_openai_compatible_base_url and not should_write:
             if (
                 current_model_provider == "openai_compatible"

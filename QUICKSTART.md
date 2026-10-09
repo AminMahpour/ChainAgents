@@ -108,7 +108,7 @@ To switch providers, edit `deepagent.toml`:
 [model]
 provider = "ollama"        # or "openai_compatible", "anthropic", or "bedrock"
 name = "gpt-oss:20b"       # change model name
-base_url = "http://127.0.0.1:11434"   # for Ollama or LM Studio
+base_url = "http://127.0.0.1:11434"   # for Ollama or LM Studio; remove for Anthropic or Bedrock
 ```
 
 For Snowflake Cortex, use the exact provider value `snowflake_cortex` (no aliases), a

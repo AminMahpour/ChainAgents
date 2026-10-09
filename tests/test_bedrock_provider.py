@@ -434,3 +434,71 @@ name = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b
     config = deepagent_runtime.RuntimeConfig.from_env()
     with pytest.raises(ValueError, match="application inference profiles"):
         deepagent_runtime.build_model(config, "medium")
+
+
+def test_bedrock_model_keeps_langchain_aws_streaming_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "meta.llama3-1-70b-instruct-v1:0"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert model.disable_streaming == "tool_calling"
+
+
+def test_bedrock_model_honors_explicit_streaming_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "meta.llama3-1-70b-instruct-v1:0"
+disable_streaming = true
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert model.disable_streaming is True
+
+
+def test_configure_command_clears_model_choices_on_provider_switch(tmp_path: Path) -> None:
+    config_path = tmp_path / "deepagent.toml"
+    config_path.write_text(
+        '[model]\nprovider = "ollama"\nname = "gpt-oss:20b"\nmodels = ["gpt-oss:20b"]\n',
+        encoding="utf-8",
+    )
+    answers = "\n".join(
+        [
+            "bedrock",
+            "",
+            "amazon.nova-pro-v1:0",
+            *([""] * (len(chainagents_cli.CONFIGURE_PROMPTS) - 3)),
+        ]
+    )
+
+    code = chainagents_cli.run_configure_command(
+        config_path=config_path,
+        stdin=io.StringIO(answers),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert code == 0
+    model = tomllib.loads(config_path.read_text(encoding="utf-8"))["model"]
+    assert "models" not in model
