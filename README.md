@@ -486,6 +486,8 @@ export AWS_PROFILE="my-profile"  # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
 - `provider = "aws_bedrock"` and `provider = "amazon_bedrock"` are accepted as aliases.
 - `reasoning_effort` is forwarded for models whose langchain-aws profile declares configurable reasoning (for example Claude Opus/Sonnet 5, Nova 2, and gpt-oss) and ignored for others. For Claude this enables adaptive thinking, and the sampling `temperature` is dropped because Claude rejects it while thinking. Set `thinking = "disabled"` to turn reasoning off.
 - Reasoning blocks streamed by Bedrock are shown as thinking, separate from the answer.
+- Leave `disable_streaming` unset to keep langchain-aws's per-model default (for example, models that cannot stream tool calls fall back to non-streaming tool requests); set `disable_streaming = true` or `"tool_calling"` to force non-streaming requests.
+- Workspace-docs RAG cannot infer Bedrock embeddings. If `[rag].enabled = true`, set `[rag.embedding].provider` to `ollama` or `openai_compatible`, together with an appropriate embedding `model` and `base_url` (and `api_key` when needed).
 
 Named model profiles let the main agent, Chainlit mode picker, and sync
 subagents use different provider settings from the same config file:
