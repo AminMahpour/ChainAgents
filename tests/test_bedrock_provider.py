@@ -754,3 +754,94 @@ temperature = 1.5
     config = deepagent_runtime.RuntimeConfig.from_env()
     with pytest.raises(ValueError, match="between 0 and 1"):
         deepagent_runtime.build_model(config, "medium")
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("us.anthropic.claude-haiku-4-5-20251001-v1:0", "claude-haiku-4-5"),
+        ("anthropic.claude-3-5-sonnet-20240620-v1:0", "claude-3-5-sonnet"),
+        ("anthropic.claude-opus-4-6-v1", "claude-opus-4-6"),
+        ("global.anthropic.claude-opus-5-5", "claude-opus-5-5"),
+        ("in.anthropic.claude-sonnet-5", "claude-sonnet-5"),
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+            "us.anthropic.claude-sonnet-5",
+            "claude-sonnet-5",
+        ),
+    ],
+)
+def test_anthropic_bedrock_base_model_strips_bedrock_decorations(
+    model_id: str,
+    expected: str,
+) -> None:
+    from chainagents.runtime.models import anthropic_bedrock_base_model
+
+    assert anthropic_bedrock_base_model(model_id) == expected
+
+
+def test_anthropic_bedrock_skips_effort_for_models_without_effort_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+temperature = 0.2
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert model.reasoning_effort is None
+    assert model.thinking is None
+    assert model.temperature == 0.2
+
+
+def test_anthropic_bedrock_sends_disabled_thinking_to_claude_5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-sonnet-5"
+thinking = "disabled"
+temperature = 0.2
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert model.thinking == {"type": "disabled"}
+    assert model.reasoning_effort is None
+    assert model.temperature == 0.2
+
+
+def test_anthropic_bedrock_rejects_disabled_thinking_on_opus_5_5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "global.anthropic.claude-opus-5-5"
+thinking = "disabled"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="cannot run with thinking"):
+        deepagent_runtime.build_model(config, "medium")

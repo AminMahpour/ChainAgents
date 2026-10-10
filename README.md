@@ -504,6 +504,8 @@ thinking = "auto"
 
 - Credentials, region and `endpoint_url` work the same way as for `provider = "bedrock"`; no API key is used.
 - `name` is a Bedrock Claude model or inference-profile ID.
+- `reasoning_effort` is only sent to Claude models that support effort; it is skipped for models such as Claude 3.x and Haiku 4.5.
+- `thinking = "disabled"` explicitly turns thinking off on Claude Opus 5 and Sonnet 5, which think by default. Claude Opus 5.5 cannot run without thinking, so that setting is rejected for it.
 - `bedrock_anthropic` and `claude_bedrock` are accepted as aliases.
 
 Named model profiles let the main agent, Chainlit mode picker, and sync

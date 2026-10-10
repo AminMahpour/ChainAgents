@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import warnings
 from collections.abc import Mapping
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
+from langchain_anthropic.chat_models import (
+    _get_default_model_profile as anthropic_model_profile,
+)
 from langchain_aws import ChatAnthropicBedrock, ChatBedrockConverse
 from langchain_ollama import ChatOllama
 
@@ -383,20 +387,26 @@ def build_anthropic_bedrock_model(
         The constructed Claude-on-Bedrock model.
     """
     validate_bedrock_temperature(model_profile.temperature)
+    base_model = anthropic_bedrock_base_model(model_profile.name)
     kwargs: dict[str, Any] = {
         "model": model_profile.name,
         "temperature": model_profile.temperature,
         "disable_streaming": model_profile.disable_streaming,
     }
-    if model_profile.thinking != "disabled":
-        # langchain-anthropic turns an effort setting into adaptive thinking on
-        # models that support it, so effort is only sent when thinking may run.
-        kwargs["effort"] = reasoning_level
-    if should_enable_anthropic_adaptive_thinking(
-        model_profile.name,
-        model_profile.thinking,
-    ):
-        kwargs["thinking"] = {"type": "adaptive"}
+    if model_profile.thinking == "disabled":
+        kwargs.update(anthropic_bedrock_disabled_thinking_kwargs(base_model))
+    else:
+        # Claude rejects output_config.effort on models without effort support
+        # (Claude 3.x, Haiku 4.5), so effort is only sent where it is accepted.
+        # langchain-anthropic also turns effort into adaptive thinking on models
+        # that support it, which is why it is skipped when thinking is disabled.
+        if anthropic_model_profile(base_model).get("reasoning_effort_levels"):
+            kwargs["effort"] = reasoning_level
+        if should_enable_anthropic_adaptive_thinking(
+            model_profile.name,
+            model_profile.thinking,
+        ):
+            kwargs["thinking"] = {"type": "adaptive"}
     if model_profile.max_tokens is not None:
         kwargs["max_tokens"] = model_profile.max_tokens
     if os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
@@ -415,13 +425,65 @@ def build_anthropic_bedrock_model(
         )
     else:
         model = ChatAnthropicBedrock(**kwargs)
-    if "thinking" in kwargs or (
+    thinking_enabled = (
+        "thinking" in kwargs and kwargs["thinking"].get("type") != "disabled"
+    )
+    if thinking_enabled or (
         "effort" in kwargs
         and "xhigh" in ((model.profile or {}).get("reasoning_effort_levels") or ())
     ):
         # Claude rejects non-default sampling temperatures while thinking.
         model.temperature = None
     return model
+
+
+def anthropic_bedrock_base_model(model_id: str) -> str:
+    """Return the Anthropic model name behind a Bedrock Claude model ID.
+
+    Strips the ARN path, cross-region geography prefix, ``anthropic.`` vendor
+    prefix, Bedrock version suffix and release date, so
+    ``us.anthropic.claude-haiku-4-5-20251001-v1:0`` becomes ``claude-haiku-4-5``.
+
+    Args:
+        model_id: The Bedrock model ID, inference-profile ID or ARN.
+
+    Returns:
+        The Anthropic model name, or the stripped ID if it is not recognized.
+    """
+    parts = model_id.rsplit("/", 1)[-1].split(".")
+    if len(parts) >= 3 and parts[0] in BEDROCK_INFERENCE_PROFILE_PREFIXES:
+        parts = parts[1:]
+    if len(parts) >= 2 and parts[0] == "anthropic":
+        parts = parts[1:]
+    name = ".".join(parts)
+    name = re.sub(r"-v\d+(:\d+)?$", "", name)
+    return re.sub(r"-\d{8}$", "", name)
+
+
+def anthropic_bedrock_disabled_thinking_kwargs(base_model: str) -> dict[str, Any]:
+    """Return the request settings that turn thinking off for a Claude model.
+
+    Opus 5 and Sonnet 5 think adaptively unless thinking is explicitly
+    disabled, and Opus 5.5 cannot run without thinking. Older models do not
+    think unless asked, so omitting the setting is enough.
+
+    Args:
+        base_model: The Anthropic model name.
+
+    Returns:
+        Constructor keyword arguments for ``ChatAnthropicBedrock``.
+
+    Raises:
+        ValueError: If the model cannot disable thinking.
+    """
+    if base_model.startswith("claude-opus-5-5"):
+        raise ValueError(
+            f'{base_model} cannot run with thinking = "disabled"; use "auto" '
+            'or "adaptive" and lower reasoning_effort instead.'
+        )
+    if base_model.startswith(("claude-opus-5", "claude-sonnet-5")):
+        return {"thinking": {"type": "disabled"}}
+    return {}
 
 
 def bedrock_arn_model_metadata(model_arn: str) -> dict[str, str]:
