@@ -502,3 +502,23 @@ def test_configure_command_clears_model_choices_on_provider_switch(tmp_path: Pat
     assert code == 0
     model = tomllib.loads(config_path.read_text(encoding="utf-8"))["model"]
     assert "models" not in model
+
+
+def test_bedrock_model_rejects_out_of_range_temperature(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "amazon.nova-pro-v1:0"
+temperature = 1.5
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        deepagent_runtime.build_model(config, "medium")

@@ -313,6 +313,11 @@ def build_bedrock_model(
     Returns:
         The constructed Bedrock model.
     """
+    if not 0 <= model_profile.temperature <= 1:
+        raise ValueError(
+            "Amazon Bedrock temperature must be between 0 and 1; "
+            f"got {model_profile.temperature}."
+        )
     kwargs: dict[str, Any] = {
         "model_id": model_profile.name,
         "temperature": model_profile.temperature,
