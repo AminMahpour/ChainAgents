@@ -47,6 +47,8 @@ CONFIGURE_PROMPTS = (
             "snowflake_cortex",
             "anthropic",
             "claude",
+            "bedrock",
+            "anthropic_bedrock",
         ),
     ),
     ConfigPrompt(
@@ -415,7 +417,13 @@ def run_configure_command(
         requires_explicit_model_name = bool(
             is_model_name
             and selected_model_provider
-            in {"openai_compatible", "snowflake_cortex", "anthropic"}
+            in {
+                "openai_compatible",
+                "snowflake_cortex",
+                "anthropic",
+                "bedrock",
+                "anthropic_bedrock",
+            }
         )
         if is_model_base_url and provider_changed:
             current_value = None
@@ -466,6 +474,7 @@ def run_configure_command(
                 removals.add(("model", "base_url"))
                 removals.add(("model", "endpoint_url"))
                 removals.add(("model", "api_key"))
+                removals.add(("model", "models"))
         if is_openai_compatible_base_url and not should_write:
             if (
                 current_model_provider == "openai_compatible"

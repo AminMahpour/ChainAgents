@@ -8,7 +8,10 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from chainagents.runtime.constants import (
+    ANTHROPIC_BEDROCK_PROVIDER_ALIASES,
     ANTHROPIC_MESSAGES_PATH_SUFFIX,
+    BEDROCK_MODEL_PROVIDERS,
+    BEDROCK_PROVIDER_ALIASES,
     DEFAULT_ANTHROPIC_BASE_URL,
     DEFAULT_MODEL,
     DEFAULT_MODEL_PROVIDER,
@@ -168,12 +171,24 @@ def normalize_model_provider(
         return default
     if candidate == "claude":
         candidate = "anthropic"
+    if candidate in BEDROCK_PROVIDER_ALIASES:
+        candidate = "bedrock"
+    if candidate in ANTHROPIC_BEDROCK_PROVIDER_ALIASES:
+        candidate = "anthropic_bedrock"
     if candidate == "snowflake_cortex" and raw_candidate != candidate:
         raise ValueError("The Snowflake Cortex provider must be 'snowflake_cortex'.")
-    if candidate not in {"ollama", "openai_compatible", "snowflake_cortex", "anthropic"}:
+    if candidate not in {
+        "ollama",
+        "openai_compatible",
+        "snowflake_cortex",
+        "anthropic",
+        "bedrock",
+        "anthropic_bedrock",
+    }:
         raise ValueError(
             "The model provider must be 'ollama', 'openai_compatible', "
-            "'snowflake_cortex', 'anthropic', or 'claude'."
+            "'snowflake_cortex', 'anthropic', 'claude', 'bedrock', or "
+            "'anthropic_bedrock'."
         )
     return candidate  # type: ignore[return-value]
 
@@ -193,6 +208,10 @@ def format_model_provider(provider: ModelProvider) -> str:
         return "Snowflake Cortex"
     if provider == "anthropic":
         return "Anthropic Claude"
+    if provider == "bedrock":
+        return "Amazon Bedrock"
+    if provider == "anthropic_bedrock":
+        return "Anthropic Claude on Amazon Bedrock"
     return "Ollama"
 
 
@@ -435,6 +454,26 @@ def normalize_anthropic_endpoint_url(
     return base_url, tuple(parse_qsl(parsed.query, keep_blank_values=True))
 
 
+def normalize_bedrock_endpoint_url(value: Any | None) -> str:
+    """Normalize an optional Bedrock runtime endpoint override.
+
+    Bedrock resolves its regional endpoint from the AWS configuration, so an
+    empty value stays empty. A bare hostname defaults to HTTPS.
+
+    Args:
+        value: Value to normalize, convert, or serialize.
+
+    Returns:
+        The normalized endpoint URL, or an empty string for the AWS default.
+    """
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    return candidate.rstrip("/")
+
+
 def model_endpoint_query_to_dict(
     query: tuple[tuple[str, str], ...],
 ) -> dict[str, object]:
@@ -592,11 +631,12 @@ def parse_model_profile_defaults(
     else:
         name = DEFAULT_MODEL if provider == "ollama" else ""
 
-    if provider in {*OPENAI_COMPATIBLE_MODEL_PROVIDERS, "anthropic"} and not name:
+    if (
+        provider in {*OPENAI_COMPATIBLE_MODEL_PROVIDERS, "anthropic", *BEDROCK_MODEL_PROVIDERS}
+        and not name
+    ):
         provider_label = (
-            "OpenAI-compatible"
-            if provider == "openai_compatible"
-            else ("Snowflake Cortex" if provider == "snowflake_cortex" else "Anthropic")
+            "Anthropic" if provider == "anthropic" else format_model_provider(provider)
         )
         raise ValueError(
             f"{provider_label} model config must define a non-empty 'name' or 'models'."
@@ -671,6 +711,10 @@ def parse_model_profile_defaults(
                 raw_model.get("base_url"),
                 required_message=required_message,
             )
+    elif provider in BEDROCK_MODEL_PROVIDERS:
+        base_url = normalize_bedrock_endpoint_url(
+            raw_endpoint_url if has_endpoint_url else raw_base_url
+        )
     else:
         if has_endpoint_url:
             base_url, endpoint_query = normalize_anthropic_endpoint_url(raw_endpoint_url)
@@ -866,10 +910,16 @@ def rebase_model_profile_defaults(
                         required_message="The model endpoint URL cannot be empty.",
                     )
                 )
+            elif model_profile.provider in BEDROCK_MODEL_PROVIDERS:
+                cross_provider_base_url = normalize_bedrock_endpoint_url(
+                    cross_provider_endpoint_url
+                )
+                cross_provider_endpoint_query = ()
             else:
                 raise ValueError(
                     "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
-                    "provider-switched Anthropic or OpenAI-compatible profiles."
+                    "provider-switched Anthropic, Bedrock, or OpenAI-compatible "
+                    "profiles."
                 )
             updates["base_url"] = cross_provider_base_url
             updates["endpoint_query"] = cross_provider_endpoint_query
@@ -884,6 +934,10 @@ def rebase_model_profile_defaults(
                     required_message=(
                         "The Snowflake Cortex model base URL cannot be empty."
                     ),
+                )
+            elif model_profile.provider in BEDROCK_MODEL_PROVIDERS:
+                cross_provider_base_url = normalize_bedrock_endpoint_url(
+                    cross_provider_base_url
                 )
             updates["base_url"] = cross_provider_base_url
             updates["endpoint_query"] = (

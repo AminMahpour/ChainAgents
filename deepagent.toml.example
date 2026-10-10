@@ -35,6 +35,16 @@ disable_streaming_for_tool_calls = false
 # endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
 # api_key = ""  # optional when ANTHROPIC_API_KEY or DEEPAGENT_MODEL_API_KEY is set
 #
+# For Amazon Bedrock (Converse API), switch to:
+# provider = "bedrock"
+# name = "us.anthropic.claude-sonnet-5"  # Bedrock model or inference-profile ID
+# endpoint_url = "https://vpce-0123.bedrock-runtime.us-east-1.vpce.amazonaws.com"  # optional
+# Credentials and region come from the AWS chain (AWS_PROFILE, access keys, SSO,
+# or an instance role) and AWS_REGION; api_key is not used.
+# For Claude on Bedrock through the Anthropic Messages API, use
+# provider = "anthropic_bedrock" with a Bedrock Claude ID such as
+# "us.anthropic.claude-sonnet-4-6".
+#
 # Named profiles can override any [model] field and can be selected from
 # Chainlit modes/settings or referenced by [agent].model and subagent model.
 [model.profiles.fast-local]

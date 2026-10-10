@@ -56,6 +56,7 @@ export DEEPAGENT_RECURSION_LIMIT="200"
 # export DEEPAGENT_MODEL_API_KEY="optional-for-secured-openai-compatible-servers"
 # export ANTHROPIC_API_KEY="required-for-provider-anthropic-unless-DEEPAGENT_MODEL_API_KEY-is-set"
 # export SNOWFLAKE_PAT="required-for-provider-snowflake_cortex-unless-a-CLI-or-generic-key-is-set"
+# export AWS_REGION="us-east-1"  # provider = "bedrock" uses the standard AWS credential chain
 export DEEPAGENT_CONFIG="deepagent.toml"
 export CHAINLIT_AUTH_SECRET="replace-with-a-long-random-string"
 export CHAINLIT_AUTH_USERS='{"admin":"change-me","alice":"alice-password"}'
@@ -81,6 +82,7 @@ export CHAINLIT_AUTH_USERS='{"admin":"change-me","alice":"alice-password"}'
 - `DEEPAGENT_MODEL_API_KEY` is used for secured OpenAI-compatible servers and can also supply the Anthropic API key when `ANTHROPIC_API_KEY` is unset
 - `ANTHROPIC_API_KEY` is read first when `provider = "anthropic"` or `provider = "claude"`, so stale generic keys do not override the Claude credential
 - `SNOWFLAKE_PAT` is read first when `provider = "snowflake_cortex"`; Cortex still requires a key, resolved in this order: `--api-key`, `SNOWFLAKE_PAT`, `DEEPAGENT_MODEL_API_KEY`, then `[model].api_key`
+- `provider = "bedrock"` and `provider = "anthropic_bedrock"` ignore API-key variables and uses the standard AWS credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, SSO, or an instance/task role); set the region with `AWS_REGION` or `AWS_DEFAULT_REGION`
 - when switching to Anthropic with `DEEPAGENT_MODEL_PROVIDER`, unset stale `DEEPAGENT_MODEL_BASE_URL`; use `DEEPAGENT_MODEL_ENDPOINT_URL` with the `/v1/messages` path for env-based Anthropic proxy switches, or pass `--base-url` explicitly from the CLI
 - `DEEPAGENT_MODEL_DISABLE_STREAMING` accepts `true`, `false`, or `tool_calling`; `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS=true` is a convenience alias for `tool_calling`
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
@@ -188,6 +190,7 @@ replaced with a labeled placeholder so the rest of the PDF can still be download
 If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
 If you are using Claude through Anthropic, set `[model].provider = "anthropic"` and provide `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY`.
 For Snowflake Cortex, use the dedicated `snowflake_cortex` provider and a Snowflake PAT as shown in [Snowflake Cortex](#snowflake-cortex).
+For Amazon Bedrock, set `[model].provider = "bedrock"` with a Bedrock model or inference-profile ID and configure AWS credentials and `AWS_REGION` as shown in [Amazon Bedrock](#amazon-bedrock). For Claude on Bedrock through the Anthropic Messages API, use `provider = "anthropic_bedrock"`.
 
 If you enable workspace-docs RAG with Ollama embeddings, also pull an embedding model such as:
 
@@ -457,6 +460,56 @@ thinking = "auto"
 # endpoint_url = "https://claude-proxy.example/proxy/v1/messages"
 ```
 
+### Amazon Bedrock
+
+For models hosted on Amazon Bedrock (Claude, Amazon Nova, Llama, Mistral, gpt-oss, and others) through the Bedrock Converse API:
+
+```toml
+[model]
+provider = "bedrock"
+temperature = 0
+name = "us.anthropic.claude-sonnet-5"
+models = ["us.anthropic.claude-sonnet-5", "amazon.nova-pro-v1:0"]
+reasoning_effort = "medium"
+thinking = "auto"
+# endpoint_url = "https://vpce-0123.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+```
+
+```bash
+export AWS_REGION="us-east-1"
+export AWS_PROFILE="my-profile"  # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, SSO, or an instance role
+```
+
+- `name` is a Bedrock model ID (such as `amazon.nova-pro-v1:0`), a cross-region inference-profile ID (such as `us.anthropic.…`), or a foundation-model/system inference-profile ARN. Application inference profiles and provisioned models are not supported, as an ID or an ARN, because they hide the underlying model; use that model or cross-region inference-profile ID instead.
+- Credentials and region come from the standard AWS chain; `api_key` and `DEEPAGENT_MODEL_API_KEY` are not used. Bedrock API keys work through boto3's own `AWS_BEARER_TOKEN_BEDROCK` variable.
+- `base_url` or `endpoint_url` optionally overrides the Bedrock runtime endpoint, for example a VPC interface endpoint; leave both unset to use the regional default.
+- `provider = "aws_bedrock"` and `provider = "amazon_bedrock"` are accepted as aliases.
+- `reasoning_effort` is forwarded for models whose langchain-aws profile declares configurable reasoning (for example Claude Opus/Sonnet 5, Nova 2, and gpt-oss) and ignored for others. For Claude this enables adaptive thinking, and the sampling `temperature` is dropped because Claude rejects it while thinking. Set `thinking = "disabled"` to turn reasoning off; for Claude Opus 5 and Sonnet 5, which think by default, this sends an explicit disabled-thinking setting. Claude Opus 5.5, Sonnet 5.5 and Fable 5 cannot run without thinking, so `thinking = "disabled"` is rejected for them. gpt-oss always reasons, so it rejects `thinking = "disabled"` too; use `reasoning_effort = "low"`.
+- Amazon Nova rejects a temperature of exactly 0, so `temperature = 0` is sent as 0.00001. At high reasoning effort Nova accepts no sampling settings, so the temperature is dropped.
+- Reasoning blocks streamed by Bedrock are shown as thinking, separate from the answer.
+- Leave `disable_streaming` unset to keep langchain-aws's per-model default (for example, models that cannot stream tool calls fall back to non-streaming tool requests); set `disable_streaming = true` or `"tool_calling"` to force non-streaming requests.
+- Workspace-docs RAG cannot infer Bedrock embeddings. If `[rag].enabled = true`, set `[rag.embedding].provider` to `ollama` or `openai_compatible`, together with an appropriate embedding `model` and `base_url` (and `api_key` when needed).
+
+### Claude on Amazon Bedrock (Anthropic Messages API)
+
+`provider = "bedrock"` uses the Converse API, which works for every Bedrock model. To run Claude on Bedrock through the Anthropic Messages API instead, use `provider = "anthropic_bedrock"`. It uses the Anthropic SDK's Bedrock client (langchain-aws `ChatAnthropicBedrock`), so Claude gets the same request handling as `provider = "anthropic"`: `effort`, adaptive thinking, and Anthropic content blocks.
+
+```toml
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-sonnet-4-6"
+reasoning_effort = "medium"
+thinking = "auto"
+# endpoint_url = "https://vpce-0123.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+```
+
+- Credentials, region and `endpoint_url` work the same way as for `provider = "bedrock"`; no API key is used.
+- `name` is a Bedrock Claude model ID or cross-region inference-profile ID.
+- `reasoning_effort` is only sent to Claude models that support effort; it is skipped for models such as Claude 3.x and Haiku 4.5.
+- `thinking = "disabled"` explicitly turns thinking off on Claude Opus 5 and Sonnet 5, which think by default. Claude Opus 5.5, Sonnet 5.5 and Fable 5 cannot run without thinking, so that setting is rejected for them.
+- Only Anthropic Claude model IDs are accepted; use `provider = "bedrock"` for other Bedrock models. Foundation-model and system inference-profile ARNs work, but application inference profiles and provisioned models hide the underlying model, so use the Claude model or inference-profile ID instead.
+- `bedrock_anthropic` and `claude_bedrock` are accepted as aliases.
+
 Named model profiles let the main agent, Chainlit mode picker, and sync
 subagents use different provider settings from the same config file:
 
@@ -492,24 +545,24 @@ model = "claude-reviewer"
 
 Notes:
 
-- `provider` selects `ChatOllama`, `ChatOpenAI`, or `ChatAnthropic`.
+- `provider` selects `ChatOllama`, `ChatOpenAI`, `ChatAnthropic`, `ChatBedrockConverse` (`provider = "bedrock"`), or `ChatAnthropicBedrock` (`provider = "anthropic_bedrock"`).
 - `provider = "claude"` is accepted as an alias for `provider = "anthropic"`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, `max_tokens`, and `reasoning_effort`.
-- `max_tokens` is an optional positive output-token limit. It maps to `max_completion_tokens` for Snowflake Cortex and OpenAI-compatible providers, `max_tokens` for Anthropic, and `num_predict` for Ollama.
+- `max_tokens` is an optional positive output-token limit. It maps to `max_completion_tokens` for Snowflake Cortex and OpenAI-compatible providers, `max_tokens` for Anthropic and Bedrock, and `num_predict` for Ollama.
 - If the model reaches this limit while producing a tool call, ChainAgents discards the incomplete call and tells the model to shorten or split it once. A second truncated tool call ends that run with a clear message; increasing `max_tokens` may help.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
 - `disable_streaming = "tool_calling"` or `disable_streaming_for_tool_calls = true` bypasses model streaming only when tools are attached to the request; use this for providers that have trouble streaming tool-call chunks. `disable_streaming = true` disables model streaming for all requests.
 - `endpoint_url` is an override for full non-standard model endpoint URLs. OpenAI-compatible paths ending in `/chat/completions` or `/responses` are normalized to the client base URL and query parameters are forwarded as OpenAI client default query parameters. Anthropic paths ending in `/v1/messages` are normalized to the Claude client base URL and query parameters are forwarded as Anthropic client default query parameters.
 - `models` is an optional list of model IDs surfaced in Chainlit settings and modes so users can switch models per session or per message.
 - `modalities` declares accepted input types for a model or profile. It defaults to `["text"]`; add `"image"` only for models that accept image content.
-- `[model.profiles.<name>]` defines a named profile. Profiles inherit omitted fields from `[model]` when they keep the same provider; profiles that switch to `openai_compatible` must provide `base_url` or `endpoint_url`, and profiles that switch to `anthropic` default to `https://api.anthropic.com` unless `base_url` or `endpoint_url` is set.
+- `[model.profiles.<name>]` defines a named profile. Profiles inherit omitted fields from `[model]` when they keep the same provider; profiles that switch to `openai_compatible` must provide `base_url` or `endpoint_url`, profiles that switch to `anthropic` default to `https://api.anthropic.com` unless `base_url` or `endpoint_url` is set, and profiles that switch to `bedrock` use the AWS regional endpoint unless `base_url` or `endpoint_url` is set.
 - Profile names are surfaced in Chainlit settings and modes alongside `[model].models`. When a selected value matches a profile name, the full profile is used; otherwise the value is treated as a raw model name using the inherited/default provider settings.
 - `[agent].model` optionally sets the main/supervisor agent's default profile or raw model name. CLI and environment model overrides still take precedence.
 - `api_key` is optional for `provider = "openai_compatible"`; when omitted, the runtime sends a placeholder token that local servers like LM Studio accept.
 - Anthropic requires an API key from `ANTHROPIC_API_KEY`, `DEEPAGENT_MODEL_API_KEY`, or `api_key`; when multiple are set, `ANTHROPIC_API_KEY` takes precedence over the generic key.
 - When switching from another provider to Anthropic through environment or CLI overrides, provide Anthropic credentials through `ANTHROPIC_API_KEY`, `DEEPAGENT_MODEL_API_KEY`, or `--api-key`; the runtime will not reuse an `api_key` from another provider's TOML config.
 - Legacy Ollama `endpoint` and `port` are still accepted when `provider = "ollama"` or omitted.
-- `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly, Anthropic maps it to Claude `effort`, and OpenAI-compatible servers may ignore it.
+- `reasoning_effort` sets the default Chainlit reasoning level for new chats. Ollama uses that level directly, Anthropic maps it to Claude `effort`, Bedrock forwards it as `reasoning_effort` for models that support it, and OpenAI-compatible servers may ignore it.
 - `thinking` controls Anthropic adaptive thinking: `auto` enables it only for known supported Claude models, `adaptive` always sends `thinking = {"type": "adaptive"}`, and `disabled` never sends a thinking parameter.
 - `DEEPAGENT_MODEL_PROVIDER`, `DEEPAGENT_MODEL_BASE_URL`, `DEEPAGENT_MODEL_ENDPOINT_URL`, `DEEPAGENT_MODEL_NAME`, `DEEPAGENT_MODEL_API_KEY`, `DEEPAGENT_MODEL_REASONING`, `DEEPAGENT_MODEL_DISABLE_STREAMING`, and `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS` override the TOML defaults when set.
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` still work as Ollama-only compatibility aliases.

@@ -65,7 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PROVIDER",
         help=(
             "Model provider: ollama, openai_compatible, Snowflake Cortex "
-            "(`snowflake_cortex`), anthropic, or claude."
+            "(`snowflake_cortex`), anthropic, claude, bedrock (Amazon Bedrock "
+            "Converse), or anthropic_bedrock (Claude on Bedrock via the "
+            "Anthropic Messages API)."
         ),
     )
     parser.add_argument("--base-url", help="Model server base URL.")

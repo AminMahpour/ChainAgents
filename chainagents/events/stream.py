@@ -32,6 +32,15 @@ LANGGRAPH_STREAM_MODES = {
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 SUMMARIZATION_STATUS_KIND = "summarization_status"
 ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
+# Bedrock Converse streams reasoning as ``reasoning_content`` content blocks.
+BEDROCK_REASONING_BLOCK_TYPE = "reasoning_content"
+# LangChain's standard content blocks (``LC_OUTPUT_VERSION=v1``) use ``reasoning``.
+STANDARD_REASONING_BLOCK_TYPE = "reasoning"
+THINKING_BLOCK_TYPES = {
+    *ANTHROPIC_THINKING_BLOCK_TYPES,
+    BEDROCK_REASONING_BLOCK_TYPE,
+    STANDARD_REASONING_BLOCK_TYPE,
+}
 TOKEN_LIMIT_RETRY_MARKER = "chainagents_token_limit_retry"
 
 
@@ -64,7 +73,7 @@ def stringify_content(value: Any) -> str:
     if isinstance(value, list):
         return "".join(stringify_content(item) for item in value)
     if isinstance(value, dict):
-        if value.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
+        if value.get("type") in THINKING_BLOCK_TYPES:
             return ""
         for key in ("text", "reasoning", "content"):
             nested = value.get(key)
@@ -75,12 +84,23 @@ def stringify_content(value: Any) -> str:
 
 
 def anthropic_thinking_text(value: Any) -> str:
-    """Extract Claude thinking text from LangChain Anthropic content blocks."""
+    """Extract thinking text from Anthropic, Bedrock Converse or standard blocks."""
     if isinstance(value, list):
         return "".join(anthropic_thinking_text(item) for item in value)
-    if not isinstance(value, dict) or value.get("type") != "thinking":
+    if not isinstance(value, dict):
         return ""
-    return stringify_content(value.get("thinking"))
+    if value.get("type") == "thinking":
+        return stringify_content(value.get("thinking"))
+    if value.get("type") == BEDROCK_REASONING_BLOCK_TYPE:
+        reasoning = value.get(BEDROCK_REASONING_BLOCK_TYPE)
+        if isinstance(reasoning, dict):
+            # Signature-only chunks carry no displayable text.
+            text = reasoning.get("text")
+            return text if isinstance(text, str) else ""
+    if value.get("type") == STANDARD_REASONING_BLOCK_TYPE:
+        reasoning = value.get(STANDARD_REASONING_BLOCK_TYPE)
+        return reasoning if isinstance(reasoning, str) else ""
+    return ""
 
 
 def langgraph_part_from_event_chunk(chunk: Any) -> dict[str, Any] | None:

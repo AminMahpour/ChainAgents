@@ -19,6 +19,8 @@ The `[model]` table selects the provider and endpoint. Supported providers:
 | `openai_compatible` | Any OpenAI-compatible server (LM Studio, vLLM, OpenAI) |
 | `anthropic` | Claude models; needs `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY` |
 | `snowflake_cortex` | Snowflake Cortex endpoint; needs a Snowflake PAT |
+| `bedrock` | Amazon Bedrock Converse API; uses the standard AWS credential chain and `AWS_REGION`, with an optional `endpoint_url` override |
+| `anthropic_bedrock` | Claude on Amazon Bedrock through the Anthropic Messages API; same AWS credentials, region and endpoint handling as `bedrock` |
 
 Example:
 

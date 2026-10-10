@@ -198,7 +198,7 @@ model = "local"
 
     assert str(exc_info.value) == (
         "DEEPAGENT_MODEL_ENDPOINT_URL can only target "
-        "provider-switched Anthropic or OpenAI-compatible profiles."
+        "provider-switched Anthropic, Bedrock, or OpenAI-compatible profiles."
     )
 
 
