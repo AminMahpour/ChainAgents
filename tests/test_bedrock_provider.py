@@ -733,3 +733,24 @@ name = "us.anthropic.claude-sonnet-4-6"
 
     assert model.aws_access_key_id is None
     assert model._client.api_key == "bedrock-api-key"
+
+
+def test_anthropic_bedrock_rejects_out_of_range_temperature(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-sonnet-4-6"
+thinking = "disabled"
+temperature = 1.5
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        deepagent_runtime.build_model(config, "medium")

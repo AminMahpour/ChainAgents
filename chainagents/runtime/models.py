@@ -316,11 +316,7 @@ def build_bedrock_model(
     Returns:
         The constructed Bedrock model.
     """
-    if not 0 <= model_profile.temperature <= 1:
-        raise ValueError(
-            "Amazon Bedrock temperature must be between 0 and 1; "
-            f"got {model_profile.temperature}."
-        )
+    validate_bedrock_temperature(model_profile.temperature)
     kwargs: dict[str, Any] = {
         "model_id": model_profile.name,
         "temperature": model_profile.temperature,
@@ -354,6 +350,21 @@ def build_bedrock_model(
     return model
 
 
+def validate_bedrock_temperature(temperature: float) -> None:
+    """Reject temperatures outside the 0..1 range Bedrock accepts.
+
+    Args:
+        temperature: The configured sampling temperature.
+
+    Raises:
+        ValueError: If the temperature is outside 0..1.
+    """
+    if not 0 <= temperature <= 1:
+        raise ValueError(
+            f"Amazon Bedrock temperature must be between 0 and 1; got {temperature}."
+        )
+
+
 def build_anthropic_bedrock_model(
     model_profile: ModelDefaults,
     reasoning_level: ReasoningLevel,
@@ -371,6 +382,7 @@ def build_anthropic_bedrock_model(
     Returns:
         The constructed Claude-on-Bedrock model.
     """
+    validate_bedrock_temperature(model_profile.temperature)
     kwargs: dict[str, Any] = {
         "model": model_profile.name,
         "temperature": model_profile.temperature,
