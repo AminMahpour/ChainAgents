@@ -294,6 +294,18 @@ def test_reasoning_text_from_token_extracts_bedrock_reasoning_blocks() -> None:
     assert stringify_content(token.content) == ""
 
 
+def test_reasoning_text_from_token_extracts_standard_reasoning_blocks() -> None:
+    token = _BedrockToken(
+        [
+            {"type": "reasoning", "reasoning": "weighing options"},
+            {"type": "text", "text": "Final answer"},
+        ]
+    )
+
+    assert reasoning_text_from_token(token) == "weighing options"
+    assert stringify_content(token.content) == "Final answer"
+
+
 def test_adapter_separates_bedrock_reasoning_from_response_text() -> None:
     adapter = AgentStreamEventAdapter(prompt="hello")
 
@@ -949,3 +961,27 @@ temperature = 0.2
     assert model.reasoning_effort == "high"
     assert "xhigh" in model.profile["reasoning_effort_levels"]
     assert model.temperature is None
+
+
+def test_anthropic_bedrock_defaults_max_tokens_from_model_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_anthropic.chat_models import _get_default_model_profile
+
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    expected = _get_default_model_profile("claude-haiku-4-5")["max_output_tokens"]
+    assert expected > 4096
+    assert model.max_tokens == expected

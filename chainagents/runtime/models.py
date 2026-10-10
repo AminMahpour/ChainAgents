@@ -418,6 +418,10 @@ def build_anthropic_bedrock_model(
             kwargs["thinking"] = {"type": "adaptive"}
     if model_profile.max_tokens is not None:
         kwargs["max_tokens"] = model_profile.max_tokens
+    elif base_profile.get("max_output_tokens"):
+        # ChatAnthropic sizes its default from the model name, which does not
+        # match Bedrock IDs, so it would otherwise fall back to 4096 tokens.
+        kwargs["max_tokens"] = base_profile["max_output_tokens"]
     if os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
         # The Anthropic SDK rejects a Bedrock API key combined with SigV4
         # credentials, which langchain-aws would otherwise read from the env.
