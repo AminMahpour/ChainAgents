@@ -134,7 +134,7 @@ def test_bedrock_model_skips_reasoning_when_thinking_disabled(
         """
 [model]
 provider = "bedrock"
-name = "us.anthropic.claude-opus-5-5"
+name = "us.amazon.nova-2-lite-v1:0"
 thinking = "disabled"
 """,
     )
@@ -827,7 +827,38 @@ temperature = 0.2
     assert model.temperature == 0.2
 
 
-def test_anthropic_bedrock_rejects_disabled_thinking_on_opus_5_5(
+@pytest.mark.parametrize("provider", ["bedrock", "anthropic_bedrock"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "global.anthropic.claude-opus-5-5",
+        "global.anthropic.claude-sonnet-5-5",
+        "us.anthropic.claude-fable-5",
+    ],
+)
+def test_bedrock_rejects_disabled_thinking_on_always_thinking_claude(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    name: str,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        f"""
+[model]
+provider = "{provider}"
+name = "{name}"
+thinking = "disabled"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="cannot run with thinking"):
+        deepagent_runtime.build_model(config, "medium")
+
+
+def test_bedrock_converse_sends_disabled_thinking_to_claude_5(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -836,12 +867,54 @@ def test_anthropic_bedrock_rejects_disabled_thinking_on_opus_5_5(
         monkeypatch,
         """
 [model]
-provider = "anthropic_bedrock"
-name = "global.anthropic.claude-opus-5-5"
+provider = "bedrock"
+name = "us.anthropic.claude-sonnet-5"
 thinking = "disabled"
+temperature = 0.2
 """,
     )
 
     config = deepagent_runtime.RuntimeConfig.from_env()
-    with pytest.raises(ValueError, match="cannot run with thinking"):
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert model.additional_model_request_fields == {"thinking": {"type": "disabled"}}
+    assert model.temperature == 0.2
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "amazon.nova-pro-v1:0",
+        "us.meta.llama3-1-70b-instruct-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
+    ],
+)
+def test_anthropic_bedrock_rejects_non_claude_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        f"""
+[model]
+provider = "anthropic_bedrock"
+name = "{name}"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="only supports Anthropic Claude"):
         deepagent_runtime.build_model(config, "medium")
+
+
+def test_anthropic_bedrock_allows_application_inference_profile_arn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chainagents.runtime.models import validate_anthropic_bedrock_model_id
+
+    validate_anthropic_bedrock_model_id(
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4"
+    )

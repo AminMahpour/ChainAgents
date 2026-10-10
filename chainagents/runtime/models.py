@@ -337,7 +337,13 @@ def build_bedrock_model(
         kwargs["endpoint_url"] = model_profile.base_url
     if model_profile.max_tokens is not None:
         kwargs["max_tokens"] = model_profile.max_tokens
-    if model_profile.thinking != "disabled":
+    if model_profile.thinking == "disabled":
+        disabled = anthropic_bedrock_disabled_thinking_kwargs(
+            anthropic_bedrock_base_model(model_profile.name)
+        )
+        if disabled:
+            kwargs["additional_model_request_fields"] = disabled
+    else:
         kwargs["reasoning_effort"] = reasoning_level
     with warnings.catch_warnings():
         if model_profile.thinking == "auto":
@@ -348,7 +354,8 @@ def build_bedrock_model(
                 message="reasoning_effort is not supported",
             )
         model = ChatBedrockConverse(**kwargs)
-    if "thinking" in (model.additional_model_request_fields or {}):
+    thinking = (model.additional_model_request_fields or {}).get("thinking")
+    if isinstance(thinking, Mapping) and thinking.get("type") != "disabled":
         # Claude rejects non-default sampling temperatures while thinking.
         model.temperature = None
     return model
@@ -387,6 +394,7 @@ def build_anthropic_bedrock_model(
         The constructed Claude-on-Bedrock model.
     """
     validate_bedrock_temperature(model_profile.temperature)
+    validate_anthropic_bedrock_model_id(model_profile.name)
     base_model = anthropic_bedrock_base_model(model_profile.name)
     kwargs: dict[str, Any] = {
         "model": model_profile.name,
@@ -460,23 +468,47 @@ def anthropic_bedrock_base_model(model_id: str) -> str:
     return re.sub(r"-\d{8}$", "", name)
 
 
+def validate_anthropic_bedrock_model_id(model_id: str) -> None:
+    """Reject Bedrock model IDs from vendors other than Anthropic.
+
+    The Anthropic Messages API only serves Claude, so a model such as
+    ``amazon.nova-pro-v1:0`` would fail on its first request. IDs without a
+    vendor prefix, such as application inference-profile ARNs, are allowed.
+
+    Args:
+        model_id: The Bedrock model ID, inference-profile ID or ARN.
+
+    Raises:
+        ValueError: If the ID names a non-Anthropic model.
+    """
+    parts = model_id.rsplit("/", 1)[-1].split(".")
+    if len(parts) >= 3 and parts[0] in BEDROCK_INFERENCE_PROFILE_PREFIXES:
+        parts = parts[1:]
+    if len(parts) >= 2 and parts[0] != "anthropic":
+        raise ValueError(
+            'provider = "anthropic_bedrock" only supports Anthropic Claude '
+            f'models; got {model_id}. Use provider = "bedrock" for other models.'
+        )
+
+
 def anthropic_bedrock_disabled_thinking_kwargs(base_model: str) -> dict[str, Any]:
     """Return the request settings that turn thinking off for a Claude model.
 
     Opus 5 and Sonnet 5 think adaptively unless thinking is explicitly
-    disabled, and Opus 5.5 cannot run without thinking. Older models do not
-    think unless asked, so omitting the setting is enough.
+    disabled, while Opus 5.5, Sonnet 5.5 and Fable 5 cannot run without
+    thinking. Older models do not think unless asked, so omitting the setting
+    is enough.
 
     Args:
         base_model: The Anthropic model name.
 
     Returns:
-        Constructor keyword arguments for ``ChatAnthropicBedrock``.
+        The ``thinking`` request setting, or an empty dict when none is needed.
 
     Raises:
         ValueError: If the model cannot disable thinking.
     """
-    if base_model.startswith("claude-opus-5-5"):
+    if base_model.startswith(("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5")):
         raise ValueError(
             f'{base_model} cannot run with thinking = "disabled"; use "auto" '
             'or "adaptive" and lower reasoning_effort instead.'

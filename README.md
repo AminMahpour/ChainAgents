@@ -484,7 +484,7 @@ export AWS_PROFILE="my-profile"  # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
 - Credentials and region come from the standard AWS chain; `api_key` and `DEEPAGENT_MODEL_API_KEY` are not used. Bedrock API keys work through boto3's own `AWS_BEARER_TOKEN_BEDROCK` variable.
 - `base_url` or `endpoint_url` optionally overrides the Bedrock runtime endpoint, for example a VPC interface endpoint; leave both unset to use the regional default.
 - `provider = "aws_bedrock"` and `provider = "amazon_bedrock"` are accepted as aliases.
-- `reasoning_effort` is forwarded for models whose langchain-aws profile declares configurable reasoning (for example Claude Opus/Sonnet 5, Nova 2, and gpt-oss) and ignored for others. For Claude this enables adaptive thinking, and the sampling `temperature` is dropped because Claude rejects it while thinking. Set `thinking = "disabled"` to turn reasoning off.
+- `reasoning_effort` is forwarded for models whose langchain-aws profile declares configurable reasoning (for example Claude Opus/Sonnet 5, Nova 2, and gpt-oss) and ignored for others. For Claude this enables adaptive thinking, and the sampling `temperature` is dropped because Claude rejects it while thinking. Set `thinking = "disabled"` to turn reasoning off; for Claude Opus 5 and Sonnet 5, which think by default, this sends an explicit disabled-thinking setting. Claude Opus 5.5, Sonnet 5.5 and Fable 5 cannot run without thinking, so `thinking = "disabled"` is rejected for them.
 - Reasoning blocks streamed by Bedrock are shown as thinking, separate from the answer.
 - Leave `disable_streaming` unset to keep langchain-aws's per-model default (for example, models that cannot stream tool calls fall back to non-streaming tool requests); set `disable_streaming = true` or `"tool_calling"` to force non-streaming requests.
 - Workspace-docs RAG cannot infer Bedrock embeddings. If `[rag].enabled = true`, set `[rag.embedding].provider` to `ollama` or `openai_compatible`, together with an appropriate embedding `model` and `base_url` (and `api_key` when needed).
@@ -505,7 +505,8 @@ thinking = "auto"
 - Credentials, region and `endpoint_url` work the same way as for `provider = "bedrock"`; no API key is used.
 - `name` is a Bedrock Claude model or inference-profile ID.
 - `reasoning_effort` is only sent to Claude models that support effort; it is skipped for models such as Claude 3.x and Haiku 4.5.
-- `thinking = "disabled"` explicitly turns thinking off on Claude Opus 5 and Sonnet 5, which think by default. Claude Opus 5.5 cannot run without thinking, so that setting is rejected for it.
+- `thinking = "disabled"` explicitly turns thinking off on Claude Opus 5 and Sonnet 5, which think by default. Claude Opus 5.5, Sonnet 5.5 and Fable 5 cannot run without thinking, so that setting is rejected for them.
+- Only Anthropic Claude model IDs are accepted; use `provider = "bedrock"` for other Bedrock models.
 - `bedrock_anthropic` and `claude_bedrock` are accepted as aliases.
 
 Named model profiles let the main agent, Chainlit mode picker, and sync
