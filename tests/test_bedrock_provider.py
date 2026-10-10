@@ -445,7 +445,7 @@ name = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b
     )
 
     config = deepagent_runtime.RuntimeConfig.from_env()
-    with pytest.raises(ValueError, match="application inference profiles"):
+    with pytest.raises(ValueError, match="Application inference profiles"):
         deepagent_runtime.build_model(config, "medium")
 
 
@@ -1074,4 +1074,23 @@ thinking = "disabled"
 
     config = deepagent_runtime.RuntimeConfig.from_env()
     with pytest.raises(ValueError, match="reasoning_effort"):
+        deepagent_runtime.build_model(config, "medium")
+
+
+def test_bedrock_rejects_opaque_application_profile_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "a1b2c3d4e5f6"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="Application inference profiles"):
         deepagent_runtime.build_model(config, "medium")

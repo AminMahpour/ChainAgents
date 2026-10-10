@@ -480,7 +480,7 @@ export AWS_REGION="us-east-1"
 export AWS_PROFILE="my-profile"  # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, SSO, or an instance role
 ```
 
-- `name` is a Bedrock model ID, inference-profile ID, or a foundation-model/system inference-profile ARN; cross-region IDs such as `us.anthropic.…` are supported. Application inference-profile and provisioned-model ARNs do not reveal the underlying model, so use the model or inference-profile ID for those.
+- `name` is a Bedrock model ID (such as `amazon.nova-pro-v1:0`), a cross-region inference-profile ID (such as `us.anthropic.…`), or a foundation-model/system inference-profile ARN. Application inference profiles and provisioned models are not supported, as an ID or an ARN, because they hide the underlying model; use that model or cross-region inference-profile ID instead.
 - Credentials and region come from the standard AWS chain; `api_key` and `DEEPAGENT_MODEL_API_KEY` are not used. Bedrock API keys work through boto3's own `AWS_BEARER_TOKEN_BEDROCK` variable.
 - `base_url` or `endpoint_url` optionally overrides the Bedrock runtime endpoint, for example a VPC interface endpoint; leave both unset to use the regional default.
 - `provider = "aws_bedrock"` and `provider = "amazon_bedrock"` are accepted as aliases.
@@ -504,7 +504,7 @@ thinking = "auto"
 ```
 
 - Credentials, region and `endpoint_url` work the same way as for `provider = "bedrock"`; no API key is used.
-- `name` is a Bedrock Claude model or inference-profile ID.
+- `name` is a Bedrock Claude model ID or cross-region inference-profile ID.
 - `reasoning_effort` is only sent to Claude models that support effort; it is skipped for models such as Claude 3.x and Haiku 4.5.
 - `thinking = "disabled"` explicitly turns thinking off on Claude Opus 5 and Sonnet 5, which think by default. Claude Opus 5.5, Sonnet 5.5 and Fable 5 cannot run without thinking, so that setting is rejected for them.
 - Only Anthropic Claude model IDs are accepted; use `provider = "bedrock"` for other Bedrock models. Foundation-model and system inference-profile ARNs work, but application inference profiles and provisioned models hide the underlying model, so use the Claude model or inference-profile ID instead.

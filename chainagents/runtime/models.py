@@ -338,12 +338,17 @@ def build_bedrock_model(
     # Otherwise langchain-aws picks the per-model default, e.g. "tool_calling"
     # for Bedrock models that cannot stream tool use.
     geo_prefix = model_profile.name.split(".", 1)[0]
-    if model_profile.name.startswith("arn:") or (
-        geo_prefix in BEDROCK_INFERENCE_PROFILE_PREFIXES
-        and geo_prefix not in MODEL_ID_GEO_PREFIXES
+    if (
+        model_profile.name.startswith("arn:")
+        or "." not in model_profile.name
+        or (
+            geo_prefix in BEDROCK_INFERENCE_PROFILE_PREFIXES
+            and geo_prefix not in MODEL_ID_GEO_PREFIXES
+        )
     ):
         # langchain-aws cannot infer the model family from ARNs or from
-        # geography prefixes it does not know yet (such as "in." or "ca.").
+        # geography prefixes it does not know yet (such as "in." or "ca."),
+        # and opaque application-profile IDs hide it entirely (rejected here).
         kwargs.update(bedrock_arn_model_metadata(model_profile.name))
     if model_profile.base_url:
         kwargs["endpoint_url"] = model_profile.base_url
@@ -599,10 +604,11 @@ def bedrock_arn_model_metadata(model_arn: str) -> dict[str, str]:
     parts = bedrock_base_model_id(model_arn).split(".")
     if len(parts) < 2 or not parts[0] or ":" in parts[0]:
         raise ValueError(
-            "Amazon Bedrock model ARNs must end in a model ID, such as a "
-            "foundation-model or system inference-profile ARN. For application "
-            "inference profiles or provisioned models, use the underlying "
-            "model or inference-profile ID as [model].name instead."
+            f"Cannot tell which model {model_arn} runs. Use a Bedrock model ID, "
+            "a cross-region inference-profile ID, or a foundation-model or "
+            "system inference-profile ARN. Application inference profiles and "
+            "provisioned models are not supported; use the underlying model or "
+            "inference-profile ID as [model].name instead."
         )
     return {"provider": parts[0], "base_model": ".".join(parts)}
 
