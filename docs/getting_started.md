@@ -43,6 +43,8 @@ them with `brew install weasyprint`; on Linux, see the
 - **Amazon Bedrock:** set `[model].provider = "bedrock"` and a Bedrock model
   or inference-profile ID as `[model].name`, and configure AWS credentials
   (`AWS_PROFILE`, access keys, SSO, or an instance role) plus `AWS_REGION`.
+  Use `provider = "anthropic_bedrock"` instead to run Claude on Bedrock
+  through the Anthropic Messages API.
 - **Snowflake Cortex:** set `[model].provider = "snowflake_cortex"` with the
   Cortex `endpoint_url` and `[model].name`, and provide a Snowflake PAT via
   `SNOWFLAKE_PAT`, `DEEPAGENT_MODEL_API_KEY`, or `[model].api_key`.
@@ -105,7 +107,7 @@ Set these before starting the app for environment-based overrides:
 | --- | --- |
 | `DATABASE_URL` | Postgres connection for persistence |
 | `DEEPAGENT_CONFIG` | Path to the config file (default: `deepagent.toml`) |
-| `DEEPAGENT_MODEL_PROVIDER` | `ollama`, `openai_compatible`, `anthropic`, `bedrock`, or `snowflake_cortex` |
+| `DEEPAGENT_MODEL_PROVIDER` | `ollama`, `openai_compatible`, `anthropic`, `bedrock`, `anthropic_bedrock`, or `snowflake_cortex` |
 | `DEEPAGENT_MODEL_BASE_URL` | Model server base URL |
 | `DEEPAGENT_MODEL_ENDPOINT_URL` | Full non-standard model endpoint URL |
 | `DEEPAGENT_MODEL_NAME` | Model name |
@@ -114,7 +116,7 @@ Set these before starting the app for environment-based overrides:
 | `DEEPAGENT_MODEL_API_KEY` | API key for secured servers |
 | `ANTHROPIC_API_KEY` | Anthropic-specific key (alternative to `DEEPAGENT_MODEL_API_KEY`) |
 | `SNOWFLAKE_PAT` | Snowflake Cortex-specific key (alternative to `DEEPAGENT_MODEL_API_KEY`) |
-| `AWS_REGION` | AWS region for `provider = "bedrock"` (credentials come from the standard AWS chain) |
+| `AWS_REGION` | AWS region for `provider = "bedrock"` or `"anthropic_bedrock"` (credentials come from the standard AWS chain) |
 | `DEEPAGENT_RECURSION_LIMIT` | LangGraph recursion limit |
 | `CHAINLIT_AUTH_SECRET` | Long random string for Chainlit auth |
 | `CHAINLIT_AUTH_USERS` | JSON map of Chainlit usernames to passwords |

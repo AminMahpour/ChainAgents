@@ -228,7 +228,7 @@ def sanitize_tools_for_model(
     Returns:
         The sanitized value.
     """
-    if model_provider in {"anthropic", "bedrock"}:
+    if model_provider in {"anthropic", "bedrock", "anthropic_bedrock"}:
         # Bedrock Converse tool specs also require an object-typed root schema.
         return [normalize_anthropic_tool_schema(tool) for tool in tools]
 

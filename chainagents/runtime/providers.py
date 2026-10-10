@@ -9,6 +9,7 @@ from functools import cached_property
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
+from langchain_aws import ChatAnthropicBedrock
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -404,3 +405,18 @@ class AnthropicDefaultQueryChatAnthropic(ChatAnthropic):
         if self.default_query:
             params["default_query"] = self.default_query
         return params
+
+
+class EndpointChatAnthropicBedrock(ChatAnthropicBedrock):
+    """ChatAnthropicBedrock that can target a custom Bedrock runtime endpoint.
+
+    langchain-aws builds the ``AnthropicBedrock`` client without a base URL, so
+    this forwards ``bedrock_endpoint_url`` (for example a VPC endpoint) to it.
+    """
+
+    bedrock_endpoint_url: str
+
+    @cached_property
+    def _client_params(self) -> dict[str, Any]:
+        """Return AnthropicBedrock client params with the endpoint override."""
+        return {**super()._client_params, "base_url": self.bedrock_endpoint_url}

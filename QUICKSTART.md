@@ -59,7 +59,7 @@ export ANTHROPIC_API_KEY="your-anthropic-key"
 
 **Option D: Amazon Bedrock**
 
-Set `provider = "bedrock"` and a Bedrock model ID in `deepagent.toml`, then use your usual AWS credentials:
+Set `provider = "bedrock"` and a Bedrock model ID in `deepagent.toml` (or `provider = "anthropic_bedrock"` to run Claude through the Anthropic Messages API), then use your usual AWS credentials:
 
 ```bash
 export AWS_REGION="us-east-1"

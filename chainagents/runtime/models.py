@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
-from langchain_aws import ChatBedrockConverse
+from langchain_aws import ChatAnthropicBedrock, ChatBedrockConverse
 from langchain_ollama import ChatOllama
 
 import chainagents.runtime.model_config as runtime_model_config
@@ -27,6 +27,7 @@ from chainagents.runtime.constants import (
 )
 from chainagents.runtime.providers import (
     AnthropicDefaultQueryChatAnthropic,
+    EndpointChatAnthropicBedrock,
     OpenAICompatibleChatOpenAI,
     SnowflakeCortexChatOpenAI,
 )
@@ -231,6 +232,8 @@ def build_model(
 
     if resolved_profile.provider == "bedrock":
         return build_bedrock_model(resolved_profile, reasoning_level)
+    if resolved_profile.provider == "anthropic_bedrock":
+        return build_anthropic_bedrock_model(resolved_profile, reasoning_level)
 
     api_key = model_api_key_for_profile(config, resolved_profile)
     if resolved_profile.provider == "anthropic":
@@ -349,6 +352,44 @@ def build_bedrock_model(
         # Claude rejects non-default sampling temperatures while thinking.
         model.temperature = None
     return model
+
+
+def build_anthropic_bedrock_model(
+    model_profile: ModelDefaults,
+    reasoning_level: ReasoningLevel,
+) -> ChatAnthropicBedrock:
+    """Build Claude on Amazon Bedrock through the Anthropic Messages API.
+
+    Uses the Anthropic SDK's Bedrock client, so requests keep the Anthropic
+    Messages format (thinking, effort, Anthropic content blocks) while
+    credentials and region come from the standard AWS chain.
+
+    Args:
+        model_profile: Resolved model profile settings.
+        reasoning_level: The reasoning level value.
+
+    Returns:
+        The constructed Claude-on-Bedrock model.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model_profile.name,
+        "temperature": model_profile.temperature,
+        "effort": reasoning_level,
+        "disable_streaming": model_profile.disable_streaming,
+    }
+    if should_enable_anthropic_adaptive_thinking(
+        model_profile.name,
+        model_profile.thinking,
+    ):
+        kwargs["thinking"] = {"type": "adaptive"}
+    if model_profile.max_tokens is not None:
+        kwargs["max_tokens"] = model_profile.max_tokens
+    if model_profile.base_url:
+        return EndpointChatAnthropicBedrock(
+            bedrock_endpoint_url=model_profile.base_url,
+            **kwargs,
+        )
+    return ChatAnthropicBedrock(**kwargs)
 
 
 def bedrock_arn_model_metadata(model_arn: str) -> dict[str, str]:

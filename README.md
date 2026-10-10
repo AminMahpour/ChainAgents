@@ -82,7 +82,7 @@ export CHAINLIT_AUTH_USERS='{"admin":"change-me","alice":"alice-password"}'
 - `DEEPAGENT_MODEL_API_KEY` is used for secured OpenAI-compatible servers and can also supply the Anthropic API key when `ANTHROPIC_API_KEY` is unset
 - `ANTHROPIC_API_KEY` is read first when `provider = "anthropic"` or `provider = "claude"`, so stale generic keys do not override the Claude credential
 - `SNOWFLAKE_PAT` is read first when `provider = "snowflake_cortex"`; Cortex still requires a key, resolved in this order: `--api-key`, `SNOWFLAKE_PAT`, `DEEPAGENT_MODEL_API_KEY`, then `[model].api_key`
-- `provider = "bedrock"` ignores API-key variables and uses the standard AWS credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, SSO, or an instance/task role); set the region with `AWS_REGION` or `AWS_DEFAULT_REGION`
+- `provider = "bedrock"` and `provider = "anthropic_bedrock"` ignore API-key variables and uses the standard AWS credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, SSO, or an instance/task role); set the region with `AWS_REGION` or `AWS_DEFAULT_REGION`
 - when switching to Anthropic with `DEEPAGENT_MODEL_PROVIDER`, unset stale `DEEPAGENT_MODEL_BASE_URL`; use `DEEPAGENT_MODEL_ENDPOINT_URL` with the `/v1/messages` path for env-based Anthropic proxy switches, or pass `--base-url` explicitly from the CLI
 - `DEEPAGENT_MODEL_DISABLE_STREAMING` accepts `true`, `false`, or `tool_calling`; `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS=true` is a convenience alias for `tool_calling`
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING` remain supported as Ollama-only compatibility aliases
@@ -190,7 +190,7 @@ replaced with a labeled placeholder so the rest of the PDF can still be download
 If you are using LM Studio or another OpenAI-compatible server instead of Ollama, skip `ollama pull`, load a model in that server, and set `[model].provider = "openai_compatible"` with the server's `base_url`.
 If you are using Claude through Anthropic, set `[model].provider = "anthropic"` and provide `ANTHROPIC_API_KEY` or `DEEPAGENT_MODEL_API_KEY`.
 For Snowflake Cortex, use the dedicated `snowflake_cortex` provider and a Snowflake PAT as shown in [Snowflake Cortex](#snowflake-cortex).
-For Amazon Bedrock, set `[model].provider = "bedrock"` with a Bedrock model or inference-profile ID and configure AWS credentials and `AWS_REGION` as shown in [Amazon Bedrock](#amazon-bedrock).
+For Amazon Bedrock, set `[model].provider = "bedrock"` with a Bedrock model or inference-profile ID and configure AWS credentials and `AWS_REGION` as shown in [Amazon Bedrock](#amazon-bedrock). For Claude on Bedrock through the Anthropic Messages API, use `provider = "anthropic_bedrock"`.
 
 If you enable workspace-docs RAG with Ollama embeddings, also pull an embedding model such as:
 
@@ -489,6 +489,23 @@ export AWS_PROFILE="my-profile"  # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
 - Leave `disable_streaming` unset to keep langchain-aws's per-model default (for example, models that cannot stream tool calls fall back to non-streaming tool requests); set `disable_streaming = true` or `"tool_calling"` to force non-streaming requests.
 - Workspace-docs RAG cannot infer Bedrock embeddings. If `[rag].enabled = true`, set `[rag.embedding].provider` to `ollama` or `openai_compatible`, together with an appropriate embedding `model` and `base_url` (and `api_key` when needed).
 
+### Claude on Amazon Bedrock (Anthropic Messages API)
+
+`provider = "bedrock"` uses the Converse API, which works for every Bedrock model. To run Claude on Bedrock through the Anthropic Messages API instead, use `provider = "anthropic_bedrock"`. It uses the Anthropic SDK's Bedrock client (langchain-aws `ChatAnthropicBedrock`), so Claude gets the same request handling as `provider = "anthropic"`: `effort`, adaptive thinking, and Anthropic content blocks.
+
+```toml
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-sonnet-4-6"
+reasoning_effort = "medium"
+thinking = "auto"
+# endpoint_url = "https://vpce-0123.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+```
+
+- Credentials, region and `endpoint_url` work the same way as for `provider = "bedrock"`; no API key is used.
+- `name` is a Bedrock Claude model or inference-profile ID.
+- `bedrock_anthropic` and `claude_bedrock` are accepted as aliases.
+
 Named model profiles let the main agent, Chainlit mode picker, and sync
 subagents use different provider settings from the same config file:
 
@@ -524,7 +541,7 @@ model = "claude-reviewer"
 
 Notes:
 
-- `provider` selects `ChatOllama`, `ChatOpenAI`, `ChatAnthropic`, or `ChatBedrockConverse` (`provider = "bedrock"`).
+- `provider` selects `ChatOllama`, `ChatOpenAI`, `ChatAnthropic`, `ChatBedrockConverse` (`provider = "bedrock"`), or `ChatAnthropicBedrock` (`provider = "anthropic_bedrock"`).
 - `provider = "claude"` is accepted as an alias for `provider = "anthropic"`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, `max_tokens`, and `reasoning_effort`.
 - `max_tokens` is an optional positive output-token limit. It maps to `max_completion_tokens` for Snowflake Cortex and OpenAI-compatible providers, `max_tokens` for Anthropic and Bedrock, and `num_predict` for Ollama.

@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Literal
 
 ModelProvider = Literal[
-    "ollama", "openai_compatible", "snowflake_cortex", "anthropic", "bedrock"
+    "ollama",
+    "openai_compatible",
+    "snowflake_cortex",
+    "anthropic",
+    "bedrock",
+    "anthropic_bedrock",
 ]
 ReasoningLevel = Literal["low", "medium", "high"]
 ModelModality = Literal["text", "image"]
@@ -71,6 +76,9 @@ OPENAI_RESPONSES_PATH_SUFFIX = "/responses"
 ANTHROPIC_MESSAGES_PATH_SUFFIX = "/v1/messages"
 OPENAI_COMPATIBLE_MODEL_PROVIDERS = frozenset({"openai_compatible", "snowflake_cortex"})
 BEDROCK_PROVIDER_ALIASES = frozenset({"aws_bedrock", "amazon_bedrock"})
+ANTHROPIC_BEDROCK_PROVIDER_ALIASES = frozenset({"bedrock_anthropic", "claude_bedrock"})
+# Providers served by Amazon Bedrock: no API key, optional endpoint override.
+BEDROCK_MODEL_PROVIDERS = frozenset({"bedrock", "anthropic_bedrock"})
 BEDROCK_INFERENCE_PROFILE_PREFIXES = frozenset(
     {"us", "us-gov", "eu", "apac", "sa", "amer", "global", "jp", "au", "ca"}
 )

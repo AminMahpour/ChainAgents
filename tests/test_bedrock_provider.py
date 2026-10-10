@@ -522,3 +522,145 @@ temperature = 1.5
     config = deepagent_runtime.RuntimeConfig.from_env()
     with pytest.raises(ValueError, match="between 0 and 1"):
         deepagent_runtime.build_model(config, "medium")
+
+
+@pytest.mark.parametrize(
+    "value", ["anthropic_bedrock", "anthropic-bedrock", "bedrock_anthropic", "claude_bedrock"]
+)
+def test_normalize_model_provider_accepts_anthropic_bedrock_aliases(value: str) -> None:
+    assert normalize_model_provider(value) == "anthropic_bedrock"
+    assert parse_model_provider_argument(value) == "anthropic_bedrock"
+    assert format_model_provider("anthropic_bedrock") == "Anthropic Claude on Amazon Bedrock"
+
+
+def test_runtime_config_builds_anthropic_bedrock_model_from_toml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_aws import ChatAnthropicBedrock
+
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-opus-4-8-v1"
+temperature = 0.2
+max_tokens = 4096
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert config.model_provider == "anthropic_bedrock"
+    assert config.model_base_url == ""
+    assert type(model) is ChatAnthropicBedrock
+    assert model.model == "us.anthropic.claude-opus-4-8-v1"
+    assert model.temperature == 0.2
+    assert model.max_tokens == 4096
+    assert model.effort == "high"
+    assert model.thinking == {"type": "adaptive"}
+    assert type(model._client).__name__ == "AnthropicBedrock"
+    assert model._client.aws_region == "us-east-1"
+
+
+def test_anthropic_bedrock_honors_disabled_thinking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-opus-4-8-v1"
+thinking = "disabled"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert model.thinking is None
+
+
+def test_anthropic_bedrock_forwards_custom_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chainagents.runtime.providers import EndpointChatAnthropicBedrock
+
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-sonnet-4-6"
+endpoint_url = "vpce-0123.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert isinstance(model, EndpointChatAnthropicBedrock)
+    assert str(model._client.base_url).rstrip("/") == (
+        "https://vpce-0123.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+    )
+
+
+def test_anthropic_bedrock_switch_needs_no_api_key_or_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+name = "local-model"
+""",
+    )
+    monkeypatch.setenv("DEEPAGENT_MODEL_PROVIDER", "anthropic_bedrock")
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "us.anthropic.claude-sonnet-4-6")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+
+    assert config.model_provider == "anthropic_bedrock"
+    assert config.model_base_url == ""
+
+
+def test_anthropic_bedrock_profile_requires_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+""",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Anthropic Claude on Amazon Bedrock model config must define",
+    ):
+        deepagent_runtime.RuntimeConfig.from_env()
+
+
+def test_anthropic_bedrock_tool_sanitization_adds_object_type_to_schema() -> None:
+    class _Tool:
+        name = "lookup"
+        args_schema: ClassVar[dict[str, object]] = {"properties": {"q": {"type": "string"}}}
+
+    [tool] = runtime_graph.sanitize_tools_for_model("anthropic_bedrock", [_Tool()])
+
+    assert tool.args_schema["type"] == "object"
