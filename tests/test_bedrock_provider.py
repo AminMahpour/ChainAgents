@@ -909,12 +909,43 @@ name = "{name}"
         deepagent_runtime.build_model(config, "medium")
 
 
-def test_anthropic_bedrock_allows_application_inference_profile_arn(
+def test_anthropic_bedrock_rejects_opaque_application_inference_profile_arn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from chainagents.runtime.models import validate_anthropic_bedrock_model_id
-
-    validate_anthropic_bedrock_model_id(
-        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4"
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4"
+""",
     )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="underlying Claude model"):
+        deepagent_runtime.build_model(config, "medium")
+
+
+def test_anthropic_bedrock_arn_uses_anthropic_profile_for_thinking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-5"
+temperature = 0.2
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert model.reasoning_effort == "high"
+    assert "xhigh" in model.profile["reasoning_effort_levels"]
+    assert model.temperature is None

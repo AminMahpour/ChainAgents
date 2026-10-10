@@ -506,7 +506,7 @@ thinking = "auto"
 - `name` is a Bedrock Claude model or inference-profile ID.
 - `reasoning_effort` is only sent to Claude models that support effort; it is skipped for models such as Claude 3.x and Haiku 4.5.
 - `thinking = "disabled"` explicitly turns thinking off on Claude Opus 5 and Sonnet 5, which think by default. Claude Opus 5.5, Sonnet 5.5 and Fable 5 cannot run without thinking, so that setting is rejected for them.
-- Only Anthropic Claude model IDs are accepted; use `provider = "bedrock"` for other Bedrock models.
+- Only Anthropic Claude model IDs are accepted; use `provider = "bedrock"` for other Bedrock models. Foundation-model and system inference-profile ARNs work, but application inference profiles and provisioned models hide the underlying model, so use the Claude model or inference-profile ID instead.
 - `bedrock_anthropic` and `claude_bedrock` are accepted as aliases.
 
 Named model profiles let the main agent, Chainlit mode picker, and sync

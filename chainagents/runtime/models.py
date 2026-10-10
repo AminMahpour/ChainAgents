@@ -396,6 +396,7 @@ def build_anthropic_bedrock_model(
     validate_bedrock_temperature(model_profile.temperature)
     validate_anthropic_bedrock_model_id(model_profile.name)
     base_model = anthropic_bedrock_base_model(model_profile.name)
+    base_profile = anthropic_model_profile(base_model)
     kwargs: dict[str, Any] = {
         "model": model_profile.name,
         "temperature": model_profile.temperature,
@@ -408,7 +409,7 @@ def build_anthropic_bedrock_model(
         # (Claude 3.x, Haiku 4.5), so effort is only sent where it is accepted.
         # langchain-anthropic also turns effort into adaptive thinking on models
         # that support it, which is why it is skipped when thinking is disabled.
-        if anthropic_model_profile(base_model).get("reasoning_effort_levels"):
+        if base_profile.get("reasoning_effort_levels"):
             kwargs["effort"] = reasoning_level
         if should_enable_anthropic_adaptive_thinking(
             model_profile.name,
@@ -433,6 +434,10 @@ def build_anthropic_bedrock_model(
         )
     else:
         model = ChatAnthropicBedrock(**kwargs)
+    if not model.profile and base_profile:
+        # langchain-aws only resolves profiles for plain and geography-prefixed
+        # model IDs, so ARNs fall back to the Anthropic model's profile.
+        model.profile = base_profile
     thinking_enabled = (
         "thinking" in kwargs and kwargs["thinking"].get("type") != "disabled"
     )
@@ -472,19 +477,27 @@ def validate_anthropic_bedrock_model_id(model_id: str) -> None:
     """Reject Bedrock model IDs from vendors other than Anthropic.
 
     The Anthropic Messages API only serves Claude, so a model such as
-    ``amazon.nova-pro-v1:0`` would fail on its first request. IDs without a
-    vendor prefix, such as application inference-profile ARNs, are allowed.
+    ``amazon.nova-pro-v1:0`` would fail on its first request. Application
+    inference profiles and provisioned models hide the underlying model, so
+    neither the vendor nor the Claude version (which decides thinking and
+    temperature handling) can be checked; they are rejected as well.
 
     Args:
         model_id: The Bedrock model ID, inference-profile ID or ARN.
 
     Raises:
-        ValueError: If the ID names a non-Anthropic model.
+        ValueError: If the ID does not name an Anthropic model.
     """
     parts = model_id.rsplit("/", 1)[-1].split(".")
     if len(parts) >= 3 and parts[0] in BEDROCK_INFERENCE_PROFILE_PREFIXES:
         parts = parts[1:]
-    if len(parts) >= 2 and parts[0] != "anthropic":
+    if len(parts) < 2:
+        raise ValueError(
+            f"Cannot tell which model {model_id} runs. For application inference "
+            "profiles or provisioned models, use the underlying Claude model or "
+            "inference-profile ID as [model].name instead."
+        )
+    if parts[0] != "anthropic":
         raise ValueError(
             'provider = "anthropic_bedrock" only supports Anthropic Claude '
             f'models; got {model_id}. Use provider = "bedrock" for other models.'
