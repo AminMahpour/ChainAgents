@@ -558,7 +558,8 @@ max_tokens = 4096
     assert config.model_base_url == ""
     assert type(model) is ChatAnthropicBedrock
     assert model.model == "us.anthropic.claude-opus-4-8-v1"
-    assert model.temperature == 0.2
+    # Adaptive thinking is on, so the configured temperature is dropped.
+    assert model.temperature is None
     assert model.max_tokens == 4096
     assert model.effort == "high"
     assert model.thinking == {"type": "adaptive"}
@@ -664,3 +665,71 @@ def test_anthropic_bedrock_tool_sanitization_adds_object_type_to_schema() -> Non
     [tool] = runtime_graph.sanitize_tools_for_model("anthropic_bedrock", [_Tool()])
 
     assert tool.args_schema["type"] == "object"
+
+
+def test_anthropic_bedrock_skips_effort_when_thinking_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-opus-4-8-v1"
+thinking = "disabled"
+temperature = 0.2
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert model.thinking is None
+    assert model.reasoning_effort is None
+    assert model.temperature == 0.2
+
+
+def test_anthropic_bedrock_drops_temperature_when_thinking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-sonnet-4-6"
+temperature = 0.2
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert model.thinking == {"type": "adaptive"}
+    assert model.temperature is None
+
+
+def test_anthropic_bedrock_prefers_bearer_token_over_env_sigv4_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "anthropic_bedrock"
+name = "us.anthropic.claude-sonnet-4-6"
+""",
+    )
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert model.aws_access_key_id is None
+    assert model._client.api_key == "bedrock-api-key"

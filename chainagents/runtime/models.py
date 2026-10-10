@@ -374,9 +374,12 @@ def build_anthropic_bedrock_model(
     kwargs: dict[str, Any] = {
         "model": model_profile.name,
         "temperature": model_profile.temperature,
-        "effort": reasoning_level,
         "disable_streaming": model_profile.disable_streaming,
     }
+    if model_profile.thinking != "disabled":
+        # langchain-anthropic turns an effort setting into adaptive thinking on
+        # models that support it, so effort is only sent when thinking may run.
+        kwargs["effort"] = reasoning_level
     if should_enable_anthropic_adaptive_thinking(
         model_profile.name,
         model_profile.thinking,
@@ -384,12 +387,29 @@ def build_anthropic_bedrock_model(
         kwargs["thinking"] = {"type": "adaptive"}
     if model_profile.max_tokens is not None:
         kwargs["max_tokens"] = model_profile.max_tokens
+    if os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
+        # The Anthropic SDK rejects a Bedrock API key combined with SigV4
+        # credentials, which langchain-aws would otherwise read from the env.
+        kwargs.update(
+            aws_access_key_id=None,
+            aws_secret_access_key=None,
+            aws_session_token=None,
+        )
+    model: ChatAnthropicBedrock
     if model_profile.base_url:
-        return EndpointChatAnthropicBedrock(
+        model = EndpointChatAnthropicBedrock(
             bedrock_endpoint_url=model_profile.base_url,
             **kwargs,
         )
-    return ChatAnthropicBedrock(**kwargs)
+    else:
+        model = ChatAnthropicBedrock(**kwargs)
+    if "thinking" in kwargs or (
+        "effort" in kwargs
+        and "xhigh" in ((model.profile or {}).get("reasoning_effort_levels") or ())
+    ):
+        # Claude rejects non-default sampling temperatures while thinking.
+        model.temperature = None
+    return model
 
 
 def bedrock_arn_model_metadata(model_arn: str) -> dict[str, str]:
