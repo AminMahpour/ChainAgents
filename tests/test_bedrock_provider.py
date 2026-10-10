@@ -144,7 +144,8 @@ thinking = "disabled"
 
     assert model.reasoning_effort is None
     assert model.additional_model_request_fields is None
-    assert model.temperature == 0.0
+    # High reasoning would drop temperature; with thinking off it is kept.
+    assert model.temperature == pytest.approx(0.00001)
 
 
 def test_bedrock_model_does_not_require_api_key(
@@ -985,3 +986,92 @@ name = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     expected = _get_default_model_profile("claude-haiku-4-5")["max_output_tokens"]
     assert expected > 4096
     assert model.max_tokens == expected
+
+
+def test_bedrock_supplies_metadata_for_geo_prefixes_langchain_aws_lacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "in.anthropic.claude-opus-5"
+temperature = 0.2
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "high")
+
+    assert model.provider == "anthropic"
+    assert model.base_model_id == "anthropic.claude-opus-5"
+    assert "thinking" in model.additional_model_request_fields
+    assert model.temperature is None
+
+
+def test_bedrock_nova_replaces_zero_temperature(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "us.amazon.nova-pro-v1:0"
+temperature = 0
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    model = deepagent_runtime.build_model(config, "medium")
+
+    assert model.temperature == pytest.approx(0.00001)
+
+
+def test_bedrock_nova_drops_temperature_at_high_reasoning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "us.amazon.nova-2-lite-v1:0"
+temperature = 0.3
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    high = deepagent_runtime.build_model(config, "high")
+    medium = deepagent_runtime.build_model(config, "medium")
+
+    assert high.additional_model_request_fields["reasoningConfig"]["maxReasoningEffort"] == "high"
+    assert high.temperature is None
+    assert medium.temperature == 0.3
+
+
+def test_bedrock_rejects_disabled_thinking_for_gpt_oss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        """
+[model]
+provider = "bedrock"
+name = "openai.gpt-oss-120b-1:0"
+thinking = "disabled"
+""",
+    )
+
+    config = deepagent_runtime.RuntimeConfig.from_env()
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        deepagent_runtime.build_model(config, "medium")

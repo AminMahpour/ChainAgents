@@ -14,6 +14,7 @@ from langchain_anthropic.chat_models import (
     _get_default_model_profile as anthropic_model_profile,
 )
 from langchain_aws import ChatAnthropicBedrock, ChatBedrockConverse
+from langchain_aws.utils import MODEL_ID_GEO_PREFIXES
 from langchain_ollama import ChatOllama
 
 import chainagents.runtime.model_config as runtime_model_config
@@ -321,9 +322,14 @@ def build_bedrock_model(
         The constructed Bedrock model.
     """
     validate_bedrock_temperature(model_profile.temperature)
+    base_model_id = bedrock_base_model_id(model_profile.name)
+    temperature: float | None = model_profile.temperature
+    if base_model_id.startswith("amazon.nova") and temperature == 0:
+        # Nova rejects a temperature of exactly 0; use its smallest value.
+        temperature = NOVA_MIN_TEMPERATURE
     kwargs: dict[str, Any] = {
         "model_id": model_profile.name,
-        "temperature": model_profile.temperature,
+        "temperature": temperature,
     }
     if model_profile.disable_streaming or "disable_streaming" in (
         model_profile.explicit_fields | model_profile.runtime_override_fields
@@ -331,13 +337,24 @@ def build_bedrock_model(
         kwargs["disable_streaming"] = model_profile.disable_streaming
     # Otherwise langchain-aws picks the per-model default, e.g. "tool_calling"
     # for Bedrock models that cannot stream tool use.
-    if model_profile.name.startswith("arn:"):
+    geo_prefix = model_profile.name.split(".", 1)[0]
+    if model_profile.name.startswith("arn:") or (
+        geo_prefix in BEDROCK_INFERENCE_PROFILE_PREFIXES
+        and geo_prefix not in MODEL_ID_GEO_PREFIXES
+    ):
+        # langchain-aws cannot infer the model family from ARNs or from
+        # geography prefixes it does not know yet (such as "in." or "ca.").
         kwargs.update(bedrock_arn_model_metadata(model_profile.name))
     if model_profile.base_url:
         kwargs["endpoint_url"] = model_profile.base_url
     if model_profile.max_tokens is not None:
         kwargs["max_tokens"] = model_profile.max_tokens
     if model_profile.thinking == "disabled":
+        if base_model_id.startswith("openai.gpt-oss"):
+            raise ValueError(
+                f'{model_profile.name} cannot run with thinking = "disabled"; '
+                'use reasoning_effort = "low" for the least reasoning instead.'
+            )
         disabled = anthropic_bedrock_disabled_thinking_kwargs(
             anthropic_bedrock_base_model(model_profile.name)
         )
@@ -354,11 +371,36 @@ def build_bedrock_model(
                 message="reasoning_effort is not supported",
             )
         model = ChatBedrockConverse(**kwargs)
-    thinking = (model.additional_model_request_fields or {}).get("thinking")
-    if isinstance(thinking, Mapping) and thinking.get("type") != "disabled":
-        # Claude rejects non-default sampling temperatures while thinking.
+    request_fields = model.additional_model_request_fields or {}
+    thinking = request_fields.get("thinking")
+    reasoning_config = request_fields.get("reasoningConfig")
+    if (isinstance(thinking, Mapping) and thinking.get("type") != "disabled") or (
+        isinstance(reasoning_config, Mapping)
+        and reasoning_config.get("maxReasoningEffort") == "high"
+    ):
+        # Claude rejects non-default sampling temperatures while thinking, and
+        # Nova rejects any sampling settings with high reasoning effort.
         model.temperature = None
     return model
+
+
+def bedrock_base_model_id(model_id: str) -> str:
+    """Return the vendor model ID behind a Bedrock ID, profile ID or ARN.
+
+    Args:
+        model_id: The Bedrock model ID, inference-profile ID or ARN.
+
+    Returns:
+        The ID without its ARN path or geography prefix, such as
+        ``amazon.nova-pro-v1:0``.
+    """
+    parts = model_id.rsplit("/", 1)[-1].split(".")
+    if len(parts) >= 3 and parts[0] in BEDROCK_INFERENCE_PROFILE_PREFIXES:
+        parts = parts[1:]
+    return ".".join(parts)
+
+
+NOVA_MIN_TEMPERATURE = 0.00001
 
 
 def validate_bedrock_temperature(temperature: float) -> None:
@@ -536,9 +578,10 @@ def anthropic_bedrock_disabled_thinking_kwargs(base_model: str) -> dict[str, Any
 
 
 def bedrock_arn_model_metadata(model_arn: str) -> dict[str, str]:
-    """Derive the provider and base model langchain-aws needs for a model ARN.
+    """Derive the provider and base model langchain-aws needs for a model ID.
 
-    langchain-aws cannot infer the model family from an ARN. Foundation-model
+    langchain-aws cannot infer the model family from an ARN or from a
+    geography prefix it does not recognize. Foundation-model
     and system inference-profile ARNs end in a model ID (for example
     ``.../inference-profile/us.anthropic.claude-sonnet-5``), so both values can
     be read from that suffix.
@@ -552,11 +595,8 @@ def bedrock_arn_model_metadata(model_arn: str) -> dict[str, str]:
     Raises:
         ValueError: If the ARN does not end in a recognizable model ID.
     """
-    model_id = model_arn.rsplit("/", 1)[-1]
-    parts = model_id.split(".")
     # Cross-region inference-profile IDs carry a geography prefix (us., eu., ...).
-    if len(parts) >= 3 and parts[0] in BEDROCK_INFERENCE_PROFILE_PREFIXES:
-        parts = parts[1:]
+    parts = bedrock_base_model_id(model_arn).split(".")
     if len(parts) < 2 or not parts[0] or ":" in parts[0]:
         raise ValueError(
             "Amazon Bedrock model ARNs must end in a model ID, such as a "
