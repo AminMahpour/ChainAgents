@@ -1282,8 +1282,10 @@ live agents disabled the names are free for custom commands.
 
 These commands never run the main agent, so they execute immediately, even
 while a main turn is running: with `[agent.user_input]` enabled they are never
-offered as steer/queue input, and without it they do not wait for the busy
-turn.
+offered as steer/queue input, they also run while the queue is paused after
+`/stop`, and without `[agent.user_input]` they do not wait for the busy turn.
+The names `live-agents`, `main`, and `user` are reserved and cannot be used as
+agent names.
 
 Agents can be addressed by name or id. Statuses are `idle`, `running`,
 `stopping`, `stopped`, and `failed`.

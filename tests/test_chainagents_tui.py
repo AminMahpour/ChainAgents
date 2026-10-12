@@ -1124,3 +1124,67 @@ async def test_tui_runs_live_agent_command_while_turn_is_active() -> None:
         await runtime.user_input.wait_idle(app.thread_id)
         await pilot.pause()
     await runtime.live_agents.close()
+
+
+@pytest.mark.anyio
+async def test_tui_live_agent_command_does_not_block_the_prompt_handler() -> None:
+    from test_live_agents_worker import FakeGraph
+
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import (
+        LiveAgentsConfig,
+        LiveAgentTemplate,
+        MessagingConfig,
+        UserInputConfig,
+    )
+    from chainagents.turns.controller import ConversationInputController
+
+    release = asyncio.Event()
+    building = asyncio.Event()
+
+    async def factory(_spec, _session_id):
+        building.set()
+        await release.wait()
+        return FakeGraph()
+
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions = SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(runtime.config.extensions.user_input, broker)
+    runtime.live_agents = LiveAgentManager(
+        LiveAgentsConfig(
+            enabled=True,
+            templates=(LiveAgentTemplate(name="coder", description="d", system_prompt="p"),),
+        ),
+        broker,
+        factory,
+    )
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt", PromptTextArea)
+        event = SimpleNamespace(stop=lambda: None, text_area=prompt)
+        prompt.load_text("/spawn coder c")
+        await asyncio.wait_for(app.on_prompt_submitted(event), 1)
+        assert prompt.text == ""
+        await asyncio.wait_for(building.wait(), 1)
+        assert not any("`c`" in e for e in app.tool_entries)
+        release.set()
+        for _ in range(20):
+            await pilot.pause()
+            if any("`c`" in e for e in app.tool_entries):
+                break
+        assert any("`c`" in e for e in app.tool_entries)
+        assert not app.live_agent_command_tasks
+
+        release.clear()
+        building.clear()
+        prompt.load_text("/spawn coder d")
+        await app.on_prompt_submitted(event)
+        await asyncio.wait_for(building.wait(), 1)
+        pending = set(app.live_agent_command_tasks)
+        assert pending
+    assert all(task.done() for task in pending)
+    await runtime.live_agents.close()

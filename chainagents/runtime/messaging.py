@@ -313,6 +313,7 @@ class MessageBroker:
                 if opened:
                     self._participants.get(session_id, {}).pop(sender_address, None)
 
+
 def _session_id(runtime: Any, fixed_session_id: str | None = None) -> str:
     configured = getattr(runtime, "config", {}) or {}
     session = (

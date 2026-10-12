@@ -17,6 +17,8 @@ from chainagents.runtime.types import (
 
 LIVE_AGENT_COMMAND_NAMES: frozenset[str] = frozenset({"agents", "spawn", "msg", "kill"})
 SUPERVISOR_TASK_HEADING = "## Task from supervisor"
+# Names of non-agent message participants; a live agent may not use them.
+RESERVED_LIVE_AGENT_NAMES: frozenset[str] = frozenset({"live-agents", "main", "user"})
 LIVE_AGENT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
 _PREFIX = "agent.live_agents"
@@ -482,6 +484,11 @@ def resolve_spawn(
                 f"Default agent name '{name}' is invalid; provide an explicit name "
                 f"matching {LIVE_AGENT_NAME_PATTERN.pattern}"
             )
+    if name in RESERVED_LIVE_AGENT_NAMES:
+        raise LiveAgentSpawnError(
+            f"Agent name '{name}' is reserved; choose another name "
+            f"(reserved: {', '.join(sorted(RESERVED_LIVE_AGENT_NAMES))})."
+        )
     if name in existing_names:
         raise LiveAgentSpawnError(
             f"Agent name '{name}' is already in use by a live agent."

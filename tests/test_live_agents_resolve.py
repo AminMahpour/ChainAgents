@@ -187,3 +187,15 @@ def test_duplicate_name_rejected():
     with pytest.raises(LiveAgentSpawnError) as err:
         _resolve(SpawnRequest(template="researcher", name="r1"), existing={"r1"})
     assert "r1" in str(err.value)
+
+
+@pytest.mark.parametrize("name", ["live-agents", "main", "user"])
+def test_reserved_agent_names_rejected(name):
+    with pytest.raises(LiveAgentSpawnError) as err:
+        _resolve(SpawnRequest(template="researcher", name=name))
+    assert f"'{name}' is reserved" in str(err.value)
+
+
+def test_reserved_names_constant():
+    expected = frozenset({"live-agents", "main", "user"})
+    assert expected == live_agents_config.RESERVED_LIVE_AGENT_NAMES
