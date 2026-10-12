@@ -20,6 +20,7 @@ from chainagents.runtime.live_agents.events import (
     LiveAgentEventKind,
 )
 from chainagents.runtime.live_agents.registry import (
+    TERMINAL_STATUSES,
     LiveAgentRecord,
     LiveAgentRegistry,
 )
@@ -164,7 +165,7 @@ class LiveAgentManager:
         if text is not None and text.strip():
             try:
                 if spawned_by == _USER_ADDRESS:
-                    self._send_as_user(session_id, record.address, text)
+                    broker.send_from_user(session_id, record.address, text)
                 else:
                     broker.send(session_id, _MAIN_ADDRESS, record.address, text)
             except ValueError:
@@ -230,25 +231,11 @@ class LiveAgentManager:
 
     def send_from_user(self, session_id: str, ref: str, body: str) -> AgentMessage:
         record = self.get(session_id, ref)
-        message = self._send_as_user(session_id, record.address, body)
+        message = self._broker.send_from_user(session_id, record.address, body)
         self._publish(
             "message", record, {"from": _USER_ADDRESS, "to": record.name, "body": body}
         )
         return message
-
-    def _send_as_user(self, session_id: str, address: str, body: str) -> AgentMessage:
-        """Send as ``user``, opening it temporarily like ``MessageBroker.send_user``."""
-        broker = self._broker
-        with broker._lock:
-            participants = broker._participants.get(session_id, {})
-            opened = _USER_ADDRESS not in participants
-            if opened:
-                broker.open(session_id, _USER_ADDRESS, name=_USER_ADDRESS, parent=None)
-            try:
-                return broker.send(session_id, _USER_ADDRESS, address, body)
-            finally:
-                if opened:
-                    broker._participants.get(session_id, {}).pop(_USER_ADDRESS, None)
 
     # -------------------------------------------------------------- teardown
 
@@ -256,14 +243,14 @@ class LiveAgentManager:
         self, session_id: str, ref: str, *, reason: str = "requested"
     ) -> LiveAgentRecord:
         record = self._registry.lookup(session_id, ref)
-        if record.status == "stopped" and record.id not in self._teardowns:
+        if record.status in TERMINAL_STATUSES and record.id not in self._teardowns:
             return record
         return await asyncio.shield(self._start_teardown(record, reason))
 
     async def teardown_session(self, session_id: str) -> None:
         records = self._registry.records(session_id, include_stopped=True)
         for record in records:
-            if record.status != "stopped" or record.id in self._teardowns:
+            if record.status not in TERMINAL_STATUSES or record.id in self._teardowns:
                 await asyncio.shield(self._start_teardown(record, "session_end"))
         self._registry.forget_session(session_id)
         self._sessions.discard(session_id)
@@ -345,7 +332,7 @@ class LiveAgentManager:
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
                 reason = "failed"
-        if record.id in self._teardowns or record.status == "stopped":
+        if record.id in self._teardowns or record.status in TERMINAL_STATUSES:
             return
         try:
             self._start_teardown(record, reason)

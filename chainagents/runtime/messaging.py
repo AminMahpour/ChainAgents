@@ -277,12 +277,25 @@ class MessageBroker:
 
     def send_user(self, session_id: str, body: str) -> AgentMessage:
         """Add a user steering note to the main agent's next model step."""
+        return self.send_from_user(session_id, "main", body)
+
+    def send_from_user(
+        self, session_id: str, recipient: str, body: str
+    ) -> AgentMessage:
+        """Send as ``user`` to any recipient.
+
+        A ``user`` participant is opened for the send when absent and removed
+        afterwards; an already-open ``user`` participant is left in place.
+        """
         with self._lock:
-            self.open(session_id, "user", name="user", parent=None)
+            opened = "user" not in self._participants.get(session_id, {})
+            if opened:
+                self.open(session_id, "user", name="user", parent=None)
             try:
-                return self.send(session_id, "user", "main", body)
+                return self.send(session_id, "user", recipient, body)
             finally:
-                self._participants[session_id].pop("user", None)
+                if opened:
+                    self._participants.get(session_id, {}).pop("user", None)
 
 
 def _session_id(runtime: Any, fixed_session_id: str | None = None) -> str:

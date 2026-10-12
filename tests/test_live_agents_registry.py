@@ -82,6 +82,21 @@ def test_name_reusable_after_stop():
     assert reg.records("s", include_stopped=True) == [old, new]
 
 
+def test_failed_agent_frees_slot_and_name():
+    reg = make(max_live_per_session=1, max_live_total=1)
+    old = reg.reserve("s", spec("a"), spawned_by="main")
+    old.status = "failed"
+    assert reg.live_names("s") == set()
+    assert reg.records("s") == []
+    with pytest.raises(KeyError):
+        reg.lookup("s", "a")
+    assert reg.lookup("s", old.id) is old
+    new = reg.reserve("s", spec("a"), spawned_by="main")
+    assert reg.lookup("s", "a") is new
+    assert reg.records("s") == [new]
+    assert reg.records("s", include_stopped=True) == [old, new]
+
+
 def test_next_sequence_counts_all():
     reg = make()
     assert reg.next_sequence("s") == 1

@@ -366,8 +366,10 @@ async def test_max_turns_tears_down_with_reason() -> None:
 @pytest.mark.anyio
 async def test_three_failures_tear_down_as_failed() -> None:
     graph = FakeGraph(default=RuntimeError("boom"))
-    h = Harness(graphs=[graph])
-    record, _ = await h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+    h = Harness(graphs=[graph], max_live_per_session=1)
+    record, _ = await h.manager.spawn(
+        SESSION, SpawnRequest(template="researcher", name="r")
+    )
     for _ in range(3):
         turns = record.turns
         h.broker.send(SESSION, "main", record.address, "try")
@@ -377,7 +379,18 @@ async def test_three_failures_tear_down_as_failed() -> None:
     assert record.status == "failed"
     assert record.stop_reason == "failed"
     assert live_tasks() == []
+    # Failed is terminal: it frees the slot and the name and leaves the roster.
+    assert h.manager.roster(SESSION) == ""
+    assert h.manager.list(SESSION) == []
+    assert h.manager.list(SESSION, include_stopped=True)[0]["status"] == "failed"
+    assert await h.manager.teardown(SESSION, record.id) is record
+    assert record.status == "failed"
+    replacement, _ = await h.manager.spawn(
+        SESSION, SpawnRequest(template="researcher", name="r")
+    )
+    assert h.manager.get(SESSION, "r") is replacement
     await h.manager.close()
+    assert record.status == "failed"
 
 
 @pytest.mark.anyio

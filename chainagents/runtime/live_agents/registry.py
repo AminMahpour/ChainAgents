@@ -12,6 +12,7 @@ from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
 from chainagents.runtime.types import LiveAgentsConfig
 
 LiveAgentStatus = Literal["idle", "running", "stopping", "stopped", "failed"]
+TERMINAL_STATUSES: frozenset[str] = frozenset({"stopped", "failed"})
 
 
 @dataclass
@@ -69,7 +70,9 @@ class LiveAgentRegistry:
 
     def _active(self, session_id: str) -> list[LiveAgentRecord]:
         return [
-            r for r in self._records.get(session_id, []) if r.status != "stopped"
+            r
+            for r in self._records.get(session_id, [])
+            if r.status not in TERMINAL_STATUSES
         ]
 
     def reserve(
@@ -112,7 +115,7 @@ class LiveAgentRegistry:
     def lookup(self, session_id: str, ref: str) -> LiveAgentRecord:
         records = self._records.get(session_id, [])
         for record in records:
-            if record.status != "stopped" and record.name == ref:
+            if record.status not in TERMINAL_STATUSES and record.name == ref:
                 return record
         for record in records:
             if record.id == ref:
