@@ -216,6 +216,17 @@ async def resolve_runtime_command(
     )
 
 
+def command_result_text(result: RuntimeCommandResult) -> str:
+    """Return display text for a command result.
+
+    Live agent output is Markdown and is shown raw; other tool results are
+    serialized as stable JSON.
+    """
+    if result.target == "live_agent":
+        return str(result.tool_result)
+    return dumps_tool_result(result.tool_result)
+
+
 def dumps_tool_result(value: Any) -> str:
     """Serialize a tool result as stable JSON for display.
 

@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
-from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.commands.native import RuntimeCommandResult, command_result_text
 from chainagents.events.stream import (
     AGENT_STREAM_MODES as AGENT_STREAM_MODES,
     AgentStreamEvent,
@@ -1306,7 +1306,7 @@ class NdjsonRenderer(BaseTurnRenderer):
         event = AgentStreamEvent(
             kind="response_delta",
             source="native-command",
-            text=dumps_tool_result(result.tool_result),
+            text=command_result_text(result),
         )
         await self._emit(_event_payload(event, self.context))
 

@@ -14,7 +14,7 @@ from langgraph.types import Command
 
 from chainagents.commands.native import (
     RuntimeCommandResult,
-    dumps_tool_result,
+    command_result_text,
     resolve_native_command,
     resolve_runtime_command,
 )
@@ -312,11 +312,7 @@ class TurnRunner:
         result = TurnResult(
             status="completed",
             prompt=request.prompt,
-            response=(
-                str(command_result.tool_result)
-                if command_result.target == "live_agent"
-                else dumps_tool_result(command_result.tool_result)
-            ),
+            response=command_result_text(command_result),
             command_result=command_result,
         )
         # The command output is not an agent response, so it is not recorded;

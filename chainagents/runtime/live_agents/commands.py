@@ -84,10 +84,6 @@ async def handle_live_agent_command(
     except KeyError as exc:
         name = exc.args[0] if exc.args else ""
         raise ValueError(f"Unknown live agent `{name}`. {usage}") from exc
-    except ValueError as exc:
-        if usage in str(exc):
-            raise
-        raise ValueError(f"{exc} {usage}") from exc
 
 
 async def _spawn(
@@ -139,7 +135,7 @@ async def _kill(
             _notify_main(
                 manager, session_id, f"FYI: user stopped {len(rows)} live agents."
             )
-        return f"Stopped {len(rows)} agents."
+        return f"Stopped {len(rows)} agent{'' if len(rows) == 1 else 's'}."
     record = manager.get(session_id, args)
     await manager.teardown(session_id, record.id)
     _notify_main(manager, session_id, f"FYI: user stopped `{record.name}`.")

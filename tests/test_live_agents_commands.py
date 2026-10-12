@@ -75,8 +75,9 @@ async def test_spawn_usage_error() -> None:
     for args in ("", "a b c", "-- only"):
         with pytest.raises(ValueError, match="Usage: /spawn"):
             await run(h, "spawn", args)
-    with pytest.raises(ValueError, match="Usage: /spawn"):
+    with pytest.raises(ValueError) as info:
         await run(h, "spawn", "nosuchtemplate")
+    assert "Usage:" not in str(info.value)  # manager rejections are not usage errors
 
 
 @pytest.mark.anyio
@@ -101,6 +102,8 @@ async def test_kill_one_and_all() -> None:
     assert await run(h, "kill", "a") == "Stopped `a`."
     assert [r["name"] for r in h.manager.list(SESSION)] == ["b", "c"]
     assert await run(h, "kill", "all") == "Stopped 2 agents."
+    await run(h, "spawn", "coder d")
+    assert await run(h, "kill", "all") == "Stopped 1 agent."
     assert await run(h, "kill", "all") == "Stopped 0 agents."
     await h.manager.close()
 
@@ -266,3 +269,30 @@ def test_native_command_specs_include_live_agent_commands_when_enabled() -> None
         "kill",
     ]
     assert build_native_command_specs(off) == []
+
+
+def test_renderers_emit_live_agent_markdown_raw() -> None:
+    import asyncio
+    import io
+
+    from chainagents.commands.native import RuntimeCommandResult
+    from chainagents.interfaces.chainlit.renderer import native_command_output_message
+    from chainagents.interfaces.cli.render import CliEventRenderer
+
+    text = "| name | status |\n| --- | --- |\n| a | idle |"
+    result = RuntimeCommandResult(
+        target="live_agent", command_name="agents", tool_result=text
+    )
+    assert native_command_output_message(result) == text
+
+    out = io.StringIO()
+    renderer = CliEventRenderer(
+        stdout=out,
+        stderr=io.StringIO(),
+        stream=False,
+        json_output=False,
+        show_reasoning=False,
+        show_tools=False,
+    )
+    asyncio.run(renderer.on_command_result(result))
+    assert out.getvalue() == text + "\n"

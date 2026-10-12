@@ -8,7 +8,11 @@ from contextlib import suppress
 
 import chainlit as cl
 
-from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.commands.native import (
+    RuntimeCommandResult,
+    command_result_text,
+    dumps_tool_result,
+)
 from chainagents.events.stream import AgentStreamEvent
 from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.exports.response import generated_file_elements
@@ -86,6 +90,8 @@ def clarification_event(
 
 def native_command_output_message(result: RuntimeCommandResult) -> str:
     """Return the System message content for an MCP-tool native command."""
+    if result.target == "live_agent":
+        return command_result_text(result)
     return (
         f"Ran `/{result.command_name}` ({result.description}).\n\n"
         "Tool result:\n```json\n"

@@ -17,7 +17,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Footer, Header, Markdown, RichLog, Static, TextArea
 
-from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.commands.native import RuntimeCommandResult, command_result_text
 from chainagents.events.stream import AgentStreamEvent
 from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.runtime.reflection import (
@@ -641,7 +641,7 @@ class TuiRenderer(BaseTurnRenderer):
 
     async def on_command_result(self, result: RuntimeCommandResult) -> None:
         """Show MCP-tool command output in the tools pane."""
-        self.app._append_tool_entry(dumps_tool_result(result.tool_result))
+        self.app._append_tool_entry(command_result_text(result))
 
     async def on_command_error(self, exc: TurnCommandError, status: int) -> None:
         """Show a failed or unknown command in the tools pane and status line."""

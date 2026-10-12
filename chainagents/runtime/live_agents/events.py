@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import logging
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -43,6 +43,7 @@ class LiveAgentEventBus:
             self._listeners.append(listener)
 
     def remove_listener(self, listener: Callable[[LiveAgentEvent], None]) -> None:
+        """Unregister a callback added with ``add_listener``."""
         with self._lock:
             if listener in self._listeners:
                 self._listeners.remove(listener)

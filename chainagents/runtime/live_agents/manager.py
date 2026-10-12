@@ -275,6 +275,7 @@ class LiveAgentManager:
             event.kind != "message"
             or event.payload.get("to") != _USER_ADDRESS
             or not self.config.notify_main_on_user_actions
+            or event.session_id not in self._sessions
         ):
             return
         self.notify_main(
