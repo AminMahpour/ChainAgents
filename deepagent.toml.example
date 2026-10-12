@@ -106,6 +106,38 @@ max_running_per_session = 4
 max_running_total = 16
 max_tasks_per_session = 100
 
+# Process-local mailboxes. Required by live agents below.
+# [agent.messaging]
+# enabled = true
+
+# Live agents: long-lived, template-based subagents that the main agent or the
+# user can spawn, message and tear down. Opt-in; requires [agent.messaging].
+# [agent.live_agents]
+# enabled = true
+# max_live_per_session = 4
+# max_live_total = 16
+# idle_timeout_seconds = 1800   # 0 disables the idle timeout
+# max_turns_per_agent = 50
+# turn_recursion_limit = 100
+# delete_history_on_teardown = true
+# notify_main_on_user_actions = true
+# stream_activity = false
+#
+# [agent.live_agents.allow]
+# applies_to = "all"            # "all" also constrains templates; "overrides" only spawn-time additions
+# allow_custom_prompt = true    # allow spawning without a template
+# models = ["fast-local"]
+# mcp_servers = []
+# skills = []
+# tools = ["ls", "read_file", "glob", "grep"]
+#
+# [[agent.live_agents.templates]]
+# name = "researcher"
+# description = "Reads the repository and answers questions about it."
+# system_prompt_file = "prompts/live/researcher.md"
+# model = "fast-local"
+# tools = ["ls", "read_file", "glob", "grep"]
+
 [agent.reflection]
 # Set true to propose compact lessons after corrections or unrecovered tool failures.
 # Chainlit asks before saving; CLI, TUI, and API only surface proposals.
@@ -127,6 +159,8 @@ tool_steps_enabled = true
 startup_status_enabled = true
 # Set false to hide generated Chainlit CustomElement panels and remove the render tool.
 generative_ui_enabled = true
+# Set false to hide the Live agents side panel (when live agents are enabled).
+# live_agents_panel_enabled = true
 # Native slash commands available from the Chainlit composer.
 commands = [
   { name = "summarize-docs", description = "Summarize repository docs.", target = "prompt", value = "Summarize the repository documentation changes.", template = "Summarize docs for: {input}" },

@@ -62,6 +62,9 @@ Notable modules inside {py:mod}`chainagents.runtime`:
 - `backends` — pluggable filesystem state and store backends.
 - `background_tasks` — queues, context scoping, and lifecycle for
   asynchronous background subagents.
+- `live_agents` — manager, worker, registry, and event bus for long-lived,
+  template-based live agents; they exist only in the ChainAgents runtime
+  (not the exported LangGraph graph) and use the `messaging` broker.
 - `mcp_sessions` — MCP server session management.
 - `tracing` — Langfuse and LangSmith callback wiring.
 - `rag_ops` — RAG indexing and search operations.
