@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
@@ -41,6 +41,9 @@ from chainagents.runtime.constants import (
     ReasoningLevel,
 )
 from chainagents.runtime.types import ModelDefaults, SubagentConfig
+
+if TYPE_CHECKING:
+    from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
 
 logger = logging.getLogger("chainagents.runtime.core")
 
@@ -1091,7 +1094,7 @@ def create_configured_graph(
 def build_live_agent_graph(
     config: RuntimeConfig,
     *,
-    spec: Any,
+    spec: ResolvedLiveAgentSpec,
     model: Any,
     model_name: str | None,
     reasoning_level: ReasoningLevel,
@@ -1123,6 +1126,10 @@ def build_live_agent_graph(
             broker, fixed_session_id=session_id
         ),
     ]
+    # FilesystemMiddleware requires read_file; grant it but hide it from the
+    # model when the spec does not include it.
+    hide_read_file = "read_file" not in spec.tools
+    fs_tools = ["read_file", *spec.tools] if hide_read_file else list(spec.tools)
     middleware = runtime_middleware.build_agent_middleware(
         backend=backend,
         config=config,
@@ -1130,8 +1137,12 @@ def build_live_agent_graph(
         model_name=model_name,
         source=f"live:{spec.name}",
         project_root=project_root,
-        filesystem_tools=spec.tools,
+        filesystem_tools=fs_tools,
     )
+    if hide_read_file:
+        from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
+
+        middleware.append(_ToolExclusionMiddleware(excluded=frozenset({"read_file"})))
     # DeepAgents otherwise adds an implicit general-purpose `task` delegate.
     middleware.append(runtime_middleware.DisableSubagentDelegationMiddleware())
     kwargs: dict[str, Any] = {

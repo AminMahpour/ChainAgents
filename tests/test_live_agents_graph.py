@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import HumanMessage
+from pydantic import Field
 
 from chainagents.runtime.artifacts import LargeToolResultArtifactRegistry
 from chainagents.runtime.background_tasks import BACKGROUND_TASK_TOOL_NAMES
@@ -26,8 +27,8 @@ LIVE_AGENT_TOOL_NAMES = {
 
 
 class RecordingModel(FakeListChatModel):
-    bound: list = []
-    seen_messages: list = []
+    bound: list = Field(default_factory=list)
+    seen_messages: list = Field(default_factory=list)
 
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         for item in tools:
@@ -68,8 +69,6 @@ def _backend(tmp_path):
 def _run(tmp_path, tools=("read_file", "ls"), prompt="You are the live agent."):
     config = _config(tmp_path)
     model = RecordingModel(responses=["done"])
-    model.bound = []
-    model.seen_messages = []
     broker = MessageBroker(config.extensions.messaging)
     broker.open("s", "main", name="main", parent=None)
     spec = ResolvedLiveAgentSpec(
@@ -129,3 +128,17 @@ def test_build_agent_middleware_default_tools_unchanged(tmp_path):
 
     assert fs_tools() == sorted(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
     assert fs_tools(filesystem_tools=["read_file"]) == ["read_file"]
+
+
+def test_live_graph_with_no_filesystem_tools_builds_and_binds_none(tmp_path):
+    names = set(_run(tmp_path, tools=()).bound)
+    assert not names & {
+        "read_file", "ls", "write_file", "edit_file", "glob", "grep"
+    }
+    assert "send_agent_message" in names
+
+
+def test_live_graph_without_read_file_hides_it(tmp_path):
+    names = set(_run(tmp_path, tools=("ls",)).bound)
+    assert "ls" in names
+    assert "read_file" not in names
