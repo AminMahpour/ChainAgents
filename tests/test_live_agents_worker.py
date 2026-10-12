@@ -145,7 +145,7 @@ async def test_message_triggers_one_turn_and_reply_reaches_sender() -> None:
     assert h.record.status == "idle"
     assert h.record.last_active_at == 100.0
     kinds = [e.kind for e in h.drain_events()]
-    assert kinds == ["turn_started", "message", "turn_finished"]
+    assert kinds == ["message", "turn_started", "message", "turn_finished"]
 
 
 @pytest.mark.anyio
@@ -227,7 +227,9 @@ async def test_multiple_senders_each_get_reply() -> None:
     assert h.inbox("main") == ["shared reply"]
     assert h.inbox("other") == ["shared reply"]
     message_events = [e for e in h.drain_events() if e.kind == "message"]
-    assert [e.payload["to"] for e in message_events] == ["main", "other"]
+    assert [e.payload["to"] for e in message_events] == [
+        "helper", "helper", "helper", "main", "other"
+    ]
 
 
 @pytest.mark.anyio
@@ -421,3 +423,27 @@ async def test_reply_to_closed_sender_is_skipped_and_others_still_replied() -> N
     assert h.record.status == "idle"
     await h.stop()
     assert h.inbox("main") == ["reply"]
+
+
+@pytest.mark.anyio
+async def test_claimed_messages_published_as_inbound_events() -> None:
+    h = Harness(FakeGraph(["done"]))
+    h.broker.open(SESSION, "other", name="other", parent="main")
+    h.broker.open(SESSION, "user", name="user", parent=None)
+    h.broker.send(SESSION, "main", ADDRESS, "from main")
+    h.broker.send(SESSION, "other", ADDRESS, "from peer")
+    h.broker.send(SESSION, "user", ADDRESS, "from user")
+    h.start()
+    await run_until(h, lambda: h.record.turns == 1 and h.record.status == "idle")
+    await asyncio.sleep(0.01)
+    await h.stop()
+
+    events = h.drain_events()
+    assert [e.kind for e in events][:3] == ["message", "message", "turn_started"]
+    inbound = [dict(e.payload) for e in events if e.kind == "message"][:2]
+    # User messages are already published by the manager, so they are skipped.
+    assert inbound == [
+        {"from": "main", "to": "helper", "body": "from main"},
+        {"from": "other", "to": "helper", "body": "from peer"},
+    ]
+    assert all(e.agent_id == "abc123" for e in events)

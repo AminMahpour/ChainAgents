@@ -184,11 +184,13 @@ class LiveAgentManager:
             except ValueError:
                 await self.teardown(session_id, record.id, reason="spawn_failed")
                 raise
-            self._publish(
-                "message",
-                record,
-                {"from": spawned_by, "to": record.name, "body": text},
-            )
+            if spawned_by == _USER_ADDRESS:
+                # Other senders are published by the worker when it claims them.
+                self._publish(
+                    "message",
+                    record,
+                    {"from": spawned_by, "to": record.name, "body": text},
+                )
         return record, spec
 
     def _check_accepting(self, session_id: str) -> None:

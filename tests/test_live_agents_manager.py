@@ -166,6 +166,23 @@ async def test_spawn_initial_message_runs_first_turn() -> None:
 
 
 @pytest.mark.anyio
+async def test_spawn_initial_message_from_main_published_once() -> None:
+    h = Harness(graphs=[FakeGraph(["findings"])])
+    h.subscribe()
+    record, _ = await h.manager.spawn(
+        SESSION, SpawnRequest(template="researcher", initial_message="look into X")
+    )
+    await until(lambda: record.turns == 1)
+    await asyncio.sleep(0)
+    payloads = [e.payload for e in h.drain() if e.kind == "message"]
+    assert payloads == [
+        {"from": "main", "to": "researcher-1", "body": "look into X"},
+        {"from": "researcher-1", "to": "main", "body": "findings"},
+    ]
+    await h.manager.close()
+
+
+@pytest.mark.anyio
 async def test_spawn_initial_message_from_user_does_not_leave_user_open() -> None:
     graph = FakeGraph(["hi user"])
     h = Harness(graphs=[graph])

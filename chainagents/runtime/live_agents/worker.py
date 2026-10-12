@@ -87,6 +87,7 @@ class LiveAgentWorker:
                     return
                 if not batch:
                     continue
+                self._publish_inbound(batch)
                 reason = await self._process(batch)
                 if reason is not None:
                     await self.on_finished(record, reason)
@@ -170,6 +171,20 @@ class LiveAgentWorker:
                     )
                     continue
             self._publish("message", {"from": record.name, "to": sender, "body": body})
+
+    def _publish_inbound(self, batch: list[AgentMessage]) -> None:
+        """Publish claimed messages so observers see every inbound message.
+
+        User messages are skipped: ``LiveAgentManager`` already publishes them
+        when they are sent.
+        """
+        for message in batch:
+            if message.sender == _USER_SENDER:
+                continue
+            self._publish(
+                "message",
+                {"from": message.sender, "to": self.record.name, "body": message.body},
+            )
 
     def _publish(self, kind: Any, payload: dict[str, object]) -> None:
         record = self.record
