@@ -296,3 +296,20 @@ def test_renderers_emit_live_agent_markdown_raw() -> None:
     )
     asyncio.run(renderer.on_command_result(result))
     assert out.getvalue() == text + "\n"
+
+
+@pytest.mark.anyio
+async def test_kill_records_user_stop_reason() -> None:
+    h = Harness()
+    await run(h, "spawn", "researcher a")
+    await run(h, "spawn", "researcher b")
+    await run(h, "spawn", "coder c")
+    await run(h, "kill", "a")
+    await run(h, "kill", "all")
+    stopped = h.manager.list(SESSION, include_stopped=True)
+    assert {row["name"]: row["stop_reason"] for row in stopped} == {
+        "a": "user",
+        "b": "user",
+        "c": "user",
+    }
+    await h.manager.close()

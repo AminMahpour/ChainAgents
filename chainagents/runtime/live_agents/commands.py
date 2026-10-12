@@ -130,13 +130,13 @@ async def _kill(
     if args == "all":
         rows = manager.list(session_id)
         for row in rows:
-            await manager.teardown(session_id, str(row["id"]))
+            await manager.teardown(session_id, str(row["id"]), reason="user")
         if rows:
             _notify_main(
                 manager, session_id, f"FYI: user stopped {len(rows)} live agents."
             )
         return f"Stopped {len(rows)} agent{'' if len(rows) == 1 else 's'}."
     record = manager.get(session_id, args)
-    await manager.teardown(session_id, record.id)
+    await manager.teardown(session_id, record.id, reason="user")
     _notify_main(manager, session_id, f"FYI: user stopped `{record.name}`.")
     return f"Stopped `{record.name}`."
