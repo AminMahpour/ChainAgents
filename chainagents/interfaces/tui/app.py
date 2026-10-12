@@ -31,6 +31,7 @@ from chainagents.runtime import (
     normalize_reasoning_level,
 )
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
+from chainagents.runtime.live_agents.events import LiveAgentEvent
 from chainagents.turns import (
     BaseTurnRenderer,
     TurnCommandError,
@@ -103,6 +104,14 @@ class BackgroundTaskCompleted(Message):
     def __init__(self, snapshot: BackgroundTaskSnapshot) -> None:
         super().__init__()
         self.snapshot = snapshot
+
+
+class LiveAgentNotice(Message):
+    """Deliver a one-line live agent notice through Textual's message queue."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
 
 
 class ChainAgentsTuiApp(App[int]):
@@ -212,6 +221,8 @@ class ChainAgentsTuiApp(App[int]):
         self.visible_command_names: list[str] = []
         self.background_task_queue: asyncio.Queue[BackgroundTaskSnapshot] | None = None
         self.background_notice_task: asyncio.Task[None] | None = None
+        self.live_agent_queue: asyncio.Queue[LiveAgentEvent] | None = None
+        self.live_agent_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         """Compose the TUI layout."""
@@ -245,6 +256,37 @@ class ChainAgentsTuiApp(App[int]):
             self.background_notice_task = asyncio.create_task(
                 self._watch_background_tasks()
             )
+        live_agents = getattr(self.runtime, "live_agents", None)
+        if live_agents is not None:
+            self.live_agent_queue = live_agents.events.subscribe(self.thread_id)
+            self.live_agent_task = asyncio.create_task(self._watch_live_agents())
+
+    async def _watch_live_agents(self) -> None:
+        """Turn live agent events into one-line notices."""
+        if self.live_agent_queue is None:
+            return
+        while True:
+            event = await self.live_agent_queue.get()
+            text = self._format_live_agent_event(event)
+            if text is not None:
+                self.post_message(LiveAgentNotice(text))
+
+    @staticmethod
+    def _format_live_agent_event(event: LiveAgentEvent) -> str | None:
+        if event.kind == "message" and event.payload.get("to") == "user":
+            body = str(event.payload.get("body", "")).strip()
+            first = body.splitlines()[0] if body else ""
+            if len(first) > 200:
+                first = first[:197] + "..."
+            return f"{event.agent_name}: {first}"
+        if event.kind == "stopped":
+            return f"{event.agent_name} stopped ({event.payload.get('reason', 'unknown')})"
+        return None
+
+    @on(LiveAgentNotice)
+    def show_live_agent_notice(self, event: LiveAgentNotice) -> None:
+        """Render one live agent notice in the tools pane."""
+        self._append_tool_entry(event.text)
 
     async def _watch_background_tasks(self) -> None:
         """Append terminal local task results to the tools pane."""
@@ -270,6 +312,14 @@ class ChainAgentsTuiApp(App[int]):
         if self.background_notice_task is not None:
             self.background_notice_task.cancel()
             self.background_notice_task = None
+        if self.live_agent_queue is not None:
+            self.runtime.live_agents.events.unsubscribe(
+                self.thread_id, self.live_agent_queue
+            )
+            self.live_agent_queue = None
+        if self.live_agent_task is not None:
+            self.live_agent_task.cancel()
+            self.live_agent_task = None
 
     @staticmethod
     def _format_background_task(snapshot: BackgroundTaskSnapshot) -> str:

@@ -992,3 +992,70 @@ async def test_tui_ctrl_c_cancels_active_run(
         assert app.status_message == "Cancelled."
         # No reflection, generated files or error are reported on cancel.
         assert app.tool_entries == []
+
+
+def _live_runtime():
+    from chainagents.runtime.live_agents.events import LiveAgentEventBus
+
+    runtime = _FakeRuntime(_FakeAgent([]))
+    bus = LiveAgentEventBus()
+    runtime.live_agents = SimpleNamespace(events=bus)
+    return runtime, bus
+
+
+@pytest.mark.anyio
+async def test_tui_shows_live_agent_reply_notice() -> None:
+    """A live agent message addressed to the user becomes a one-line notice."""
+    from chainagents.runtime.live_agents.events import LiveAgentEvent
+
+    runtime, bus = _live_runtime()
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        bus.publish(
+            LiveAgentEvent(
+                "message",
+                DEFAULT_TUI_THREAD_ID,
+                "a1",
+                "researcher-1",
+                {"from": "researcher-1", "to": "user", "body": "first line\nsecond"},
+            )
+        )
+        bus.publish(
+            LiveAgentEvent(
+                "message",
+                DEFAULT_TUI_THREAD_ID,
+                "a1",
+                "researcher-1",
+                {"from": "researcher-1", "to": "other", "body": "internal"},
+            )
+        )
+        await pilot.pause()
+        await pilot.pause()
+
+        assert any("researcher-1: first line" in e for e in app.tool_entries)
+        assert all("second" not in e and "internal" not in e for e in app.tool_entries)
+
+
+@pytest.mark.anyio
+async def test_tui_shows_live_agent_stopped_notice() -> None:
+    """A stopped live agent is announced with its reason."""
+    from chainagents.runtime.live_agents.events import LiveAgentEvent
+
+    runtime, bus = _live_runtime()
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        bus.publish(
+            LiveAgentEvent(
+                "stopped",
+                DEFAULT_TUI_THREAD_ID,
+                "a1",
+                "researcher-1",
+                {"reason": "idle_timeout"},
+            )
+        )
+        await pilot.pause()
+        await pilot.pause()
+
+        assert any("researcher-1 stopped (idle_timeout)" in e for e in app.tool_entries)

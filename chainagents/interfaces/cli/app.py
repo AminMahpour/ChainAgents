@@ -340,6 +340,13 @@ async def _read_terminal_line(
     return line.rstrip("\r\n")
 
 
+async def _teardown_live_agents(runtime: AgentRuntime, thread_id: str) -> None:
+    """Stop the session's live agents when the runtime has them enabled."""
+    live_agents = getattr(runtime, "live_agents", None)
+    if live_agents is not None:
+        await live_agents.teardown_session(thread_id)
+
+
 async def interactive_repl(
     runtime: AgentRuntime,
     args: argparse.Namespace,
@@ -595,45 +602,51 @@ async def run_cli(
         return 1
 
     if has_prompt:
-        prompt_result = await run_agent_prompt(
-            runtime,
-            args,
-            prompt=prompt or "",
-            stdout=stdout,
-            stderr=stderr,
-            emit_json=not args.json_output,
-        )
-        background_snapshots = []
-        if isinstance(prompt_result, dict) or int(prompt_result) == 0:
-            background_snapshots = await runtime.background_tasks.wait_session(thread_id)
-        if args.json_output:
-            if isinstance(prompt_result, dict):
-                json_actions.update(prompt_result)
-                json_actions["background_tasks"] = [
-                    snapshot.to_payload() for snapshot in background_snapshots
-                ]
-                print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
-                return 0
-            return int(prompt_result)
-        for snapshot in background_snapshots:
-            print(
-                format_background_task_notice(snapshot, include_result=True),
-                file=stderr,
+        try:
+            prompt_result = await run_agent_prompt(
+                runtime,
+                args,
+                prompt=prompt or "",
+                stdout=stdout,
+                stderr=stderr,
+                emit_json=not args.json_output,
             )
-        return int(prompt_result)
+            background_snapshots = []
+            if isinstance(prompt_result, dict) or int(prompt_result) == 0:
+                background_snapshots = await runtime.background_tasks.wait_session(thread_id)
+            if args.json_output:
+                if isinstance(prompt_result, dict):
+                    json_actions.update(prompt_result)
+                    json_actions["background_tasks"] = [
+                        snapshot.to_payload() for snapshot in background_snapshots
+                    ]
+                    print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
+                    return 0
+                return int(prompt_result)
+            for snapshot in background_snapshots:
+                print(
+                    format_background_task_notice(snapshot, include_result=True),
+                    file=stderr,
+                )
+            return int(prompt_result)
+        finally:
+            await _teardown_live_agents(runtime, thread_id)
 
     if args.status or args.list_commands or args.rebuild_rag or args.upload_rag:
         if args.json_output:
             print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
         return 0
 
-    return await interactive_repl(
-        runtime,
-        args,
-        stdout=stdout,
-        stderr=stderr,
-        stdin=stdin,
-    )
+    try:
+        return await interactive_repl(
+            runtime,
+            args,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=stdin,
+        )
+    finally:
+        await _teardown_live_agents(runtime, thread_id)
 
 
 async def async_main(argv: list[str] | None = None) -> int:

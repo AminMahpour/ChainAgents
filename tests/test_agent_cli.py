@@ -2543,3 +2543,48 @@ async def test_interactive_cli_strips_queue_prefix_while_paused(monkeypatch) -> 
     )
     assert code == 0
     assert seen == ["inspect the tests"]
+
+
+@pytest.mark.anyio
+async def test_cli_one_shot_tears_down_live_agents(monkeypatch) -> None:
+    """One-shot runs must stop the session's live agents, even on failure."""
+    args = chainagents_cli.parse_args(["--prompt", "hello", "--thread-id", "thread-1"])
+    torn_down: list[str] = []
+
+    class Tasks:
+        async def wait_session(self, session_id):
+            return []
+
+    class Live:
+        async def teardown_session(self, session_id):
+            torn_down.append(session_id)
+
+    runtime = SimpleNamespace(background_tasks=Tasks(), live_agents=Live())
+
+    async def run_agent_prompt(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", run_agent_prompt)
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=runtime,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+        stdin=io.StringIO(""),
+    )
+    assert code == 0
+    assert torn_down == ["thread-1"]
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", failing)
+    with pytest.raises(RuntimeError):
+        await chainagents_cli.run_cli(
+            args,
+            runtime=runtime,
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            stdin=io.StringIO(""),
+        )
+    assert torn_down == ["thread-1", "thread-1"]
