@@ -15,6 +15,7 @@ from chainagents.runtime.constants import (
     DEFAULT_RECURSION_LIMIT,
     AgentStateMode,
 )
+from chainagents.runtime.live_agents import config as live_agents_config
 from chainagents.runtime.reflection import normalize_reflection_config
 from chainagents.runtime.types import (
     BATCH_RESULT_FORMATS,
@@ -720,6 +721,15 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
             raise ValueError(f"MCP server '{name}' must be a table/object.")
         mcp_servers[str(name)] = normalize_mcp_server_config(raw_server, base_dir)
 
+    live_agents = live_agents_config.parse_live_agents_config(
+        agent_section.get("live_agents"),
+        base_dir=base_dir,
+        mcp_servers=mcp_servers,
+        messaging_enabled=messaging.enabled,
+        delete_tool_enabled=raw_delete_tool_enabled,
+        execute_tool_enabled=raw_execute_tool_enabled,
+    )
+
     raw_skill_paths = agent_section.get("skills", [])
     custom_instruction = parse_agent_custom_instruction(agent_section, base_dir)
     raw_summarization_middleware_enabled = agent_section.get(
@@ -827,6 +837,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
     raw_startup_status_enabled = chainlit_section.get("startup_status_enabled", True)
     raw_chronological_ui_enabled = chainlit_section.get("chronological_ui_enabled", True)
     raw_generative_ui_enabled = chainlit_section.get("generative_ui_enabled", True)
+    raw_live_agents_panel_enabled = chainlit_section.get("live_agents_panel_enabled", True)
     if not isinstance(raw_reasoning_mode_enabled, bool):
         raise ValueError(
             "The top-level 'chainlit.reasoning_mode_enabled' config must be a boolean."
@@ -856,6 +867,11 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
             "The top-level 'chainlit.generative_ui_enabled' config must be a boolean."
         )
 
+    if not isinstance(raw_live_agents_panel_enabled, bool):
+        raise ValueError(
+            "The top-level 'chainlit.live_agents_panel_enabled' config must be a boolean."
+        )
+
     chainlit_commands: list[ChainlitCommandConfig] = []
     seen_commands: set[str] = set()
     for index, raw_chainlit_command in enumerate(raw_chainlit_commands, start=1):
@@ -872,6 +888,11 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         if not name or " " in name:
             raise ValueError(
                 f"Chainlit command entry #{index} must define a slash-compatible 'name' with no spaces."
+            )
+        if name in live_agents_config.LIVE_AGENT_COMMAND_NAMES:
+            raise ValueError(
+                f"Chainlit command '/{name}' uses a name reserved for live agents: "
+                f"{', '.join(sorted(live_agents_config.LIVE_AGENT_COMMAND_NAMES))}."
             )
         if name in seen_commands:
             raise ValueError(f"Chainlit command '/{name}' is defined more than once.")
@@ -983,6 +1004,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         messaging=messaging,
         user_input=user_input,
         clarification=clarification,
+        live_agents=live_agents,
         chainlit_commands=tuple(chainlit_commands),
         chainlit_starters=tuple(chainlit_starters),
         chainlit_response_actions=tuple(chainlit_response_actions),
@@ -993,6 +1015,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
         chainlit_startup_status_enabled=raw_startup_status_enabled,
         chainlit_chronological_ui_enabled=raw_chronological_ui_enabled,
         chainlit_generative_ui_enabled=raw_generative_ui_enabled,
+        chainlit_live_agents_panel_enabled=raw_live_agents_panel_enabled,
         summarization_middleware_enabled=raw_summarization_middleware_enabled,
         summarization_trigger_tokens=raw_summarization_trigger_tokens,
         summarization_keep_tokens=raw_summarization_keep_tokens,

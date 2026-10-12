@@ -11,6 +11,7 @@ from typing import Any
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.extension_config as runtime_extension_config
 import chainagents.runtime.model_config as runtime_model_config
+from chainagents.runtime.live_agents import config as live_agents_config
 from chainagents.rag.runtime import (
     RagConfig,
     ResolvedRagConfig,
@@ -118,10 +119,13 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
 
     model_defaults = runtime_model_config.parse_model_defaults(raw_config)
     raw_model = raw_config.get("model", {})
+    extensions = runtime_extension_config.parse_extensions_config(raw_config, resolved_config_path)
+    model_profiles = runtime_model_config.parse_model_profiles(raw_model, base=model_defaults)
+    live_agents_config.validate_live_agent_models(extensions.live_agents, model_profiles)
     return FileConfig(
         model=model_defaults,
-        extensions=runtime_extension_config.parse_extensions_config(raw_config, resolved_config_path),
-        model_profiles=runtime_model_config.parse_model_profiles(raw_model, base=model_defaults),
+        extensions=extensions,
+        model_profiles=model_profiles,
         langfuse=parse_langfuse_config(raw_config),
         langsmith=parse_langsmith_config(raw_config),
         rag=parse_rag_config(raw_config, resolved_config_path),
