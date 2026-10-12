@@ -1226,7 +1226,7 @@ Each `[[agent.live_agents.templates]]` entry needs a unique `name`, a
 (not both). Optional fields are `model` (a model profile name), `tools`,
 `skills`, and `mcp_servers`.
 
-- `tools` may only name filesystem tools: `ls`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`, plus `delete` and `execute` when `delete_tool_enabled` / `execute_tool_enabled` are set under `[agent]`. A live agent never gets `read_file` or any other tool unless a template or spawn grants it, so a spawn without a template has no filesystem tools.
+- `tools` may only name filesystem tools: `ls`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`, plus `delete` and `execute` when `delete_tool_enabled` / `execute_tool_enabled` are set under `[agent]`. A live agent never gets `read_file` or any other tool unless a template or spawn grants it, so a spawn without a template starts with no tools and gets only what `add_tools` grants from the allowlist.
 - `skills` paths are normalized like those of `[[subagents]]` but are not checked for existence.
 - `mcp_servers` must name servers defined under `[mcp]`.
 - Model profile existence and the model allowlist are checked after model profiles are parsed.
@@ -1294,11 +1294,11 @@ the delete route returns the agent's final status. Unknown agents return 404.
 
 #### Limits and teardown
 
-An agent stops (status `stopped`, or `failed` for repeated errors) for one of
-these reasons: `requested` (the main agent called `teardown_live_agent`),
+An agent stops (status `stopped`, or `failed` for repeated errors). The stop
+reason is recorded on the agent and includes: `requested` (the main agent called `teardown_live_agent`; it may pass its own `reason` instead),
 `user` (`/kill` or the panel/API), `idle_timeout`, `max_turns`, `failed`
 (three consecutive failed turns), `worker_exited` (the worker ended
-unexpectedly), or `session_end` (the conversation closed). Both `stopped` and
+unexpectedly), `spawn_failed` (the initial message could not be delivered), or `session_end` (the conversation closed). Both `stopped` and
 `failed` are terminal: they free the name and the slot. When
 `delete_history_on_teardown` is true, the agent's own history is deleted too.
 
