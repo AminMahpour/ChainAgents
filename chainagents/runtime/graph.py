@@ -1086,3 +1086,67 @@ def create_configured_graph(
             langsmith_tracing.with_callback if langsmith_tracing is not None else None
         ),
     )
+
+
+def build_live_agent_graph(
+    config: RuntimeConfig,
+    *,
+    spec: Any,
+    model: Any,
+    model_name: str | None,
+    reasoning_level: ReasoningLevel,
+    mcp_tools: list[Any],
+    backend: Any,
+    project_root: Path,
+    broker: runtime_messaging.MessageBroker,
+    session_id: str,
+    store: Any | None = None,
+    checkpointer: Any | None = None,
+) -> Any:
+    """Compile a restricted, long-lived live agent graph.
+
+    Live agents get only their resolved filesystem tools, their MCP tools and
+    the agent-messaging tools; never subagents, background-task tools or
+    live-agent management tools.
+    """
+    runtime_messaging.validate_agent_message_tool_names(mcp_tools)
+    provider = runtime_models.resolve_runtime_model_profile(
+        config,
+        spec.model,
+        inherited_model=ModelDefaults(
+            provider=config.model_provider, name=config.model_name
+        ),
+    ).provider
+    tools = [
+        *sanitize_tools_for_model(provider, list(mcp_tools)),
+        *runtime_messaging.create_agent_message_tools(
+            broker, fixed_session_id=session_id
+        ),
+    ]
+    middleware = runtime_middleware.build_agent_middleware(
+        backend=backend,
+        config=config,
+        reasoning_level=reasoning_level,
+        model_name=model_name,
+        source=f"live:{spec.name}",
+        project_root=project_root,
+        filesystem_tools=spec.tools,
+    )
+    # DeepAgents otherwise adds an implicit general-purpose `task` delegate.
+    middleware.append(runtime_middleware.DisableSubagentDelegationMiddleware())
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "tools": tools,
+        "system_prompt": spec.system_prompt,
+        "middleware": middleware,
+        "backend": backend,
+        "skills": list(spec.skills) or None,
+        "subagents": [],
+    }
+    if store is not None:
+        kwargs["store"] = store
+    if checkpointer is not None:
+        kwargs["checkpointer"] = checkpointer
+    return runtime_middleware.create_deep_agent_with_configured_summarization(
+        config, **kwargs
+    )
