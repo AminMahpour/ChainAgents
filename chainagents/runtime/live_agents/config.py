@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +16,8 @@ from chainagents.runtime.types import (
 )
 
 LIVE_AGENT_COMMAND_NAMES: frozenset[str] = frozenset({"agents", "spawn", "msg", "kill"})
+SUPERVISOR_TASK_HEADING = "## Task from supervisor"
+LIVE_AGENT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
 _PREFIX = "agent.live_agents"
 _LIMIT_FIELDS = (
@@ -331,3 +335,164 @@ def validate_live_agent_models(
                 f"Live agent template '{template.name}' uses model '{template.model}' "
                 f"outside '{_PREFIX}.allow.models'."
             )
+
+@dataclass(frozen=True)
+class SpawnRequest:
+    """A request to spawn a live agent, before resolution."""
+
+    template: str | None = None
+    name: str | None = None
+    instructions: str | None = None
+    model: str | None = None
+    add_tools: tuple[str, ...] = ()
+    remove_tools: tuple[str, ...] = ()
+    add_skills: tuple[str, ...] = ()
+    add_mcp_servers: tuple[str, ...] = ()
+    initial_message: str | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedLiveAgentSpec:
+    """A spawn request resolved against a template and the allowlist."""
+
+    name: str
+    template: str | None
+    system_prompt: str
+    model: str | None
+    tools: tuple[str, ...]
+    skills: tuple[str, ...]
+    mcp_servers: tuple[str, ...]
+
+
+class LiveAgentSpawnError(ValueError):
+    """Raised when a spawn request violates templates, allowlist or naming rules."""
+
+
+def _merge(base: tuple[str, ...], additions: tuple[str, ...]) -> tuple[str, ...]:
+    merged = list(base)
+    for item in additions:
+        if item not in merged:
+            merged.append(item)
+    return tuple(merged)
+
+
+def _require_allowed(
+    items: tuple[str, ...], allowed: tuple[str, ...], *, kind: str
+) -> None:
+    for item in items:
+        if item not in allowed:
+            raise LiveAgentSpawnError(
+                f"{kind} '{item}' is not permitted. Permitted {kind}s: {list(allowed)}"
+            )
+
+
+def resolve_spawn(
+    request: SpawnRequest,
+    config: LiveAgentsConfig,
+    *,
+    existing_names: Collection[str],
+    sequence: int,
+) -> ResolvedLiveAgentSpec:
+    """Resolve a spawn request into a concrete agent spec or raise.
+
+    Additions must be in the matching allowlist (in both ``applies_to``
+    modes); removals are always permitted.
+    """
+    allow = config.allow
+    instructions = (request.instructions or "").strip()
+    template: LiveAgentTemplate | None = None
+
+    if request.template is not None:
+        template = next(
+            (t for t in config.templates if t.name == request.template), None
+        )
+        if template is None:
+            raise LiveAgentSpawnError(
+                f"Unknown live agent template '{request.template}'. "
+                f"Available templates: {[t.name for t in config.templates]}"
+            )
+        system_prompt = template.system_prompt
+        if instructions:
+            system_prompt = (
+                f"{system_prompt}\n\n{SUPERVISOR_TASK_HEADING}\n{instructions}"
+            )
+        base_tools, base_skills, base_servers = (
+            template.tools,
+            template.skills,
+            template.mcp_servers,
+        )
+        model = template.model
+    else:
+        if not allow.allow_custom_prompt:
+            raise LiveAgentSpawnError(
+                "Spawning without a template is not permitted "
+                "(allow_custom_prompt is false). "
+                f"Choose a template: {[t.name for t in config.templates]}"
+            )
+        if not instructions:
+            raise LiveAgentSpawnError(
+                "Spawning without a template requires non-empty 'instructions'."
+            )
+        system_prompt = instructions
+        base_tools, base_skills, base_servers = (), (), ()
+        model = None
+
+    if request.model is not None:
+        _require_allowed((request.model,), allow.models, kind="model")
+        model = request.model
+
+    _require_allowed(request.add_tools, allow.tools, kind="tool")
+    _require_allowed(request.add_mcp_servers, allow.mcp_servers, kind="MCP server")
+
+    # Imported lazily: extension_config imports this module.
+    from chainagents.runtime.constants import PROJECT_ROOT
+    from chainagents.runtime.extension_config import normalize_skill_source_path
+
+    added_skills: list[str] = []
+    for skill in request.add_skills:
+        if skill in allow.skills:
+            added_skills.append(skill)
+            continue
+        try:
+            normalized = normalize_skill_source_path(skill, PROJECT_ROOT)
+        except ValueError:
+            normalized = skill
+        _require_allowed((normalized,), allow.skills, kind="skill")
+        added_skills.append(normalized)
+
+    tools = tuple(
+        t
+        for t in _merge(base_tools, request.add_tools)
+        if t not in request.remove_tools
+    )
+    skills = _merge(base_skills, tuple(added_skills))
+    servers = _merge(base_servers, request.add_mcp_servers)
+
+    if request.name is not None:
+        name = request.name
+        if not LIVE_AGENT_NAME_PATTERN.fullmatch(name):
+            raise LiveAgentSpawnError(
+                f"Invalid agent name '{name}'. A name must match "
+                f"{LIVE_AGENT_NAME_PATTERN.pattern}"
+            )
+    else:
+        name = f"{template.name if template else 'agent'}-{sequence}"
+        if not LIVE_AGENT_NAME_PATTERN.fullmatch(name):
+            raise LiveAgentSpawnError(
+                f"Default agent name '{name}' is invalid; provide an explicit name "
+                f"matching {LIVE_AGENT_NAME_PATTERN.pattern}"
+            )
+    if name in existing_names:
+        raise LiveAgentSpawnError(
+            f"Agent name '{name}' is already in use by a live agent."
+        )
+
+    return ResolvedLiveAgentSpec(
+        name=name,
+        template=template.name if template else None,
+        system_prompt=system_prompt,
+        model=model,
+        tools=tools,
+        skills=skills,
+        mcp_servers=servers,
+    )
