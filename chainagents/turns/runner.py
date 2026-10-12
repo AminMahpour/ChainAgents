@@ -280,7 +280,7 @@ class TurnRunner:
                 )
                 await renderer.on_complete(result)
                 return result
-            if command_result is not None and command_result.target == "mcp_tool":
+            if command_result is not None and command_result.target in ("mcp_tool", "live_agent"):
                 return await self._finish_command_output(
                     request, command_result, renderer
                 )
@@ -312,7 +312,11 @@ class TurnRunner:
         result = TurnResult(
             status="completed",
             prompt=request.prompt,
-            response=dumps_tool_result(command_result.tool_result),
+            response=(
+                str(command_result.tool_result)
+                if command_result.target == "live_agent"
+                else dumps_tool_result(command_result.tool_result)
+            ),
             command_result=command_result,
         )
         # The command output is not an agent response, so it is not recorded;

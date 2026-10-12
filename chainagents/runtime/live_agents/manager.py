@@ -74,6 +74,7 @@ class LiveAgentManager:
         self._closing_sessions: dict[str, int] = {}
         self._closed = False
         self._reaper: asyncio.Task[None] | None = None
+        self.events.add_listener(self._on_event)
 
     # ------------------------------------------------------------------ start
 
@@ -97,6 +98,7 @@ class LiveAgentManager:
         Spawns are refused afterwards; a spawn still building its graph aborts.
         """
         self._closed = True
+        self.events.remove_listener(self._on_event)
         reaper, self._reaper = self._reaper, None
         if reaper is not None:
             reaper.cancel()
@@ -254,7 +256,31 @@ class LiveAgentManager:
             return ""
         return "Live agents: " + ", ".join(f"{r.name}: {r.status}" for r in records)
 
+    def now(self) -> float:
+        """Return the manager clock's current time."""
+        return self._clock()
+
     # -------------------------------------------------------------- messages
+
+    def notify_main(self, session_id: str, text: str) -> None:
+        """Send an FYI to ``main`` as the user; log and skip when unavailable."""
+        try:
+            self._broker.send_from_user(session_id, _MAIN_ADDRESS, text)
+        except Exception:
+            logger.warning("Could not forward an FYI to main", exc_info=True)
+
+    def _on_event(self, event: LiveAgentEvent) -> None:
+        """Forward an agent's reply to the user to ``main`` as an FYI."""
+        if (
+            event.kind != "message"
+            or event.payload.get("to") != _USER_ADDRESS
+            or not self.config.notify_main_on_user_actions
+        ):
+            return
+        self.notify_main(
+            event.session_id,
+            f"FYI: `{event.agent_name}` replied to user: {event.payload.get('body', '')}",
+        )
 
     def send_from_user(self, session_id: str, ref: str, body: str) -> AgentMessage:
         record = self.get(session_id, ref)

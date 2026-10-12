@@ -6,6 +6,9 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple
 
+from chainagents.runtime.live_agents.commands import handle_live_agent_command
+from chainagents.runtime.live_agents.config import LIVE_AGENT_COMMAND_NAMES
+
 
 class ParsedNativeCommand(NamedTuple):
     """Represent a parsed native command and its raw argument text.
@@ -31,7 +34,7 @@ class RuntimeCommandResult:
         tool_result: The tool result value.
     """
 
-    target: Literal["unknown", "prompt", "mcp_tool"]
+    target: Literal["unknown", "prompt", "mcp_tool", "live_agent"]
     command_name: str
     description: str = ""
     prompt: str | None = None
@@ -145,6 +148,20 @@ async def resolve_runtime_command(
     Returns:
         The resolved runtime command.
     """
+    live_agents = getattr(runtime, "live_agents", None)
+    if live_agents is not None and parsed.command_name in LIVE_AGENT_COMMAND_NAMES:
+        text = await handle_live_agent_command(
+            live_agents,
+            command_name=parsed.command_name,
+            raw_args=parsed.raw_args,
+            session_id=thread_id,
+        )
+        return RuntimeCommandResult(
+            target="live_agent",
+            command_name=parsed.command_name,
+            tool_result=text,
+        )
+
     command = runtime.resolve_chainlit_command(parsed.command_name)
     if command is None:
         return RuntimeCommandResult(

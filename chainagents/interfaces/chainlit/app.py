@@ -83,6 +83,7 @@ from chainagents.runtime import (
     format_model_provider,
     resolve_runtime_model_profile,
 )
+from chainagents.runtime.live_agents.commands import LIVE_AGENT_COMMAND_DESCRIPTIONS
 from chainagents.runtime.reflection import (
     ReflectionProposal,
     format_reflection_proposal,
@@ -705,7 +706,7 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
         "mcp_tool": "wrench",
         "skill": "book-open",
     }
-    return [
+    specs = [
         {
             "id": command.name,
             "description": command.description,
@@ -715,6 +716,20 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
         }
         for command in runtime.chainlit_commands
     ]
+    if getattr(runtime, "live_agents", None) is not None:
+        taken = {spec["id"] for spec in specs}
+        specs.extend(
+            {
+                "id": name,
+                "description": description,
+                "icon": "bot",
+                "button": False,
+                "persistent": True,
+            }
+            for name, description in LIVE_AGENT_COMMAND_DESCRIPTIONS.items()
+            if name not in taken
+        )
+    return specs
 
 
 async def publish_native_commands(runtime: AgentRuntime) -> None:

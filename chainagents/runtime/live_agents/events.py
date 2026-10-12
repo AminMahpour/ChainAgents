@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Mapping
+import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 LiveAgentEventKind = Literal[
     "spawned", "turn_started", "turn_finished", "message", "stopped"
@@ -32,6 +35,17 @@ class LiveAgentEventBus:
         self._subscribers: dict[
             str, list[tuple[asyncio.Queue[LiveAgentEvent], asyncio.AbstractEventLoop]]
         ] = {}
+        self._listeners: list[Callable[[LiveAgentEvent], None]] = []
+
+    def add_listener(self, listener: Callable[[LiveAgentEvent], None]) -> None:
+        """Register a synchronous callback run on every published event."""
+        with self._lock:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener: Callable[[LiveAgentEvent], None]) -> None:
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
 
     def subscribe(self, session_id: str) -> asyncio.Queue[LiveAgentEvent]:
         """Subscribe the running event loop to a session's events."""
@@ -57,6 +71,12 @@ class LiveAgentEventBus:
         """Deliver without blocking; safe to call from any thread."""
         with self._lock:
             entries = list(self._subscribers.get(event.session_id, []))
+            listeners = list(self._listeners)
+        for listener in listeners:
+            try:
+                listener(event)
+            except Exception:
+                logger.exception("Live agent event listener failed")
         for queue, loop in entries:
             if not loop.is_closed():
                 loop.call_soon_threadsafe(queue.put_nowait, event)
