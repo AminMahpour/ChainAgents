@@ -70,6 +70,9 @@ class LiveAgentManager:
         self._teardowns: dict[str, asyncio.Task[LiveAgentRecord]] = {}
         self._background: set[asyncio.Task[Any]] = set()
         self._sessions: set[str] = set()
+        # Sessions whose teardown is in progress; spawns into them are refused.
+        self._closing_sessions: dict[str, int] = {}
+        self._closed = False
         self._reaper: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------ start
@@ -89,7 +92,11 @@ class LiveAgentManager:
         )
 
     async def close(self) -> None:
-        """Stop the reaper and tear down every session's live agents."""
+        """Stop the reaper and tear down every session's live agents.
+
+        Spawns are refused afterwards; a spawn still building its graph aborts.
+        """
+        self._closed = True
         reaper, self._reaper = self._reaper, None
         if reaper is not None:
             reaper.cancel()
@@ -118,6 +125,7 @@ class LiveAgentManager:
         spawned_by: str = _MAIN_ADDRESS,
         parent_trace: Any = None,
     ) -> tuple[LiveAgentRecord, ResolvedLiveAgentSpec]:
+        self._check_accepting(session_id)
         self.start()
         registry = self._registry
         spec = resolve_spawn(
@@ -133,8 +141,11 @@ class LiveAgentManager:
         except BaseException:
             registry.discard(record)
             raise
-        if record.status != "idle":
-            # Torn down (e.g. session end) while the graph was being built.
+        if not self._still_wanted(record):
+            # Torn down, forgotten (session end) or the manager closed while the
+            # graph was being built: never start a worker nobody can stop.
+            if record.status not in TERMINAL_STATUSES:
+                registry.discard(record)
             raise RuntimeError(f"Live agent '{record.name}' was stopped during spawn.")
         self._sessions.add(session_id)
 
@@ -177,6 +188,22 @@ class LiveAgentManager:
                 {"from": spawned_by, "to": record.name, "body": text},
             )
         return record, spec
+
+    def _check_accepting(self, session_id: str) -> None:
+        if self._closed:
+            raise RuntimeError("The live agent manager is closed.")
+        if session_id in self._closing_sessions:
+            raise RuntimeError("This conversation's live agents are shutting down.")
+
+    def _still_wanted(self, record: LiveAgentRecord) -> bool:
+        if self._closed or record.session_id in self._closing_sessions:
+            return False
+        if record.status != "idle":
+            return False
+        try:
+            return self._registry.lookup(record.session_id, record.id) is record
+        except KeyError:
+            return False
 
     # ------------------------------------------------------------ inspection
 
@@ -248,14 +275,26 @@ class LiveAgentManager:
         return await asyncio.shield(self._start_teardown(record, reason))
 
     async def teardown_session(self, session_id: str) -> None:
-        records = self._registry.records(session_id, include_stopped=True)
-        for record in records:
-            if record.status not in TERMINAL_STATUSES or record.id in self._teardowns:
-                await asyncio.shield(self._start_teardown(record, "session_end"))
-        self._registry.forget_session(session_id)
-        self._sessions.discard(session_id)
-        for record in records:
-            self._teardowns.pop(record.id, None)
+        # Refuse new spawns first, so the snapshot below covers every record.
+        self._closing_sessions[session_id] = (
+            self._closing_sessions.get(session_id, 0) + 1
+        )
+        try:
+            records = self._registry.records(session_id, include_stopped=True)
+            for record in records:
+                if (
+                    record.status not in TERMINAL_STATUSES
+                    or record.id in self._teardowns
+                ):
+                    await asyncio.shield(self._start_teardown(record, "session_end"))
+            self._registry.forget_session(session_id)
+            self._sessions.discard(session_id)
+            for record in records:
+                self._teardowns.pop(record.id, None)
+        finally:
+            remaining = self._closing_sessions.pop(session_id) - 1
+            if remaining:
+                self._closing_sessions[session_id] = remaining
 
     async def reap_idle(self) -> list[LiveAgentRecord]:
         timeout = self.config.idle_timeout_seconds
@@ -337,6 +376,7 @@ class LiveAgentManager:
         try:
             self._start_teardown(record, reason)
         except RuntimeError:  # event loop is shutting down
+            self._broker.close(record.session_id, record.address)
             record.status = "failed" if reason == "failed" else "stopped"
             record.stop_reason = reason
 

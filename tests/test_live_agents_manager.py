@@ -504,21 +504,28 @@ async def test_start_is_idempotent_and_lazy() -> None:
     assert h.manager._reaper is None
 
 
-@pytest.mark.anyio
-async def test_teardown_session_during_spawn_leaves_no_worker() -> None:
-    h = Harness()
-    release = asyncio.Event()
+def gated_factory(h: Harness) -> tuple[asyncio.Event, asyncio.Event]:
+    """Make the graph build block; return (building, release) events."""
+    building, release = asyncio.Event(), asyncio.Event()
     original = h._factory
 
     async def slow_factory(spec: ResolvedLiveAgentSpec, session_id: str) -> Any:
+        building.set()
         await release.wait()
         return await original(spec, session_id)
 
     h.manager._graph_factory = slow_factory
+    return building, release
+
+
+@pytest.mark.anyio
+async def test_teardown_session_during_spawn_leaves_no_worker() -> None:
+    h = Harness()
+    building, release = gated_factory(h)
     spawn = asyncio.create_task(
         h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
     )
-    await asyncio.sleep(0.01)
+    await building.wait()
     await h.manager.teardown_session(SESSION)
     release.set()
 
@@ -527,3 +534,52 @@ async def test_teardown_session_during_spawn_leaves_no_worker() -> None:
     assert live_tasks() == []
     assert h.manager.list(SESSION, include_stopped=True) == []
     await h.manager.close()
+
+
+@pytest.mark.anyio
+async def test_spawn_reserved_during_teardown_session_does_not_start_worker() -> None:
+    h = Harness(delete=True)
+    existing, _ = await h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+    deleting, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow_delete(thread_id: str) -> None:
+        deleting.set()
+        await gate.wait()
+
+    h.manager._delete_thread = slow_delete
+    closing = asyncio.create_task(h.manager.teardown_session(SESSION))
+    await deleting.wait()  # teardown_session is mid-await on the snapshot
+
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await h.manager.spawn(SESSION, SpawnRequest(template="coder"))
+    gate.set()
+    await closing
+
+    assert existing.status == "stopped"
+    assert live_tasks() == []
+    assert h.manager.list(SESSION, include_stopped=True) == []
+    # The session accepts spawns again once its teardown has finished.
+    again, _ = await h.manager.spawn(SESSION, SpawnRequest(template="coder"))
+    assert h.manager.get(SESSION, again.name) is again
+    await h.manager.close()
+    assert live_tasks() == []
+
+
+@pytest.mark.anyio
+async def test_spawn_building_during_close_does_not_start_worker() -> None:
+    h = Harness()
+    building, release = gated_factory(h)
+    spawn = asyncio.create_task(
+        h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+    )
+    await building.wait()
+    await h.manager.close()
+    release.set()
+
+    with pytest.raises(RuntimeError, match="stopped during spawn"):
+        await spawn
+    assert live_tasks() == []
+    assert h.manager.list(SESSION, include_stopped=True) == []
+    with pytest.raises(RuntimeError, match="manager is closed"):
+        await h.manager.spawn(SESSION, SpawnRequest(template="coder"))
+    assert live_tasks() == []
