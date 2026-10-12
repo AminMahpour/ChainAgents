@@ -889,7 +889,7 @@ def parse_extensions_config(raw_config: dict[str, Any], config_path: Path) -> Ex
             raise ValueError(
                 f"Chainlit command entry #{index} must define a slash-compatible 'name' with no spaces."
             )
-        if name in live_agents_config.LIVE_AGENT_COMMAND_NAMES:
+        if live_agents.enabled and name in live_agents_config.LIVE_AGENT_COMMAND_NAMES:
             raise ValueError(
                 f"Chainlit command '/{name}' uses a name reserved for live agents: "
                 f"{', '.join(sorted(live_agents_config.LIVE_AGENT_COMMAND_NAMES))}."

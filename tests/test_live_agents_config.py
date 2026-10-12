@@ -1,4 +1,3 @@
-from pathlib import Path
 
 import pytest
 
@@ -44,13 +43,13 @@ def test_defaults_when_section_missing(tmp_path):
 
 
 def test_enabled_requires_messaging(tmp_path):
-    with pytest.raises(ValueError, match="agent.messaging"):
+    with pytest.raises(ValueError, match=r"agent\.messaging"):
         parse({"enabled": True}, tmp_path, messaging_enabled=False)
     assert parse({"enabled": True}, tmp_path).enabled is True
 
 
 def test_rejects_unknown_fields(tmp_path):
-    with pytest.raises(ValueError, match="Unknown 'agent.live_agents'"):
+    with pytest.raises(ValueError, match=r"Unknown 'agent\.live_agents'"):
         parse({"bogus": 1}, tmp_path)
 
 
@@ -80,9 +79,9 @@ def test_applies_to_must_be_all_or_overrides(tmp_path):
 
 
 def test_template_requires_name_and_description(tmp_path):
-    with pytest.raises(ValueError, match="name.*description"):
+    with pytest.raises(ValueError, match=r"name.*description"):
         parse({"templates": [template(description="")]}, tmp_path)
-    with pytest.raises(ValueError, match="name.*description"):
+    with pytest.raises(ValueError, match=r"name.*description"):
         parse({"templates": [template(name="")]}, tmp_path)
 
 
@@ -110,7 +109,7 @@ def test_template_prompt_file_loaded(tmp_path):
 def test_template_prompt_file_missing_raises_value_error(tmp_path):
     raw = template(system_prompt_file="missing.md")
     del raw["system_prompt"]
-    with pytest.raises(ValueError, match="'researcher' system_prompt_file.*not readable"):
+    with pytest.raises(ValueError, match=r"'researcher' system_prompt_file.*not readable"):
         parse({"templates": [raw]}, tmp_path)
 
 
@@ -204,17 +203,31 @@ def test_validate_models_all_mode_requires_allowlisted_template_model(tmp_path):
     validate_live_agent_models(overrides, {"fast": object()})
 
 
-def test_reserved_chainlit_command_rejected(tmp_path):
-    assert LIVE_AGENT_COMMAND_NAMES == {"agents", "spawn", "msg", "kill"}
-    raw = {
+def _kill_command_config(*, live_agents_enabled: bool) -> dict:
+    return {
+        "agent": {
+            "messaging": {"enabled": True},
+            "live_agents": {"enabled": live_agents_enabled},
+        },
         "chainlit": {
             "commands": [
                 {"name": "kill", "description": "x", "target": "prompt", "value": "v"}
             ]
-        }
+        },
     }
+
+
+def test_reserved_chainlit_command_rejected_when_live_agents_enabled(tmp_path):
+    assert {"agents", "spawn", "msg", "kill"} == LIVE_AGENT_COMMAND_NAMES
+    raw = _kill_command_config(live_agents_enabled=True)
     with pytest.raises(ValueError, match="reserved"):
         parse_extensions_config(raw, tmp_path / "deepagent.toml")
+
+
+def test_reserved_chainlit_command_allowed_when_live_agents_disabled(tmp_path):
+    raw = _kill_command_config(live_agents_enabled=False)
+    config = parse_extensions_config(raw, tmp_path / "deepagent.toml")
+    assert [command.name for command in config.chainlit_commands] == ["kill"]
 
 
 def test_extensions_config_exposes_live_agents_and_panel_flag(tmp_path):
