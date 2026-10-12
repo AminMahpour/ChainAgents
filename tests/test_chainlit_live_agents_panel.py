@@ -404,3 +404,20 @@ async def test_closed_panel_is_not_treated_as_current(monkeypatch) -> None:
     assert not app._live_agents_panel_is_current("thread-2")
     await panel.aclose()
     assert not app._live_agents_panel_is_current("thread-1")
+
+
+def test_panel_jsx_reports_action_failures_inline() -> None:
+    import re
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "public/elements/LiveAgentsPanel.jsx"
+    ).read_text()
+    for handler in ("send", "shutDown"):
+        body = source.split(f"async function {handler}() {{", 1)[1].split(
+            "\n  }\n", 1
+        )[0]
+        assert re.search(r"try \{.*callAction.*\} catch", body, re.S), handler
+        assert "setError(" in body, handler
+    assert "{error}" in source  # Rendered as a React text node.
+    assert "innerHTML" not in source

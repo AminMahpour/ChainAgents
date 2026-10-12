@@ -42,6 +42,7 @@ function formatTime(value) {
 function AgentCard({ agent }) {
   const [draft, setDraft] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
   const agentRef = asText(agent.id || agent.name);
   const name = asText(agent.name) || agentRef;
   const status = asText(agent.status) || "idle";
@@ -54,12 +55,15 @@ function AgentCard({ agent }) {
       return;
     }
     setBusy(true);
+    setError("");
     try {
       await callAction({
         name: "live_agent_message",
         payload: { agent: agentRef, body },
       });
       setDraft("");
+    } catch (err) {
+      setError(`Could not send the message: ${asText(err && err.message) || "unknown error"}`);
     } finally {
       setBusy(false);
     }
@@ -69,7 +73,12 @@ function AgentCard({ agent }) {
     if (terminal || !window.confirm(`Shut down live agent "${name}"?`)) {
       return;
     }
-    await callAction({ name: "live_agent_kill", payload: { agent: agentRef } });
+    setError("");
+    try {
+      await callAction({ name: "live_agent_kill", payload: { agent: agentRef } });
+    } catch (err) {
+      setError(`Could not shut down the agent: ${asText(err && err.message) || "unknown error"}`);
+    }
   }
 
   return (
@@ -109,6 +118,11 @@ function AgentCard({ agent }) {
           ))
         )}
       </div>
+      {error ? (
+        <p role="alert" className="border-t border-border px-3 py-1 text-xs text-destructive">
+          {error}
+        </p>
+      ) : null}
       <div className="flex gap-2 border-t border-border px-3 py-2">
         <input
           className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1 text-sm text-foreground"
