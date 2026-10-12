@@ -83,6 +83,7 @@ from chainagents.runtime import (
     format_model_provider,
     resolve_runtime_model_profile,
 )
+from chainagents.interfaces.chainlit.live_agents import LiveAgentsPanel
 from chainagents.runtime.live_agents.commands import LIVE_AGENT_COMMAND_DESCRIPTIONS
 from chainagents.runtime.reflection import (
     ReflectionProposal,
@@ -107,6 +108,9 @@ SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY = "local_background_task_notifier"
 SESSION_LOCAL_NOTICE_IDS_KEY = "local_background_notice_ids"
+SESSION_LIVE_AGENTS_PANEL_KEY = "live_agents_panel"
+LIVE_AGENT_MESSAGE_ACTION = "live_agent_message"
+LIVE_AGENT_KILL_ACTION = "live_agent_kill"
 SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
 SESSION_INPUT_DRAFTS_KEY = "pending_input_drafts"
 STEER_INPUT_ACTION = "steer_busy_input"
@@ -902,6 +906,31 @@ async def start_local_background_notifier(
     cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, notifier)
 
 
+async def start_live_agents_panel(*, runtime: AgentRuntime, session_id: str) -> None:
+    """Start (or restart) the live agents side panel listener for this chat."""
+    await stop_live_agents_panel()
+    manager = getattr(runtime, "live_agents", None)
+    if manager is None or not getattr(
+        runtime.config.extensions, "chainlit_live_agents_panel_enabled", False
+    ):
+        return
+    panel = LiveAgentsPanel(
+        manager,
+        session_id,
+        stream_activity=bool(getattr(manager.config, "stream_activity", False)),
+    )
+    await panel.start()
+    cl.user_session.set(SESSION_LIVE_AGENTS_PANEL_KEY, panel)
+
+
+async def stop_live_agents_panel() -> None:
+    """Stop the live agents panel listener stored in this Chainlit session."""
+    panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
+    if isinstance(panel, LiveAgentsPanel):
+        await panel.aclose()
+        cl.user_session.set(SESSION_LIVE_AGENTS_PANEL_KEY, None)
+
+
 @cl.on_chat_start
 async def on_chat_start() -> None:
     """Initialize Chainlit session state when a chat starts."""
@@ -938,6 +967,7 @@ async def on_chat_start() -> None:
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
     )
+    await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1057,6 +1087,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
     )
+    await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     run_task_list = await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
@@ -1200,6 +1231,12 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
             reasoning_steps_enabled=settings.show_reasoning_stream,
             tool_steps_enabled=settings.show_tool_calls,
         )
+    live_agents_panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
+    if (
+        not isinstance(live_agents_panel, LiveAgentsPanel)
+        or live_agents_panel.session_id != settings.thread_id
+    ):
+        await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     run_task_list = cl.user_session.get(SESSION_TASK_LIST_KEY)
     if isinstance(run_task_list, RunTaskList):
         run_task_list.configure(
@@ -1403,6 +1440,64 @@ async def _resume_nonblocking_input(action: cl.Action) -> None:
         return
     runtime.user_input.resume(thread_id)
     await cl.Message(content="Queued turns resumed.", author="System").send()
+
+
+async def _live_agent_action_target(
+    action: cl.Action,
+) -> tuple[Any, str, Any] | None:
+    """Resolve (manager, thread_id, record) for a live agents panel action."""
+    runtime = await get_runtime_or_notify()
+    manager = getattr(runtime, "live_agents", None) if runtime is not None else None
+    if runtime is None or manager is None:
+        return None
+    thread_id = _current_input_thread_id(runtime)
+    ref = str(action.payload.get("agent", "")).strip()
+    try:
+        record = manager.get(thread_id, ref)
+    except KeyError:
+        await cl.Message(content=f"Unknown live agent `{ref}`.", author="System").send()
+        return None
+    return manager, thread_id, record
+
+
+def _live_agent_fyi(manager: Any, thread_id: str, text: str) -> None:
+    if getattr(manager.config, "notify_main_on_user_actions", False):
+        manager.notify_main(thread_id, text)
+
+
+@cl.action_callback(LIVE_AGENT_MESSAGE_ACTION)
+async def live_agent_message_action(action: cl.Action) -> None:
+    """Send a panel-typed message to a live agent (same as ``/msg``)."""
+    body = str(action.payload.get("body", "")).strip()
+    if not body:
+        return
+    target = await _live_agent_action_target(action)
+    if target is None:
+        return
+    manager, thread_id, record = target
+    try:
+        manager.send_from_user(thread_id, record.id, body)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        await cl.Message(content=str(exc), author="System").send()
+        return
+    _live_agent_fyi(
+        manager, thread_id, f"FYI: user sent a message to `{record.name}`: {body}"
+    )
+
+
+@cl.action_callback(LIVE_AGENT_KILL_ACTION)
+async def live_agent_kill_action(action: cl.Action) -> None:
+    """Shut down a live agent from the panel (same as ``/kill``)."""
+    target = await _live_agent_action_target(action)
+    if target is None:
+        return
+    manager, thread_id, record = target
+    try:
+        await manager.teardown(thread_id, record.id, reason="user")
+    except (KeyError, ValueError, RuntimeError) as exc:
+        await cl.Message(content=str(exc), author="System").send()
+        return
+    _live_agent_fyi(manager, thread_id, f"FYI: user stopped `{record.name}`.")
 
 
 @cl.action_callback(RUN_RESPONSE_ACTION)
@@ -2015,6 +2110,7 @@ async def on_chat_end() -> None:
         # own timeout may remove user_session while cancellation renders UI.
         notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
         local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+        live_agents_panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
         def still_disconnected() -> bool:
             return expected_socket_id is None or (
                 getattr(session, "socket_id", None) == expected_socket_id
@@ -2053,6 +2149,8 @@ async def on_chat_end() -> None:
             )
         if isinstance(notifier, AsyncTaskNotifier):
             notifier.cancel()
+        if isinstance(live_agents_panel, LiveAgentsPanel):
+            await live_agents_panel.aclose()
         if isinstance(local_notifier, LocalBackgroundTaskNotifier):
             if preserve_work:
                 await local_notifier.aclose_for_handoff()
