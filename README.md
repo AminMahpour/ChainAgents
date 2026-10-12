@@ -1171,6 +1171,11 @@ Live agents are opt-in and exist only in the ChainAgents runtime (Chainlit, TUI,
 CLI, and HTTP API). They are not part of the exported LangGraph graph used by
 the Agent Server. They run in the current process, so a restart ends them.
 
+A live agent keeps its own conversation history between turns even when
+`[agent].state = "stateless"`: without a runtime checkpointer, live agents
+share a process-local in-memory checkpointer, so that history is lost on
+restart.
+
 #### Configuration
 
 Live agents communicate through the message broker, so
@@ -1217,7 +1222,7 @@ tools = ["ls", "read_file", "glob", "grep"]
 - `turn_recursion_limit`: default `100`. LangGraph step limit for a single live agent turn.
 - `delete_history_on_teardown`: default `true`. Deletes the agent's own conversation history when it stops.
 - `notify_main_on_user_actions`: default `true`. When the user spawns, messages, or stops an agent with a slash command, the main agent receives a short `FYI:` notice.
-- `stream_activity`: default `false`. Streams live agent reasoning and tool activity as nested Chainlit steps; other interfaces stay completion-only.
+- `stream_activity`: default `false`. Shows one Chainlit step per live agent turn, opened when the turn starts and closed with whether it finished or failed; other interfaces stay completion-only.
 
 #### Templates
 
@@ -1249,7 +1254,8 @@ When enabled, the main agent receives `list_live_agent_templates`,
 `spawn_live_agent`, `list_live_agents`, and `teardown_live_agent`, alongside the
 messaging tools (`send_agent_message`, `get_agent_message`,
 `wait_for_agent_messages`). These tool names are reserved; a configured tool
-with one of them is rejected at startup. The main agent's system prompt gains a
+with one of them is rejected at startup. Only the main agent gets the four live
+agent tools: the general-purpose `task` delegate and other subagents do not. The main agent's system prompt gains a
 short Live agents section and a one-line roster of live agent statuses.
 
 `spawn_live_agent` accepts `template`, `name`, `instructions`, `model`,
@@ -1269,6 +1275,10 @@ Available in Chainlit, the TUI, and the CLI when live agents are enabled:
 - `/spawn <template> [name] [-- instructions]`: spawn from a template, optionally naming it and adding instructions after ` -- `.
 - `/msg <agent> <text>`: send a message; the reply appears when ready.
 - `/kill <agent|all>`: stop one agent or every live agent in the conversation.
+
+While live agents are enabled these four names are reserved, and a
+`[[chainlit.commands]]` entry using one of them is rejected at startup. With
+live agents disabled the names are free for custom commands.
 
 Agents can be addressed by name or id. Statuses are `idle`, `running`,
 `stopping`, `stopped`, and `failed`.
@@ -1291,6 +1301,10 @@ curl -X DELETE "http://127.0.0.1:8000/api/live-agents/researcher?thread_id=$THRE
 
 The list returns `{"agents": [...]}`; the message route returns a `message_id`;
 the delete route returns the agent's final status. Unknown agents return 404.
+Replies to the user are not pushed over HTTP: each agent row (also in the main
+agent's `list_live_agents` result) carries `last_reply`, either `null` or
+`{"body": "...", "at": <monotonic seconds>}` for the latest reply to a user
+message, so a client can poll the list after posting.
 
 #### Limits and teardown
 
@@ -1300,7 +1314,9 @@ reason is recorded on the agent and includes: `requested` (the main agent called
 (three consecutive failed turns), `worker_exited` (the worker ended
 unexpectedly), `spawn_failed` (the initial message could not be delivered), or `session_end` (the conversation closed). Both `stopped` and
 `failed` are terminal: they free the name and the slot. When
-`delete_history_on_teardown` is true, the agent's own history is deleted too.
+`delete_history_on_teardown` is true, the agent's own history is deleted too; a
+delete that takes longer than 10 seconds is abandoned with a warning so teardown
+and conversation close are not blocked.
 
 ## Chainlit Native Commands
 

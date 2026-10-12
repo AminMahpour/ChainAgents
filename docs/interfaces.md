@@ -83,7 +83,9 @@ external rate limiter is required in front of a public deployment.
 When `[agent.live_agents]` is enabled, the HTTP API also exposes
 `GET /api/live-agents?thread_id=...`,
 `POST /api/live-agents/{agent}/messages?thread_id=...` (body `{"body": "..."}`),
-and `DELETE /api/live-agents/{agent}?thread_id=...`. The CLI and TUI accept
+and `DELETE /api/live-agents/{agent}?thread_id=...`. Each listed agent
+carries `last_reply` (the latest reply to a user message, or `null`), so a
+client can poll the list after posting a message. The CLI and TUI accept
 the same `/agents`, `/spawn`, `/msg`, and `/kill` commands as Chainlit. Live
 agents are not part of the LangGraph Agent Server graphs. See the README's
 Live Agents section.
