@@ -22,6 +22,7 @@ import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
 import chainagents.runtime.messaging as runtime_messaging
+import chainagents.runtime.live_agents.tools as runtime_live_agent_tools
 import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
     WorkspaceDocsRAG,
@@ -44,6 +45,7 @@ from chainagents.runtime.types import ModelDefaults, SubagentConfig
 
 if TYPE_CHECKING:
     from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
 
 logger = logging.getLogger("chainagents.runtime.core")
 
@@ -869,6 +871,7 @@ def build_agent_kwargs(
     session_id: str | None = None,
     langsmith_tracing: runtime_tracing.LangSmithTracing | None = None,
     messaging_broker: runtime_messaging.MessageBroker | None = None,
+    live_agent_manager: LiveAgentManager | None = None,
 ) -> dict[str, Any]:
     """Build the DeepAgents keyword arguments for a configured main agent.
 
@@ -897,6 +900,9 @@ def build_agent_kwargs(
         background_manager: Background task manager, or None when disabled.
         session_id: Session whose background generation scopes task tools.
         langsmith_tracing: LangSmith tracing for background task runs.
+        messaging_broker: Agent message broker, or None to use a shared one.
+        live_agent_manager: Live agent manager whose tools, prompt and roster
+            are added to the main agent, or None when live agents are off.
 
     Returns:
         Keyword arguments for ``create_deep_agent_with_configured_summarization``.
@@ -940,6 +946,20 @@ def build_agent_kwargs(
         if config.extensions.messaging.enabled:
             runtime_messaging.validate_agent_message_tool_names(main_tools)
             main_tools.extend(runtime_messaging.create_agent_message_tools(messaging_broker, fixed_session_id=session_id))
+    if live_agent_manager is not None:
+        runtime_live_agent_tools.validate_live_agent_tool_names(main_tools)
+        main_tools.extend(
+            runtime_live_agent_tools.create_live_agent_tools(
+                live_agent_manager,
+                fixed_session_id=session_id,
+                langsmith_tracing=langsmith_tracing,
+            )
+        )
+        middleware.append(
+            runtime_live_agent_tools.LiveAgentRosterMiddleware(
+                live_agent_manager, session_id
+            )
+        )
     clarification_enabled = clarification_available(config)
     if clarification_enabled:
         middleware.append(runtime_clarification.ClarificationMiddleware())
@@ -1003,6 +1023,11 @@ def build_agent_kwargs(
         + (
             f"\n\n{runtime_clarification.CLARIFICATION_SYSTEM_PROMPT}"
             if clarification_enabled
+            else ""
+        )
+        + (
+            f"\n\n{runtime_live_agent_tools.LIVE_AGENTS_PROMPT}"
+            if live_agent_manager is not None
             else ""
         ),
         "middleware": middleware,

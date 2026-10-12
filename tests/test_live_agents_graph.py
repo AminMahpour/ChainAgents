@@ -13,17 +13,11 @@ from chainagents.runtime.backends import build_deepagent_backend
 from chainagents.runtime.constants import DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS
 from chainagents.runtime.graph import build_live_agent_graph
 from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
+from chainagents.runtime.live_agents.tools import LIVE_AGENT_TOOL_NAMES
 from chainagents.runtime.messaging import MessageBroker
 from chainagents.runtime.middleware import build_agent_middleware
 from chainagents.runtime.types import ExtensionsConfig, MessagingConfig
 from test_deepagent_runtime_rag import make_runtime_config
-
-LIVE_AGENT_TOOL_NAMES = {
-    "list_live_agent_templates",
-    "spawn_live_agent",
-    "list_live_agents",
-    "teardown_live_agent",
-}
 
 
 class RecordingModel(FakeListChatModel):
