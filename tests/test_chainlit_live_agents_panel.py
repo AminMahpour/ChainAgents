@@ -73,8 +73,17 @@ class _FakeElement:
         self.updates: list[dict[str, Any]] = []
         _FakeElement.instances.append(self)
 
-    async def update(self) -> None:
-        self.updates.append(self.props)
+    def to_dict(self) -> dict[str, Any]:
+        return {"element": self, "props": self.props}
+
+
+async def _record_element_update(element_dict: dict[str, Any]) -> None:
+    element_dict["element"].updates.append(element_dict["props"])
+
+
+_FAKE_CONTEXT = SimpleNamespace(
+    emitter=SimpleNamespace(send_element=_record_element_update)
+)
 
 
 class _FakeSidebar:
@@ -104,6 +113,7 @@ async def test_panel_throttles_renders(monkeypatch) -> None:
     _FakeElement.instances = []
     sidebar = _FakeSidebar()
     monkeypatch.setattr(panel_module.cl, "CustomElement", _FakeElement)
+    monkeypatch.setattr(panel_module.cl, "context", _FAKE_CONTEXT)
     monkeypatch.setattr(panel_module.cl, "ElementSidebar", sidebar)
     bus = LiveAgentEventBus()
     rows: list[dict[str, object]] = []
@@ -146,6 +156,7 @@ async def test_panel_throttles_renders(monkeypatch) -> None:
 async def test_panel_streams_turn_activity_as_steps(monkeypatch) -> None:
     _FakeElement.instances = []
     monkeypatch.setattr(panel_module.cl, "CustomElement", _FakeElement)
+    monkeypatch.setattr(panel_module.cl, "context", _FAKE_CONTEXT)
     monkeypatch.setattr(panel_module.cl, "ElementSidebar", _FakeSidebar())
     steps: list[Any] = []
 
@@ -269,3 +280,51 @@ async def test_action_callbacks_call_manager(monkeypatch) -> None:
     assert len(sent) == 1 and "ghost" in sent[0]
     assert app.LIVE_AGENT_MESSAGE_ACTION == "live_agent_message"
     assert app.LIVE_AGENT_KILL_ACTION == "live_agent_kill"
+
+
+@pytest.mark.anyio
+async def test_panel_rerender_does_not_persist_element(monkeypatch) -> None:
+    import chainlit.element as chainlit_element
+
+    persisted: list[str] = []
+    created: list[Any] = []
+    emitted: list[dict[str, Any]] = []
+
+    async def persist_file(**kwargs: Any) -> dict[str, str]:
+        persisted.append(kwargs["name"])
+        return {"id": f"file-{len(persisted)}"}
+
+    async def send_element(element_dict: dict[str, Any]) -> None:
+        emitted.append(element_dict)
+
+    async def create_element(element: Any) -> None:
+        created.append(element)
+
+    fake_context = SimpleNamespace(
+        session=SimpleNamespace(persist_file=persist_file, thread_id="thread-1"),
+        emitter=SimpleNamespace(send_element=send_element),
+    )
+    monkeypatch.setattr(chainlit_element, "context", fake_context)
+    monkeypatch.setattr(panel_module.cl, "context", fake_context)
+    monkeypatch.setattr(
+        chainlit_element,
+        "get_data_layer",
+        lambda: SimpleNamespace(create_element=create_element),
+    )
+    monkeypatch.setattr(panel_module.cl, "ElementSidebar", _FakeSidebar())
+    bus = LiveAgentEventBus()
+    manager = SimpleNamespace(
+        events=bus,
+        list=lambda session_id, include_stopped=False: [_agent("a1", "scout")],
+    )
+    panel = LiveAgentsPanel(manager, "thread-1", min_interval=0.0)  # type: ignore[arg-type]
+    await panel._render()  # Opens the sidebar.
+    await panel._handle(_event("message", {"from": "user", "to": "scout", "body": "hi"}))
+    await panel._render()
+    await panel._render()
+    await asyncio.sleep(0)
+    assert persisted == []
+    assert created == []
+    assert len(emitted) >= 2
+    assert emitted[-1]["props"]["agents"][0]["thread"][0]["body"] == "hi"
+    await panel.aclose()

@@ -187,4 +187,7 @@ class LiveAgentsPanel:
             await cl.ElementSidebar.set_title(PANEL_TITLE)
             return
         self._element.props = props
-        await self._element.update()
+        # ``CustomElement.update()`` re-persists the element (a new session
+        # file and, with a data layer, a new element row) on every call. The
+        # sidebar copy was already sent once; re-emitting it carries the props.
+        await cl.context.emitter.send_element(self._element.to_dict())
