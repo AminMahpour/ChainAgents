@@ -159,7 +159,10 @@ class LiveAgentWorker:
         body = text[: self.broker.config.max_message_chars]
         senders = list(dict.fromkeys(m.sender for m in batch))
         for sender in senders:
-            if sender != _USER_SENDER:
+            if sender == _USER_SENDER:
+                # Users only see replies as events; keep the latest for polling.
+                record.last_reply = {"body": body, "at": self.clock()}
+            else:
                 try:
                     self.broker.send(record.session_id, record.address, sender, body)
                 except ValueError:

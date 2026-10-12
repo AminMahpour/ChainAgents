@@ -447,3 +447,21 @@ async def test_claimed_messages_published_as_inbound_events() -> None:
         {"from": "other", "to": "helper", "body": "from peer"},
     ]
     assert all(e.agent_id == "abc123" for e in events)
+
+
+@pytest.mark.anyio
+async def test_reply_to_user_is_recorded_as_last_reply() -> None:
+    h = Harness(FakeGraph(["not for user", "for you"]))
+    h.start()
+    assert h.record.last_reply is None
+    h.broker.send(SESSION, "main", ADDRESS, "from main")
+    await run_until(h, lambda: h.record.turns == 1 and h.record.status == "idle")
+    assert h.record.last_reply is None  # Replies to agents are not recorded.
+    h.now = 150.0
+    h.broker.open(SESSION, "user", name="user", parent=None)
+    h.broker.send(SESSION, "user", ADDRESS, "hey agent")
+    await run_until(h, lambda: h.record.turns == 2 and h.record.status == "idle")
+    await h.stop()
+
+    assert h.record.last_reply == {"body": "for you", "at": 150.0}
+    assert h.record.to_payload()["last_reply"] == {"body": "for you", "at": 150.0}

@@ -34,6 +34,8 @@ class LiveAgentRecord:
     consecutive_failures: int = 0
     stop_reason: str | None = None
     parent_trace: Any = None
+    # Latest reply to the user (``{"body": str, "at": float}``), for API polling.
+    last_reply: dict[str, object] | None = None
 
     def to_payload(self, *, pending: int = 0) -> dict[str, object]:
         return {
@@ -47,6 +49,7 @@ class LiveAgentRecord:
             "last_active_at": self.last_active_at,
             "pending": pending,
             "stop_reason": self.stop_reason,
+            "last_reply": dict(self.last_reply) if self.last_reply else None,
         }
 
 

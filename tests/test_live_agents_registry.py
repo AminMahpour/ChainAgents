@@ -121,6 +121,7 @@ def test_payload_shape():
         "last_active_at": rec.last_active_at,
         "pending": 3,
         "stop_reason": None,
+        "last_reply": None,
     }
 
 

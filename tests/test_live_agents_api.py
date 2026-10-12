@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from chainagents.interfaces.api import app as chainagents_api
@@ -116,3 +117,61 @@ def test_broker_value_error_returns_422() -> None:
             "/api/live-agents/a1/messages?thread_id=t1", json={"body": "x" * 200}
         )
     assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_posted_message_reply_visible_in_list() -> None:
+    import asyncio
+
+    import httpx
+    from test_live_agents_worker import FakeGraph
+
+    from chainagents.runtime.live_agents.config import SpawnRequest
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import (
+        LiveAgentsConfig,
+        LiveAgentTemplate,
+        MessagingConfig,
+    )
+
+    async def factory(_spec, _session_id):
+        return FakeGraph(["here is the answer"])
+
+    config = LiveAgentsConfig(
+        enabled=True,
+        templates=(
+            LiveAgentTemplate(name="researcher", description="d", system_prompt="p"),
+        ),
+    )
+    manager = LiveAgentManager(
+        config, MessageBroker(MessagingConfig(enabled=True)), factory
+    )
+    runtime = SimpleNamespace(live_agents=manager)
+    app = chainagents_api.create_app(runtime=runtime)
+    app.state.runtime = runtime  # Normally set by the lifespan.
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+    try:
+        record, _spec = await manager.spawn("t1", SpawnRequest(template="researcher"))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1"
+        ) as client:
+            posted = await client.post(
+                f"/api/live-agents/{record.name}/messages?thread_id=t1",
+                json={"body": "question?"},
+            )
+            assert posted.status_code == 200
+
+            async def replied() -> dict[str, Any]:
+                while True:
+                    listed = await client.get("/api/live-agents?thread_id=t1")
+                    agent = listed.json()["agents"][0]
+                    if agent["last_reply"] is not None:
+                        return agent
+                    await asyncio.sleep(0.01)
+
+            agent = await asyncio.wait_for(replied(), 2)
+        assert agent["last_reply"]["body"] == "here is the answer"
+        assert isinstance(agent["last_reply"]["at"], float)
+    finally:
+        await manager.close()
