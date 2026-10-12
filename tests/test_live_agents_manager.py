@@ -657,3 +657,34 @@ def test_publish_drops_subscriber_whose_loop_closed() -> None:
     bus.publish(event)
     assert open_loop.calls == [event]
     assert [queue for queue, _ in bus._subscribers[SESSION]] == [live_queue]
+
+
+@pytest.mark.anyio
+async def test_notify_main_fyi_is_not_user_steering() -> None:
+    from types import SimpleNamespace
+
+    from chainagents.runtime.live_agents.manager import LIVE_AGENTS_NOTICE_ADDRESS
+    from chainagents.runtime.messaging import AgentMessageMiddleware
+
+    h = Harness()
+    h.broker.open(SESSION, "main", name="main", parent=None)
+    h.manager.notify_main(SESSION, "FYI: user spawned `x`.")
+
+    pending = h.broker.pending(SESSION, "main")
+    assert [m.sender for m in pending] == [LIVE_AGENTS_NOTICE_ADDRESS]
+    assert LIVE_AGENTS_NOTICE_ADDRESS == "live-agents"
+    assert h.broker.pending_user_steering_count(SESSION) == 0
+    assert h.broker.take_late_user_steering(SESSION) == []
+    assert h.inbox("main") == ["FYI: user spawned `x`."]
+    # The notice participant is not left open as a recipient agents could use.
+    assert LIVE_AGENTS_NOTICE_ADDRESS not in {
+        r.address for r in h.broker.recipients(SESSION, "main")
+    }
+
+    middleware = AgentMessageMiddleware(h.broker, fixed_session_id=SESSION)
+    update = middleware.before_model({}, SimpleNamespace(config={}))
+    assert update is not None
+    content = update["messages"][0].content
+    assert content.startswith("Message from live-agents (id ")
+    assert content.endswith(":\nFYI: user spawned `x`.")
+    await h.manager.close()

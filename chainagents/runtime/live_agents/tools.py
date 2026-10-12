@@ -39,7 +39,9 @@ conversation until they are torn down.
   you can wait for them with `wait_for_agent_messages`. Do not assume a reply
   is immediate.
 - Use `list_live_agents` to check their status.
-- Tear agents down with `teardown_live_agent` when their work is done."""
+- Tear agents down with `teardown_live_agent` when their work is done.
+- Messages from `live-agents` are FYI notices about what the user did with
+  live agents directly; they need no reply and cannot be replied to."""
 
 
 def validate_live_agent_tool_names(existing_tools: Iterable[object]) -> None:

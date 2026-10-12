@@ -35,6 +35,9 @@ LiveAgentGraphFactory = Callable[[ResolvedLiveAgentSpec, str], Awaitable[Any]]
 WORKER_TASK_PREFIX = "chainagents-live-agent-"
 _MAIN_ADDRESS = "main"
 _USER_ADDRESS = "user"
+# Sender of FYI notes to ``main``. Distinct from ``user`` so FYIs never count as
+# (or get promoted into follow-up turns like) real user steering.
+LIVE_AGENTS_NOTICE_ADDRESS = "live-agents"
 _REAPER_MAX_INTERVAL = 30
 # Bounds a hung checkpointer so it cannot block teardown or conversation close.
 DELETE_THREAD_TIMEOUT_SECONDS: float = 10
@@ -267,9 +270,19 @@ class LiveAgentManager:
     # -------------------------------------------------------------- messages
 
     def notify_main(self, session_id: str, text: str) -> None:
-        """Send an FYI to ``main`` as the user; log and skip when unavailable."""
+        """Send an FYI to ``main`` from ``live-agents``; log and skip on failure.
+
+        FYIs are not user steering: they wait for main's next model step and
+        never trigger a follow-up turn or use steering/queue capacity.
+        """
         try:
-            self._broker.send_from_user(session_id, _MAIN_ADDRESS, text)
+            self._broker.send_as(
+                session_id,
+                LIVE_AGENTS_NOTICE_ADDRESS,
+                LIVE_AGENTS_NOTICE_ADDRESS,
+                _MAIN_ADDRESS,
+                text,
+            )
         except Exception:
             logger.warning("Could not forward an FYI to main", exc_info=True)
 

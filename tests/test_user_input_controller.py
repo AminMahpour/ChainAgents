@@ -773,3 +773,70 @@ def test_managed_turn_stays_waiting_until_runner_acquires_lock(monkeypatch):
         assert job.status == "completed"
 
     asyncio.run(exercise())
+
+
+
+def _fyi_harness(max_queued_turns):
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.types import LiveAgentsConfig
+
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    controller = ConversationInputController(
+        UserInputConfig(enabled=True, max_queued_turns=max_queued_turns), broker
+    )
+
+    async def factory(spec, session_id):
+        raise AssertionError("no agents are spawned")
+
+    manager = LiveAgentManager(LiveAgentsConfig(enabled=True), broker, factory)
+    broker.open("s", "main", name="main", parent=None)
+    return broker, controller, manager
+
+
+def test_live_agent_fyi_during_active_turn_does_not_create_followup():
+    async def exercise():
+        broker, controller, manager = _fyi_harness(max_queued_turns=10)
+        gate = asyncio.Event()
+        seen = []
+
+        async def run(text):
+            seen.append(text)
+            await gate.wait()
+
+        controller.submit("s", "original", run, followup_factory=lambda text: text)
+        await asyncio.sleep(0)
+        manager.notify_main("s", "FYI: user spawned `x`.")
+        manager.notify_main("s", "FYI: user stopped `x`.")
+        gate.set()
+        await controller.wait_idle("s")
+        assert seen == ["original"]
+        assert [m.body for m in broker.pending("s", "main")] == [
+            "FYI: user spawned `x`.",
+            "FYI: user stopped `x`.",
+        ]
+        await manager.close()
+
+    asyncio.run(exercise())
+
+
+def test_live_agent_fyi_does_not_reserve_queue_or_steering_capacity():
+    async def exercise():
+        _broker, controller, manager = _fyi_harness(max_queued_turns=1)
+        gate = asyncio.Event()
+        seen = []
+
+        async def run(text):
+            seen.append(text)
+            if text == "original":
+                await gate.wait()
+
+        controller.submit("s", "original", run, followup_factory=lambda text: text)
+        await asyncio.sleep(0)
+        manager.notify_main("s", "FYI: user spawned `x`.")
+        controller.submit("s", "queued", run, followup_factory=lambda text: text)
+        gate.set()
+        await controller.wait_idle("s")
+        assert seen == ["original", "queued"]
+        await manager.close()
+
+    asyncio.run(exercise())
