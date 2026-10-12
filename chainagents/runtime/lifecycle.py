@@ -126,6 +126,8 @@ class AgentRuntime:
         self._turn_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._mcp_pool = MCPSessionPool(lambda: self.config.extensions)
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
+        # Stateless runtimes still keep live agent history between turns.
+        self._live_agent_memory_saver: MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
         self.large_tool_result_artifacts = (
@@ -950,12 +952,25 @@ class AgentRuntime:
             broker=self.message_broker,
             session_id=session_id,
             store=self.store if stateful else None,
-            checkpointer=self.checkpointer if stateful else None,
+            checkpointer=self._live_agent_checkpointer(),
         )
+
+    def _live_agent_checkpointer(self) -> AsyncPostgresSaver | MemorySaver:
+        """Return the checkpointer live agents use for their thread history.
+
+        Live agents keep their conversation between turns even when the main
+        agent is stateless: without a runtime checkpointer they share one
+        runtime-owned in-memory saver.
+        """
+        if self._checkpointer is not None:
+            return self._checkpointer
+        if self._live_agent_memory_saver is None:
+            self._live_agent_memory_saver = MemorySaver()
+        return self._live_agent_memory_saver
 
     async def _delete_live_agent_thread(self, thread_id: str) -> None:
         """Delete a torn-down live agent's checkpointer history, when stored."""
-        delete_thread = getattr(self._checkpointer, "adelete_thread", None)
+        delete_thread = getattr(self._live_agent_checkpointer(), "adelete_thread", None)
         if delete_thread is not None:
             await delete_thread(thread_id)
 
@@ -1152,5 +1167,6 @@ class AgentRuntime:
                                 )
                     finally:
                         self._checkpointer = None
+                        self._live_agent_memory_saver = None
                         self._store = None
                         self._mcp_pool.client = None

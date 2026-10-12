@@ -289,3 +289,43 @@ async def test_general_purpose_delegate_lacks_live_agent_tools(tmp_path):
         assert all("send_agent_message" in b for b in delegate_bindings)
     finally:
         await manager.close()
+
+
+@pytest.mark.anyio
+async def test_stateless_runtime_gives_live_agents_a_shared_checkpointer(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path, live=True)
+    assert config.agent_state == "stateless"
+    runtime = core.AgentRuntime(config, project_root=tmp_path)
+    model = RecordingModel(
+        responses=[AIMessage(content="first"), AIMessage(content="second")]
+    )
+    monkeypatch.setattr(runtime, "_build_model", lambda level, **kw: model)
+    built: list[Any] = []
+    real_build = core.runtime_graph.build_live_agent_graph
+
+    def spy(*args, **kwargs):
+        built.append(kwargs["checkpointer"])
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(core.runtime_graph, "build_live_agent_graph", spy)
+    try:
+        _record, spec = await runtime.live_agents.spawn(
+            "s", SpawnRequest(template="researcher")
+        )
+        graph_one = await runtime._build_live_agent_graph(spec, "s")
+        graph_two = await runtime._build_live_agent_graph(spec, "s")
+        assert built[0] is not None and built[0] is built[1]
+        run_config = {"configurable": {"thread_id": "live-thread"}}
+        await graph_one.ainvoke(
+            {"messages": [HumanMessage(content="remember zebra")]}, run_config
+        )
+        await graph_two.ainvoke(
+            {"messages": [HumanMessage(content="what animal?")]}, run_config
+        )
+        assert "remember zebra" in str(model.seen[-1])
+        await runtime._delete_live_agent_thread("live-thread")
+        assert built[0].get_tuple(run_config) is None
+    finally:
+        await runtime.close()
