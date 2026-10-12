@@ -328,3 +328,79 @@ async def test_panel_rerender_does_not_persist_element(monkeypatch) -> None:
     assert len(emitted) >= 2
     assert emitted[-1]["props"]["agents"][0]["thread"][0]["body"] == "hi"
     await panel.aclose()
+
+
+def _panel_runtime(bus: LiveAgentEventBus) -> Any:
+    manager = SimpleNamespace(
+        events=bus,
+        list=lambda session_id, include_stopped=False: [],
+        config=SimpleNamespace(stream_activity=False),
+    )
+    extensions = SimpleNamespace(
+        background_subagents=SimpleNamespace(enabled=False),
+        async_subagents=(),
+        mcp_stateful=True,
+        chainlit_live_agents_panel_enabled=True,
+        chainlit_reasoning_steps_enabled=False,
+        chainlit_tool_steps_enabled=False,
+    )
+    config = SimpleNamespace(
+        extensions=extensions, model_name="m", model_choices=("m",)
+    )
+    return SimpleNamespace(live_agents=manager, config=config)
+
+
+@pytest.mark.anyio
+async def test_reconnect_restore_restarts_closed_live_agents_panel(monkeypatch) -> None:
+    bus = LiveAgentEventBus()
+    runtime = _panel_runtime(bus)
+    old_panel = LiveAgentsPanel(runtime.live_agents, "thread-1")  # type: ignore[arg-type]
+    await old_panel.start()
+    await old_panel.aclose()  # Closed by the disconnect cleanup.
+    session_values: dict[str, Any] = {app.SESSION_LIVE_AGENTS_PANEL_KEY: old_panel}
+    monkeypatch.setattr(app.cl, "user_session", _Session(session_values))
+    monkeypatch.setattr(app.AgentRuntime, "current", staticmethod(lambda: runtime))
+    monkeypatch.setattr(
+        app,
+        "coerce_settings",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            thread_id="thread-1", show_reasoning_stream=False, show_tool_calls=False
+        ),
+    )
+
+    async def lease(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(app.conversation_scopes, "lease", lease)
+    recovery = app._ReconnectRecovery(
+        disconnected_socket_id="old",
+        runtime=runtime,  # type: ignore[arg-type]
+        raw_settings={"thread_id": "thread-1"},
+        async_notifier=None,
+        local_notifier=None,
+    )
+    await app._restore_reconnected_observers(SimpleNamespace(), recovery)
+    restarted = session_values[app.SESSION_LIVE_AGENTS_PANEL_KEY]
+    try:
+        assert isinstance(restarted, LiveAgentsPanel)
+        assert restarted is not old_panel
+        assert restarted.is_running
+        assert not old_panel.is_running
+        assert len(bus._subscribers["thread-1"]) == 1
+    finally:
+        await restarted.aclose()
+
+
+@pytest.mark.anyio
+async def test_closed_panel_is_not_treated_as_current(monkeypatch) -> None:
+    bus = LiveAgentEventBus()
+    runtime = _panel_runtime(bus)
+    panel = LiveAgentsPanel(runtime.live_agents, "thread-1")  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        app.cl, "user_session", _Session({app.SESSION_LIVE_AGENTS_PANEL_KEY: panel})
+    )
+    await panel.start()
+    assert app._live_agents_panel_is_current("thread-1")
+    assert not app._live_agents_panel_is_current("thread-2")
+    await panel.aclose()
+    assert not app._live_agents_panel_is_current("thread-1")

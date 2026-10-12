@@ -462,6 +462,9 @@ async def _restore_reconnected_observers(
             settings=settings,
             mcp_session_id=settings.thread_id,
         )
+    if not _live_agents_panel_is_current(settings.thread_id):
+        # The disconnect cleanup closed the panel; same gating as chat start.
+        await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     if getattr(session, SESSION_RECONNECT_RECOVERY_KEY, None) is recovery:
         delattr(session, SESSION_RECONNECT_RECOVERY_KEY)
 
@@ -923,6 +926,16 @@ async def start_live_agents_panel(*, runtime: AgentRuntime, session_id: str) -> 
     cl.user_session.set(SESSION_LIVE_AGENTS_PANEL_KEY, panel)
 
 
+def _live_agents_panel_is_current(session_id: str) -> bool:
+    """Whether this chat's live agents panel is running for ``session_id``."""
+    panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
+    return (
+        isinstance(panel, LiveAgentsPanel)
+        and panel.is_running
+        and panel.session_id == session_id
+    )
+
+
 async def stop_live_agents_panel() -> None:
     """Stop the live agents panel listener stored in this Chainlit session."""
     panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
@@ -1231,11 +1244,7 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
             reasoning_steps_enabled=settings.show_reasoning_stream,
             tool_steps_enabled=settings.show_tool_calls,
         )
-    live_agents_panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
-    if (
-        not isinstance(live_agents_panel, LiveAgentsPanel)
-        or live_agents_panel.session_id != settings.thread_id
-    ):
+    if not _live_agents_panel_is_current(settings.thread_id):
         await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     run_task_list = cl.user_session.get(SESSION_TASK_LIST_KEY)
     if isinstance(run_task_list, RunTaskList):

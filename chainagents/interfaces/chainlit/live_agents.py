@@ -75,6 +75,11 @@ class LiveAgentsPanel:
         self._reopen = False
         self._steps: dict[str, Any] = {}
 
+    @property
+    def is_running(self) -> bool:
+        """Whether the panel is started and still listening for events."""
+        return self._consumer is not None and not self._consumer.done()
+
     async def start(self) -> None:
         """Subscribe to the session's events; render now if agents exist."""
         if self._consumer is not None:
