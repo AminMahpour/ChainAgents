@@ -107,6 +107,18 @@ def test_template_prompt_file_loaded(tmp_path):
     )
 
 
+def test_template_prompt_file_missing_raises_value_error(tmp_path):
+    raw = template(system_prompt_file="missing.md")
+    del raw["system_prompt"]
+    with pytest.raises(ValueError, match="'researcher' system_prompt_file.*not readable"):
+        parse({"templates": [raw]}, tmp_path)
+
+
+def test_template_name_must_be_string(tmp_path):
+    with pytest.raises(ValueError, match="must be strings"):
+        parse({"templates": [template(name=5)]}, tmp_path)
+
+
 def test_unknown_mcp_server_rejected(tmp_path):
     with pytest.raises(ValueError, match="unknown MCP server 'nope'"):
         parse({"allow": {"mcp_servers": ["nope"]}}, tmp_path)

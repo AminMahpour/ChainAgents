@@ -91,7 +91,14 @@ def parse_live_agents_config(
     delete_tool_enabled: bool,
     execute_tool_enabled: bool,
 ) -> LiveAgentsConfig:
-    """Parse and validate the opt-in ``[agent.live_agents]`` section."""
+    """Parse and validate the opt-in ``[agent.live_agents]`` section.
+
+    Validation is two-step. This function validates structure, limits, tools,
+    skills and MCP servers, including allowlist membership for those. Model
+    profile existence and model allowlist membership are validated separately
+    by ``validate_live_agent_models``, which ``load_file_config`` calls once
+    model profiles are parsed.
+    """
     # Imported lazily: extension_config imports this module.
     from chainagents.runtime.extension_config import (
         normalize_skill_source_path,
@@ -205,8 +212,15 @@ def parse_live_agents_config(
     for index, raw in enumerate(raw_templates, start=1):
         if not isinstance(raw, dict):
             raise ValueError(f"Live agent template entry #{index} must be a table/object.")
-        name = str(raw.get("name", "")).strip()
-        description = str(raw.get("description", "")).strip()
+        raw_name = raw.get("name", "")
+        raw_description = raw.get("description", "")
+        if not isinstance(raw_name, str) or not isinstance(raw_description, str):
+            raise ValueError(
+                f"Live agent template entry #{index} 'name' and 'description' "
+                "must be strings."
+            )
+        name = raw_name.strip()
+        description = raw_description.strip()
         if not name or not description:
             raise ValueError(
                 f"Live agent template entry #{index} must include non-empty "
@@ -222,14 +236,20 @@ def parse_live_agents_config(
             )
         inline_prompt = raw.get("system_prompt")
         prompt_file = raw.get("system_prompt_file")
-        if inline_prompt and prompt_file:
+        if inline_prompt is not None and prompt_file is not None:
             raise ValueError(
                 f"Live agent template '{name}' cannot define both "
                 "'system_prompt' and 'system_prompt_file'."
             )
-        if prompt_file:
+        if prompt_file is not None:
             prompt_path = resolve_local_path(str(prompt_file), base_dir)
-            system_prompt = prompt_path.read_text(encoding="utf-8").strip()
+            try:
+                system_prompt = prompt_path.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ValueError(
+                    f"Live agent template '{name}' system_prompt_file "
+                    f"'{prompt_file}' does not exist or is not readable."
+                ) from exc
         else:
             system_prompt = str(inline_prompt or "").strip()
         if not system_prompt:
@@ -287,7 +307,11 @@ def parse_live_agents_config(
 def validate_live_agent_models(
     config: LiveAgentsConfig, model_profiles: Mapping[str, Any]
 ) -> None:
-    """Check that referenced model profiles exist and respect the allowlist."""
+    """Check that referenced model profiles exist and respect the allowlist.
+
+    Second step of live-agent validation, run after ``parse_live_agents_config``
+    once model profiles are available (``load_file_config`` calls it).
+    """
     for model in config.allow.models:
         if model not in model_profiles:
             raise ValueError(
