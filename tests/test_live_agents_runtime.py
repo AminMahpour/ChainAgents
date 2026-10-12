@@ -242,3 +242,50 @@ async def test_runtime_builds_live_graph_from_spec(tmp_path, monkeypatch):
         assert built["model"][1] == built["reasoning_level"]
     finally:
         await runtime.close()
+
+
+class PerCallRecordingModel(FakeMessagesListChatModel):
+    bindings: list = Field(default_factory=list)
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        self.bindings.append({getattr(item, "name", None) for item in tools})
+        return self
+
+
+@pytest.mark.anyio
+async def test_general_purpose_delegate_lacks_live_agent_tools(tmp_path):
+    config = _config(tmp_path, live=True)
+    broker = MessageBroker(config.extensions.messaging)
+
+    async def factory(_spec, _session_id):
+        return FakeGraph()
+
+    manager = LiveAgentManager(config.extensions.live_agents, broker, factory)
+    model = PerCallRecordingModel(
+        responses=[
+            _call(
+                "task",
+                {"description": "look around", "subagent_type": "general-purpose"},
+                "c1",
+            ),
+            AIMessage(content="delegate done"),
+            AIMessage(content="main done"),
+        ]
+    )
+    kwargs = _kwargs(config, tmp_path, model, broker, manager)
+    graph = create_deep_agent_with_configured_summarization(config, **kwargs)
+    try:
+        await graph.ainvoke(
+            {"messages": [HumanMessage(content="delegate")]},
+            {"configurable": {"thread_id": "s"}},
+        )
+        main_bindings = [b for b in model.bindings if "task" in b]
+        delegate_bindings = [b for b in model.bindings if "task" not in b]
+        assert main_bindings and all(
+            b >= LIVE_AGENT_TOOL_NAMES for b in main_bindings
+        )
+        assert delegate_bindings
+        assert all(not b & LIVE_AGENT_TOOL_NAMES for b in delegate_bindings)
+        assert all("send_agent_message" in b for b in delegate_bindings)
+    finally:
+        await manager.close()

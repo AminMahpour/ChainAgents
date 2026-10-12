@@ -848,6 +848,66 @@ def build_main_tools(
     return tools
 
 
+# Default general-purpose delegate middleware slots that DeepAgents lets the
+# main agent's middleware override by name (its profile adds the token guards).
+_GENERAL_PURPOSE_INHERITED_MIDDLEWARE = frozenset({
+    "FilesystemMiddleware",
+    "SummarizationMiddleware",
+    "PatchToolCallsMiddleware",
+    "SkillsMiddleware",
+    "TokenLimitedToolCallMiddleware",
+    "RepeatedToolResultGuardMiddleware",
+})
+
+
+def _with_general_purpose_without_live_tools(
+    subagent_specs: list[Any],
+    *,
+    tools: list[Any],
+    middleware: list[Any],
+    skills: list[str] | None,
+) -> list[Any]:
+    """Declare the general-purpose delegate explicitly, minus live agent tools.
+
+    DeepAgents' implicit ``general-purpose`` delegate inherits every main agent
+    tool; only the main agent (or the user) may manage live agents. The
+    explicit spec keeps the default name, description and prompt, the main
+    model, skills and the main middleware the default delegate inherits.
+
+    Args:
+        subagent_specs: Configured subagent specs.
+        tools: Tools passed to the main agent.
+        middleware: Main agent middleware.
+        skills: Skill sources the main agent uses.
+
+    Returns:
+        Subagent specs including the general-purpose delegate.
+    """
+    from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+
+    if any(
+        spec.get("name") == GENERAL_PURPOSE_SUBAGENT["name"] for spec in subagent_specs
+    ):
+        return subagent_specs
+    spec: dict[str, Any] = {
+        **GENERAL_PURPOSE_SUBAGENT,
+        "tools": [
+            tool
+            for tool in tools
+            if getattr(tool, "name", None)
+            not in runtime_live_agent_tools.LIVE_AGENT_TOOL_NAMES
+        ],
+        "middleware": [
+            item
+            for item in middleware
+            if item.name in _GENERAL_PURPOSE_INHERITED_MIDDLEWARE
+        ],
+    }
+    if skills is not None:
+        spec["skills"] = skills
+    return [spec, *subagent_specs]
+
+
 def build_agent_kwargs(
     config: RuntimeConfig,
     *,
@@ -1008,6 +1068,13 @@ def build_agent_kwargs(
     if clarification_enabled:
         runtime_clarification.validate_ask_user_tool_name(
             [*main_tools, *background_tools]
+        )
+    if live_agent_manager is not None:
+        subagent_specs = _with_general_purpose_without_live_tools(
+            subagent_specs,
+            tools=[*main_tools, *background_tools],
+            middleware=middleware,
+            skills=list(config.extensions.skills) or None,
         )
     agent_kwargs: dict[str, Any] = {
         "model": model,
