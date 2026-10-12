@@ -79,5 +79,10 @@ class LiveAgentEventBus:
             except Exception:
                 logger.exception("Live agent event listener failed")
         for queue, loop in entries:
-            if not loop.is_closed():
+            if loop.is_closed():
+                continue
+            try:
                 loop.call_soon_threadsafe(queue.put_nowait, event)
+            except RuntimeError:
+                # The loop closed after the check; its subscriber is gone.
+                self.unsubscribe(event.session_id, queue)

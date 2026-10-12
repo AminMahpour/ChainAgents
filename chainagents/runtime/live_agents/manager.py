@@ -36,6 +36,8 @@ WORKER_TASK_PREFIX = "chainagents-live-agent-"
 _MAIN_ADDRESS = "main"
 _USER_ADDRESS = "user"
 _REAPER_MAX_INTERVAL = 30
+# Bounds a hung checkpointer so it cannot block teardown or conversation close.
+DELETE_THREAD_TIMEOUT_SECONDS: float = 10
 
 
 class LiveAgentManager:
@@ -367,7 +369,16 @@ class LiveAgentManager:
         self._broker.close(record.session_id, record.address)
         if self._delete_thread is not None and self.config.delete_history_on_teardown:
             try:
-                await self._delete_thread(record.thread_id)
+                await asyncio.wait_for(
+                    self._delete_thread(record.thread_id),
+                    timeout=DELETE_THREAD_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Timed out deleting history for live agent %s after %ss",
+                    record.id,
+                    DELETE_THREAD_TIMEOUT_SECONDS,
+                )
             except Exception:
                 logger.warning(
                     "Could not delete history for live agent %s",

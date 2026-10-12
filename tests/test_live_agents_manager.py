@@ -600,3 +600,60 @@ async def test_spawn_building_during_close_does_not_start_worker() -> None:
     with pytest.raises(RuntimeError, match="manager is closed"):
         await h.manager.spawn(SESSION, SpawnRequest(template="coder"))
     assert live_tasks() == []
+
+
+@pytest.mark.anyio
+async def test_teardown_bounds_a_hung_history_delete(monkeypatch, caplog) -> None:
+    import chainagents.runtime.live_agents.manager as manager_module
+
+    monkeypatch.setattr(manager_module, "DELETE_THREAD_TIMEOUT_SECONDS", 0.05)
+    h = Harness()
+    hung = asyncio.Event()
+
+    async def delete_thread(_thread_id: str) -> None:
+        await hung.wait()  # Never set: a hung checkpointer.
+
+    h.manager._delete_thread = delete_thread
+    record, _ = await h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+    with caplog.at_level("WARNING", logger=manager_module.__name__):
+        await asyncio.wait_for(
+            h.manager.teardown(SESSION, record.name, reason="done"), 2
+        )
+    assert record.status == "stopped"
+    assert "Timed out deleting history" in caplog.text
+    await h.manager.close()
+
+
+def test_publish_drops_subscriber_whose_loop_closed() -> None:
+    bus = LiveAgentEventBus()
+
+    class ClosingLoop:
+        def is_closed(self) -> bool:
+            return False  # Closes between the check and the call.
+
+        def call_soon_threadsafe(self, *_args: Any) -> None:
+            raise RuntimeError("Event loop is closed")
+
+    class OpenLoop:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Any, event: Any) -> None:
+            self.calls.append(event)
+
+    stale_queue: asyncio.Queue[LiveAgentEvent] = asyncio.Queue()
+    live_queue: asyncio.Queue[LiveAgentEvent] = asyncio.Queue()
+    open_loop = OpenLoop()
+    bus._subscribers[SESSION] = [
+        (stale_queue, ClosingLoop()),  # type: ignore[list-item]
+        (live_queue, open_loop),  # type: ignore[list-item]
+    ]
+    event = LiveAgentEvent(
+        kind="spawned", session_id=SESSION, agent_id="a", agent_name="a", payload={}
+    )
+    bus.publish(event)
+    assert open_loop.calls == [event]
+    assert [queue for queue, _ in bus._subscribers[SESSION]] == [live_queue]
