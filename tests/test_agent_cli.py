@@ -2588,3 +2588,30 @@ async def test_cli_one_shot_tears_down_live_agents(monkeypatch) -> None:
             stdin=io.StringIO(""),
         )
     assert torn_down == ["thread-1", "thread-1"]
+
+
+@pytest.mark.anyio
+async def test_cli_teardown_failure_does_not_mask_run_error(monkeypatch) -> None:
+    """A failing teardown warns on stderr and keeps the original error."""
+    args = chainagents_cli.parse_args(["--prompt", "hello", "--thread-id", "thread-1"])
+
+    class Live:
+        async def teardown_session(self, session_id):
+            raise ValueError("teardown-broke")
+
+    runtime = SimpleNamespace(background_tasks=SimpleNamespace(), live_agents=Live())
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("run-broke")
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", failing)
+    stderr = io.StringIO()
+    with pytest.raises(RuntimeError, match="run-broke"):
+        await chainagents_cli.run_cli(
+            args,
+            runtime=runtime,
+            stdout=io.StringIO(),
+            stderr=stderr,
+            stdin=io.StringIO(""),
+        )
+    assert "teardown-broke" in stderr.getvalue()

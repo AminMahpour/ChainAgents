@@ -340,11 +340,17 @@ async def _read_terminal_line(
     return line.rstrip("\r\n")
 
 
-async def _teardown_live_agents(runtime: AgentRuntime, thread_id: str) -> None:
-    """Stop the session's live agents when the runtime has them enabled."""
+async def _teardown_live_agents(
+    runtime: AgentRuntime, thread_id: str, stderr: TextIO
+) -> None:
+    """Best-effort, cancellation-shielded live agent teardown for a session."""
     live_agents = getattr(runtime, "live_agents", None)
-    if live_agents is not None:
-        await live_agents.teardown_session(thread_id)
+    if live_agents is None:
+        return
+    try:
+        await asyncio.shield(live_agents.teardown_session(thread_id))
+    except Exception as exc:
+        print(f"Warning: live agent teardown failed: {exc}", file=stderr)
 
 
 async def interactive_repl(
@@ -630,7 +636,7 @@ async def run_cli(
                 )
             return int(prompt_result)
         finally:
-            await _teardown_live_agents(runtime, thread_id)
+            await _teardown_live_agents(runtime, thread_id, stderr)
 
     if args.status or args.list_commands or args.rebuild_rag or args.upload_rag:
         if args.json_output:
@@ -646,7 +652,7 @@ async def run_cli(
             stdin=stdin,
         )
     finally:
-        await _teardown_live_agents(runtime, thread_id)
+        await _teardown_live_agents(runtime, thread_id, stderr)
 
 
 async def async_main(argv: list[str] | None = None) -> int:

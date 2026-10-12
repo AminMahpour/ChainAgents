@@ -1059,3 +1059,15 @@ async def test_tui_shows_live_agent_stopped_notice() -> None:
         await pilot.pause()
 
         assert any("researcher-1 stopped (idle_timeout)" in e for e in app.tool_entries)
+
+
+@pytest.mark.anyio
+async def test_tui_unmount_unsubscribes_live_agent_queue() -> None:
+    """Exiting the TUI removes its live agent subscription."""
+    runtime, bus = _live_runtime()
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test():
+        assert bus._subscribers.get(DEFAULT_TUI_THREAD_ID)
+
+    assert not bus._subscribers.get(DEFAULT_TUI_THREAD_ID)
