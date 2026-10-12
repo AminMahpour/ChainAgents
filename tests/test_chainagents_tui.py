@@ -1071,3 +1071,56 @@ async def test_tui_unmount_unsubscribes_live_agent_queue() -> None:
         assert bus._subscribers.get(DEFAULT_TUI_THREAD_ID)
 
     assert not bus._subscribers.get(DEFAULT_TUI_THREAD_ID)
+
+
+@pytest.mark.anyio
+async def test_tui_runs_live_agent_command_while_turn_is_active() -> None:
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import (
+        LiveAgentsConfig,
+        MessagingConfig,
+        UserInputConfig,
+    )
+    from chainagents.turns.controller import ConversationInputController
+
+    async def factory(_spec, _session_id):
+        raise AssertionError("no agent is built")
+
+    agent = _BlockingAgent()
+    runtime = _FakeRuntime(agent)
+    runtime.config.extensions = SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(runtime.config.extensions.user_input, broker)
+    runtime.live_agents = LiveAgentManager(LiveAgentsConfig(enabled=True), broker, factory)
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt", PromptTextArea)
+        event = SimpleNamespace(stop=lambda: None, text_area=prompt)
+        prompt.load_text("first")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        await agent.started.wait()
+        jobs = len(runtime.user_input._session(app.thread_id).jobs)
+
+        prompt.load_text("/agents")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert prompt.text == ""
+        assert "No live agents." in app.tool_entries
+        prompt.load_text("/kill ghost")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert any("Unknown live agent `ghost`" in e for e in app.tool_entries)
+        assert len(runtime.user_input._session(app.thread_id).jobs) == jobs
+
+        prompt.load_text("second")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert prompt.text == "second"
+        await app.action_cancel_or_quit()
+        await runtime.user_input.wait_idle(app.thread_id)
+        await pilot.pause()
+    await runtime.live_agents.close()

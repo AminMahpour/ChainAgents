@@ -17,7 +17,12 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Footer, Header, Markdown, RichLog, Static, TextArea
 
-from chainagents.commands.native import RuntimeCommandResult, command_result_text
+from chainagents.commands.native import (
+    RuntimeCommandResult,
+    command_result_text,
+    resolve_live_agent_command,
+    run_live_agent_command,
+)
 from chainagents.events.stream import AgentStreamEvent
 from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.runtime.reflection import (
@@ -343,6 +348,10 @@ class ChainAgentsTuiApp(App[int]):
         """Send a submitted prompt to the agent."""
         event.stop()
         prompt = event.text_area.text.strip()
+        if await self._run_live_agent_command_now(prompt):
+            event.text_area.load_text("")
+            self.hide_command_help()
+            return
         if getattr(getattr(getattr(self.runtime.config, "extensions", None), "user_input", None), "enabled", False):
             if not prompt:
                 return
@@ -391,6 +400,30 @@ class ChainAgentsTuiApp(App[int]):
         event.text_area.load_text("")
         self.hide_command_help()
         self.active_task = asyncio.create_task(self._run_prompt(prompt))
+
+    async def _run_live_agent_command_now(self, prompt: str) -> bool:
+        """Run a live agent command at once, even while a turn is active.
+
+        Live agent commands never run the main agent, so they neither steer
+        nor queue. Returns whether ``prompt`` was such a command.
+        """
+        parsed = resolve_live_agent_command(self.runtime, raw_text=prompt)
+        if parsed is None:
+            return False
+        # The tools pane, not the conversation: a "You" entry mounted while an
+        # answer streams would split that answer into two entries.
+        self._append_tool_entry(prompt)
+        try:
+            output = await run_live_agent_command(
+                self.runtime, parsed, thread_id=self.thread_id
+            )
+        except Exception as exc:
+            self._append_tool_entry(f"command /{parsed.command_name} failed: {exc}")
+            self._set_status(f"Command /{parsed.command_name} failed.")
+            return True
+        self._append_tool_entry(output)
+        self._set_status(f"Ran /{parsed.command_name}.")
+        return True
 
     @on(TextArea.Changed, "#prompt")
     def on_prompt_changed(self, event: TextArea.Changed) -> None:

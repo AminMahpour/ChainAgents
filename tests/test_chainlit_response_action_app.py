@@ -568,3 +568,146 @@ async def test_queued_turn_uses_mcp_scope_of_its_submitted_thread(monkeypatch) -
     await main._handle_message(message, settings_override=snapshot)
 
     assert seen == [("thread-old", "thread-old")]
+
+
+def _live_agent_runtime(*, user_input_enabled: bool) -> tuple[Any, Any]:
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.types import LiveAgentsConfig, LiveAgentTemplate
+
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    config = UserInputConfig(enabled=user_input_enabled)
+
+    from test_live_agents_worker import FakeGraph
+
+    async def factory(_spec, _session_id):
+        return FakeGraph()
+
+    manager = LiveAgentManager(
+        LiveAgentsConfig(
+            enabled=True,
+            templates=(
+                LiveAgentTemplate(name="coder", description="d", system_prompt="p"),
+            ),
+        ),
+        broker,
+        factory,
+    )
+    runtime = SimpleNamespace(
+        user_input=ConversationInputController(config, broker),
+        live_agents=manager,
+        config=SimpleNamespace(
+            model_name="model", model_choices=("model",),
+            extensions=SimpleNamespace(
+                user_input=config,
+                chainlit_reasoning_steps_enabled=True,
+                chainlit_tool_steps_enabled=True,
+            ),
+        ),
+    )
+    return runtime, broker
+
+
+def _patch_live_agent_chainlit(monkeypatch, runtime, notices, seen, gate=None):
+    class Message:
+        def __init__(self, content: str, author: str = "User", actions=None):
+            self.id = content
+            self.content = content
+            self.author = author
+            self.actions = actions or []
+            self.elements = []
+
+        async def send(self):
+            notices.append(self)
+            return self
+
+    class Step:
+        def __init__(self, **_kwargs):
+            self.input = ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def get_runtime():
+        return runtime
+
+    async def handle(message, *, settings_override=None):
+        seen.append(message.content)
+        if gate is not None:
+            await gate.wait()
+
+    monkeypatch.setattr(main.cl, "user_session", Session())
+    monkeypatch.setattr(main.cl, "Message", Message)
+    monkeypatch.setattr(main.cl, "Step", Step)
+    monkeypatch.setattr(
+        main.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="s"))
+    )
+    monkeypatch.setattr(main, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(
+        main, "coerce_settings", lambda *_args, **_kwargs: SimpleNamespace(thread_id="s")
+    )
+    monkeypatch.setattr(main, "_handle_message", handle)
+    return Message
+
+
+@pytest.mark.anyio
+async def test_chainlit_live_agent_command_runs_immediately_while_busy(monkeypatch) -> None:
+    runtime, broker = _live_agent_runtime(user_input_enabled=True)
+    broker.open("s", "main", name="main", parent=None)
+    notices: list[Any] = []
+    seen: list[str] = []
+    gate = asyncio.Event()
+    Message = _patch_live_agent_chainlit(monkeypatch, runtime, notices, seen, gate)
+
+    await main._guarded_chainlit_message_callback(Message("first"))
+    await asyncio.sleep(0)
+    assert runtime.user_input.status("s")["active_job_id"] is not None
+    jobs_before = len(runtime.user_input._session("s").jobs)
+    notices.clear()
+
+    await main._guarded_chainlit_message_callback(Message("/agents"))
+    assert [n.content for n in notices] == ["No live agents."]
+    assert notices[0].actions == []
+
+    await main._guarded_chainlit_message_callback(Message("/spawn coder c"))
+    assert "`c`" in notices[-1].content
+    assert notices[-1].actions == []
+
+    await main._guarded_chainlit_message_callback(Message("/kill ghost"))
+    assert notices[-1].author == "System"
+    assert "Unknown live agent `ghost`" in notices[-1].content
+
+    assert len(runtime.user_input._session("s").jobs) == jobs_before
+    assert broker.pending_user_steering_count("s") == 0
+
+    await main._guarded_chainlit_message_callback(Message("hello"))
+    assert [a.label for a in notices[-1].actions] == [
+        "Steer active turn",
+        "Queue next turn",
+    ]
+    gate.set()
+    await runtime.user_input.wait_idle("s")
+    assert seen == ["first"]
+    await runtime.live_agents.close()
+
+
+@pytest.mark.anyio
+async def test_chainlit_live_agent_command_bypasses_legacy_busy_gate(monkeypatch) -> None:
+    runtime, _broker = _live_agent_runtime(user_input_enabled=False)
+    notices: list[Any] = []
+    seen: list[str] = []
+    Message = _patch_live_agent_chainlit(monkeypatch, runtime, notices, seen)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    main.cl.user_session.set(main.SESSION_ACTIVE_TURN_KEY, blocker)
+    try:
+        await main._guarded_chainlit_message_callback(Message("/agents"))
+        assert [n.content for n in notices] == ["No live agents."]
+        await main._guarded_chainlit_message_callback(Message("hello"))
+        assert "already responding" in notices[-1].content
+        assert seen == []
+        assert main.cl.user_session.get(main.SESSION_ACTIVE_TURN_KEY) is blocker
+    finally:
+        blocker.cancel()
+    await runtime.live_agents.close()

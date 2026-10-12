@@ -83,6 +83,10 @@ from chainagents.runtime import (
     format_model_provider,
     resolve_runtime_model_profile,
 )
+from chainagents.commands.native import (
+    resolve_live_agent_command,
+    run_live_agent_command,
+)
 from chainagents.interfaces.chainlit.live_agents import LiveAgentsPanel
 from chainagents.runtime.live_agents.commands import LIVE_AGENT_COMMAND_DESCRIPTIONS
 from chainagents.runtime.reflection import (
@@ -1714,10 +1718,42 @@ async def on_message(message: cl.Message) -> None:
 _chainlit_message_callback = chainlit_config.code.on_message
 
 
+async def _run_live_agent_command_now(runtime: AgentRuntime, message: cl.Message) -> bool:
+    """Run a live agent command at once, outside the main agent's turn.
+
+    ``/agents``, ``/spawn``, ``/msg`` and ``/kill`` never run the main agent,
+    so they neither claim the turn nor steer or queue behind a busy one.
+    Returns whether ``message`` was such a command.
+    """
+    if getattr(message, "elements", None) or message_is_clarification_answer(message):
+        return False
+    parsed = resolve_live_agent_command(
+        runtime,
+        raw_text=message.content or "",
+        selected_command=getattr(message, "command", None),
+    )
+    if parsed is None:
+        return False
+    try:
+        content = await run_live_agent_command(
+            runtime, parsed, thread_id=_current_input_thread_id(runtime)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if not isinstance(exc, ValueError):
+            logger.exception("Live agent command /%s failed", parsed.command_name)
+        content = f"Native command `/{parsed.command_name}` failed: {exc}"
+    await cl.Message(content=content, author="System").send()
+    return True
+
+
 async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
     """Reject a busy message before Chainlit creates its on_message run step."""
     runtime = await get_runtime_or_notify()
     if runtime is None:
+        return
+    if await _run_live_agent_command_now(runtime, message):
         return
     if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
         settings = coerce_settings(

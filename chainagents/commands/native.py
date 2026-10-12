@@ -86,6 +86,42 @@ def resolve_native_command(
     return parse_native_command(raw_text)
 
 
+def resolve_live_agent_command(
+    runtime: Any,
+    *,
+    raw_text: str,
+    selected_command: str | None = None,
+) -> ParsedNativeCommand | None:
+    """Return the live agent command in ``raw_text``, if ``runtime`` runs one.
+
+    Live agent commands (``/agents``, ``/spawn``, ``/msg``, ``/kill``) never
+    run the main agent, so interfaces execute them immediately, even while a
+    main turn is busy, instead of steering or queueing them.
+    """
+    if getattr(runtime, "live_agents", None) is None:
+        return None
+    parsed = resolve_native_command(raw_text=raw_text, selected_command=selected_command)
+    if parsed is None or parsed.command_name not in LIVE_AGENT_COMMAND_NAMES:
+        return None
+    return parsed
+
+
+async def run_live_agent_command(
+    runtime: Any, parsed: ParsedNativeCommand, *, thread_id: str
+) -> str:
+    """Run a live agent command for ``thread_id`` and return its Markdown output.
+
+    Raises:
+        ValueError: On usage errors, unknown agents and manager rejections.
+    """
+    return await handle_live_agent_command(
+        runtime.live_agents,
+        command_name=parsed.command_name,
+        raw_args=parsed.raw_args,
+        session_id=thread_id,
+    )
+
+
 def apply_native_template(template: str | None, raw_args: str) -> str:
     """Apply native template.
 
@@ -150,16 +186,12 @@ async def resolve_runtime_command(
     """
     live_agents = getattr(runtime, "live_agents", None)
     if live_agents is not None and parsed.command_name in LIVE_AGENT_COMMAND_NAMES:
-        text = await handle_live_agent_command(
-            live_agents,
-            command_name=parsed.command_name,
-            raw_args=parsed.raw_args,
-            session_id=thread_id,
-        )
         return RuntimeCommandResult(
             target="live_agent",
             command_name=parsed.command_name,
-            tool_result=text,
+            tool_result=await run_live_agent_command(
+                runtime, parsed, thread_id=thread_id
+            ),
         )
 
     command = runtime.resolve_chainlit_command(parsed.command_name)

@@ -14,6 +14,10 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, TextIO
 
+from chainagents.commands.native import (
+    resolve_live_agent_command,
+    run_live_agent_command,
+)
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
 from chainagents.runtime import (
     AgentRuntime,
@@ -353,6 +357,31 @@ async def _teardown_live_agents(
         print(f"Warning: live agent teardown failed: {exc}", file=stderr)
 
 
+async def _run_live_agent_command_now(
+    runtime: AgentRuntime,
+    prompt: str,
+    *,
+    thread_id: str,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> bool:
+    """Run a live agent command at once, even while a turn is active.
+
+    Live agent commands never run the main agent, so they neither steer nor
+    queue. Returns whether ``prompt`` was such a command.
+    """
+    parsed = resolve_live_agent_command(runtime, raw_text=prompt)
+    if parsed is None:
+        return False
+    try:
+        output = await run_live_agent_command(runtime, parsed, thread_id=thread_id)
+    except Exception as exc:
+        print(f"Command /{parsed.command_name} failed: {exc}", file=stderr)
+    else:
+        print(output, file=stdout)
+    return True
+
+
 async def interactive_repl(
     runtime: AgentRuntime,
     args: argparse.Namespace,
@@ -398,6 +427,10 @@ async def interactive_repl(
                 print("", file=stderr)
                 return 130
             if not prompt.strip():
+                continue
+            if await _run_live_agent_command_now(
+                runtime, prompt, thread_id=thread_id, stdout=stdout, stderr=stderr
+            ):
                 continue
             if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
                 stripped = prompt.strip()

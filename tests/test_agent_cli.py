@@ -2615,3 +2615,71 @@ async def test_cli_teardown_failure_does_not_mask_run_error(monkeypatch) -> None
             stdin=io.StringIO(""),
         )
     assert "teardown-broke" in stderr.getvalue()
+
+
+@pytest.mark.anyio
+async def test_interactive_cli_runs_live_agent_command_while_turn_is_active(
+    monkeypatch,
+) -> None:
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import (
+        LiveAgentsConfig,
+        MessagingConfig,
+        UserInputConfig,
+    )
+    from chainagents.turns.controller import ConversationInputController
+
+    async def factory(_spec, _session_id):
+        raise AssertionError("no agent is built")
+
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    config = SimpleNamespace(
+        extensions=SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    )
+    runtime = SimpleNamespace(
+        background_tasks=BackgroundTaskManager(BackgroundSubagentConfig(enabled=True)),
+        config=config,
+        user_input=ConversationInputController(config.extensions.user_input, broker),
+        live_agents=LiveAgentManager(LiveAgentsConfig(enabled=True), broker, factory),
+    )
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    asked: list[str] = []
+    prompts = iter(("first", "/agents", "/kill ghost"))
+    seen: list[str] = []
+
+    async def fake_read(*, prompt, **_kwargs):
+        asked.append(prompt)
+        if prompt.startswith("Agent working"):
+            return "q"
+        try:
+            item = next(prompts)
+        except StopIteration:
+            gate.set()
+            await runtime.user_input.wait_idle("thread-1")
+            raise EOFError from None
+        if item != "first":
+            await started.wait()
+        return item
+
+    async def fake_run(_runtime, _args, *, prompt, **_kwargs):
+        seen.append(prompt)
+        started.set()
+        await gate.wait()
+        return 0
+
+    monkeypatch.setattr(chainagents_cli, "_read_terminal_line", fake_read)
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", fake_run)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    code = await chainagents_cli.interactive_repl(
+        runtime,
+        chainagents_cli.parse_args(["--thread-id", "thread-1"]),
+        stdout=stdout, stderr=stderr, stdin=io.StringIO(),
+    )
+    assert code == 0
+    assert seen == ["first"]
+    assert not any(p.startswith("Agent working") for p in asked)
+    assert "No live agents." in stdout.getvalue()
+    assert "Command /kill failed: Unknown live agent `ghost`" in stderr.getvalue()
+    await runtime.live_agents.close()

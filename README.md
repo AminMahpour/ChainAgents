@@ -1221,7 +1221,7 @@ tools = ["ls", "read_file", "glob", "grep"]
 - `max_turns_per_agent`: default `50`. After this many turns an agent is torn down.
 - `turn_recursion_limit`: default `100`. LangGraph step limit for a single live agent turn.
 - `delete_history_on_teardown`: default `true`. Deletes the agent's own conversation history when it stops.
-- `notify_main_on_user_actions`: default `true`. When the user spawns, messages, or stops an agent with a slash command, the main agent receives a short `FYI:` notice.
+- `notify_main_on_user_actions`: default `true`. When the user spawns, messages, or stops an agent with a slash command, the main agent receives a short `FYI:` notice. Notices come from the internal `live-agents` sender (`Message from live-agents ...`), not from `user`: they reach the main agent at its next model step, never count as steering, and never start a follow-up turn.
 - `stream_activity`: default `false`. Shows one Chainlit step per live agent turn, opened when the turn starts and closed with whether it finished or failed; other interfaces stay completion-only.
 
 #### Templates
@@ -1279,6 +1279,11 @@ Available in Chainlit, the TUI, and the CLI when live agents are enabled:
 While live agents are enabled these four names are reserved, and a
 `[[chainlit.commands]]` entry using one of them is rejected at startup. With
 live agents disabled the names are free for custom commands.
+
+These commands never run the main agent, so they execute immediately, even
+while a main turn is running: with `[agent.user_input]` enabled they are never
+offered as steer/queue input, and without it they do not wait for the busy
+turn.
 
 Agents can be addressed by name or id. Statuses are `idle`, `running`,
 `stopping`, `stopped`, and `failed`.
