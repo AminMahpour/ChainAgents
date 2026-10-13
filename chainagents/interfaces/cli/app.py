@@ -19,6 +19,7 @@ from chainagents.commands.native import (
     run_live_agent_command,
 )
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
+from chainagents.runtime.live_agents.events import format_live_agent_notice
 from chainagents.runtime import (
     AgentRuntime,
     ReasoningLevel,
@@ -411,6 +412,22 @@ async def interactive_repl(
             print(format_background_task_notice(snapshot), file=stderr)
 
     notice_task = asyncio.create_task(print_completions())
+    # Live agent replies to the user (e.g. after /msg) and stops, one line each.
+    live_events = getattr(getattr(runtime, "live_agents", None), "events", None)
+    live_queue = live_events.subscribe(thread_id) if live_events is not None else None
+
+    async def print_live_agent_notices() -> None:
+        assert live_queue is not None
+        while True:
+            text = format_live_agent_notice(await live_queue.get())
+            if text is not None:
+                print(text, file=stdout, flush=True)
+
+    live_task = (
+        asyncio.create_task(print_live_agent_notices())
+        if live_queue is not None
+        else None
+    )
     print("ChainAgents CLI. Press Ctrl-D to exit.", file=stderr)
     try:
         while True:
@@ -504,6 +521,12 @@ async def interactive_repl(
         notice_task.cancel()
         with suppress(asyncio.CancelledError):
             await notice_task
+        if live_events is not None and live_queue is not None:
+            live_events.unsubscribe(thread_id, live_queue)
+        if live_task is not None:
+            live_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await live_task
 
 
 def format_background_task_notice(

@@ -2683,3 +2683,48 @@ async def test_interactive_cli_runs_live_agent_command_while_turn_is_active(
     assert "No live agents." in stdout.getvalue()
     assert "Command /kill failed: Unknown live agent `ghost`" in stderr.getvalue()
     await runtime.live_agents.close()
+
+
+@pytest.mark.anyio
+async def test_interactive_cli_prints_live_agent_replies_and_stops(monkeypatch) -> None:
+    from chainagents.runtime.live_agents.events import LiveAgentEvent, LiveAgentEventBus
+
+    bus = LiveAgentEventBus()
+    runtime = SimpleNamespace(
+        background_tasks=BackgroundTaskManager(BackgroundSubagentConfig(enabled=True)),
+        config=SimpleNamespace(extensions=SimpleNamespace()),
+        live_agents=SimpleNamespace(events=bus),
+    )
+
+    def event(kind, payload, session_id="thread-1"):
+        return LiveAgentEvent(
+            kind=kind,
+            session_id=session_id,
+            agent_id="a1",
+            agent_name="scout",
+            payload=payload,
+        )
+
+    async def fake_read(**_kwargs):
+        assert set(bus._subscribers) == {"thread-1"}
+        bus.publish(event("message", {"from": "scout", "to": "user", "body": "x" * 300 + "\nmore"}))
+        bus.publish(event("message", {"from": "scout", "to": "main", "body": "hidden"}))
+        bus.publish(event("message", {"from": "scout", "to": "user", "body": "other"}, "thread-2"))
+        bus.publish(event("stopped", {"reason": "idle_timeout"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        raise EOFError
+
+    monkeypatch.setattr(chainagents_cli, "_read_terminal_line", fake_read)
+    stdout = io.StringIO()
+    code = await chainagents_cli.interactive_repl(
+        runtime,
+        chainagents_cli.parse_args(["--thread-id", "thread-1"]),
+        stdout=stdout, stderr=io.StringIO(), stdin=io.StringIO(),
+    )
+    assert code == 0
+    assert stdout.getvalue().splitlines() == [
+        "scout: " + "x" * 197 + "...",
+        "scout stopped (idle_timeout)",
+    ]
+    assert bus._subscribers == {}

@@ -37,7 +37,10 @@ from chainagents.runtime import (
     normalize_reasoning_level,
 )
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
-from chainagents.runtime.live_agents.events import LiveAgentEvent
+from chainagents.runtime.live_agents.events import (
+    LiveAgentEvent,
+    format_live_agent_notice,
+)
 from chainagents.turns import (
     BaseTurnRenderer,
     TurnCommandError,
@@ -280,15 +283,7 @@ class ChainAgentsTuiApp(App[int]):
 
     @staticmethod
     def _format_live_agent_event(event: LiveAgentEvent) -> str | None:
-        if event.kind == "message" and event.payload.get("to") == "user":
-            body = str(event.payload.get("body", "")).strip()
-            first = body.splitlines()[0] if body else ""
-            if len(first) > 200:
-                first = first[:197] + "..."
-            return f"{event.agent_name}: {first}"
-        if event.kind == "stopped":
-            return f"{event.agent_name} stopped ({event.payload.get('reason', 'unknown')})"
-        return None
+        return format_live_agent_notice(event)
 
     @on(LiveAgentNotice)
     def show_live_agent_notice(self, event: LiveAgentNotice) -> None:

@@ -27,6 +27,26 @@ class LiveAgentEvent:
     payload: Mapping[str, object]
 
 
+NOTICE_BODY_LIMIT = 200
+
+
+def format_live_agent_notice(event: LiveAgentEvent) -> str | None:
+    """One-line terminal notice for a reply to the user or a stop, else ``None``.
+
+    Replies show the first line of the body, truncated to ``NOTICE_BODY_LIMIT``
+    characters.
+    """
+    if event.kind == "message" and event.payload.get("to") == "user":
+        body = str(event.payload.get("body", "")).strip()
+        first = body.splitlines()[0] if body else ""
+        if len(first) > NOTICE_BODY_LIMIT:
+            first = first[: NOTICE_BODY_LIMIT - 3] + "..."
+        return f"{event.agent_name}: {first}"
+    if event.kind == "stopped":
+        return f"{event.agent_name} stopped ({event.payload.get('reason', 'unknown')})"
+    return None
+
+
 class LiveAgentEventBus:
     """Fan out live agent events to per-session asyncio queues."""
 
