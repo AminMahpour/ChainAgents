@@ -14,14 +14,25 @@ from chainagents.interfaces.api import app as chainagents_api
 class _Record:
     def __init__(self, ref: str) -> None:
         self.ref = ref
+        self.name = f"name-{ref}"
 
     def to_payload(self) -> dict[str, Any]:
         return {"ref": self.ref, "status": "stopped"}
 
 
 class _FakeManager:
-    def __init__(self) -> None:
+    def __init__(self, *, notify: bool = False) -> None:
         self.calls: list[tuple[Any, ...]] = []
+        self.config = SimpleNamespace(notify_main_on_user_actions=notify)
+        self.notes: list[tuple[str, str]] = []
+
+    def get(self, session_id, ref):
+        if ref == "missing":
+            raise KeyError(ref)
+        return SimpleNamespace(id=ref, name=f"name-{ref}")
+
+    def notify_main(self, session_id, text):
+        self.notes.append((session_id, text))
 
     def list(self, session_id, *, include_stopped=False):
         self.calls.append(("list", session_id, include_stopped))
@@ -175,3 +186,25 @@ async def test_posted_message_reply_visible_in_list() -> None:
         assert isinstance(agent["last_reply"]["at"], float)
     finally:
         await manager.close()
+
+
+@pytest.mark.parametrize("notify", [True, False])
+def test_user_actions_send_fyi_to_main_when_enabled(notify: bool) -> None:
+    manager = _FakeManager(notify=notify)
+    with _client(manager) as client:
+        assert (
+            client.post(
+                "/api/live-agents/a1/messages?thread_id=t1", json={"body": "hi"}
+            ).status_code
+            == 200
+        )
+        assert client.delete("/api/live-agents/a1?thread_id=t1").status_code == 200
+        # Rejected actions never notify.
+        client.post("/api/live-agents/missing/messages?thread_id=t1", json={"body": "x"})
+        client.post("/api/live-agents/a1/messages?thread_id=t1", json={"body": "x" * 200})
+        client.delete("/api/live-agents/missing?thread_id=t1")
+    expected = [
+        ("t1", "FYI: user sent a message to `name-a1`: hi"),
+        ("t1", "FYI: user stopped `name-a1`."),
+    ]
+    assert manager.notes == (expected if notify else [])

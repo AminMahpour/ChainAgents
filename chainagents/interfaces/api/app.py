@@ -60,6 +60,11 @@ from chainagents.runtime import (
     normalize_reasoning_level,
     resolve_runtime_model_profile,
 )
+from chainagents.runtime.live_agents.commands import (
+    fyi_user_message,
+    fyi_user_stopped,
+    notify_main_of_user_action,
+)
 from chainagents.runtime.reflection import (
     ReflectionProposal,
     reflection_save_prompt as reflection_save_prompt,
@@ -642,11 +647,15 @@ def create_app(
         body = _required_text(payload.body, "body")
         manager = _live_agents_from_request(request)
         try:
-            message = manager.send_from_user(session_id, ref, body)
+            target = manager.get(session_id, ref)
+            message = manager.send_from_user(session_id, target.id, body)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        notify_main_of_user_action(
+            manager, session_id, fyi_user_message(target.name, body)
+        )
         return {"message_id": message.id}
 
     @app.delete("/api/live-agents/{agent}")
@@ -665,6 +674,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        notify_main_of_user_action(manager, session_id, fyi_user_stopped(record.name))
         return record.to_payload()
 
     @app.get("/api/generated-files/{relative_path:path}")
