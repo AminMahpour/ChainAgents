@@ -83,6 +83,17 @@ from chainagents.runtime import (
     format_model_provider,
     resolve_runtime_model_profile,
 )
+from chainagents.commands.native import (
+    resolve_live_agent_command,
+    run_live_agent_command,
+)
+from chainagents.interfaces.chainlit.live_agents import LiveAgentsPanel
+from chainagents.runtime.live_agents.commands import (
+    LIVE_AGENT_COMMAND_DESCRIPTIONS,
+    fyi_user_message,
+    fyi_user_stopped,
+    notify_main_of_user_action,
+)
 from chainagents.runtime.reflection import (
     ReflectionProposal,
     format_reflection_proposal,
@@ -106,6 +117,9 @@ SESSION_TASK_LIST_KEY = "run_task_list"
 SESSION_ASYNC_TASK_NOTIFIER_KEY = "async_task_notifier"
 SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY = "local_background_task_notifier"
 SESSION_LOCAL_NOTICE_IDS_KEY = "local_background_notice_ids"
+SESSION_LIVE_AGENTS_PANEL_KEY = "live_agents_panel"
+LIVE_AGENT_MESSAGE_ACTION = "live_agent_message"
+LIVE_AGENT_KILL_ACTION = "live_agent_kill"
 SESSION_GENERATED_UI_ELEMENTS_KEY = "generated_ui_elements"
 SESSION_INPUT_DRAFTS_KEY = "pending_input_drafts"
 STEER_INPUT_ACTION = "steer_busy_input"
@@ -457,6 +471,9 @@ async def _restore_reconnected_observers(
             settings=settings,
             mcp_session_id=settings.thread_id,
         )
+    if not _live_agents_panel_is_current(settings.thread_id):
+        # The disconnect cleanup closed the panel; same gating as chat start.
+        await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     if getattr(session, SESSION_RECONNECT_RECOVERY_KEY, None) is recovery:
         delattr(session, SESSION_RECONNECT_RECOVERY_KEY)
 
@@ -705,7 +722,7 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
         "mcp_tool": "wrench",
         "skill": "book-open",
     }
-    return [
+    specs = [
         {
             "id": command.name,
             "description": command.description,
@@ -715,6 +732,20 @@ def build_native_command_specs(runtime: AgentRuntime) -> list[dict[str, Any]]:
         }
         for command in runtime.chainlit_commands
     ]
+    if getattr(runtime, "live_agents", None) is not None:
+        taken = {spec["id"] for spec in specs}
+        specs.extend(
+            {
+                "id": name,
+                "description": description,
+                "icon": "bot",
+                "button": False,
+                "persistent": True,
+            }
+            for name, description in LIVE_AGENT_COMMAND_DESCRIPTIONS.items()
+            if name not in taken
+        )
+    return specs
 
 
 async def publish_native_commands(runtime: AgentRuntime) -> None:
@@ -887,6 +918,41 @@ async def start_local_background_notifier(
     cl.user_session.set(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY, notifier)
 
 
+async def start_live_agents_panel(*, runtime: AgentRuntime, session_id: str) -> None:
+    """Start (or restart) the live agents side panel listener for this chat."""
+    await stop_live_agents_panel()
+    manager = getattr(runtime, "live_agents", None)
+    if manager is None or not getattr(
+        runtime.config.extensions, "chainlit_live_agents_panel_enabled", False
+    ):
+        return
+    panel = LiveAgentsPanel(
+        manager,
+        session_id,
+        stream_activity=bool(getattr(manager.config, "stream_activity", False)),
+    )
+    await panel.start()
+    cl.user_session.set(SESSION_LIVE_AGENTS_PANEL_KEY, panel)
+
+
+def _live_agents_panel_is_current(session_id: str) -> bool:
+    """Whether this chat's live agents panel is running for ``session_id``."""
+    panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
+    return (
+        isinstance(panel, LiveAgentsPanel)
+        and panel.is_running
+        and panel.session_id == session_id
+    )
+
+
+async def stop_live_agents_panel() -> None:
+    """Stop the live agents panel listener stored in this Chainlit session."""
+    panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
+    if isinstance(panel, LiveAgentsPanel):
+        await panel.aclose()
+        cl.user_session.set(SESSION_LIVE_AGENTS_PANEL_KEY, None)
+
+
 @cl.on_chat_start
 async def on_chat_start() -> None:
     """Initialize Chainlit session state when a chat starts."""
@@ -923,6 +989,7 @@ async def on_chat_start() -> None:
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
     )
+    await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     await publish_modes(
         settings,
         available_models=runtime.config.model_choices,
@@ -1042,6 +1109,7 @@ async def on_chat_resume(thread: ThreadDict) -> None:
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
     )
+    await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     run_task_list = await get_run_task_list(
         reasoning_steps_enabled=settings.show_reasoning_stream,
         tool_steps_enabled=settings.show_tool_calls,
@@ -1185,6 +1253,8 @@ async def on_settings_update(raw_settings: dict[str, Any]) -> None:
             reasoning_steps_enabled=settings.show_reasoning_stream,
             tool_steps_enabled=settings.show_tool_calls,
         )
+    if not _live_agents_panel_is_current(settings.thread_id):
+        await start_live_agents_panel(runtime=runtime, session_id=settings.thread_id)
     run_task_list = cl.user_session.get(SESSION_TASK_LIST_KEY)
     if isinstance(run_task_list, RunTaskList):
         run_task_list.configure(
@@ -1388,6 +1458,72 @@ async def _resume_nonblocking_input(action: cl.Action) -> None:
         return
     runtime.user_input.resume(thread_id)
     await cl.Message(content="Queued turns resumed.", author="System").send()
+
+
+async def _live_agent_action_target(
+    action: cl.Action,
+) -> tuple[Any, str, Any] | str:
+    """Resolve (manager, thread_id, record) for a live agents panel action.
+
+    Returns an error message instead when the action cannot be resolved.
+    """
+    runtime = await get_runtime_or_notify()
+    manager = getattr(runtime, "live_agents", None) if runtime is not None else None
+    if runtime is None or manager is None:
+        return "Live agents are not available."
+    thread_id = _current_input_thread_id(runtime)
+    ref = str(action.payload.get("agent", "")).strip()
+    try:
+        record = manager.get(thread_id, ref)
+    except KeyError:
+        error = f"Unknown live agent `{ref}`."
+        await cl.Message(content=error, author="System").send()
+        return error
+    return manager, thread_id, record
+
+
+def _live_agent_action_failed(error: str) -> dict[str, object]:
+    """Panel action result telling ``callAction`` the action did not happen.
+
+    Chainlit resolves ``callAction`` with ``{"success": true, "response": ...}``
+    whenever the callback returns, so failures travel in ``response``.
+    """
+    return {"ok": False, "error": error}
+
+
+@cl.action_callback(LIVE_AGENT_MESSAGE_ACTION)
+async def live_agent_message_action(action: cl.Action) -> dict[str, object]:
+    """Send a panel-typed message to a live agent (same as ``/msg``)."""
+    body = str(action.payload.get("body", "")).strip()
+    if not body:
+        return _live_agent_action_failed("The message is empty.")
+    target = await _live_agent_action_target(action)
+    if isinstance(target, str):
+        return _live_agent_action_failed(target)
+    manager, thread_id, record = target
+    try:
+        manager.send_from_user(thread_id, record.id, body)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        await cl.Message(content=str(exc), author="System").send()
+        return _live_agent_action_failed(str(exc))
+    notify_main_of_user_action(manager, thread_id, fyi_user_message(record.name, body))
+    return {"ok": True}
+
+
+@cl.action_callback(LIVE_AGENT_KILL_ACTION)
+async def live_agent_kill_action(action: cl.Action) -> dict[str, object]:
+    """Shut down a live agent from the panel (same as ``/kill``)."""
+    target = await _live_agent_action_target(action)
+    if isinstance(target, str):
+        return _live_agent_action_failed(target)
+    manager, thread_id, record = target
+    try:
+        await manager.teardown(thread_id, record.id, reason="user")
+    except (KeyError, ValueError, RuntimeError) as exc:
+        await cl.Message(content=str(exc), author="System").send()
+        return _live_agent_action_failed(str(exc))
+    notify_main_of_user_action(manager, thread_id, fyi_user_stopped(record.name))
+    return {"ok": True}
 
 
 @cl.action_callback(RUN_RESPONSE_ACTION)
@@ -1595,10 +1731,42 @@ async def on_message(message: cl.Message) -> None:
 _chainlit_message_callback = chainlit_config.code.on_message
 
 
+async def _run_live_agent_command_now(runtime: AgentRuntime, message: cl.Message) -> bool:
+    """Run a live agent command at once, outside the main agent's turn.
+
+    ``/agents``, ``/spawn``, ``/msg`` and ``/kill`` never run the main agent,
+    so they neither claim the turn nor steer or queue behind a busy one.
+    Returns whether ``message`` was such a command.
+    """
+    if getattr(message, "elements", None) or message_is_clarification_answer(message):
+        return False
+    parsed = resolve_live_agent_command(
+        runtime,
+        raw_text=message.content or "",
+        selected_command=getattr(message, "command", None),
+    )
+    if parsed is None:
+        return False
+    try:
+        content = await run_live_agent_command(
+            runtime, parsed, thread_id=_current_input_thread_id(runtime)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if not isinstance(exc, ValueError):
+            logger.exception("Live agent command /%s failed", parsed.command_name)
+        content = f"Native command `/{parsed.command_name}` failed: {exc}"
+    await cl.Message(content=content, author="System").send()
+    return True
+
+
 async def _guarded_chainlit_message_callback(message: cl.Message) -> None:
     """Reject a busy message before Chainlit creates its on_message run step."""
     runtime = await get_runtime_or_notify()
     if runtime is None:
+        return
+    if await _run_live_agent_command_now(runtime, message):
         return
     if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
         settings = coerce_settings(
@@ -2000,6 +2168,7 @@ async def on_chat_end() -> None:
         # own timeout may remove user_session while cancellation renders UI.
         notifier = cl.user_session.get(SESSION_ASYNC_TASK_NOTIFIER_KEY)
         local_notifier = cl.user_session.get(SESSION_LOCAL_BACKGROUND_NOTIFIER_KEY)
+        live_agents_panel = cl.user_session.get(SESSION_LIVE_AGENTS_PANEL_KEY)
         def still_disconnected() -> bool:
             return expected_socket_id is None or (
                 getattr(session, "socket_id", None) == expected_socket_id
@@ -2038,6 +2207,8 @@ async def on_chat_end() -> None:
             )
         if isinstance(notifier, AsyncTaskNotifier):
             notifier.cancel()
+        if isinstance(live_agents_panel, LiveAgentsPanel):
+            await live_agents_panel.aclose()
         if isinstance(local_notifier, LocalBackgroundTaskNotifier):
             if preserve_work:
                 await local_notifier.aclose_for_handoff()

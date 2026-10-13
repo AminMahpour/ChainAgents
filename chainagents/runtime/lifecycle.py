@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AbstractContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -26,6 +26,7 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 import chainagents.runtime.artifacts as runtime_artifacts
+import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.background_tasks as runtime_background_tasks
 import chainagents.runtime.commands as runtime_commands
 import chainagents.runtime.constants as runtime_constants
@@ -44,6 +45,9 @@ from chainagents.rag.runtime import (
 )
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.constants import SYSTEM_PROMPT, ReasoningLevel
+from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
+from chainagents.runtime.live_agents.manager import LiveAgentManager
+from chainagents.runtime.live_agents.registry import LiveAgentRecord
 from chainagents.runtime.mcp_sessions import (
     MCPSessionPool,
     _MCPSessionOwner as _MCPSessionOwner,
@@ -122,6 +126,8 @@ class AgentRuntime:
         self._turn_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._mcp_pool = MCPSessionPool(lambda: self.config.extensions)
         self._checkpointer: AsyncPostgresSaver | MemorySaver | None = None
+        # Stateless runtimes still keep live agent history between turns.
+        self._live_agent_memory_saver: MemorySaver | None = None
         self._store: AsyncPostgresStore | InMemoryStore | None = None
         self._rag_service: WorkspaceDocsRAG | None = None
         self.large_tool_result_artifacts = (
@@ -137,6 +143,23 @@ class AgentRuntime:
         if config.extensions.user_input.enabled and not broker_config.enabled:
             broker_config = replace(broker_config, enabled=True)
         self.message_broker = runtime_messaging.MessageBroker(broker_config)
+        self.live_agents: LiveAgentManager | None = None
+        if config.extensions.live_agents.enabled:
+            self.live_agents = LiveAgentManager(
+                config.extensions.live_agents,
+                self.message_broker,
+                # Resolved per call so the builder can be swapped (tests).
+                lambda spec, session_id: self._build_live_agent_graph(
+                    spec, session_id
+                ),
+                delete_thread=self._delete_live_agent_thread,
+                turn_context=(
+                    self._live_agent_turn_context
+                    if self.langsmith_tracing is not None
+                    else None
+                ),
+            )
+            self._exit_stack.push_async_callback(self.live_agents.close)
         self.user_input = ConversationInputController(
             config.extensions.user_input, self.message_broker, runner_serialized=True
         )
@@ -438,6 +461,9 @@ class AgentRuntime:
             await postgres_checkpointer.setup()
             self._checkpointer = postgres_checkpointer
 
+        if self.live_agents is not None:
+            self.live_agents.start()
+
         if self.config.rag is not None:
             self._rag_service = WorkspaceDocsRAG(
                 self.config.rag,
@@ -699,6 +725,7 @@ class AgentRuntime:
                 session_id=thread_id,
                 langsmith_tracing=self.langsmith_tracing,
                 messaging_broker=self.message_broker,
+                live_agent_manager=self.live_agents,
             )
             agent = runtime_middleware.create_deep_agent_with_configured_summarization(
                 self.config,
@@ -889,6 +916,73 @@ class AgentRuntime:
             )
         return runtime_models.build_model(self.config, reasoning_level, model_name=model_name)
 
+    async def _build_live_agent_graph(
+        self, spec: ResolvedLiveAgentSpec, session_id: str
+    ) -> Any:
+        """Build one live agent's graph from its resolved spec."""
+        profile = runtime_models.resolve_runtime_model_profile(self.config, spec.model)
+        # Like sync subagents: the profile's own default reasoning level.
+        reasoning_level = runtime_graph.reasoning_level_for_profile(
+            profile, self.config.default_reasoning, fallback_is_explicit=False
+        )
+        model = self._build_model(reasoning_level, model_profile=profile)
+        mcp_tools = (
+            await self._get_mcp_tools(
+                spec.mcp_servers, thread_id=session_id, mcp_session_id=session_id
+            )
+            if spec.mcp_servers
+            else []
+        )
+        stateful = self.config.agent_state == "stateful"
+        backend = runtime_backends.build_deepagent_backend(
+            project_root=self.project_root,
+            include_memories=stateful,
+            memory_namespace=self.config.extensions.agent_memory_namespace,
+            artifact_registry=self.large_tool_result_artifacts,
+        )
+        return runtime_graph.build_live_agent_graph(
+            self.config,
+            spec=spec,
+            model=model,
+            model_name=spec.model or self.config.model_name,
+            reasoning_level=reasoning_level,
+            mcp_tools=mcp_tools,
+            backend=backend,
+            project_root=self.project_root,
+            broker=self.message_broker,
+            session_id=session_id,
+            store=self.store if stateful else None,
+            checkpointer=self._live_agent_checkpointer(),
+        )
+
+    def _live_agent_checkpointer(self) -> AsyncPostgresSaver | MemorySaver:
+        """Return the checkpointer live agents use for their thread history.
+
+        Live agents keep their conversation between turns even when the main
+        agent is stateless: without a runtime checkpointer they share one
+        runtime-owned in-memory saver.
+        """
+        if self._checkpointer is not None:
+            return self._checkpointer
+        if self._live_agent_memory_saver is None:
+            self._live_agent_memory_saver = MemorySaver()
+        return self._live_agent_memory_saver
+
+    async def _delete_live_agent_thread(self, thread_id: str) -> None:
+        """Delete a torn-down live agent's checkpointer history, when stored."""
+        delete_thread = getattr(self._live_agent_checkpointer(), "adelete_thread", None)
+        if delete_thread is not None:
+            await delete_thread(thread_id)
+
+    def _live_agent_turn_context(
+        self, record: LiveAgentRecord
+    ) -> AbstractContextManager[Any]:
+        """Trace a live agent turn under the main run that spawned it."""
+        assert self.langsmith_tracing is not None
+        return self.langsmith_tracing.background_scope(
+            record.parent_trace, mode=self.config.langsmith.background_trace_mode
+        )
+
     async def _get_mcp_tools(
         self,
         server_names: tuple[str, ...],
@@ -997,8 +1091,14 @@ class AgentRuntime:
                 self.background_tasks.closing_session(thread_id),
             ):
                 await self.user_input.close_session(thread_id)
-                self.message_broker.close_session(thread_id)
                 errors: list[BaseException] = []
+                if self.live_agents is not None:
+                    # Stop live agents before their broker session disappears.
+                    try:
+                        await self.live_agents.teardown_session(thread_id)
+                    except BaseException as exc:
+                        errors.append(exc)
+                self.message_broker.close_session(thread_id)
                 try:
                     await self.large_tool_result_artifacts.close_session(thread_id)
                 except BaseException as exc:
@@ -1037,6 +1137,9 @@ class AgentRuntime:
         try:
             await self.user_input.close_all()
             await self.background_tasks.close()
+            if self.live_agents is not None:
+                # Before the exit stack closes the checkpointer they may delete from.
+                await self.live_agents.close()
         finally:
             try:
                 await self.large_tool_result_artifacts.close()
@@ -1064,5 +1167,6 @@ class AgentRuntime:
                                 )
                     finally:
                         self._checkpointer = None
+                        self._live_agent_memory_saver = None
                         self._store = None
                         self._mcp_pool.client = None

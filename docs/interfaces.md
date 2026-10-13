@@ -31,6 +31,9 @@ Notable UI features:
 - Chainlit Modes for per-message reasoning selection (`Low`, `Medium`,
   `High`).
 - Notifications when asynchronous background subagents finish.
+- A **Live agents** side panel and `/agents`, `/spawn`, `/msg`, `/kill`
+  commands when live agents are enabled (hide the panel with
+  `[chainlit].live_agents_panel_enabled = false`).
 - Optional authentication via `CHAINLIT_AUTH_SECRET` and
   `CHAINLIT_AUTH_USERS`.
 - Optional native Chainlit history, which needs all three: `DATABASE_URL`
@@ -74,6 +77,18 @@ A FastAPI application with a streaming endpoint. It uses the same
 [API_SECURITY.md](API_SECURITY.md) covers authentication and the
 request-size/resource limits — note these are not rate limits, so an
 external rate limiter is required in front of a public deployment.
+
+### Live agents
+
+When `[agent.live_agents]` is enabled, the HTTP API also exposes
+`GET /api/live-agents?thread_id=...`,
+`POST /api/live-agents/{agent}/messages?thread_id=...` (body `{"body": "..."}`),
+and `DELETE /api/live-agents/{agent}?thread_id=...`. Each listed agent
+carries `last_reply` (the latest reply to a user message, or `null`), so a
+client can poll the list after posting a message. The CLI and TUI accept
+the same `/agents`, `/spawn`, `/msg`, and `/kill` commands as Chainlit. Live
+agents are not part of the LangGraph Agent Server graphs. See the README's
+Live Agents section.
 
 ## LangGraph Agent Server
 

@@ -14,7 +14,12 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, TextIO
 
+from chainagents.commands.native import (
+    resolve_live_agent_command,
+    run_live_agent_command,
+)
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
+from chainagents.runtime.live_agents.events import format_live_agent_notice
 from chainagents.runtime import (
     AgentRuntime,
     ReasoningLevel,
@@ -340,6 +345,44 @@ async def _read_terminal_line(
     return line.rstrip("\r\n")
 
 
+async def _teardown_live_agents(
+    runtime: AgentRuntime, thread_id: str, stderr: TextIO
+) -> None:
+    """Best-effort, cancellation-shielded live agent teardown for a session."""
+    live_agents = getattr(runtime, "live_agents", None)
+    if live_agents is None:
+        return
+    try:
+        await asyncio.shield(live_agents.teardown_session(thread_id))
+    except Exception as exc:
+        print(f"Warning: live agent teardown failed: {exc}", file=stderr)
+
+
+async def _run_live_agent_command_now(
+    runtime: AgentRuntime,
+    prompt: str,
+    *,
+    thread_id: str,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> bool:
+    """Run a live agent command at once, even while a turn is active.
+
+    Live agent commands never run the main agent, so they neither steer nor
+    queue. Returns whether ``prompt`` was such a command.
+    """
+    parsed = resolve_live_agent_command(runtime, raw_text=prompt)
+    if parsed is None:
+        return False
+    try:
+        output = await run_live_agent_command(runtime, parsed, thread_id=thread_id)
+    except Exception as exc:
+        print(f"Command /{parsed.command_name} failed: {exc}", file=stderr)
+    else:
+        print(output, file=stdout)
+    return True
+
+
 async def interactive_repl(
     runtime: AgentRuntime,
     args: argparse.Namespace,
@@ -369,6 +412,22 @@ async def interactive_repl(
             print(format_background_task_notice(snapshot), file=stderr)
 
     notice_task = asyncio.create_task(print_completions())
+    # Live agent replies to the user (e.g. after /msg) and stops, one line each.
+    live_events = getattr(getattr(runtime, "live_agents", None), "events", None)
+    live_queue = live_events.subscribe(thread_id) if live_events is not None else None
+
+    async def print_live_agent_notices() -> None:
+        assert live_queue is not None
+        while True:
+            text = format_live_agent_notice(await live_queue.get())
+            if text is not None:
+                print(text, file=stdout, flush=True)
+
+    live_task = (
+        asyncio.create_task(print_live_agent_notices())
+        if live_queue is not None
+        else None
+    )
     print("ChainAgents CLI. Press Ctrl-D to exit.", file=stderr)
     try:
         while True:
@@ -385,6 +444,10 @@ async def interactive_repl(
                 print("", file=stderr)
                 return 130
             if not prompt.strip():
+                continue
+            if await _run_live_agent_command_now(
+                runtime, prompt, thread_id=thread_id, stdout=stdout, stderr=stderr
+            ):
                 continue
             if getattr(getattr(runtime.config.extensions, "user_input", None), "enabled", False):
                 stripped = prompt.strip()
@@ -458,6 +521,12 @@ async def interactive_repl(
         notice_task.cancel()
         with suppress(asyncio.CancelledError):
             await notice_task
+        if live_events is not None and live_queue is not None:
+            live_events.unsubscribe(thread_id, live_queue)
+        if live_task is not None:
+            live_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await live_task
 
 
 def format_background_task_notice(
@@ -595,45 +664,51 @@ async def run_cli(
         return 1
 
     if has_prompt:
-        prompt_result = await run_agent_prompt(
-            runtime,
-            args,
-            prompt=prompt or "",
-            stdout=stdout,
-            stderr=stderr,
-            emit_json=not args.json_output,
-        )
-        background_snapshots = []
-        if isinstance(prompt_result, dict) or int(prompt_result) == 0:
-            background_snapshots = await runtime.background_tasks.wait_session(thread_id)
-        if args.json_output:
-            if isinstance(prompt_result, dict):
-                json_actions.update(prompt_result)
-                json_actions["background_tasks"] = [
-                    snapshot.to_payload() for snapshot in background_snapshots
-                ]
-                print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
-                return 0
-            return int(prompt_result)
-        for snapshot in background_snapshots:
-            print(
-                format_background_task_notice(snapshot, include_result=True),
-                file=stderr,
+        try:
+            prompt_result = await run_agent_prompt(
+                runtime,
+                args,
+                prompt=prompt or "",
+                stdout=stdout,
+                stderr=stderr,
+                emit_json=not args.json_output,
             )
-        return int(prompt_result)
+            background_snapshots = []
+            if isinstance(prompt_result, dict) or int(prompt_result) == 0:
+                background_snapshots = await runtime.background_tasks.wait_session(thread_id)
+            if args.json_output:
+                if isinstance(prompt_result, dict):
+                    json_actions.update(prompt_result)
+                    json_actions["background_tasks"] = [
+                        snapshot.to_payload() for snapshot in background_snapshots
+                    ]
+                    print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
+                    return 0
+                return int(prompt_result)
+            for snapshot in background_snapshots:
+                print(
+                    format_background_task_notice(snapshot, include_result=True),
+                    file=stderr,
+                )
+            return int(prompt_result)
+        finally:
+            await _teardown_live_agents(runtime, thread_id, stderr)
 
     if args.status or args.list_commands or args.rebuild_rag or args.upload_rag:
         if args.json_output:
             print(json.dumps(json_actions, indent=2, sort_keys=True), file=stdout)
         return 0
 
-    return await interactive_repl(
-        runtime,
-        args,
-        stdout=stdout,
-        stderr=stderr,
-        stdin=stdin,
-    )
+    try:
+        return await interactive_repl(
+            runtime,
+            args,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=stdin,
+        )
+    finally:
+        await _teardown_live_agents(runtime, thread_id, stderr)
 
 
 async def async_main(argv: list[str] | None = None) -> int:

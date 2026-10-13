@@ -113,6 +113,21 @@ max_pending_per_recipient = 100
 max_messages_per_session = 1000
 max_deliveries_per_step = 10
 
+[agent.live_agents]
+# Long-lived, template-based subagents the main agent or user can spawn, message
+# and tear down. Opt-in; requires [agent.messaging] enabled = true. Templates
+# are declared with [[agent.live_agents.templates]]; see
+# deepagent.toml.example for a complete example.
+enabled = false
+# max_live_per_session = 4
+# max_live_total = 16
+# idle_timeout_seconds = 1800   # 0 disables the idle timeout
+# max_turns_per_agent = 50
+# turn_recursion_limit = 100
+# delete_history_on_teardown = true
+# notify_main_on_user_actions = true
+# stream_activity = false
+
 [agent.user_input]
 # Keep Chainlit, TUI, CLI and API input available while a main turn runs.
 # Busy input can steer the active turn or queue a later turn.

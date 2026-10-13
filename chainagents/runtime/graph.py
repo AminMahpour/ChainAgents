@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
@@ -22,6 +22,7 @@ import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.middleware as runtime_middleware
 import chainagents.runtime.models as runtime_models
 import chainagents.runtime.messaging as runtime_messaging
+import chainagents.runtime.live_agents.tools as runtime_live_agent_tools
 import chainagents.runtime.tracing as runtime_tracing
 from chainagents.rag.runtime import (
     WorkspaceDocsRAG,
@@ -41,6 +42,10 @@ from chainagents.runtime.constants import (
     ReasoningLevel,
 )
 from chainagents.runtime.types import ModelDefaults, SubagentConfig
+
+if TYPE_CHECKING:
+    from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
 
 logger = logging.getLogger("chainagents.runtime.core")
 
@@ -843,6 +848,66 @@ def build_main_tools(
     return tools
 
 
+# Default general-purpose delegate middleware slots that DeepAgents lets the
+# main agent's middleware override by name (its profile adds the token guards).
+_GENERAL_PURPOSE_INHERITED_MIDDLEWARE = frozenset({
+    "FilesystemMiddleware",
+    "SummarizationMiddleware",
+    "PatchToolCallsMiddleware",
+    "SkillsMiddleware",
+    "TokenLimitedToolCallMiddleware",
+    "RepeatedToolResultGuardMiddleware",
+})
+
+
+def _with_general_purpose_without_live_tools(
+    subagent_specs: list[Any],
+    *,
+    tools: list[Any],
+    middleware: list[Any],
+    skills: list[str] | None,
+) -> list[Any]:
+    """Declare the general-purpose delegate explicitly, minus live agent tools.
+
+    DeepAgents' implicit ``general-purpose`` delegate inherits every main agent
+    tool; only the main agent (or the user) may manage live agents. The
+    explicit spec keeps the default name, description and prompt, the main
+    model, skills and the main middleware the default delegate inherits.
+
+    Args:
+        subagent_specs: Configured subagent specs.
+        tools: Tools passed to the main agent.
+        middleware: Main agent middleware.
+        skills: Skill sources the main agent uses.
+
+    Returns:
+        Subagent specs including the general-purpose delegate.
+    """
+    from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+
+    if any(
+        spec.get("name") == GENERAL_PURPOSE_SUBAGENT["name"] for spec in subagent_specs
+    ):
+        return subagent_specs
+    spec: dict[str, Any] = {
+        **GENERAL_PURPOSE_SUBAGENT,
+        "tools": [
+            tool
+            for tool in tools
+            if getattr(tool, "name", None)
+            not in runtime_live_agent_tools.LIVE_AGENT_TOOL_NAMES
+        ],
+        "middleware": [
+            item
+            for item in middleware
+            if item.name in _GENERAL_PURPOSE_INHERITED_MIDDLEWARE
+        ],
+    }
+    if skills is not None:
+        spec["skills"] = skills
+    return [spec, *subagent_specs]
+
+
 def build_agent_kwargs(
     config: RuntimeConfig,
     *,
@@ -866,6 +931,7 @@ def build_agent_kwargs(
     session_id: str | None = None,
     langsmith_tracing: runtime_tracing.LangSmithTracing | None = None,
     messaging_broker: runtime_messaging.MessageBroker | None = None,
+    live_agent_manager: LiveAgentManager | None = None,
 ) -> dict[str, Any]:
     """Build the DeepAgents keyword arguments for a configured main agent.
 
@@ -894,6 +960,9 @@ def build_agent_kwargs(
         background_manager: Background task manager, or None when disabled.
         session_id: Session whose background generation scopes task tools.
         langsmith_tracing: LangSmith tracing for background task runs.
+        messaging_broker: Agent message broker, or None to use a shared one.
+        live_agent_manager: Live agent manager whose tools, prompt and roster
+            are added to the main agent, or None when live agents are off.
 
     Returns:
         Keyword arguments for ``create_deep_agent_with_configured_summarization``.
@@ -937,6 +1006,20 @@ def build_agent_kwargs(
         if config.extensions.messaging.enabled:
             runtime_messaging.validate_agent_message_tool_names(main_tools)
             main_tools.extend(runtime_messaging.create_agent_message_tools(messaging_broker, fixed_session_id=session_id))
+    if live_agent_manager is not None:
+        runtime_live_agent_tools.validate_live_agent_tool_names(main_tools)
+        main_tools.extend(
+            runtime_live_agent_tools.create_live_agent_tools(
+                live_agent_manager,
+                fixed_session_id=session_id,
+                langsmith_tracing=langsmith_tracing,
+            )
+        )
+        middleware.append(
+            runtime_live_agent_tools.LiveAgentRosterMiddleware(
+                live_agent_manager, session_id
+            )
+        )
     clarification_enabled = clarification_available(config)
     if clarification_enabled:
         middleware.append(runtime_clarification.ClarificationMiddleware())
@@ -986,6 +1069,13 @@ def build_agent_kwargs(
         runtime_clarification.validate_ask_user_tool_name(
             [*main_tools, *background_tools]
         )
+    if live_agent_manager is not None:
+        subagent_specs = _with_general_purpose_without_live_tools(
+            subagent_specs,
+            tools=[*main_tools, *background_tools],
+            middleware=middleware,
+            skills=list(config.extensions.skills) or None,
+        )
     agent_kwargs: dict[str, Any] = {
         "model": model,
         "tools": [*main_tools, *background_tools] or None,
@@ -1000,6 +1090,11 @@ def build_agent_kwargs(
         + (
             f"\n\n{runtime_clarification.CLARIFICATION_SYSTEM_PROMPT}"
             if clarification_enabled
+            else ""
+        )
+        + (
+            f"\n\n{runtime_live_agent_tools.LIVE_AGENTS_PROMPT}"
+            if live_agent_manager is not None
             else ""
         ),
         "middleware": middleware,
@@ -1085,4 +1180,76 @@ def create_configured_graph(
         run_config_transform=(
             langsmith_tracing.with_callback if langsmith_tracing is not None else None
         ),
+    )
+
+
+def build_live_agent_graph(
+    config: RuntimeConfig,
+    *,
+    spec: ResolvedLiveAgentSpec,
+    model: Any,
+    model_name: str | None,
+    reasoning_level: ReasoningLevel,
+    mcp_tools: list[Any],
+    backend: Any,
+    project_root: Path,
+    broker: runtime_messaging.MessageBroker,
+    session_id: str,
+    store: Any | None = None,
+    checkpointer: Any | None = None,
+) -> Any:
+    """Compile a restricted, long-lived live agent graph.
+
+    Live agents get only their resolved filesystem tools, their MCP tools and
+    the agent-messaging tools; never subagents, background-task tools or
+    live-agent management tools.
+    """
+    runtime_messaging.validate_agent_message_tool_names(mcp_tools)
+    provider = runtime_models.resolve_runtime_model_profile(
+        config,
+        spec.model,
+        inherited_model=ModelDefaults(
+            provider=config.model_provider, name=config.model_name
+        ),
+    ).provider
+    tools = [
+        *sanitize_tools_for_model(provider, list(mcp_tools)),
+        *runtime_messaging.create_agent_message_tools(
+            broker, fixed_session_id=session_id
+        ),
+    ]
+    # FilesystemMiddleware requires read_file; grant it but hide it from the
+    # model when the spec does not include it.
+    hide_read_file = "read_file" not in spec.tools
+    fs_tools = ["read_file", *spec.tools] if hide_read_file else list(spec.tools)
+    middleware = runtime_middleware.build_agent_middleware(
+        backend=backend,
+        config=config,
+        reasoning_level=reasoning_level,
+        model_name=model_name,
+        source=f"live:{spec.name}",
+        project_root=project_root,
+        filesystem_tools=fs_tools,
+    )
+    if hide_read_file:
+        from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
+
+        middleware.append(_ToolExclusionMiddleware(excluded=frozenset({"read_file"})))
+    # DeepAgents otherwise adds an implicit general-purpose `task` delegate.
+    middleware.append(runtime_middleware.DisableSubagentDelegationMiddleware())
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "tools": tools,
+        "system_prompt": spec.system_prompt,
+        "middleware": middleware,
+        "backend": backend,
+        "skills": list(spec.skills) or None,
+        "subagents": [],
+    }
+    if store is not None:
+        kwargs["store"] = store
+    if checkpointer is not None:
+        kwargs["checkpointer"] = checkpointer
+    return runtime_middleware.create_deep_agent_with_configured_summarization(
+        config, **kwargs
     )

@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
-from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.commands.native import RuntimeCommandResult, command_result_text
 from chainagents.events.stream import (
     AGENT_STREAM_MODES as AGENT_STREAM_MODES,
     AgentStreamEvent,
@@ -59,6 +59,11 @@ from chainagents.runtime import (
     ReasoningLevel,
     normalize_reasoning_level,
     resolve_runtime_model_profile,
+)
+from chainagents.runtime.live_agents.commands import (
+    fyi_user_message,
+    fyi_user_stopped,
+    notify_main_of_user_action,
 )
 from chainagents.runtime.reflection import (
     ReflectionProposal,
@@ -301,6 +306,12 @@ class RuntimeUploadCapabilities(BaseModel):
     max_file_size_bytes: int
     image_mime_types: list[str]
     rag_extensions: list[str]
+
+
+class LiveAgentMessageRequest(BaseModel):
+    """Body of a user message to one live agent."""
+
+    body: str
 
 
 class ReflectionProposalRequest(BaseModel):
@@ -601,6 +612,70 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return snapshot.to_payload()
+
+    def _live_agents_from_request(request: Request) -> Any:
+        manager = getattr(_runtime_from_request(request), "live_agents", None)
+        if manager is None:
+            raise HTTPException(status_code=404, detail="Live agents are disabled.")
+        return manager
+
+    @app.get("/api/live-agents")
+    async def list_live_agents(
+        request: Request,
+        thread_id: str,
+        include_stopped: bool = False,
+    ) -> dict[str, object]:
+        """List live agents for one conversation."""
+        session_id = _required_text(thread_id, "thread_id")
+        manager = _live_agents_from_request(request)
+        try:
+            agents = manager.list(session_id, include_stopped=include_stopped)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"agents": agents}
+
+    @app.post("/api/live-agents/{agent}/messages")
+    async def message_live_agent(
+        agent: str,
+        payload: LiveAgentMessageRequest,
+        request: Request,
+        thread_id: str,
+    ) -> dict[str, object]:
+        """Send a user message to one live agent."""
+        session_id = _required_text(thread_id, "thread_id")
+        ref = _required_text(agent, "agent")
+        body = _required_text(payload.body, "body")
+        manager = _live_agents_from_request(request)
+        try:
+            target = manager.get(session_id, ref)
+            message = manager.send_from_user(session_id, target.id, body)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        notify_main_of_user_action(
+            manager, session_id, fyi_user_message(target.name, body)
+        )
+        return {"message_id": message.id}
+
+    @app.delete("/api/live-agents/{agent}")
+    async def stop_live_agent(
+        agent: str,
+        request: Request,
+        thread_id: str,
+    ) -> dict[str, object]:
+        """Tear down one live agent."""
+        session_id = _required_text(thread_id, "thread_id")
+        ref = _required_text(agent, "agent")
+        manager = _live_agents_from_request(request)
+        try:
+            record = await manager.teardown(session_id, ref, reason="user")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        notify_main_of_user_action(manager, session_id, fyi_user_stopped(record.name))
+        return record.to_payload()
 
     @app.get("/api/generated-files/{relative_path:path}")
     async def download_generated_file(
@@ -1306,7 +1381,7 @@ class NdjsonRenderer(BaseTurnRenderer):
         event = AgentStreamEvent(
             kind="response_delta",
             source="native-command",
-            text=dumps_tool_result(result.tool_result),
+            text=command_result_text(result),
         )
         await self._emit(_event_payload(event, self.context))
 

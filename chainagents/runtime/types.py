@@ -302,6 +302,48 @@ class LangSmithConfig:
 
 
 @dataclass(frozen=True)
+class LiveAgentTemplate:
+    """A configured template for spawning long-lived live agents."""
+
+    name: str
+    description: str
+    system_prompt: str
+    model: str | None = None
+    tools: tuple[str, ...] = ()
+    skills: tuple[str, ...] = ()
+    mcp_servers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LiveAgentAllowlist:
+    """Allowlist limiting what live agents may be granted."""
+
+    applies_to: Literal["all", "overrides"] = "all"
+    models: tuple[str, ...] = ()
+    mcp_servers: tuple[str, ...] = ()
+    skills: tuple[str, ...] = ()
+    tools: tuple[str, ...] = ()
+    allow_custom_prompt: bool = True
+
+
+@dataclass(frozen=True)
+class LiveAgentsConfig:
+    """Opt-in settings for on-demand, long-lived live agents."""
+
+    enabled: bool = False
+    max_live_per_session: int = 4
+    max_live_total: int = 16
+    idle_timeout_seconds: int = 1800
+    max_turns_per_agent: int = 50
+    turn_recursion_limit: int = 100
+    delete_history_on_teardown: bool = True
+    notify_main_on_user_actions: bool = True
+    stream_activity: bool = False
+    allow: LiveAgentAllowlist = LiveAgentAllowlist()
+    templates: tuple[LiveAgentTemplate, ...] = ()
+
+
+@dataclass(frozen=True)
 class ExtensionsConfig:
     """Store optional runtime extension settings parsed from configuration.
 
@@ -357,6 +399,7 @@ class ExtensionsConfig:
     messaging: MessagingConfig = MessagingConfig()
     user_input: UserInputConfig = UserInputConfig()
     clarification: ClarificationConfig = ClarificationConfig()
+    live_agents: LiveAgentsConfig = LiveAgentsConfig()
     chainlit_commands: tuple[ChainlitCommandConfig, ...] = ()
     chainlit_starters: tuple[ChainlitStarterConfig, ...] = ()
     chainlit_response_actions: tuple[ChainlitResponseActionConfig, ...] = ()
@@ -367,6 +410,7 @@ class ExtensionsConfig:
     chainlit_startup_status_enabled: bool = True
     chainlit_chronological_ui_enabled: bool = True
     chainlit_generative_ui_enabled: bool = True
+    chainlit_live_agents_panel_enabled: bool = True
     summarization_middleware_enabled: bool = False
     summarization_trigger_tokens: int | None = None
     summarization_keep_tokens: int | None = None
@@ -390,6 +434,7 @@ class ExtensionsConfig:
             or self.messaging.enabled
             or self.user_input.enabled
             or self.clarification.enabled
+            or self.live_agents.enabled
             or self.chainlit_commands
             or self.chainlit_starters
             or self.chainlit_response_actions

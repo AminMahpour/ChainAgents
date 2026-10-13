@@ -113,6 +113,15 @@ either private inline definitions or reuse of a top-level subagent.
 Synchronous subagents may pin their own `model`; remote async subagents
 reject it, since their model is configured on the remote graph.
 
+## Live agents
+
+Opt-in, long-lived, template-based subagents the main agent or user can spawn,
+message, and tear down. Configure them under `[agent.live_agents]`,
+`[agent.live_agents.allow]`, and `[[agent.live_agents.templates]]`; they
+require `[agent.messaging] enabled = true`. See the
+README's *Live Agents* section for the full reference, and `deepagent.toml.example` for a
+commented example.
+
 ## RAG
 
 Workspace documentation RAG (index, uploads, and a search tool) is disabled

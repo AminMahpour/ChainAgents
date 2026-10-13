@@ -8,7 +8,7 @@ import inspect
 import json
 import logging
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -665,6 +665,7 @@ def build_agent_middleware(
     model_name: str | None = None,
     source: str = "main-agent",
     project_root: Path | None = None,
+    filesystem_tools: Sequence[str] | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build agent middleware.
 
@@ -675,6 +676,8 @@ def build_agent_middleware(
         model_name: The model name value.
         source: The source value.
         project_root: Project root used to resolve local paths.
+        filesystem_tools: Explicit filesystem tool names; replaces the
+            computed default list when given.
 
     Returns:
         The constructed agent middleware.
@@ -683,15 +686,19 @@ def build_agent_middleware(
     # sync-subagent stacks. Passing another SummarizationMiddleware here creates
     # duplicate middleware names that LangChain rejects during agent creation.
     middleware: list[AgentMiddleware[Any, Any, Any]] = [TodoListMiddleware()]
-    filesystem_tools: list[Any] = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
-    if config is not None:
-        if config.extensions.delete_tool_enabled:
-            filesystem_tools.append("delete")
-        if config.extensions.execute_tool_enabled:
-            filesystem_tools.append("execute")
+    resolved_fs_tools: list[Any]
+    if filesystem_tools is not None:
+        resolved_fs_tools = list(filesystem_tools)
+    else:
+        resolved_fs_tools = list(DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS)
+        if config is not None:
+            if config.extensions.delete_tool_enabled:
+                resolved_fs_tools.append("delete")
+            if config.extensions.execute_tool_enabled:
+                resolved_fs_tools.append("execute")
     filesystem_middleware = FilesystemMiddleware(
         backend=backend,
-        tools=filesystem_tools,
+        tools=resolved_fs_tools,
     )
     middleware.append(filesystem_middleware)
     middleware.append(TokenLimitedToolCallMiddleware())

@@ -992,3 +992,199 @@ async def test_tui_ctrl_c_cancels_active_run(
         assert app.status_message == "Cancelled."
         # No reflection, generated files or error are reported on cancel.
         assert app.tool_entries == []
+
+
+def _live_runtime():
+    from chainagents.runtime.live_agents.events import LiveAgentEventBus
+
+    runtime = _FakeRuntime(_FakeAgent([]))
+    bus = LiveAgentEventBus()
+    runtime.live_agents = SimpleNamespace(events=bus)
+    return runtime, bus
+
+
+@pytest.mark.anyio
+async def test_tui_shows_live_agent_reply_notice() -> None:
+    """A live agent message addressed to the user becomes a one-line notice."""
+    from chainagents.runtime.live_agents.events import LiveAgentEvent
+
+    runtime, bus = _live_runtime()
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        bus.publish(
+            LiveAgentEvent(
+                "message",
+                DEFAULT_TUI_THREAD_ID,
+                "a1",
+                "researcher-1",
+                {"from": "researcher-1", "to": "user", "body": "first line\nsecond"},
+            )
+        )
+        bus.publish(
+            LiveAgentEvent(
+                "message",
+                DEFAULT_TUI_THREAD_ID,
+                "a1",
+                "researcher-1",
+                {"from": "researcher-1", "to": "other", "body": "internal"},
+            )
+        )
+        await pilot.pause()
+        await pilot.pause()
+
+        assert any("researcher-1: first line" in e for e in app.tool_entries)
+        assert all("second" not in e and "internal" not in e for e in app.tool_entries)
+
+
+@pytest.mark.anyio
+async def test_tui_shows_live_agent_stopped_notice() -> None:
+    """A stopped live agent is announced with its reason."""
+    from chainagents.runtime.live_agents.events import LiveAgentEvent
+
+    runtime, bus = _live_runtime()
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        bus.publish(
+            LiveAgentEvent(
+                "stopped",
+                DEFAULT_TUI_THREAD_ID,
+                "a1",
+                "researcher-1",
+                {"reason": "idle_timeout"},
+            )
+        )
+        await pilot.pause()
+        await pilot.pause()
+
+        assert any("researcher-1 stopped (idle_timeout)" in e for e in app.tool_entries)
+
+
+@pytest.mark.anyio
+async def test_tui_unmount_unsubscribes_live_agent_queue() -> None:
+    """Exiting the TUI removes its live agent subscription."""
+    runtime, bus = _live_runtime()
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test():
+        assert bus._subscribers.get(DEFAULT_TUI_THREAD_ID)
+
+    assert not bus._subscribers.get(DEFAULT_TUI_THREAD_ID)
+
+
+@pytest.mark.anyio
+async def test_tui_runs_live_agent_command_while_turn_is_active() -> None:
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import (
+        LiveAgentsConfig,
+        MessagingConfig,
+        UserInputConfig,
+    )
+    from chainagents.turns.controller import ConversationInputController
+
+    async def factory(_spec, _session_id):
+        raise AssertionError("no agent is built")
+
+    agent = _BlockingAgent()
+    runtime = _FakeRuntime(agent)
+    runtime.config.extensions = SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(runtime.config.extensions.user_input, broker)
+    runtime.live_agents = LiveAgentManager(LiveAgentsConfig(enabled=True), broker, factory)
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt", PromptTextArea)
+        event = SimpleNamespace(stop=lambda: None, text_area=prompt)
+        prompt.load_text("first")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        await agent.started.wait()
+        jobs = len(runtime.user_input._session(app.thread_id).jobs)
+
+        prompt.load_text("/agents")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert prompt.text == ""
+        assert "No live agents." in app.tool_entries
+        prompt.load_text("/kill ghost")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert any("Unknown live agent `ghost`" in e for e in app.tool_entries)
+        assert len(runtime.user_input._session(app.thread_id).jobs) == jobs
+
+        prompt.load_text("second")
+        await app.on_prompt_submitted(event)
+        await pilot.pause()
+        assert prompt.text == "second"
+        await app.action_cancel_or_quit()
+        await runtime.user_input.wait_idle(app.thread_id)
+        await pilot.pause()
+    await runtime.live_agents.close()
+
+
+@pytest.mark.anyio
+async def test_tui_live_agent_command_does_not_block_the_prompt_handler() -> None:
+    from test_live_agents_worker import FakeGraph
+
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import (
+        LiveAgentsConfig,
+        LiveAgentTemplate,
+        MessagingConfig,
+        UserInputConfig,
+    )
+    from chainagents.turns.controller import ConversationInputController
+
+    release = asyncio.Event()
+    building = asyncio.Event()
+
+    async def factory(_spec, _session_id):
+        building.set()
+        await release.wait()
+        return FakeGraph()
+
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.config.extensions = SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    runtime.user_input = ConversationInputController(runtime.config.extensions.user_input, broker)
+    runtime.live_agents = LiveAgentManager(
+        LiveAgentsConfig(
+            enabled=True,
+            templates=(LiveAgentTemplate(name="coder", description="d", system_prompt="p"),),
+        ),
+        broker,
+        factory,
+    )
+    app = ChainAgentsTuiApp(runtime=runtime, args=_args())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt", PromptTextArea)
+        event = SimpleNamespace(stop=lambda: None, text_area=prompt)
+        prompt.load_text("/spawn coder c")
+        await asyncio.wait_for(app.on_prompt_submitted(event), 1)
+        assert prompt.text == ""
+        await asyncio.wait_for(building.wait(), 1)
+        assert not any("`c`" in e for e in app.tool_entries)
+        release.set()
+        for _ in range(20):
+            await pilot.pause()
+            if any("`c`" in e for e in app.tool_entries):
+                break
+        assert any("`c`" in e for e in app.tool_entries)
+        assert not app.live_agent_command_tasks
+
+        release.clear()
+        building.clear()
+        prompt.load_text("/spawn coder d")
+        await app.on_prompt_submitted(event)
+        await asyncio.wait_for(building.wait(), 1)
+        pending = set(app.live_agent_command_tasks)
+        assert pending
+    assert all(task.done() for task in pending)
+    await runtime.live_agents.close()

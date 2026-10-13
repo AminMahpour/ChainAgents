@@ -2543,3 +2543,188 @@ async def test_interactive_cli_strips_queue_prefix_while_paused(monkeypatch) -> 
     )
     assert code == 0
     assert seen == ["inspect the tests"]
+
+
+@pytest.mark.anyio
+async def test_cli_one_shot_tears_down_live_agents(monkeypatch) -> None:
+    """One-shot runs must stop the session's live agents, even on failure."""
+    args = chainagents_cli.parse_args(["--prompt", "hello", "--thread-id", "thread-1"])
+    torn_down: list[str] = []
+
+    class Tasks:
+        async def wait_session(self, session_id):
+            return []
+
+    class Live:
+        async def teardown_session(self, session_id):
+            torn_down.append(session_id)
+
+    runtime = SimpleNamespace(background_tasks=Tasks(), live_agents=Live())
+
+    async def run_agent_prompt(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", run_agent_prompt)
+    code = await chainagents_cli.run_cli(
+        args,
+        runtime=runtime,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+        stdin=io.StringIO(""),
+    )
+    assert code == 0
+    assert torn_down == ["thread-1"]
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", failing)
+    with pytest.raises(RuntimeError):
+        await chainagents_cli.run_cli(
+            args,
+            runtime=runtime,
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            stdin=io.StringIO(""),
+        )
+    assert torn_down == ["thread-1", "thread-1"]
+
+
+@pytest.mark.anyio
+async def test_cli_teardown_failure_does_not_mask_run_error(monkeypatch) -> None:
+    """A failing teardown warns on stderr and keeps the original error."""
+    args = chainagents_cli.parse_args(["--prompt", "hello", "--thread-id", "thread-1"])
+
+    class Live:
+        async def teardown_session(self, session_id):
+            raise ValueError("teardown-broke")
+
+    runtime = SimpleNamespace(background_tasks=SimpleNamespace(), live_agents=Live())
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("run-broke")
+
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", failing)
+    stderr = io.StringIO()
+    with pytest.raises(RuntimeError, match="run-broke"):
+        await chainagents_cli.run_cli(
+            args,
+            runtime=runtime,
+            stdout=io.StringIO(),
+            stderr=stderr,
+            stdin=io.StringIO(""),
+        )
+    assert "teardown-broke" in stderr.getvalue()
+
+
+@pytest.mark.anyio
+async def test_interactive_cli_runs_live_agent_command_while_turn_is_active(
+    monkeypatch,
+) -> None:
+    from chainagents.runtime.live_agents.manager import LiveAgentManager
+    from chainagents.runtime.messaging import MessageBroker
+    from chainagents.runtime.types import (
+        LiveAgentsConfig,
+        MessagingConfig,
+        UserInputConfig,
+    )
+    from chainagents.turns.controller import ConversationInputController
+
+    async def factory(_spec, _session_id):
+        raise AssertionError("no agent is built")
+
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    config = SimpleNamespace(
+        extensions=SimpleNamespace(user_input=UserInputConfig(enabled=True))
+    )
+    runtime = SimpleNamespace(
+        background_tasks=BackgroundTaskManager(BackgroundSubagentConfig(enabled=True)),
+        config=config,
+        user_input=ConversationInputController(config.extensions.user_input, broker),
+        live_agents=LiveAgentManager(LiveAgentsConfig(enabled=True), broker, factory),
+    )
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    asked: list[str] = []
+    prompts = iter(("first", "/agents", "/kill ghost"))
+    seen: list[str] = []
+
+    async def fake_read(*, prompt, **_kwargs):
+        asked.append(prompt)
+        if prompt.startswith("Agent working"):
+            return "q"
+        try:
+            item = next(prompts)
+        except StopIteration:
+            gate.set()
+            await runtime.user_input.wait_idle("thread-1")
+            raise EOFError from None
+        if item != "first":
+            await started.wait()
+        return item
+
+    async def fake_run(_runtime, _args, *, prompt, **_kwargs):
+        seen.append(prompt)
+        started.set()
+        await gate.wait()
+        return 0
+
+    monkeypatch.setattr(chainagents_cli, "_read_terminal_line", fake_read)
+    monkeypatch.setattr(chainagents_cli, "run_agent_prompt", fake_run)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    code = await chainagents_cli.interactive_repl(
+        runtime,
+        chainagents_cli.parse_args(["--thread-id", "thread-1"]),
+        stdout=stdout, stderr=stderr, stdin=io.StringIO(),
+    )
+    assert code == 0
+    assert seen == ["first"]
+    assert not any(p.startswith("Agent working") for p in asked)
+    assert "No live agents." in stdout.getvalue()
+    assert "Command /kill failed: Unknown live agent `ghost`" in stderr.getvalue()
+    await runtime.live_agents.close()
+
+
+@pytest.mark.anyio
+async def test_interactive_cli_prints_live_agent_replies_and_stops(monkeypatch) -> None:
+    from chainagents.runtime.live_agents.events import LiveAgentEvent, LiveAgentEventBus
+
+    bus = LiveAgentEventBus()
+    runtime = SimpleNamespace(
+        background_tasks=BackgroundTaskManager(BackgroundSubagentConfig(enabled=True)),
+        config=SimpleNamespace(extensions=SimpleNamespace()),
+        live_agents=SimpleNamespace(events=bus),
+    )
+
+    def event(kind, payload, session_id="thread-1"):
+        return LiveAgentEvent(
+            kind=kind,
+            session_id=session_id,
+            agent_id="a1",
+            agent_name="scout",
+            payload=payload,
+        )
+
+    async def fake_read(**_kwargs):
+        assert set(bus._subscribers) == {"thread-1"}
+        bus.publish(event("message", {"from": "scout", "to": "user", "body": "x" * 300 + "\nmore"}))
+        bus.publish(event("message", {"from": "scout", "to": "main", "body": "hidden"}))
+        bus.publish(event("message", {"from": "scout", "to": "user", "body": "other"}, "thread-2"))
+        bus.publish(event("stopped", {"reason": "idle_timeout"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        raise EOFError
+
+    monkeypatch.setattr(chainagents_cli, "_read_terminal_line", fake_read)
+    stdout = io.StringIO()
+    code = await chainagents_cli.interactive_repl(
+        runtime,
+        chainagents_cli.parse_args(["--thread-id", "thread-1"]),
+        stdout=stdout, stderr=io.StringIO(), stdin=io.StringIO(),
+    )
+    assert code == 0
+    assert stdout.getvalue().splitlines() == [
+        "scout: " + "x" * 197 + "...",
+        "scout stopped (idle_timeout)",
+    ]
+    assert bus._subscribers == {}

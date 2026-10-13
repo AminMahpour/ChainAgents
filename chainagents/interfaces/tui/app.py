@@ -17,7 +17,13 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Footer, Header, Markdown, RichLog, Static, TextArea
 
-from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.commands.native import (
+    ParsedNativeCommand,
+    RuntimeCommandResult,
+    command_result_text,
+    resolve_live_agent_command,
+    run_live_agent_command,
+)
 from chainagents.events.stream import AgentStreamEvent
 from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.runtime.reflection import (
@@ -31,6 +37,10 @@ from chainagents.runtime import (
     normalize_reasoning_level,
 )
 from chainagents.runtime.background_tasks import BackgroundTaskSnapshot
+from chainagents.runtime.live_agents.events import (
+    LiveAgentEvent,
+    format_live_agent_notice,
+)
 from chainagents.turns import (
     BaseTurnRenderer,
     TurnCommandError,
@@ -103,6 +113,14 @@ class BackgroundTaskCompleted(Message):
     def __init__(self, snapshot: BackgroundTaskSnapshot) -> None:
         super().__init__()
         self.snapshot = snapshot
+
+
+class LiveAgentNotice(Message):
+    """Deliver a one-line live agent notice through Textual's message queue."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
 
 
 class ChainAgentsTuiApp(App[int]):
@@ -212,6 +230,9 @@ class ChainAgentsTuiApp(App[int]):
         self.visible_command_names: list[str] = []
         self.background_task_queue: asyncio.Queue[BackgroundTaskSnapshot] | None = None
         self.background_notice_task: asyncio.Task[None] | None = None
+        self.live_agent_queue: asyncio.Queue[LiveAgentEvent] | None = None
+        self.live_agent_task: asyncio.Task[None] | None = None
+        self.live_agent_command_tasks: set[asyncio.Task[None]] = set()
 
     def compose(self) -> ComposeResult:
         """Compose the TUI layout."""
@@ -245,6 +266,29 @@ class ChainAgentsTuiApp(App[int]):
             self.background_notice_task = asyncio.create_task(
                 self._watch_background_tasks()
             )
+        live_agents = getattr(self.runtime, "live_agents", None)
+        if live_agents is not None:
+            self.live_agent_queue = live_agents.events.subscribe(self.thread_id)
+            self.live_agent_task = asyncio.create_task(self._watch_live_agents())
+
+    async def _watch_live_agents(self) -> None:
+        """Turn live agent events into one-line notices."""
+        if self.live_agent_queue is None:
+            return
+        while True:
+            event = await self.live_agent_queue.get()
+            text = self._format_live_agent_event(event)
+            if text is not None:
+                self.post_message(LiveAgentNotice(text))
+
+    @staticmethod
+    def _format_live_agent_event(event: LiveAgentEvent) -> str | None:
+        return format_live_agent_notice(event)
+
+    @on(LiveAgentNotice)
+    def show_live_agent_notice(self, event: LiveAgentNotice) -> None:
+        """Render one live agent notice in the tools pane."""
+        self._append_tool_entry(event.text)
 
     async def _watch_background_tasks(self) -> None:
         """Append terminal local task results to the tools pane."""
@@ -270,6 +314,17 @@ class ChainAgentsTuiApp(App[int]):
         if self.background_notice_task is not None:
             self.background_notice_task.cancel()
             self.background_notice_task = None
+        if self.live_agent_queue is not None:
+            self.runtime.live_agents.events.unsubscribe(
+                self.thread_id, self.live_agent_queue
+            )
+            self.live_agent_queue = None
+        if self.live_agent_task is not None:
+            self.live_agent_task.cancel()
+            self.live_agent_task = None
+        for task in tuple(self.live_agent_command_tasks):
+            task.cancel()
+        self.live_agent_command_tasks.clear()
 
     @staticmethod
     def _format_background_task(snapshot: BackgroundTaskSnapshot) -> str:
@@ -293,6 +348,10 @@ class ChainAgentsTuiApp(App[int]):
         """Send a submitted prompt to the agent."""
         event.stop()
         prompt = event.text_area.text.strip()
+        if self._start_live_agent_command(prompt):
+            event.text_area.load_text("")
+            self.hide_command_help()
+            return
         if getattr(getattr(getattr(self.runtime.config, "extensions", None), "user_input", None), "enabled", False):
             if not prompt:
                 return
@@ -341,6 +400,38 @@ class ChainAgentsTuiApp(App[int]):
         event.text_area.load_text("")
         self.hide_command_help()
         self.active_task = asyncio.create_task(self._run_prompt(prompt))
+
+    def _start_live_agent_command(self, prompt: str) -> bool:
+        """Start a live agent command at once, even while a turn is active.
+
+        Live agent commands never run the main agent, so they neither steer
+        nor queue. They run as tracked background tasks so a slow spawn or
+        teardown never blocks the message pump (or stopping the main turn).
+        Returns whether ``prompt`` was such a command.
+        """
+        parsed = resolve_live_agent_command(self.runtime, raw_text=prompt)
+        if parsed is None:
+            return False
+        # The tools pane, not the conversation: a "You" entry mounted while an
+        # answer streams would split that answer into two entries.
+        self._append_tool_entry(prompt)
+        self._set_status(f"Running /{parsed.command_name}...")
+        task = asyncio.create_task(self._run_live_agent_command(parsed))
+        self.live_agent_command_tasks.add(task)
+        task.add_done_callback(self.live_agent_command_tasks.discard)
+        return True
+
+    async def _run_live_agent_command(self, parsed: ParsedNativeCommand) -> None:
+        try:
+            output = await run_live_agent_command(
+                self.runtime, parsed, thread_id=self.thread_id
+            )
+        except Exception as exc:
+            self._append_tool_entry(f"command /{parsed.command_name} failed: {exc}")
+            self._set_status(f"Command /{parsed.command_name} failed.")
+            return
+        self._append_tool_entry(output)
+        self._set_status(f"Ran /{parsed.command_name}.")
 
     @on(TextArea.Changed, "#prompt")
     def on_prompt_changed(self, event: TextArea.Changed) -> None:
@@ -641,7 +732,7 @@ class TuiRenderer(BaseTurnRenderer):
 
     async def on_command_result(self, result: RuntimeCommandResult) -> None:
         """Show MCP-tool command output in the tools pane."""
-        self.app._append_tool_entry(dumps_tool_result(result.tool_result))
+        self.app._append_tool_entry(command_result_text(result))
 
     async def on_command_error(self, exc: TurnCommandError, status: int) -> None:
         """Show a failed or unknown command in the tools pane and status line."""

@@ -80,3 +80,25 @@ def test_claim_is_recoverable_until_model_step_acknowledges_it():
     broker.claim("s", "worker:one")
     broker.acknowledge("s", "worker:one")
     assert broker.get("s", message.id).status == "delivered"
+
+
+def test_send_from_user_to_named_recipient():
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    broker.open("s", "main", name="main", parent=None)
+    broker.open("s", "live:helper:abc", name="helper", parent="main")
+
+    sent = broker.send_from_user("s", "helper", "hello helper")
+
+    assert sent.sender == "user"
+    assert sent.recipient == "live:helper:abc"
+    assert [m.body for m in broker.pending("s", "live:helper:abc")] == ["hello helper"]
+    # The temporary user participant is removed again.
+    assert "user" not in {r.address for r in broker.recipients("s", "main")}
+    with pytest.raises(ValueError, match="unavailable"):
+        broker.send_from_user("s", "missing", "hi")
+    assert "user" not in {r.address for r in broker.recipients("s", "main")}
+
+    # An already-open user participant is left in place.
+    broker.open("s", "user", name="user", parent=None)
+    broker.send_from_user("s", "helper", "again")
+    assert "user" in {r.address for r in broker.recipients("s", "main")}

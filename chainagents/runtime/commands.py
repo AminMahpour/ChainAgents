@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.constants as runtime_constants
 from chainagents.runtime.constants import GENERATIVE_UI_COMPONENT_NAME
+from chainagents.runtime.live_agents.config import LIVE_AGENT_COMMAND_NAMES
 from chainagents.runtime.types import (
     ChainlitCommandConfig,
     ExtensionsConfig,
@@ -322,7 +323,24 @@ def build_chainlit_command_catalog(
         command.name: command for command in merged_commands
     }
 
+    reserved_names = (
+        LIVE_AGENT_COMMAND_NAMES if extensions.live_agents.enabled else frozenset()
+    )
+
+    def _hidden_by_live_agents(metadata: SkillCommandMetadata) -> bool:
+        if metadata.name not in reserved_names:
+            return False
+        note = (
+            f"`/{metadata.name}` from {metadata.label} is hidden by the built-in "
+            f"live agent command `/{metadata.name}`."
+        )
+        notes.append(note)
+        logger.warning(note)
+        return True
+
     for metadata in main_skill_commands:
+        if _hidden_by_live_agents(metadata):
+            continue
         explicit = explicit_names.get(metadata.name)
         if explicit is not None:
             note = (
@@ -336,6 +354,8 @@ def build_chainlit_command_catalog(
         winner_by_name[metadata.name] = metadata
 
     for metadata in subagent_skill_commands:
+        if _hidden_by_live_agents(metadata):
+            continue
         winner = winner_by_name.get(metadata.name)
         if winner is None:
             merged_commands.append(metadata.to_chainlit_command())

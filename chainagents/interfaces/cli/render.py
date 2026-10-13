@@ -12,7 +12,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from chainagents.commands.native import RuntimeCommandResult, dumps_tool_result
+from chainagents.commands.native import RuntimeCommandResult, command_result_text
 from chainagents.events.stream import AgentStreamEvent, stringify_content
 from chainagents.rag.runtime import RagStatus, RagUploadResult
 from chainagents.runtime import (
@@ -181,7 +181,7 @@ class CliEventRenderer(BaseTurnRenderer):
 
     async def on_command_result(self, result: RuntimeCommandResult) -> None:
         """Print MCP-tool command output as raw JSON on stdout."""
-        print(dumps_tool_result(result.tool_result), file=self.stdout)
+        print(command_result_text(result), file=self.stdout)
 
     async def on_command_error(self, exc: TurnCommandError, status: int) -> None:
         """Print a failed or unknown native command to stderr."""

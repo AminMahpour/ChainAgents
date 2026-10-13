@@ -956,6 +956,7 @@ Main `[agent]` additions:
 - `execute_tool_enabled`: optional boolean controlling DeepAgents 0.7's `execute` tool for the main agent and local synchronous subagents. Defaults to `false`.
 - `[agent.background_subagents]`: global opt-in and limits for process-local background execution. `enabled` defaults to `false`; eligible synchronous subagents must also set `background = true`. `stream_activity = true` exposes live reasoning and tool activity as nested Chainlit steps while leaving other interfaces completion-only. `batch_result_format` selects `run_subagent_batch` results from `json`, `markdown`, or `markdown_files` and defaults to `markdown`. The three positive integer limits bound running work per conversation, running work across the process, and retained task records per conversation. When the retained limit is reached, the oldest finished tasks are forgotten to make room; unfinished tasks, parents of retained tasks, and tasks whose cleanup has not completed are kept.
 - `[agent.messaging]`: opt-in process-local mailboxes. The main agent and each `messaging = true` synchronous subagent receive `list_agent_recipients`, `send_agent_message`, `get_agent_message`, and `wait_for_agent_messages`. A message is inserted before the recipient's next model step; an idle agent is not woken. Addresses identify individual invocations, so use `list_agent_recipients` when same-name agents run concurrently. Finished subagents cannot receive messages. Mailboxes are cleared when the conversation closes or the process exits.
+- `[agent.live_agents]`: opt-in long-lived, template-based subagents the main agent or user can spawn, message, and tear down. Requires `[agent.messaging] enabled = true`. See [Live Agents](#live-agents) for the full reference.
 - `[agent.user_input]`: opt-in nonblocking user prompts. A conversation still runs one main turn at a time. In Chainlit, busy input offers **Steer active turn** and **Queue next turn**; Stop pauses queued turns until Resume. In the TUI, use `/steer text`, `/queue text`, `/stop`, and `/resume` (or Ctrl+R). The interactive CLI prompts for steer or queue during a run and also accepts those commands. HTTP clients can submit through `POST /api/agent/input` with `mode` set to `turn`, `steer`, or `queue`, then query `/api/agent/turns/{thread_id}/{turn_id}` or its `/events` NDJSON stream. Stop and resume use the corresponding `/api/agent/turns/{thread_id}/stop` and `/resume` endpoints. Input IDs make repeated API submissions idempotent while their turns are retained. Steering is text-only; queued turns retain attachments and run settings. If an active turn ends before it reads a steering note, the note runs as a visible follow-up ahead of queued turns. `max_queued_turns` also reserves room for pending steering follow-ups; `max_completed_turns` bounds retained results and idempotency records.
 - `[agent.clarification]`: opt-in clarifying questions. When `enabled = true` on a stateful runtime, the main agent gets an `ask_user` tool and is told to call it once, before delegating, when a request is ambiguous in ways that would change what subagents do. The tool pauses the run with a LangGraph interrupt; your next message on the same thread is the answer and resumes the paused run instead of starting a new turn. A bare option number such as `2` picks that suggested option. While a question is pending, only plain text answers it: slash commands, configured response actions, and replies with attachments are refused with a reminder, and turns queued earlier through `[agent.user_input]` wait until the answer has run. When the model emits other tool calls next to `ask_user`, they are dropped so no subagent starts before the answer. Chainlit shows the question with one button per option; the CLI and TUI print numbered options; the HTTP API reports `status: "awaiting_input"` with the pending `clarifications` on `/api/agent/invoke` and on the stream's `done` event, and a `clarification_requested` stream event carries the question. Subagents never get the tool, and it is disabled when `agent.state = "stateless"` because resuming needs a checkpointer. With the in-memory checkpointer a pending question is lost on restart.
 - `model`: optional profile name or raw model name for the main/supervisor agent. CLI and environment model overrides take precedence.
@@ -1158,6 +1159,177 @@ session affinity when multiple workers are used. The custom Agent Server app
 exposes `DELETE /background-tasks/sessions/{thread_id}` for explicit cleanup and
 closes all remaining managers and tracked offloads during server shutdown.
 
+### Live Agents
+
+Live agents are long-lived helpers that persist across turns of a conversation.
+Unlike a synchronous or background subagent, which handles one delegated task
+and finishes, a live agent is spawned from a template, keeps its own
+conversation history, and answers messages asynchronously until it is torn
+down. Both the main agent and the user can spawn, message, and stop them.
+
+Live agents are opt-in and exist only in the ChainAgents runtime (Chainlit, TUI,
+CLI, and HTTP API). They are not part of the exported LangGraph graph used by
+the Agent Server. They run in the current process, so a restart ends them.
+
+A live agent keeps its own conversation history between turns even when
+`[agent].state = "stateless"`: without a runtime checkpointer, live agents
+share a process-local in-memory checkpointer, so that history is lost on
+restart.
+
+#### Configuration
+
+Live agents communicate through the message broker, so
+`[agent.messaging] enabled = true` is required. Enabling live agents without it
+is a config error.
+
+```toml
+[agent.messaging]
+enabled = true
+
+[agent.live_agents]
+enabled = true
+max_live_per_session = 4
+max_live_total = 16
+idle_timeout_seconds = 1800
+max_turns_per_agent = 50
+turn_recursion_limit = 100
+delete_history_on_teardown = true
+notify_main_on_user_actions = true
+stream_activity = false
+
+[agent.live_agents.allow]
+applies_to = "all"
+allow_custom_prompt = true
+models = ["fast-local"]
+mcp_servers = []
+skills = []
+tools = ["ls", "read_file", "glob", "grep"]
+
+[[agent.live_agents.templates]]
+name = "researcher"
+description = "Reads the repository and answers questions about it."
+system_prompt_file = "prompts/live/researcher.md"
+model = "fast-local"
+tools = ["ls", "read_file", "glob", "grep"]
+```
+
+`[agent.live_agents]` fields (all optional):
+
+- `enabled`: defaults to `false`.
+- `max_live_per_session` (default `4`) and `max_live_total` (default `16`): positive integers bounding live agents per conversation and across the process. Stopped and failed agents free their slot.
+- `idle_timeout_seconds`: default `1800`. An agent that has been idle this long is torn down. Idle time counts from when the agent's worker starts (after its graph and MCP tools are built) or its last turn. `0` disables the idle timeout.
+- `max_turns_per_agent`: default `50`. After this many turns an agent is torn down.
+- `turn_recursion_limit`: default `100`. LangGraph step limit for a single live agent turn.
+- `delete_history_on_teardown`: default `true`. Deletes the agent's own conversation history when it stops.
+- `notify_main_on_user_actions`: default `true`. When the user spawns, messages, or stops an agent with a slash command (or messages or stops one from the Chainlit panel or the HTTP API), the main agent receives a short `FYI:` notice. Notices come from the internal `live-agents` sender (`Message from live-agents ...`), not from `user`: they reach the main agent at its next model step, never count as steering, and never start a follow-up turn.
+- `stream_activity`: default `false`. Shows one Chainlit step per live agent turn, opened when the turn starts and closed with whether it finished or failed (a step still open when the panel closes is closed with a note); other interfaces stay completion-only.
+
+#### Templates
+
+Each `[[agent.live_agents.templates]]` entry needs a unique `name`, a
+`description`, and either an inline `system_prompt` or a `system_prompt_file`
+(not both). Optional fields are `model` (a model profile name), `tools`,
+`skills`, and `mcp_servers`.
+
+- `tools` may only name filesystem tools: `ls`, `read_file`, `write_file`, `edit_file`, `glob`, and `grep`, plus `delete` and `execute` when `delete_tool_enabled` / `execute_tool_enabled` are set under `[agent]`. A live agent never gets `read_file` or any other tool unless a template or spawn grants it, so a spawn without a template starts with no tools and gets only what `add_tools` grants from the allowlist.
+- `skills` paths are normalized like those of `[[subagents]]` but are not checked for existence.
+- `mcp_servers` must name servers defined under `[mcp]`.
+- Model profile existence and the model allowlist are checked after model profiles are parsed.
+- Prompt file paths resolve relative to the config file's directory.
+- Template names must be unique; agent names (see below) are lowercase letters, digits, `_`, or `-`, start with a letter or digit, and are at most 40 characters.
+
+#### Allowlist
+
+`[agent.live_agents.allow]` limits what live agents may use:
+
+- `models`, `mcp_servers`, `skills`, `tools`: the values a template or a spawn may reference. All default to empty.
+- `allow_custom_prompt`: default `true`. When `false`, a spawn must name a template. A spawn without a template requires non-empty instructions and starts with no tools, skills, or MCP servers.
+- `applies_to`: `"all"` (default) validates templates at config load against the allowlists as well as spawn-time additions. `"overrides"` trusts templates and applies the allowlists only to what a spawn adds.
+
+In both modes, a spawn can add a model, tools, skills, or MCP servers only if they are in the matching allowlist. Removing tools from a template is always permitted. Instructions given with a template are appended to the template prompt under a `## Task from supervisor` heading.
+
+#### Main agent tools
+
+When enabled, the main agent receives `list_live_agent_templates`,
+`spawn_live_agent`, `list_live_agents`, and `teardown_live_agent`, alongside the
+messaging tools (`send_agent_message`, `get_agent_message`,
+`wait_for_agent_messages`). These tool names are reserved; a configured tool
+with one of them is rejected at startup. Only the main agent gets the four live
+agent tools: the general-purpose `task` delegate and other subagents do not. The main agent's system prompt gains a
+short Live agents section and a one-line roster of live agent statuses.
+
+`spawn_live_agent` accepts `template`, `name`, `instructions`, `model`,
+`add_tools`, `remove_tools`, `add_skills`, `add_mcp_servers`, and
+`initial_message`. If `name` is omitted it defaults to `<template>-<n>`. A
+live agent is addressed as `live:<name>:<id>` (the name alone also works). Replies reach the main agent as
+messages on a later step, formatted `Message from live:<name>:<id> ...`, or can
+be awaited with `wait_for_agent_messages`. A message to an agent that is torn
+down before reading it is marked `undeliverable`; check it with
+`get_agent_message`. There is no proactive notice.
+
+#### Slash commands
+
+Available in Chainlit, the TUI, and the CLI when live agents are enabled:
+
+- `/agents`: table of live agents with name, template, status, turns, and idle time.
+- `/spawn <template> [name] [-- instructions]`: spawn from a template, optionally naming it and adding instructions after ` -- `.
+- `/msg <agent> <text>`: send a message; the reply appears when ready. In the TUI and the interactive CLI, replies to the user and agent stops are printed as one-line notices (`<name>: <first line>`, `<name> stopped (<reason>)`).
+- `/kill <agent|all>`: stop one agent or every live agent in the conversation.
+
+While live agents are enabled these four names are reserved, and a
+`[[chainlit.commands]]` entry using one of them is rejected at startup. With
+live agents disabled the names are free for custom commands.
+
+These commands never run the main agent, so they execute immediately, even
+while a main turn is running: with `[agent.user_input]` enabled they are never
+offered as steer/queue input, they also run while the queue is paused after
+`/stop`, and without `[agent.user_input]` they do not wait for the busy turn.
+The names `live-agents`, `main`, and `user` are reserved and cannot be used as
+agent names.
+
+Agents can be addressed by name or id. Statuses are `idle`, `running`,
+`stopping`, `stopped`, and `failed`.
+
+#### Chainlit panel
+
+In Chainlit a **Live agents** side panel shows a card per agent with its status,
+recent thread, a message box, and a stop button. If a message or stop is
+rejected (for example the agent stopped meanwhile or its pending message limit
+is reached), the card shows the error inline and keeps the typed message. Set
+`[chainlit].live_agents_panel_enabled = false` to hide it; it defaults to `true`
+and only appears when live agents are enabled.
+
+#### HTTP API
+
+```bash
+curl "http://127.0.0.1:8000/api/live-agents?thread_id=$THREAD_ID&include_stopped=true"
+curl -X POST "http://127.0.0.1:8000/api/live-agents/researcher/messages?thread_id=$THREAD_ID" \
+  -H "Content-Type: application/json" -d '{"body": "Summarize the auth flow."}'
+curl -X DELETE "http://127.0.0.1:8000/api/live-agents/researcher?thread_id=$THREAD_ID"
+```
+
+The list returns `{"agents": [...]}`; the message route returns a `message_id`;
+the delete route returns the agent's final status. Unknown agents return 404.
+Replies to the user are not pushed over HTTP: each agent row (also in the main
+agent's `list_live_agents` result) carries `last_reply`, either `null` or
+`{"body": "...", "at": <monotonic seconds>}` for the latest reply to a user
+message, so a client can poll the list after posting.
+
+#### Limits and teardown
+
+An agent stops (status `stopped`, or `failed` for repeated errors). The stop
+reason is recorded on the agent and includes: `requested` (the main agent called `teardown_live_agent`; it may pass its own `reason` instead),
+`user` (`/kill` or the panel/API), `idle_timeout`, `max_turns`, `failed`
+(three consecutive failed turns), `worker_exited` (the worker ended
+unexpectedly), `spawn_failed` (the initial message could not be delivered), or `session_end` (the conversation closed). Both `stopped` and
+`failed` are terminal: they free the name and the slot. Each conversation keeps
+at most the 50 most recently stopped agents for listings
+(`include_stopped=true`, the panel); older ones are forgotten, after which
+looking them up by id fails like an unknown agent. When
+`delete_history_on_teardown` is true, the agent's own history is deleted too; a
+delete that takes longer than 10 seconds is abandoned with a warning so teardown
+and conversation close are not blocked.
+
 ## Chainlit Native Commands
 
 You can configure slash-style commands that run from the Chainlit composer before the model call.
@@ -1215,9 +1387,11 @@ Notes:
 - `[chainlit].startup_status_enabled = false` disables the initial startup status message that summarizes runtime configuration.
 - `[chainlit].generative_ui_enabled = false` hides generated Chainlit CustomElement panels and removes the `render_chainlit_ui` tool from the main agent.
 - `[chainlit].chronological_ui_enabled = false` disables chronological UI ordering so response tokens stream immediately and reasoning steps are not force-rolled at tool boundaries.
+- `[chainlit].live_agents_panel_enabled = false` hides the Live agents side panel while keeping the slash commands and tools. Defaults to `true`.
 - Command `name` is invoked as `/<name>` and must be unique.
 - `template` is optional and may include `{input}`.
 - For `mcp_tool`, user command arguments must be valid JSON, e.g. `/repo-readme {"path":"README.md"}`.
+- When live agents are enabled, `/agents`, `/spawn`, `/msg`, and `/kill` are added automatically; see [Live Agents](#live-agents).
 - Each discovered skill also becomes `/<skill-name>` automatically. For example, a skill with `name: reviewer` is available as `/reviewer`.
 - Skill-backed commands always force the main agent to read the selected `SKILL.md` first and use it for that turn.
 - If a configured `[chainlit].commands` entry and a skill share the same slash name, the configured command wins.
