@@ -51,9 +51,27 @@ def _agents_table(manager: LiveAgentManager, session_id: str) -> str:
     return "\n".join(lines)
 
 
-def _notify_main(manager: LiveAgentManager, session_id: str, text: str) -> None:
-    if manager.config.notify_main_on_user_actions:
+def fyi_user_message(name: str, body: str) -> str:
+    """FYI text telling ``main`` the user messaged a live agent."""
+    return f"FYI: user sent a message to `{name}`: {body}"
+
+
+def fyi_user_stopped(name: str) -> str:
+    """FYI text telling ``main`` the user stopped a live agent."""
+    return f"FYI: user stopped `{name}`."
+
+
+def notify_main_of_user_action(
+    manager: LiveAgentManager, session_id: str, text: str
+) -> None:
+    """Forward a user action FYI to ``main`` when ``notify_main_on_user_actions``.
+
+    Shared by slash commands, the Chainlit panel and the HTTP API.
+    """
+    config = getattr(manager, "config", None)
+    if getattr(config, "notify_main_on_user_actions", False):
         manager.notify_main(session_id, text)
+
 
 
 async def handle_live_agent_command(
@@ -100,7 +118,7 @@ async def _spawn(
     )
     record, _spec = await manager.spawn(session_id, request, spawned_by="user")
     template = record.template or "custom"
-    _notify_main(
+    notify_main_of_user_action(
         manager,
         session_id,
         f"FYI: user spawned `{record.name}` (template {template}).",
@@ -114,10 +132,10 @@ def _msg(manager: LiveAgentManager, session_id: str, args: str, usage: str) -> s
         raise ValueError(usage)
     record = manager.get(session_id, parts[0])
     manager.send_from_user(session_id, record.id, parts[1])
-    _notify_main(
+    notify_main_of_user_action(
         manager,
         session_id,
-        f"FYI: user sent a message to `{record.name}`: {parts[1]}",
+        fyi_user_message(record.name, parts[1]),
     )
     return f"Sent to `{record.name}`. The reply will appear when ready."
 
@@ -132,11 +150,11 @@ async def _kill(
         for row in rows:
             await manager.teardown(session_id, str(row["id"]), reason="user")
         if rows:
-            _notify_main(
+            notify_main_of_user_action(
                 manager, session_id, f"FYI: user stopped {len(rows)} live agents."
             )
         return f"Stopped {len(rows)} agent{'' if len(rows) == 1 else 's'}."
     record = manager.get(session_id, args)
     await manager.teardown(session_id, record.id, reason="user")
-    _notify_main(manager, session_id, f"FYI: user stopped `{record.name}`.")
+    notify_main_of_user_action(manager, session_id, fyi_user_stopped(record.name))
     return f"Stopped `{record.name}`."

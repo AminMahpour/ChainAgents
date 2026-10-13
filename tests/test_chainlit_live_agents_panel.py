@@ -421,3 +421,138 @@ def test_panel_jsx_reports_action_failures_inline() -> None:
         assert "setError(" in body, handler
     assert "{error}" in source  # Rendered as a React text node.
     assert "innerHTML" not in source
+
+
+@pytest.mark.anyio
+async def test_action_callbacks_return_failure_to_the_client(monkeypatch) -> None:
+    """Manager rejections must reach ``callAction`` so the panel keeps the draft."""
+
+    class Manager:
+        config = SimpleNamespace(notify_main_on_user_actions=False)
+
+        def get(self, session_id: str, ref: str) -> Any:
+            if ref == "ghost":
+                raise KeyError(ref)
+            return SimpleNamespace(id="a1", name="scout")
+
+        def send_from_user(self, session_id: str, ref: str, body: str) -> None:
+            if body == "fail":
+                raise ValueError("Pending message limit reached.")
+
+        async def teardown(self, session_id: str, ref: str, *, reason: str) -> None:
+            raise RuntimeError("Agent already stopped.")
+
+        def notify_main(self, session_id: str, text: str) -> None:
+            raise AssertionError("FYIs are disabled")
+
+    runtime = SimpleNamespace(
+        live_agents=Manager(),
+        config=SimpleNamespace(model_name="m", model_choices=("m",)),
+    )
+
+    async def get_runtime():
+        return runtime
+
+    sent: list[str] = []
+
+    class Message:
+        def __init__(self, content: str, **_kwargs: Any) -> None:
+            self.content = content
+
+        async def send(self) -> None:
+            sent.append(self.content)
+
+    monkeypatch.setattr(app, "get_runtime_or_notify", get_runtime)
+    monkeypatch.setattr(
+        app.cl,
+        "user_session",
+        _Session({app.SESSION_SETTINGS_KEY: {"model": "m", "thread_id": "thread-1"}}),
+    )
+    monkeypatch.setattr(app.cl, "Message", Message)
+
+    def message(agent: str, body: str) -> Any:
+        return app.cl.Action(
+            name=app.LIVE_AGENT_MESSAGE_ACTION, payload={"agent": agent, "body": body}
+        )
+
+    assert await app.live_agent_message_action(message("a1", "ok")) == {"ok": True}
+    assert await app.live_agent_message_action(message("a1", "fail")) == {
+        "ok": False,
+        "error": "Pending message limit reached.",
+    }
+    unknown = await app.live_agent_message_action(message("ghost", "hi"))
+    assert unknown["ok"] is False and "ghost" in unknown["error"]
+    assert await app.live_agent_kill_action(
+        app.cl.Action(name=app.LIVE_AGENT_KILL_ACTION, payload={"agent": "a1"})
+    ) == {"ok": False, "error": "Agent already stopped."}
+    # The failure is still reported in the chat as well.
+    assert "Pending message limit reached." in sent
+    assert "Agent already stopped." in sent
+
+
+def test_panel_jsx_keeps_draft_when_action_reports_failure() -> None:
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "public/elements/LiveAgentsPanel.jsx"
+    ).read_text()
+    send = source.split("async function send() {", 1)[1].split("\n  }\n", 1)[0]
+    # The callback's ``{ok: false, error}`` arrives as ``result.response``.
+    assert "actionFailure(" in send
+    failure_check = send.index("actionFailure(")
+    assert failure_check < send.index('setDraft("")')
+    shut_down = source.split("async function shutDown() {", 1)[1].split("\n  }\n", 1)[0]
+    assert "actionFailure(" in shut_down
+
+
+@pytest.mark.anyio
+async def test_panel_close_finishes_open_activity_steps(monkeypatch) -> None:
+    _FakeElement.instances = []
+    monkeypatch.setattr(panel_module.cl, "CustomElement", _FakeElement)
+    monkeypatch.setattr(panel_module.cl, "context", _FAKE_CONTEXT)
+    monkeypatch.setattr(panel_module.cl, "ElementSidebar", _FakeSidebar())
+    steps: list[Any] = []
+
+    class Step:
+        def __init__(self, *, name: str, type: str) -> None:
+            self.name = name
+            self.output = ""
+            self.end = None
+            self.updated = 0
+            steps.append(self)
+
+        async def send(self) -> Step:
+            return self
+
+        async def update(self) -> None:
+            self.updated += 1
+            if self.name == "live:broken":
+                raise RuntimeError("Chainlit context not found")
+
+    monkeypatch.setattr(panel_module.cl, "Step", Step)
+    bus = LiveAgentEventBus()
+    manager = SimpleNamespace(
+        events=bus,
+        list=lambda session_id, include_stopped=False: [_agent("a1", "scout")],
+    )
+    panel = LiveAgentsPanel(  # type: ignore[arg-type]
+        manager, "thread-1", min_interval=0.0, stream_activity=True
+    )
+    await panel.start()
+    bus.publish(_event("turn_started"))
+    bus.publish(
+        LiveAgentEvent(
+            kind="turn_started",
+            session_id="thread-1",
+            agent_id="a2",
+            agent_name="broken",
+            payload={},
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert [s.updated for s in steps] == [0, 0]
+    await panel.aclose()  # Must not raise although one update fails.
+    assert [s.updated for s in steps] == [1, 1]
+    assert all(s.output == "Panel closed before this turn finished." for s in steps)
+    assert all(s.end for s in steps)
+    assert panel._steps == {}

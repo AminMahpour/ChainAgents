@@ -88,7 +88,12 @@ from chainagents.commands.native import (
     run_live_agent_command,
 )
 from chainagents.interfaces.chainlit.live_agents import LiveAgentsPanel
-from chainagents.runtime.live_agents.commands import LIVE_AGENT_COMMAND_DESCRIPTIONS
+from chainagents.runtime.live_agents.commands import (
+    LIVE_AGENT_COMMAND_DESCRIPTIONS,
+    fyi_user_message,
+    fyi_user_stopped,
+    notify_main_of_user_action,
+)
 from chainagents.runtime.reflection import (
     ReflectionProposal,
     format_reflection_proposal,
@@ -1457,60 +1462,68 @@ async def _resume_nonblocking_input(action: cl.Action) -> None:
 
 async def _live_agent_action_target(
     action: cl.Action,
-) -> tuple[Any, str, Any] | None:
-    """Resolve (manager, thread_id, record) for a live agents panel action."""
+) -> tuple[Any, str, Any] | str:
+    """Resolve (manager, thread_id, record) for a live agents panel action.
+
+    Returns an error message instead when the action cannot be resolved.
+    """
     runtime = await get_runtime_or_notify()
     manager = getattr(runtime, "live_agents", None) if runtime is not None else None
     if runtime is None or manager is None:
-        return None
+        return "Live agents are not available."
     thread_id = _current_input_thread_id(runtime)
     ref = str(action.payload.get("agent", "")).strip()
     try:
         record = manager.get(thread_id, ref)
     except KeyError:
-        await cl.Message(content=f"Unknown live agent `{ref}`.", author="System").send()
-        return None
+        error = f"Unknown live agent `{ref}`."
+        await cl.Message(content=error, author="System").send()
+        return error
     return manager, thread_id, record
 
 
-def _live_agent_fyi(manager: Any, thread_id: str, text: str) -> None:
-    if getattr(manager.config, "notify_main_on_user_actions", False):
-        manager.notify_main(thread_id, text)
+def _live_agent_action_failed(error: str) -> dict[str, object]:
+    """Panel action result telling ``callAction`` the action did not happen.
+
+    Chainlit resolves ``callAction`` with ``{"success": true, "response": ...}``
+    whenever the callback returns, so failures travel in ``response``.
+    """
+    return {"ok": False, "error": error}
 
 
 @cl.action_callback(LIVE_AGENT_MESSAGE_ACTION)
-async def live_agent_message_action(action: cl.Action) -> None:
+async def live_agent_message_action(action: cl.Action) -> dict[str, object]:
     """Send a panel-typed message to a live agent (same as ``/msg``)."""
     body = str(action.payload.get("body", "")).strip()
     if not body:
-        return
+        return _live_agent_action_failed("The message is empty.")
     target = await _live_agent_action_target(action)
-    if target is None:
-        return
+    if isinstance(target, str):
+        return _live_agent_action_failed(target)
     manager, thread_id, record = target
     try:
         manager.send_from_user(thread_id, record.id, body)
     except (KeyError, ValueError, RuntimeError) as exc:
         await cl.Message(content=str(exc), author="System").send()
-        return
-    _live_agent_fyi(
-        manager, thread_id, f"FYI: user sent a message to `{record.name}`: {body}"
-    )
+        return _live_agent_action_failed(str(exc))
+    notify_main_of_user_action(manager, thread_id, fyi_user_message(record.name, body))
+    return {"ok": True}
 
 
 @cl.action_callback(LIVE_AGENT_KILL_ACTION)
-async def live_agent_kill_action(action: cl.Action) -> None:
+async def live_agent_kill_action(action: cl.Action) -> dict[str, object]:
     """Shut down a live agent from the panel (same as ``/kill``)."""
     target = await _live_agent_action_target(action)
-    if target is None:
-        return
+    if isinstance(target, str):
+        return _live_agent_action_failed(target)
     manager, thread_id, record = target
     try:
         await manager.teardown(thread_id, record.id, reason="user")
     except (KeyError, ValueError, RuntimeError) as exc:
         await cl.Message(content=str(exc), author="System").send()
-        return
-    _live_agent_fyi(manager, thread_id, f"FYI: user stopped `{record.name}`.")
+        return _live_agent_action_failed(str(exc))
+    notify_main_of_user_action(manager, thread_id, fyi_user_stopped(record.name))
+    return {"ok": True}
 
 
 @cl.action_callback(RUN_RESPONSE_ACTION)

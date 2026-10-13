@@ -12,6 +12,7 @@ from datetime import datetime, UTC
 from typing import TYPE_CHECKING, Any
 
 import chainlit as cl
+from chainlit.utils import utc_now
 
 from chainagents.runtime.live_agents.events import LiveAgentEvent
 
@@ -23,6 +24,14 @@ logger = logging.getLogger(__name__)
 THREAD_HISTORY_LIMIT = 50
 PANEL_ELEMENT_NAME = "LiveAgentsPanel"
 PANEL_TITLE = "Live agents"
+CLOSED_STEP_OUTPUT = "Panel closed before this turn finished."
+
+
+async def _finish_step(step: Any, output: str) -> None:
+    """Close a ``live:<name>`` activity step with ``output``."""
+    step.output = output
+    step.end = utc_now()
+    await step.update()
 
 
 def build_panel_props(
@@ -94,7 +103,7 @@ class LiveAgentsPanel:
             self._request_render()
 
     async def aclose(self) -> None:
-        """Stop listening and cancel any pending render."""
+        """Stop listening, cancel any pending render and end open turn steps."""
         for task in (self._consumer, self._trailing):
             if task is not None and not task.done():
                 task.cancel()
@@ -105,6 +114,13 @@ class LiveAgentsPanel:
         if self._queue is not None:
             self.manager.events.unsubscribe(self.session_id, self._queue)
             self._queue = None
+        steps, self._steps = list(self._steps.values()), {}
+        for step in steps:
+            try:
+                await _finish_step(step, CLOSED_STEP_OUTPUT)
+            except Exception:
+                # The Chainlit context may already be gone at session end.
+                logger.debug("Could not finish a live agent step on close", exc_info=True)
 
     async def _consume(self) -> None:
         assert self._queue is not None
@@ -147,8 +163,7 @@ class LiveAgentsPanel:
             return
         turns = event.payload.get("turns")
         ok = bool(event.payload.get("ok", True))
-        step.output = f"Turn {turns} {'finished' if ok else 'failed'}."
-        await step.update()
+        await _finish_step(step, f"Turn {turns} {'finished' if ok else 'failed'}.")
 
     def _request_render(self) -> None:
         """Render now if the interval has passed, else once it has (trailing)."""

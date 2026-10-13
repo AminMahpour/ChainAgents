@@ -39,6 +39,16 @@ function formatTime(value) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+// Chainlit resolves callAction with { success, response }; the Python callback
+// returns { ok: false, error } in `response` when the action did not happen.
+function actionFailure(result) {
+  const outcome = result && result.response;
+  if (outcome && outcome.ok === false) {
+    return asText(outcome.error) || "unknown error";
+  }
+  return "";
+}
+
 function AgentCard({ agent }) {
   const [draft, setDraft] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -57,10 +67,15 @@ function AgentCard({ agent }) {
     setBusy(true);
     setError("");
     try {
-      await callAction({
+      const result = await callAction({
         name: "live_agent_message",
         payload: { agent: agentRef, body },
       });
+      const failure = actionFailure(result);
+      if (failure) {
+        setError(`Could not send the message: ${failure}`);
+        return;
+      }
       setDraft("");
     } catch (err) {
       setError(`Could not send the message: ${asText(err && err.message) || "unknown error"}`);
@@ -75,7 +90,11 @@ function AgentCard({ agent }) {
     }
     setError("");
     try {
-      await callAction({ name: "live_agent_kill", payload: { agent: agentRef } });
+      const result = await callAction({ name: "live_agent_kill", payload: { agent: agentRef } });
+      const failure = actionFailure(result);
+      if (failure) {
+        setError(`Could not shut down the agent: ${failure}`);
+      }
     } catch (err) {
       setError(`Could not shut down the agent: ${asText(err && err.message) || "unknown error"}`);
     }
