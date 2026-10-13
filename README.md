@@ -1217,12 +1217,12 @@ tools = ["ls", "read_file", "glob", "grep"]
 
 - `enabled`: defaults to `false`.
 - `max_live_per_session` (default `4`) and `max_live_total` (default `16`): positive integers bounding live agents per conversation and across the process. Stopped and failed agents free their slot.
-- `idle_timeout_seconds`: default `1800`. An agent that has been idle this long is torn down. `0` disables the idle timeout.
+- `idle_timeout_seconds`: default `1800`. An agent that has been idle this long is torn down. Idle time counts from when the agent's worker starts (after its graph and MCP tools are built) or its last turn. `0` disables the idle timeout.
 - `max_turns_per_agent`: default `50`. After this many turns an agent is torn down.
 - `turn_recursion_limit`: default `100`. LangGraph step limit for a single live agent turn.
 - `delete_history_on_teardown`: default `true`. Deletes the agent's own conversation history when it stops.
-- `notify_main_on_user_actions`: default `true`. When the user spawns, messages, or stops an agent with a slash command, the main agent receives a short `FYI:` notice. Notices come from the internal `live-agents` sender (`Message from live-agents ...`), not from `user`: they reach the main agent at its next model step, never count as steering, and never start a follow-up turn.
-- `stream_activity`: default `false`. Shows one Chainlit step per live agent turn, opened when the turn starts and closed with whether it finished or failed; other interfaces stay completion-only.
+- `notify_main_on_user_actions`: default `true`. When the user spawns, messages, or stops an agent with a slash command (or messages or stops one from the Chainlit panel or the HTTP API), the main agent receives a short `FYI:` notice. Notices come from the internal `live-agents` sender (`Message from live-agents ...`), not from `user`: they reach the main agent at its next model step, never count as steering, and never start a follow-up turn.
+- `stream_activity`: default `false`. Shows one Chainlit step per live agent turn, opened when the turn starts and closed with whether it finished or failed (a step still open when the panel closes is closed with a note); other interfaces stay completion-only.
 
 #### Templates
 
@@ -1273,7 +1273,7 @@ Available in Chainlit, the TUI, and the CLI when live agents are enabled:
 
 - `/agents`: table of live agents with name, template, status, turns, and idle time.
 - `/spawn <template> [name] [-- instructions]`: spawn from a template, optionally naming it and adding instructions after ` -- `.
-- `/msg <agent> <text>`: send a message; the reply appears when ready.
+- `/msg <agent> <text>`: send a message; the reply appears when ready. In the TUI and the interactive CLI, replies to the user and agent stops are printed as one-line notices (`<name>: <first line>`, `<name> stopped (<reason>)`).
 - `/kill <agent|all>`: stop one agent or every live agent in the conversation.
 
 While live agents are enabled these four names are reserved, and a
@@ -1293,7 +1293,9 @@ Agents can be addressed by name or id. Statuses are `idle`, `running`,
 #### Chainlit panel
 
 In Chainlit a **Live agents** side panel shows a card per agent with its status,
-recent thread, a message box, and a stop button. Set
+recent thread, a message box, and a stop button. If a message or stop is
+rejected (for example the agent stopped meanwhile or its pending message limit
+is reached), the card shows the error inline and keeps the typed message. Set
 `[chainlit].live_agents_panel_enabled = false` to hide it; it defaults to `true`
 and only appears when live agents are enabled.
 
@@ -1320,7 +1322,10 @@ reason is recorded on the agent and includes: `requested` (the main agent called
 `user` (`/kill` or the panel/API), `idle_timeout`, `max_turns`, `failed`
 (three consecutive failed turns), `worker_exited` (the worker ended
 unexpectedly), `spawn_failed` (the initial message could not be delivered), or `session_end` (the conversation closed). Both `stopped` and
-`failed` are terminal: they free the name and the slot. When
+`failed` are terminal: they free the name and the slot. Each conversation keeps
+at most the 50 most recently stopped agents for listings
+(`include_stopped=true`, the panel); older ones are forgotten, after which
+looking them up by id fails like an unknown agent. When
 `delete_history_on_teardown` is true, the agent's own history is deleted too; a
 delete that takes longer than 10 seconds is abandoned with a warning so teardown
 and conversation close are not blocked.
