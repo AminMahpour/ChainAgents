@@ -688,3 +688,48 @@ async def test_notify_main_fyi_is_not_user_steering() -> None:
     assert content.startswith("Message from live-agents (id ")
     assert content.endswith(":\nFYI: user spawned `x`.")
     await h.manager.close()
+
+
+@pytest.mark.anyio
+async def test_slow_graph_build_does_not_make_agent_instantly_reapable() -> None:
+    h = Harness(idle_timeout_seconds=10)
+    building, release = gated_factory(h)
+    spawn = asyncio.create_task(
+        h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+    )
+    await building.wait()
+    h.now += 15  # The build takes longer than the idle timeout.
+    release.set()
+    record, _ = await spawn
+    assert record.last_active_at == h.now
+    assert await h.manager.reap_idle() == []
+    assert record.status == "idle"
+    h.now += 10
+    assert await h.manager.reap_idle() == [record]
+    await h.manager.close()
+
+
+@pytest.mark.anyio
+async def test_terminal_records_are_capped_per_session(monkeypatch) -> None:
+    from chainagents.runtime.live_agents import registry as registry_module
+
+    assert registry_module.MAX_RETAINED_TERMINAL_RECORDS == 50
+    monkeypatch.setattr(registry_module, "MAX_RETAINED_TERMINAL_RECORDS", 3)
+    h = Harness()
+    keeper, _ = await h.manager.spawn(SESSION, SpawnRequest(template="coder"))
+    stopped = []
+    for _ in range(5):
+        record, _ = await h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+        h.now += 1
+        await h.manager.teardown(SESSION, record.id)
+        stopped.append(record)
+
+    rows = h.manager.list(SESSION, include_stopped=True)
+    assert [r["id"] for r in rows] == [keeper.id] + [r.id for r in stopped[-3:]]
+    assert keeper.status == "idle"  # Live records are never evicted.
+    for evicted in stopped[:2]:
+        assert evicted.id not in h.manager._teardowns
+        with pytest.raises(KeyError):
+            h.manager.get(SESSION, evicted.id)
+    assert all(r.id in h.manager._teardowns for r in stopped[-3:])
+    await h.manager.close()

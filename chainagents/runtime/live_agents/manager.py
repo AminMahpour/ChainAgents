@@ -155,6 +155,9 @@ class LiveAgentManager:
             if record.status not in TERMINAL_STATUSES:
                 registry.discard(record)
             raise RuntimeError(f"Live agent '{record.name}' was stopped during spawn.")
+        # Idle time counts from when the worker starts, not from the
+        # reservation: a slow graph/MCP build must not make it reapable at once.
+        record.last_active_at = self._clock()
         self._sessions.add(session_id)
 
         broker = self._broker
@@ -402,8 +405,16 @@ class LiveAgentManager:
         record.status = "failed" if reason == "failed" else "stopped"
         record.stop_reason = reason
         record.last_active_at = self._clock()
+        self._evict_terminal(record.session_id)
         self._publish("stopped", record, {"reason": reason})
         return record
+
+    def _evict_terminal(self, session_id: str) -> None:
+        """Forget the session's oldest stopped records beyond the retention cap."""
+        if session_id in self._closing_sessions:
+            return  # teardown_session forgets every record itself.
+        for evicted in self._registry.evict_terminal(session_id):
+            self._teardowns.pop(evicted.id, None)
 
     async def _on_worker_finished(self, record: LiveAgentRecord, reason: str) -> None:
         # Called from inside the worker task: schedule, never await, the teardown

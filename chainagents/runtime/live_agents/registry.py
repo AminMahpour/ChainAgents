@@ -13,6 +13,9 @@ from chainagents.runtime.types import LiveAgentsConfig
 
 LiveAgentStatus = Literal["idle", "running", "stopping", "stopped", "failed"]
 TERMINAL_STATUSES: frozenset[str] = frozenset({"stopped", "failed"})
+# Stopped/failed records kept per session for listings (the panel shows them);
+# older ones are evicted so repeated spawn/stop cannot grow memory unbounded.
+MAX_RETAINED_TERMINAL_RECORDS = 50
 
 
 @dataclass
@@ -115,7 +118,34 @@ class LiveAgentRegistry:
         if record in records:
             records.remove(record)
 
+    def evict_terminal(self, session_id: str) -> list[LiveAgentRecord]:
+        """Drop the oldest terminal records beyond ``MAX_RETAINED_TERMINAL_RECORDS``.
+
+        Age is the time the record stopped (``last_active_at``), then spawn
+        order. Live records are never evicted. Evicted records disappear from
+        listings and ``lookup`` by id raises ``KeyError`` for them.
+
+        Returns:
+            The evicted records.
+        """
+        records = self._records.get(session_id, [])
+        terminal = [r for r in records if r.status in TERMINAL_STATUSES]
+        excess = len(terminal) - MAX_RETAINED_TERMINAL_RECORDS
+        if excess <= 0:
+            return []
+        terminal.sort(key=lambda r: r.last_active_at)  # stable: ties keep spawn order
+        evicted = terminal[:excess]
+        dropped = {id(r) for r in evicted}
+        self._records[session_id] = [r for r in records if id(r) not in dropped]
+        return evicted
+
     def lookup(self, session_id: str, ref: str) -> LiveAgentRecord:
+        """Find a live record by name, else any retained record by id.
+
+        Raises:
+            KeyError: No match, including terminal records already evicted by
+                ``evict_terminal``.
+        """
         records = self._records.get(session_id, [])
         for record in records:
             if record.status not in TERMINAL_STATUSES and record.name == ref:
