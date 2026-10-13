@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -340,12 +341,12 @@ class LiveAgentManager:
             if remaining:
                 self._closing_sessions[session_id] = remaining
 
-    async def reap_idle(self) -> list[LiveAgentRecord]:
+    async def reap_idle(self) -> builtins.list[LiveAgentRecord]:
         timeout = self.config.idle_timeout_seconds
         if timeout <= 0:
             return []
         now = self._clock()
-        reaped: list[LiveAgentRecord] = []
+        reaped: builtins.list[LiveAgentRecord] = []
         for session_id in list(self._sessions):
             for record in self._registry.records(session_id):
                 if (

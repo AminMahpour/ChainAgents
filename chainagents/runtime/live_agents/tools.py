@@ -60,7 +60,7 @@ def validate_live_agent_tool_names(existing_tools: Iterable[object]) -> None:
         )
 
 
-def _error(exc: BaseException) -> dict[str, str]:
+def _error(exc: BaseException) -> dict[str, object]:
     if isinstance(exc, KeyError) and exc.args:
         return {"error": f"Unknown live agent '{exc.args[0]}'."}
     return {"error": str(exc) or type(exc).__name__}
