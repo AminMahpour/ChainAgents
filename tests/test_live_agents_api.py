@@ -46,6 +46,9 @@ class _FakeManager:
             raise ValueError("body too long")
         return SimpleNamespace(id="msg-1")
 
+    def payload(self, session_id, record):
+        return {**record.to_payload(), "session": session_id}
+
     async def teardown(self, session_id, ref, *, reason="requested"):
         self.calls.append(("teardown", session_id, ref, reason))
         if ref == "missing":
@@ -84,7 +87,7 @@ def test_delete_agent() -> None:
     with _client(manager) as client:
         response = client.delete("/api/live-agents/a1?thread_id=t1")
     assert response.status_code == 200
-    assert response.json() == {"ref": "a1", "status": "stopped"}
+    assert response.json() == {"ref": "a1", "status": "stopped", "session": "t1"}
     assert manager.calls == [("teardown", "t1", "a1", "user")]
 
 

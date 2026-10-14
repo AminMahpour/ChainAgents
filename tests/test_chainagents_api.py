@@ -281,6 +281,22 @@ def test_background_task_routes_are_conversation_scoped() -> None:
     ]
 
 
+def test_status_advertises_live_agents_and_their_commands() -> None:
+    """Clients discover live agents and their slash commands from the status."""
+    runtime = _FakeRuntime(_FakeAgent([]))
+    runtime.live_agents = object()
+    app = chainagents_api.create_app(runtime=runtime)
+
+    with TestClient(app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1") as client:
+        payload = client.get("/api/status").json()
+
+    assert payload["features"]["live_agents"] is True
+    live_commands = [c for c in payload["commands"] if c["target"] == "live_agent"]
+    assert [c["name"] for c in live_commands] == ["agents", "spawn", "msg", "kill"]
+    assert live_commands[1]["description"].startswith("Spawn a live agent")
+    assert payload["commands"][0]["name"] == "review"
+
+
 def test_status_reports_runtime_configuration() -> None:
     """Verify the status endpoint exposes resolved runtime configuration."""
     runtime = _FakeRuntime(_FakeAgent([]))
@@ -322,6 +338,7 @@ def test_status_reports_runtime_configuration() -> None:
             "reflection": True,
             "rag": True,
             "images": False,
+            "live_agents": False,
         },
         "starters": [
             {

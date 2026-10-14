@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -59,6 +60,7 @@ class LiveAgentWorker:
         recursion_limit: int,
         max_turns: int,
         clock: Callable[[], float],
+        wall_clock: Callable[[], float] = time.time,
         turn_context: Callable[[LiveAgentRecord], AbstractContextManager[Any]]
         | None = None,
         on_finished: Callable[[LiveAgentRecord, str], Awaitable[None]],
@@ -70,6 +72,7 @@ class LiveAgentWorker:
         self.recursion_limit = recursion_limit
         self.max_turns = max_turns
         self.clock = clock
+        self.wall_clock = wall_clock
         self.turn_context = turn_context
         self.on_finished = on_finished
 
@@ -100,7 +103,7 @@ class LiveAgentWorker:
         """Run one turn for a claimed batch; return a finish reason, if any."""
         record = self.record
         record.status = "running"
-        record.last_active_at = self.clock()
+        record.mark_active(self.clock(), self.wall_clock())
         self._publish("turn_started", {})
         try:
             text = await self.run_turn(batch)
@@ -114,7 +117,7 @@ class LiveAgentWorker:
         record.consecutive_failures = 0 if ok else record.consecutive_failures + 1
         self._reply(batch, text)
         record.status = "idle"
-        record.last_active_at = self.clock()
+        record.mark_active(self.clock(), self.wall_clock())
         self._publish("turn_finished", {"turns": record.turns, "ok": ok})
         if record.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
             record.status = "failed"
@@ -161,7 +164,7 @@ class LiveAgentWorker:
         for sender in senders:
             if sender == _USER_SENDER:
                 # Users only see replies as events; keep the latest for polling.
-                record.last_reply = {"body": body, "at": self.clock()}
+                record.set_last_reply(body, self.clock(), self.wall_clock())
             else:
                 try:
                     self.broker.send(record.session_id, record.address, sender, body)

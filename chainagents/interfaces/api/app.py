@@ -61,6 +61,7 @@ from chainagents.runtime import (
     resolve_runtime_model_profile,
 )
 from chainagents.runtime.live_agents.commands import (
+    LIVE_AGENT_COMMAND_DESCRIPTIONS,
     fyi_user_message,
     fyi_user_stopped,
     notify_main_of_user_action,
@@ -280,6 +281,7 @@ class RuntimeFeatureFlags(BaseModel):
     reflection: bool
     rag: bool
     images: bool
+    live_agents: bool = False
 
 
 class RuntimeStarter(BaseModel):
@@ -498,6 +500,7 @@ def create_app(
         reflection = getattr(extensions, "agent_reflection", None)
         starters = getattr(extensions, "chainlit_starters", ())
         commands = getattr(extensions, "chainlit_commands", ())
+        live_agents_enabled = getattr(active_runtime, "live_agents", None) is not None
         return RuntimeStatusResponse(
             model=config.model_name,
             model_provider=active_model.provider,
@@ -520,6 +523,7 @@ def create_app(
                 reflection=bool(getattr(reflection, "enabled", False)),
                 rag=bool(config.rag_requested and config.rag is not None),
                 images=any("image" in option.modalities for option in model_options),
+                live_agents=live_agents_enabled,
             ),
             starters=[
                 RuntimeStarter(
@@ -537,6 +541,11 @@ def create_app(
                     target=command.target,
                 )
                 for command in commands
+            ]
+            + [
+                RuntimeCommand(name=name, description=description, target="live_agent")
+                for name, description in LIVE_AGENT_COMMAND_DESCRIPTIONS.items()
+                if live_agents_enabled
             ],
             uploads=RuntimeUploadCapabilities(
                 max_files=MAX_UPLOAD_FILES,
@@ -675,7 +684,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         notify_main_of_user_action(manager, session_id, fyi_user_stopped(record.name))
-        return record.to_payload()
+        return manager.payload(session_id, record)
 
     @app.get("/api/generated-files/{relative_path:path}")
     async def download_generated_file(

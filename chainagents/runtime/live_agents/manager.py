@@ -59,6 +59,7 @@ class LiveAgentManager:
         *,
         events: LiveAgentEventBus | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         delete_thread: Callable[[str], Awaitable[None]] | None = None,
         turn_context: Callable[[LiveAgentRecord], AbstractContextManager[Any]]
         | None = None,
@@ -68,9 +69,10 @@ class LiveAgentManager:
         self._broker = broker
         self._graph_factory = graph_factory
         self._clock = clock
+        self._wall_clock = wall_clock
         self._delete_thread = delete_thread
         self._turn_context = turn_context
-        self._registry = LiveAgentRegistry(config, clock=clock)
+        self._registry = LiveAgentRegistry(config, clock=clock, wall_clock=wall_clock)
         self._workers: dict[str, asyncio.Task[None]] = {}
         # One teardown task per agent id; doubles as the "torn down" marker.
         self._teardowns: dict[str, asyncio.Task[LiveAgentRecord]] = {}
@@ -157,7 +159,7 @@ class LiveAgentManager:
             raise RuntimeError(f"Live agent '{record.name}' was stopped during spawn.")
         # Idle time counts from when the worker starts, not from the
         # reservation: a slow graph/MCP build must not make it reapable at once.
-        record.last_active_at = self._clock()
+        record.mark_active(self._clock(), self._wall_clock())
         self._sessions.add(session_id)
 
         broker = self._broker
@@ -171,6 +173,7 @@ class LiveAgentManager:
             recursion_limit=self.config.turn_recursion_limit,
             max_turns=self.config.max_turns_per_agent,
             clock=self._clock,
+            wall_clock=self._wall_clock,
             turn_context=self._turn_context,
             on_finished=self._on_worker_finished,
         )
@@ -223,16 +226,20 @@ class LiveAgentManager:
     def list(
         self, session_id: str, *, include_stopped: bool = False
     ) -> list[dict[str, object]]:
-        payloads: list[dict[str, object]] = []
-        for record in self._registry.records(
-            session_id, include_stopped=include_stopped
-        ):
-            try:
-                pending = len(self._broker.pending(session_id, record.address))
-            except ValueError:
-                pending = 0
-            payloads.append(record.to_payload(pending=pending))
-        return payloads
+        return [
+            self.payload(session_id, record)
+            for record in self._registry.records(
+                session_id, include_stopped=include_stopped
+            )
+        ]
+
+    def payload(self, session_id: str, record: LiveAgentRecord) -> dict[str, object]:
+        """Return ``record`` for clients, with its pending count and UTC times."""
+        try:
+            pending = len(self._broker.pending(session_id, record.address))
+        except ValueError:
+            pending = 0
+        return record.to_payload(pending=pending)
 
     def get(self, session_id: str, ref: str) -> LiveAgentRecord:
         return self._registry.lookup(session_id, ref)
@@ -404,7 +411,7 @@ class LiveAgentManager:
                 )
         record.status = "failed" if reason == "failed" else "stopped"
         record.stop_reason = reason
-        record.last_active_at = self._clock()
+        record.mark_active(self._clock(), self._wall_clock())
         self._evict_terminal(record.session_id)
         self._publish("stopped", record, {"reason": reason})
         return record

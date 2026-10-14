@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
@@ -39,9 +40,29 @@ class LiveAgentRecord:
     parent_trace: Any = None
     # Latest reply to the user (``{"body": str, "at": float}``), for API polling.
     last_reply: dict[str, object] | None = None
+    # Wall-clock (``time.time``) twins of the monotonic times above, captured
+    # when each event happens so later clock jumps or suspends cannot shift them.
+    created_at_wall: float | None = None
+    last_active_at_wall: float | None = None
+    last_reply_wall: float | None = None
+
+    def mark_active(self, now: float, wall: float) -> None:
+        """Record activity at monotonic ``now`` and wall-clock ``wall``."""
+        self.last_active_at = now
+        self.last_active_at_wall = wall
+
+    def set_last_reply(self, body: str, now: float, wall: float) -> None:
+        """Keep ``body`` as the latest reply to the user."""
+        self.last_reply = {"body": body, "at": now}
+        self.last_reply_wall = wall
 
     def to_payload(self, *, pending: int = 0) -> dict[str, object]:
-        return {
+        """Return the record for clients.
+
+        ``*_at`` times are on the manager's monotonic clock; the ``*_utc``
+        fields are ISO 8601 UTC wall-clock times clients can display.
+        """
+        payload: dict[str, object] = {
             "id": self.id,
             "name": self.name,
             "template": self.template,
@@ -54,6 +75,20 @@ class LiveAgentRecord:
             "stop_reason": self.stop_reason,
             "last_reply": dict(self.last_reply) if self.last_reply else None,
         }
+        if self.created_at_wall is not None:
+            payload["created_at_utc"] = _utc_iso(self.created_at_wall)
+        if self.last_active_at_wall is not None:
+            payload["last_active_at_utc"] = _utc_iso(self.last_active_at_wall)
+        if self.last_reply and self.last_reply_wall is not None:
+            payload["last_reply"] = {
+                **self.last_reply,
+                "at_utc": _utc_iso(self.last_reply_wall),
+            }
+        return payload
+
+
+def _utc_iso(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds")
 
 
 class LiveAgentLimitError(ValueError):
@@ -68,9 +103,11 @@ class LiveAgentRegistry:
         config: LiveAgentsConfig,
         *,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self._clock = clock
+        self._wall_clock = wall_clock
         self._records: dict[str, list[LiveAgentRecord]] = {}
         self._sequence: dict[str, int] = {}
 
@@ -95,7 +132,7 @@ class LiveAgentRegistry:
                 f"Total live agent limit reached ({self.config.max_live_total})."
             )
         agent_id = uuid.uuid4().hex[:12]
-        now = self._clock()
+        now, wall = self._clock(), self._wall_clock()
         record = LiveAgentRecord(
             id=agent_id,
             session_id=session_id,
@@ -108,6 +145,8 @@ class LiveAgentRegistry:
             created_at=now,
             last_active_at=now,
             spawned_by=spawned_by,
+            created_at_wall=wall,
+            last_active_at_wall=wall,
         )
         self._records.setdefault(session_id, []).append(record)
         self._sequence[session_id] = self._sequence.get(session_id, 0) + 1

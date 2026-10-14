@@ -464,4 +464,10 @@ async def test_reply_to_user_is_recorded_as_last_reply() -> None:
     await h.stop()
 
     assert h.record.last_reply == {"body": "for you", "at": 150.0}
-    assert h.record.to_payload()["last_reply"] == {"body": "for you", "at": 150.0}
+    reply = h.record.to_payload()["last_reply"]
+    assert isinstance(reply, dict)
+    assert {k: v for k, v in reply.items() if k != "at_utc"} == {
+        "body": "for you",
+        "at": 150.0,
+    }
+    assert str(reply["at_utc"]).endswith("+00:00")
