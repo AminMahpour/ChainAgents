@@ -24,6 +24,8 @@ from chainagents.runtime.types import (
 )
 
 SESSION = "s1"
+# Maps the harness clock (starting at 1000.0) onto 2026-01-01T00:00:00Z.
+WALL_OFFSET = 1_767_225_600.0 - 1000.0
 TASK_PREFIX = "chainagents-live-agent-"
 
 
@@ -70,6 +72,7 @@ class Harness:
             self._factory,
             events=self.events,
             clock=lambda: self.now,
+            wall_clock=lambda: self.now + WALL_OFFSET,
             delete_thread=delete_thread if delete else None,
         )
         self.queue: asyncio.Queue[LiveAgentEvent] | None = None
@@ -145,6 +148,18 @@ async def test_spawn_opens_address_and_starts_idle() -> None:
     assert payload[0]["pending"] == 0
     await h.manager.close()
     assert live_tasks() == []
+
+
+@pytest.mark.anyio
+async def test_list_and_payload_report_wall_clock_times() -> None:
+    h = Harness()
+    record, _ = await h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+
+    listed = h.manager.list(SESSION)[0]
+
+    assert listed["created_at_utc"] == "2026-01-01T00:00:00+00:00"
+    assert h.manager.payload(SESSION, record) == listed
+    await h.manager.close()
 
 
 @pytest.mark.anyio

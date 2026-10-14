@@ -85,7 +85,12 @@ When `[agent.live_agents]` is enabled, the HTTP API also exposes
 `POST /api/live-agents/{agent}/messages?thread_id=...` (body `{"body": "..."}`),
 and `DELETE /api/live-agents/{agent}?thread_id=...`. Each listed agent
 carries `last_reply` (the latest reply to a user message, or `null`), so a
-client can poll the list after posting a message. The CLI and TUI accept
+client can poll the list after posting a message. Times in these payloads
+(`created_at`, `last_active_at`, `last_reply.at`) use the server's monotonic
+clock; the matching `created_at_utc`, `last_active_at_utc` and
+`last_reply.at_utc` fields are ISO 8601 UTC strings for display.
+`GET /api/status` reports `features.live_agents` and lists the four live agent
+commands under `commands` with `target = "live_agent"`. The CLI and TUI accept
 the same `/agents`, `/spawn`, `/msg`, and `/kill` commands as Chainlit. Live
 agents are not part of the LangGraph Agent Server graphs. See the README's
 Live Agents section.

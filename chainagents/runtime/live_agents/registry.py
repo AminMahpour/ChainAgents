@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
@@ -40,8 +41,16 @@ class LiveAgentRecord:
     # Latest reply to the user (``{"body": str, "at": float}``), for API polling.
     last_reply: dict[str, object] | None = None
 
-    def to_payload(self, *, pending: int = 0) -> dict[str, object]:
-        return {
+    def to_payload(
+        self, *, pending: int = 0, wall_offset: float | None = None
+    ) -> dict[str, object]:
+        """Return the record for clients.
+
+        Times are on the manager's monotonic clock. With ``wall_offset`` (wall
+        clock minus monotonic clock, see ``LiveAgentManager.wall_offset``) the
+        payload also carries ISO 8601 UTC ``*_utc`` fields clients can display.
+        """
+        payload: dict[str, object] = {
             "id": self.id,
             "name": self.name,
             "template": self.template,
@@ -54,6 +63,18 @@ class LiveAgentRecord:
             "stop_reason": self.stop_reason,
             "last_reply": dict(self.last_reply) if self.last_reply else None,
         }
+        if wall_offset is not None:
+            payload["created_at_utc"] = _utc_iso(self.created_at + wall_offset)
+            payload["last_active_at_utc"] = _utc_iso(self.last_active_at + wall_offset)
+            if self.last_reply:
+                reply = dict(self.last_reply)
+                reply["at_utc"] = _utc_iso(float(reply["at"]) + wall_offset)  # type: ignore[arg-type]
+                payload["last_reply"] = reply
+        return payload
+
+
+def _utc_iso(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds")
 
 
 class LiveAgentLimitError(ValueError):

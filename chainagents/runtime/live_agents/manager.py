@@ -59,6 +59,7 @@ class LiveAgentManager:
         *,
         events: LiveAgentEventBus | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         delete_thread: Callable[[str], Awaitable[None]] | None = None,
         turn_context: Callable[[LiveAgentRecord], AbstractContextManager[Any]]
         | None = None,
@@ -68,6 +69,7 @@ class LiveAgentManager:
         self._broker = broker
         self._graph_factory = graph_factory
         self._clock = clock
+        self._wall_clock = wall_clock
         self._delete_thread = delete_thread
         self._turn_context = turn_context
         self._registry = LiveAgentRegistry(config, clock=clock)
@@ -223,16 +225,24 @@ class LiveAgentManager:
     def list(
         self, session_id: str, *, include_stopped: bool = False
     ) -> list[dict[str, object]]:
-        payloads: list[dict[str, object]] = []
-        for record in self._registry.records(
-            session_id, include_stopped=include_stopped
-        ):
-            try:
-                pending = len(self._broker.pending(session_id, record.address))
-            except ValueError:
-                pending = 0
-            payloads.append(record.to_payload(pending=pending))
-        return payloads
+        return [
+            self.payload(session_id, record)
+            for record in self._registry.records(
+                session_id, include_stopped=include_stopped
+            )
+        ]
+
+    def payload(self, session_id: str, record: LiveAgentRecord) -> dict[str, object]:
+        """Return ``record`` for clients, with its pending count and UTC times."""
+        try:
+            pending = len(self._broker.pending(session_id, record.address))
+        except ValueError:
+            pending = 0
+        return record.to_payload(pending=pending, wall_offset=self.wall_offset())
+
+    def wall_offset(self) -> float:
+        """Return wall-clock minus manager-clock seconds, to date record times."""
+        return self._wall_clock() - self._clock()
 
     def get(self, session_id: str, ref: str) -> LiveAgentRecord:
         return self._registry.lookup(session_id, ref)

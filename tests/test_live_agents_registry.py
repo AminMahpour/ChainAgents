@@ -125,6 +125,27 @@ def test_payload_shape():
     }
 
 
+def test_payload_adds_utc_times_with_wall_offset():
+    reg = make()
+    rec = reg.reserve("s", spec("a"), spawned_by="user")
+    rec.created_at, rec.last_active_at = 10.0, 70.0
+    rec.last_reply = {"body": "hi", "at": 130.0}
+    offset = 1_767_225_600.0 - 10.0  # created_at maps to 2026-01-01T00:00:00Z
+
+    payload = rec.to_payload(wall_offset=offset)
+
+    assert payload["created_at"] == 10.0
+    assert payload["created_at_utc"] == "2026-01-01T00:00:00+00:00"
+    assert payload["last_active_at_utc"] == "2026-01-01T00:01:00+00:00"
+    assert payload["last_reply"] == {
+        "body": "hi",
+        "at": 130.0,
+        "at_utc": "2026-01-01T00:02:00+00:00",
+    }
+    assert rec.last_reply == {"body": "hi", "at": 130.0}
+    assert "created_at_utc" not in rec.to_payload()
+
+
 @pytest.mark.anyio
 async def test_event_bus_delivers_to_session_subscribers_only():
     bus = LiveAgentEventBus()
