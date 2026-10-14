@@ -23,9 +23,16 @@ def spec(name="worker", template=None):
     )
 
 
+JAN_1_2026 = 1_767_225_600.0
+
+
 def make(**kwargs):
     ticks = iter(range(1, 1000))
-    return LiveAgentRegistry(LiveAgentsConfig(**kwargs), clock=lambda: float(next(ticks)))
+    return LiveAgentRegistry(
+        LiveAgentsConfig(**kwargs),
+        clock=lambda: float(next(ticks)),
+        wall_clock=lambda: JAN_1_2026,
+    )
 
 
 def test_reserve_enforces_session_limit():
@@ -122,20 +129,21 @@ def test_payload_shape():
         "pending": 3,
         "stop_reason": None,
         "last_reply": None,
+        "created_at_utc": "2026-01-01T00:00:00+00:00",
+        "last_active_at_utc": "2026-01-01T00:00:00+00:00",
     }
 
 
-def test_payload_adds_utc_times_with_wall_offset():
+def test_payload_reports_wall_clock_times_captured_at_each_event():
     reg = make()
     rec = reg.reserve("s", spec("a"), spawned_by="user")
-    rec.created_at, rec.last_active_at = 10.0, 70.0
-    rec.last_reply = {"body": "hi", "at": 130.0}
-    offset = 1_767_225_600.0 - 10.0  # created_at maps to 2026-01-01T00:00:00Z
+    rec.mark_active(70.0, JAN_1_2026 + 60)
+    rec.set_last_reply("hi", 130.0, JAN_1_2026 + 120)
 
-    payload = rec.to_payload(wall_offset=offset)
+    payload = rec.to_payload()
 
-    assert payload["created_at"] == 10.0
     assert payload["created_at_utc"] == "2026-01-01T00:00:00+00:00"
+    assert payload["last_active_at"] == 70.0
     assert payload["last_active_at_utc"] == "2026-01-01T00:01:00+00:00"
     assert payload["last_reply"] == {
         "body": "hi",
@@ -143,7 +151,6 @@ def test_payload_adds_utc_times_with_wall_offset():
         "at_utc": "2026-01-01T00:02:00+00:00",
     }
     assert rec.last_reply == {"body": "hi", "at": 130.0}
-    assert "created_at_utc" not in rec.to_payload()
 
 
 @pytest.mark.anyio

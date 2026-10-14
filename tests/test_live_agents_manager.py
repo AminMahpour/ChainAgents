@@ -56,6 +56,8 @@ class Harness:
         self.broker = MessageBroker(MessagingConfig(enabled=True))
         self.events = LiveAgentEventBus()
         self.now = 1000.0
+        # Seconds the wall clock ran ahead of the monotonic clock (host suspend).
+        self.suspended = 0.0
         self.graphs = list(graphs or [])
         self.built: list[tuple[ResolvedLiveAgentSpec, str, Any]] = []
         self.deleted: list[str] = []
@@ -72,7 +74,7 @@ class Harness:
             self._factory,
             events=self.events,
             clock=lambda: self.now,
-            wall_clock=lambda: self.now + WALL_OFFSET,
+            wall_clock=lambda: self.now + self.suspended + WALL_OFFSET,
             delete_thread=delete_thread if delete else None,
         )
         self.queue: asyncio.Queue[LiveAgentEvent] | None = None
@@ -159,6 +161,20 @@ async def test_list_and_payload_report_wall_clock_times() -> None:
 
     assert listed["created_at_utc"] == "2026-01-01T00:00:00+00:00"
     assert h.manager.payload(SESSION, record) == listed
+    await h.manager.close()
+
+
+@pytest.mark.anyio
+async def test_reported_times_do_not_shift_after_host_suspend() -> None:
+    h = Harness()
+    await h.manager.spawn(SESSION, SpawnRequest(template="researcher"))
+    before = h.manager.list(SESSION)[0]
+
+    h.suspended = 3600.0  # wall clock advanced an hour; monotonic did not
+
+    after = h.manager.list(SESSION)[0]
+    assert after["created_at_utc"] == before["created_at_utc"]
+    assert after["last_active_at_utc"] == before["last_active_at_utc"]
     await h.manager.close()
 
 
