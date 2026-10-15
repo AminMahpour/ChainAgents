@@ -30,6 +30,7 @@ from chainagents.runtime.constants import (
     SUMMARIZATION_STATUS_EVENT_KIND,
     ReasoningLevel,
 )
+from chainagents.runtime.summarization_budget import configured_thresholds
 
 logger = logging.getLogger("chainagents.runtime.core")
 
@@ -585,13 +586,7 @@ def _build_deepagents_summarization_factory(
             compute_summarization_defaults,
         )
 
-        profile = getattr(model, "profile", None) or {}
-        trigger_tokens = profile.get(runtime_models.SUMMARIZATION_TRIGGER_TOKENS_KEY)
-        keep_tokens = profile.get(runtime_models.SUMMARIZATION_KEEP_TOKENS_KEY)
-        if trigger_tokens is None:
-            trigger_tokens = config.extensions.summarization_trigger_tokens
-        if keep_tokens is None:
-            keep_tokens = config.extensions.summarization_keep_tokens
+        trigger_tokens, keep_tokens = configured_thresholds(model, config.extensions)
         if trigger_tokens is None and keep_tokens is None:
             return default_factory(model, backend)
 
