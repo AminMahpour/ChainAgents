@@ -74,6 +74,13 @@ def runtime_default_model_profile(config: RuntimeConfig) -> ModelDefaults:
         max_tokens=runtime_model_config.normalize_model_max_tokens(
             getattr(config, "model_max_tokens", None)
         ),
+        context_window=getattr(config, "model_context_window", None),
+        summarization_trigger_tokens=getattr(
+            config, "model_summarization_trigger_tokens", None
+        ),
+        summarization_keep_tokens=getattr(
+            config, "model_summarization_keep_tokens", None
+        ),
         repeat_penalty=runtime_model_config.normalize_repeat_penalty(
             getattr(config, "model_repeat_penalty", None)
         ),
@@ -198,6 +205,12 @@ def model_api_key_for_profile(
     return None
 
 
+# Keys ChainAgents adds to a chat model's ``profile`` so each agent's
+# summarization middleware can find the budget of the model it runs on.
+SUMMARIZATION_TRIGGER_TOKENS_KEY = "chainagents_summarization_trigger_tokens"
+SUMMARIZATION_KEEP_TOKENS_KEY = "chainagents_summarization_keep_tokens"
+
+
 def build_model(
     config: RuntimeConfig,
     reasoning_level: ReasoningLevel,
@@ -205,7 +218,55 @@ def build_model(
     model_name: str | None = None,
     model_profile: ModelDefaults | None = None,
 ) -> Any:
-    """Build model.
+    """Build a chat model and attach its profile's context settings.
+
+    Args:
+        config: Configuration object used by the operation.
+        reasoning_level: The reasoning level value.
+        model_name: The model name or profile reference.
+        model_profile: Already resolved model profile settings.
+
+    Returns:
+        The constructed model.
+    """
+    resolved_profile = model_profile or resolve_runtime_model_profile(
+        config,
+        model_name,
+    )
+    model = _build_provider_model(
+        config,
+        reasoning_level,
+        model_profile=resolved_profile,
+    )
+    return apply_context_settings(model, resolved_profile)
+
+
+def apply_context_settings(model: Any, model_profile: ModelDefaults) -> Any:
+    """Record a profile's context window and summarization budget on ``model``.
+
+    ``max_input_tokens`` is the standard LangChain profile key DeepAgents reads to
+    size summarization; the budget keys are read by ChainAgents' summarization
+    factory. Models without these settings are returned unchanged.
+    """
+    settings = {
+        "max_input_tokens": model_profile.context_window,
+        SUMMARIZATION_TRIGGER_TOKENS_KEY: model_profile.summarization_trigger_tokens,
+        SUMMARIZATION_KEEP_TOKENS_KEY: model_profile.summarization_keep_tokens,
+    }
+    updates = {key: value for key, value in settings.items() if value is not None}
+    if updates and hasattr(model, "profile"):
+        model.profile = {**(model.profile or {}), **updates}
+    return model
+
+
+def _build_provider_model(
+    config: RuntimeConfig,
+    reasoning_level: ReasoningLevel,
+    *,
+    model_name: str | None = None,
+    model_profile: ModelDefaults | None = None,
+) -> Any:
+    """Build the provider chat model for a profile.
 
     Args:
         config: Configuration object used by the operation.
@@ -233,6 +294,8 @@ def build_model(
             kwargs["repeat_penalty"] = resolved_profile.repeat_penalty
         if resolved_profile.max_tokens is not None:
             kwargs["num_predict"] = resolved_profile.max_tokens
+        if resolved_profile.context_window is not None:
+            kwargs["num_ctx"] = resolved_profile.context_window
         return ChatOllama(**kwargs)
 
     if resolved_profile.provider == "bedrock":

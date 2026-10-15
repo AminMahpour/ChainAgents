@@ -457,6 +457,12 @@ class ModelDefaults:
         thinking: The Anthropic thinking mode.
         temperature: The temperature value.
         max_tokens: Maximum output tokens for one model response.
+        context_window: Input context window in tokens; Ollama also allocates
+            it as ``num_ctx``.
+        summarization_trigger_tokens: Context size that triggers summarization
+            for agents on this model; overrides the global ``[agent]`` value.
+        summarization_keep_tokens: Recent context kept after summarization for
+            agents on this model; overrides the global ``[agent]`` value.
         repeat_penalty: The repeat penalty value.
         disable_streaming: Whether to disable model streaming.
         cross_provider_base_url: Runtime endpoint override for provider-switched
@@ -480,6 +486,9 @@ class ModelDefaults:
     thinking: ModelThinking = DEFAULT_MODEL_THINKING
     temperature: float = DEFAULT_TEMPERATURE
     max_tokens: int | None = None
+    context_window: int | None = None
+    summarization_trigger_tokens: int | None = None
+    summarization_keep_tokens: int | None = None
     repeat_penalty: float | None = None
     disable_streaming: DisableStreaming = False
     modalities: tuple[ModelModality, ...] = ("text",)

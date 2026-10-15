@@ -289,6 +289,90 @@ def normalize_model_max_tokens(
     return value
 
 
+CONTEXT_FIELDS = (
+    "context_window",
+    "summarization_trigger_tokens",
+    "summarization_keep_tokens",
+)
+
+
+def _inherits_context_field(
+    field_name: str,
+    explicit_fields: set[str] | frozenset[str],
+    *,
+    same_model: bool,
+) -> bool:
+    """Return whether a profile inherits ``field_name`` from its base model.
+
+    A context window belongs to one model, so only a profile for the same model
+    (same provider and name) inherits it. A summarization budget is sized for a
+    window, so a profile that declares its own ``context_window`` does not
+    inherit the base model's budget either.
+    """
+    if field_name in explicit_fields or not same_model:
+        return False
+    return field_name == "context_window" or "context_window" not in explicit_fields
+
+
+def validate_context_settings(
+    *,
+    context_window: int | None,
+    summarization_trigger_tokens: int | None,
+    summarization_keep_tokens: int | None,
+    field_prefix: str,
+) -> None:
+    """Reject a summarization budget that cannot fit the profile's window."""
+    limits = (
+        ("summarization_trigger_tokens", summarization_trigger_tokens, "context_window", context_window),
+        ("summarization_keep_tokens", summarization_keep_tokens, "context_window", context_window),
+        (
+            "summarization_keep_tokens",
+            summarization_keep_tokens,
+            "summarization_trigger_tokens",
+            summarization_trigger_tokens,
+        ),
+    )
+    for field_name, value, limit_name, limit in limits:
+        if value is not None and limit is not None and value >= limit:
+            raise ValueError(
+                f"The {field_prefix}.{field_name} config ({value}) must be less than "
+                f"{limit_name} ({limit})."
+            )
+
+
+def validate_global_summarization_budget(
+    model_defaults: ModelDefaults,
+    model_profiles: dict[str, ModelDefaults],
+    *,
+    trigger_tokens: int | None,
+    keep_tokens: int | None,
+) -> None:
+    """Reject global ``[agent]`` thresholds that overflow a profile's window.
+
+    The global thresholds apply to every model profile that does not set its own,
+    so each such profile must still satisfy the per-profile limits.
+    """
+    profiles = {"[model]": model_defaults} | {
+        f"[model.profiles.{name}]": profile for name, profile in model_profiles.items()
+    }
+    for label, profile in profiles.items():
+        trigger = profile.summarization_trigger_tokens
+        keep = profile.summarization_keep_tokens
+        try:
+            validate_context_settings(
+                context_window=profile.context_window,
+                summarization_trigger_tokens=trigger if trigger is not None else trigger_tokens,
+                summarization_keep_tokens=keep if keep is not None else keep_tokens,
+                field_prefix="[agent]",
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{exc} The global value applies to {label}; set "
+                f"summarization_trigger_tokens/summarization_keep_tokens there or "
+                f"lower the [agent] value."
+            ) from exc
+
+
 def normalize_repeat_penalty(value: Any | None) -> float | None:
     """Normalize repeat penalty.
 
@@ -771,6 +855,23 @@ def parse_model_profile_defaults(
     )
     if "max_tokens" in raw_model:
         explicit_fields.add("max_tokens")
+    context_settings: dict[str, int | None] = {}
+    for context_field in CONTEXT_FIELDS:
+        if context_field in raw_model:
+            explicit_fields.add(context_field)
+            context_settings[context_field] = normalize_model_max_tokens(
+                raw_model.get(context_field),
+                field_name=f"{field_prefix}.{context_field}",
+            )
+        elif base is not None and _inherits_context_field(
+            context_field,
+            explicit_fields,
+            same_model=provider == base.provider and name == base.name,
+        ):
+            context_settings[context_field] = getattr(base, context_field)
+        else:
+            context_settings[context_field] = None
+    validate_context_settings(**context_settings, field_prefix=field_prefix)
     repeat_penalty = (
         normalize_repeat_penalty(raw_model.get("repeat_penalty"))
         if "repeat_penalty" in raw_model or base is None
@@ -816,6 +917,9 @@ def parse_model_profile_defaults(
         disable_streaming=disable_streaming,
         modalities=modalities,
         explicit_fields=frozenset(explicit_fields),
+        context_window=context_settings["context_window"],
+        summarization_trigger_tokens=context_settings["summarization_trigger_tokens"],
+        summarization_keep_tokens=context_settings["summarization_keep_tokens"],
     )
 
 
@@ -988,10 +1092,19 @@ def rebase_model_profile_defaults(
         "thinking",
         "temperature",
         "max_tokens",
+        *CONTEXT_FIELDS,
         "repeat_penalty",
         "disable_streaming",
         "modalities",
     ):
+        if field_name in CONTEXT_FIELDS and not _inherits_context_field(
+            field_name,
+            explicit_fields,
+            same_model=(
+                "name" not in explicit_fields or model_profile.name == base_model.name
+            ),
+        ):
+            continue
         if (
             field_name in runtime_override_fields
             or field_name not in explicit_fields

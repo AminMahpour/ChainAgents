@@ -40,8 +40,30 @@ At launch, the supported `DEEPAGENT_MODEL_*` environment overrides
 `DEEPAGENT_MODEL_DISABLE_STREAMING_FOR_TOOL_CALLS`) replace the matching
 `[model]` values. `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_REASONING`
 still work as Ollama-only compatibility aliases. Other model settings (such as
-`temperature`, `max_tokens`, `models`, `modalities`, or `thinking`) are only
-set in the file.
+`temperature`, `max_tokens`, `context_window`, `models`, `modalities`, or
+`thinking`) are only set in the file.
+
+### Context window and summarization budget
+
+`[model]` and each `[model.profiles.<name>]` table accept:
+
+- `context_window`: the model's input window in tokens. It is recorded as the
+  model's `max_input_tokens`, so DeepAgents summarizes at 85% of it and keeps
+  10% by default. On Ollama it is also sent as `num_ctx`, the window Ollama
+  allocates. Without it, a model whose window LangChain does not know
+  summarizes only at 170,000 tokens.
+- `summarization_trigger_tokens` and `summarization_keep_tokens`: the
+  summarization budget for agents running on this model.
+
+Every agent (main agent, subagents, live agents) summarizes with the budget of
+its own model profile. Each threshold comes from the profile, then from
+`[agent].summarization_trigger_tokens` / `summarization_keep_tokens`, then from
+the defaults above. A profile inherits these fields from `[model]` only when it
+runs the same model (same provider and name), and a profile declaring its own
+`context_window` does not inherit the budget, which was sized for another
+window. Startup fails if a trigger or keep value is not
+smaller than its `context_window`, if keep is not smaller than trigger, or if a
+global `[agent]` value would overflow a profile's window.
 
 ## Agent runtime
 

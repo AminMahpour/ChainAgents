@@ -122,6 +122,12 @@ def load_file_config(config_path: str | Path | None = None) -> FileConfig:
     extensions = runtime_extension_config.parse_extensions_config(raw_config, resolved_config_path)
     model_profiles = runtime_model_config.parse_model_profiles(raw_model, base=model_defaults)
     live_agents_config.validate_live_agent_models(extensions.live_agents, model_profiles)
+    runtime_model_config.validate_global_summarization_budget(
+        model_defaults,
+        model_profiles,
+        trigger_tokens=extensions.summarization_trigger_tokens,
+        keep_tokens=extensions.summarization_keep_tokens,
+    )
     return FileConfig(
         model=model_defaults,
         extensions=extensions,
@@ -870,6 +876,9 @@ def _build_runtime_default_model(
         thinking=model_defaults.thinking,
         temperature=generation.temperature,
         max_tokens=model_defaults.max_tokens,
+        context_window=model_defaults.context_window,
+        summarization_trigger_tokens=model_defaults.summarization_trigger_tokens,
+        summarization_keep_tokens=model_defaults.summarization_keep_tokens,
         repeat_penalty=model_defaults.repeat_penalty,
         disable_streaming=generation.disable_streaming,
         modalities=model_defaults.modalities,
@@ -926,6 +935,11 @@ class RuntimeConfig:
         model_api_key: The model API key value.
         model_temperature: The model temperature value.
         model_max_tokens: Maximum output tokens for one model response.
+        model_context_window: Input context window of the default model.
+        model_summarization_trigger_tokens: Summarization trigger for the
+            default model.
+        model_summarization_keep_tokens: Context kept after summarization for
+            the default model.
         default_reasoning: The default reasoning value.
         persistence_mode: The persistence mode value.
         agent_state: Whether the DeepAgents graph is stateful or stateless.
@@ -968,6 +982,9 @@ class RuntimeConfig:
     persistence_mode: PersistenceMode
     extensions: ExtensionsConfig
     model_max_tokens: int | None = None
+    model_context_window: int | None = None
+    model_summarization_trigger_tokens: int | None = None
+    model_summarization_keep_tokens: int | None = None
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     langsmith: LangSmithConfig = field(default_factory=LangSmithConfig)
     agent_state: AgentStateMode = DEFAULT_AGENT_STATE
@@ -1041,6 +1058,9 @@ class RuntimeConfig:
             model_api_key=api_key.value,
             model_temperature=generation.temperature,
             model_max_tokens=model_defaults.max_tokens,
+            model_context_window=model_defaults.context_window,
+            model_summarization_trigger_tokens=model_defaults.summarization_trigger_tokens,
+            model_summarization_keep_tokens=model_defaults.summarization_keep_tokens,
             model_repeat_penalty=model_defaults.repeat_penalty,
             default_reasoning=generation.reasoning,
             persistence_mode="postgres" if database_url else "memory",
