@@ -53,12 +53,27 @@ New module `chainagents/runtime/context_usage.py` with
 
 ### Middleware
 
-`ContextUsageMiddleware(agent_label, agent_path, session_resolver, registry,
-emit_stream_events, extensions)` is added as the innermost middleware of every
-agent stack: the main agent, sync subagents, background subagents and live
-agents. Innermost means it sees the request the model actually receives, after
-summarization and argument truncation. `emit_stream_events` is true only for
-the main agent.
+`ContextUsageMiddleware(registry, extensions)` is added to every agent stack
+built by `build_agent_middleware` (main agent, configured subagents, live
+agents) and is inherited by DeepAgents' `general-purpose` delegate. DeepAgents
+merges it after its core stack, so it sees the request after summarization and
+argument truncation. Middleware in DeepAgents' tail (skills, memory, prompt
+caching) runs inside it; the `system` remainder rule below accounts for what
+they add.
+
+The middleware resolves which agent is calling at call time, because one
+instance can serve several agents (the `general-purpose` delegate inherits the
+main agent's instances, and a background run reuses its sync subagent graph):
+
+- `kind`: `configurable["chainagents_agent_kind"]` when set (`background` or
+  `live`); otherwise `main` when the run metadata has no `lc_agent_name`, and
+  `subagent` when it does.
+- `agent`: `configurable["chainagents_agent_name"]` when set (background and
+  live runs), else `main` for the main agent, else `lc_agent_name` (DeepAgents
+  sets it to the subagent's name).
+- Registry key: `configurable["chainagents_agent_instance"]` when set (the
+  background task id or live agent id), else `kind:agent`.
+- Only `kind == "main"` emits stream events.
 
 On each `awrap_model_call` / `wrap_model_call`:
 
@@ -73,8 +88,11 @@ On each `awrap_model_call` / `wrap_model_call`:
    the counter DeepAgents' summarization uses, applied per category.
 2. Call the handler.
 3. If the response's `AIMessage.usage_metadata["input_tokens"]` is a positive
-   integer, scale the category estimates proportionally so they sum to it
-   (largest-remainder rounding) and set `exact = true`. Otherwise keep the
+   integer, set `exact = true` and make the categories sum to it: `tools`,
+   `summary`, `messages` and `tool_results` keep their estimates, scaled down
+   proportionally only if together they exceed the total, and `system` is the
+   remainder. The remainder also covers prompt sections added inside this
+   middleware (skills, memory) and provider formatting. Otherwise keep the
    estimates and set `exact = false`.
 4. Build the snapshot, store it in the registry, and when
    `emit_stream_events` is true, write it to the LangGraph custom stream writer
@@ -99,7 +117,6 @@ only step whose exceptions propagate.
 | Field | Type | Meaning |
 |---|---|---|
 | `agent` | str | Display label: `main`, the subagent name, or the live agent name. |
-| `agent_path` | list[str] | Path from the main agent, e.g. `["research-manager", "repo-planner"]`; empty for the main agent. |
 | `kind` | str | `main`, `subagent`, `background` or `live`. |
 | `model` | str | Model name. |
 | `window` | int \| null | `model.profile["max_input_tokens"]`, or null. |
@@ -138,15 +155,16 @@ main agent emits stream events, subagent snapshots never reach the stream.
 `BackgroundTaskManager` and `LiveAgentManager` and exposed as
 `AgentRuntime.context_usage`.
 
-- Keyed by session id, then agent key (`kind` plus joined `agent_path`, or
-  the live agent id).
+- Keyed by session id, then the agent key described in section 1.
 - Session id resolution: the middleware reads
   `configurable["chainagents_session_id"]` and falls back to
   `configurable["thread_id"]`. The main agent and sync subagents run on the
   conversation's thread, so the fallback is correct for them. Background
   subagent runs (thread `{session}:background:{task}`) and live agent turns
   (thread `live-{session}-{id}`) set `chainagents_session_id` to the owning
-  conversation's session in their run config.
+  conversation's session, plus `chainagents_agent_kind`,
+  `chainagents_agent_name` and `chainagents_agent_instance`, in their run
+  config.
 - At most 50 agents per session; the least recently updated entry is dropped.
 - `close_conversation(thread_id)` clears the session, so the existing
   `DELETE /api/background-tasks?thread_id=…` cleanup removes it.
