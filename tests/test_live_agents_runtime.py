@@ -329,3 +329,48 @@ async def test_stateless_runtime_gives_live_agents_a_shared_checkpointer(
         assert built[0].get_tuple(run_config) is None
     finally:
         await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_runtime_live_agent_turns_keep_artifact_scope_and_langfuse(
+    tmp_path, monkeypatch
+):
+    """Isolated live agent workers still get the conversation's scope and tracing."""
+    config = replace(
+        _config(tmp_path, live=True),
+        agent_state="stateful",
+        langfuse=replace(make_runtime_config(tmp_path).langfuse, enabled=True),
+    )
+    tracer = object()
+    monkeypatch.setattr(
+        core.runtime_tracing, "build_langfuse_callback_handler", lambda _config: tracer
+    )
+    runtime = core.AgentRuntime(config, project_root=tmp_path)
+    runtime._store = InMemoryStore()
+    runtime._checkpointer = MemorySaver()
+    artifacts = runtime.large_tool_result_artifacts
+    seen: list[object] = []
+
+    async def capture() -> str:
+        seen.append(artifacts.current_handle())
+        return "findings"
+
+    graph = FakeGraph([capture])
+
+    async def stub_graph(_spec, _session_id):
+        return graph
+
+    runtime._build_live_agent_graph = stub_graph
+    assert runtime.live_agents is not None
+    try:
+        await runtime.live_agents.spawn(
+            "s", SpawnRequest(template="researcher", initial_message="look")
+        )
+        for _ in range(200):
+            if graph.calls:
+                break
+            await asyncio.sleep(0.01)
+        assert seen == [artifacts.open_session("s")]
+        assert graph.calls[0][1]["callbacks"] == [tracer]
+    finally:
+        await runtime.close()
