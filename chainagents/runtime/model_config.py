@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from chainagents.runtime.constants import (
@@ -287,6 +287,165 @@ def normalize_model_max_tokens(
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"The {field_name} config must be a positive integer.")
     return value
+
+
+CONTEXT_FIELDS = (
+    "context_window",
+    "summarization_trigger_tokens",
+    "summarization_keep_tokens",
+)
+
+
+def _inherits_context_field(
+    field_name: str,
+    explicit_fields: set[str] | frozenset[str],
+    *,
+    same_model: bool,
+) -> bool:
+    """Return whether a profile inherits ``field_name`` from its base model.
+
+    A context window belongs to one model, so only a profile for the same model
+    (same provider and name) inherits it. A summarization budget is sized for a
+    window, so a profile that declares its own ``context_window`` does not
+    inherit the base model's budget either.
+    """
+    if field_name in explicit_fields or not same_model:
+        return False
+    return field_name == "context_window" or "context_window" not in explicit_fields
+
+
+def validate_context_settings(
+    *,
+    context_window: int | None,
+    summarization_trigger_tokens: int | None,
+    summarization_keep_tokens: int | None,
+    field_prefix: str,
+) -> None:
+    """Reject a summarization budget that cannot fit the profile's window."""
+    limits = (
+        ("summarization_trigger_tokens", summarization_trigger_tokens, "context_window", context_window),
+        ("summarization_keep_tokens", summarization_keep_tokens, "context_window", context_window),
+        (
+            "summarization_keep_tokens",
+            summarization_keep_tokens,
+            "summarization_trigger_tokens",
+            summarization_trigger_tokens,
+        ),
+    )
+    for field_name, value, limit_name, limit in limits:
+        if value is not None and limit is not None and value >= limit:
+            raise ValueError(
+                f"The {field_prefix}.{field_name} config ({value}) must be less than "
+                f"{limit_name} ({limit})."
+            )
+
+
+# DeepAgents' summarization defaults when only the window is known.
+DEFAULT_TRIGGER_PERCENT = 85
+DEFAULT_KEEP_PERCENT = 10
+
+
+class ContextSettings(TypedDict):
+    """Context window and summarization budget of one model."""
+
+    context_window: int | None
+    summarization_trigger_tokens: int | None
+    summarization_keep_tokens: int | None
+
+
+def context_settings_for(
+    model: ModelDefaults, *, provider: str, name: str
+) -> ContextSettings:
+    """Return ``model``'s context settings while ``provider``/``name`` still name it.
+
+    A context window and its summarization budget belong to one model, so a
+    runtime override or a raw model choice that switches models drops them.
+    """
+    if provider == model.provider and name == model.name:
+        return ContextSettings(
+            context_window=model.context_window,
+            summarization_trigger_tokens=model.summarization_trigger_tokens,
+            summarization_keep_tokens=model.summarization_keep_tokens,
+        )
+    return ContextSettings(
+        context_window=None,
+        summarization_trigger_tokens=None,
+        summarization_keep_tokens=None,
+    )
+
+
+def _effective_threshold(
+    profile_value: int | None,
+    global_value: int | None,
+    window: int | None,
+    *,
+    label: str,
+    field_name: str,
+    default_percent: int,
+) -> tuple[int | None, str]:
+    """Return one effective threshold and a description of where it came from."""
+    if profile_value is not None:
+        return profile_value, f"set in {label}"
+    if global_value is not None:
+        return global_value, f"from [agent].{field_name}"
+    if window is not None:
+        return window * default_percent // 100, f"default {default_percent}% of context_window"
+    return None, ""
+
+
+def validate_global_summarization_budget(
+    model_defaults: ModelDefaults,
+    model_profiles: dict[str, ModelDefaults],
+    *,
+    trigger_tokens: int | None,
+    keep_tokens: int | None,
+) -> None:
+    """Reject effective summarization thresholds that cannot work for a profile.
+
+    Each threshold resolves like the summarizer does: the profile's value, then
+    the global ``[agent]`` value, then DeepAgents' fraction of the window. The
+    effective keep must be below the effective trigger, and both below the
+    window, for every profile.
+    """
+    profiles = {"[model]": model_defaults} | {
+        f"[model.profiles.{name}]": profile for name, profile in model_profiles.items()
+    }
+    for label, profile in profiles.items():
+        window = profile.context_window
+        trigger, trigger_source = _effective_threshold(
+            profile.summarization_trigger_tokens,
+            trigger_tokens,
+            window,
+            label=label,
+            field_name="summarization_trigger_tokens",
+            default_percent=DEFAULT_TRIGGER_PERCENT,
+        )
+        keep, keep_source = _effective_threshold(
+            profile.summarization_keep_tokens,
+            keep_tokens,
+            window,
+            label=label,
+            field_name="summarization_keep_tokens",
+            default_percent=DEFAULT_KEEP_PERCENT,
+        )
+        checks = (
+            ("trigger", trigger, trigger_source, "context_window", window, f"set in {label}"),
+            ("keep", keep, keep_source, "context_window", window, f"set in {label}"),
+            ("keep", keep, keep_source, "summarization trigger", trigger, trigger_source),
+        )
+        for name, value, source, limit_name, limit, limit_source in checks:
+            if value is None or limit is None or value < limit:
+                continue
+            hint = (
+                " Set summarization_trigger_tokens/summarization_keep_tokens there or "
+                "lower the [agent] value."
+                if "[agent]" in source or "[agent]" in limit_source
+                else ""
+            )
+            raise ValueError(
+                f"The effective summarization {name} ({value}, {source}) must be less "
+                f"than {limit_name} ({limit}, {limit_source}) for {label}.{hint}"
+            )
 
 
 def normalize_repeat_penalty(value: Any | None) -> float | None:
@@ -771,6 +930,23 @@ def parse_model_profile_defaults(
     )
     if "max_tokens" in raw_model:
         explicit_fields.add("max_tokens")
+    context_settings: dict[str, int | None] = {}
+    for context_field in CONTEXT_FIELDS:
+        if context_field in raw_model:
+            explicit_fields.add(context_field)
+            context_settings[context_field] = normalize_model_max_tokens(
+                raw_model.get(context_field),
+                field_name=f"{field_prefix}.{context_field}",
+            )
+        elif base is not None and _inherits_context_field(
+            context_field,
+            explicit_fields,
+            same_model=provider == base.provider and name == base.name,
+        ):
+            context_settings[context_field] = getattr(base, context_field)
+        else:
+            context_settings[context_field] = None
+    validate_context_settings(**context_settings, field_prefix=field_prefix)
     repeat_penalty = (
         normalize_repeat_penalty(raw_model.get("repeat_penalty"))
         if "repeat_penalty" in raw_model or base is None
@@ -816,6 +992,9 @@ def parse_model_profile_defaults(
         disable_streaming=disable_streaming,
         modalities=modalities,
         explicit_fields=frozenset(explicit_fields),
+        context_window=context_settings["context_window"],
+        summarization_trigger_tokens=context_settings["summarization_trigger_tokens"],
+        summarization_keep_tokens=context_settings["summarization_keep_tokens"],
     )
 
 
@@ -867,6 +1046,9 @@ def resolve_model_profile_defaults(
             models=(),
             name_is_explicit=True,
             explicit_fields=base_model.explicit_fields | frozenset({"name", "models"}),
+            **context_settings_for(
+                base_model, provider=base_model.provider, name=selected_ref
+            ),
         )
     return base_model
 
@@ -988,10 +1170,19 @@ def rebase_model_profile_defaults(
         "thinking",
         "temperature",
         "max_tokens",
+        *CONTEXT_FIELDS,
         "repeat_penalty",
         "disable_streaming",
         "modalities",
     ):
+        if field_name in CONTEXT_FIELDS and not _inherits_context_field(
+            field_name,
+            explicit_fields,
+            same_model=(
+                "name" not in explicit_fields or model_profile.name == base_model.name
+            ),
+        ):
+            continue
         if (
             field_name in runtime_override_fields
             or field_name not in explicit_fields

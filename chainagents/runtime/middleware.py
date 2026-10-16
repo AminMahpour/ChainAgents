@@ -558,29 +558,42 @@ def _build_summarization_middleware(
 
 def _build_deepagents_summarization_factory(
     config: RuntimeConfig,
-) -> Callable[[Any, Any], AgentMiddleware[Any, Any, Any]] | None:
-    """Build a DeepAgents summarization factory honoring configured thresholds.
+    default_factory: Callable[[Any, Any], AgentMiddleware[Any, Any, Any]],
+) -> Callable[[Any, Any], AgentMiddleware[Any, Any, Any]]:
+    """Build a DeepAgents summarization factory honoring configured budgets.
+
+    DeepAgents calls the factory once per agent with that agent's model, so each
+    agent uses the budget of its own model profile. For each threshold, the
+    model profile's budget wins over the global ``[agent]`` value, which wins over
+    DeepAgents' defaults (fractions of ``max_input_tokens`` when the window is
+    known). Models with no configured budget use ``default_factory`` unchanged.
 
     Args:
         config: Configuration object used by the operation.
+        default_factory: DeepAgents' own summarization middleware factory.
 
     Returns:
-        A replacement DeepAgents summarization factory, or None when the
-        built-in defaults should be used unchanged.
+        The summarization factory to install while the graph is created.
     """
-    trigger_tokens = config.extensions.summarization_trigger_tokens
-    keep_tokens = config.extensions.summarization_keep_tokens
-    if trigger_tokens is None and keep_tokens is None:
-        return None
 
     def factory(model: Any, backend: Any) -> AgentMiddleware[Any, Any, Any]:
-        """Create DeepAgents summarization middleware with configured thresholds."""
+        """Create DeepAgents summarization middleware with the model's budget."""
         from langchain.agents.middleware.summarization import ContextSize
 
         from deepagents.middleware.summarization import (
             SummarizationMiddleware,
             compute_summarization_defaults,
         )
+
+        profile = getattr(model, "profile", None) or {}
+        trigger_tokens = profile.get(runtime_models.SUMMARIZATION_TRIGGER_TOKENS_KEY)
+        keep_tokens = profile.get(runtime_models.SUMMARIZATION_KEEP_TOKENS_KEY)
+        if trigger_tokens is None:
+            trigger_tokens = config.extensions.summarization_trigger_tokens
+        if keep_tokens is None:
+            keep_tokens = config.extensions.summarization_keep_tokens
+        if trigger_tokens is None and keep_tokens is None:
+            return default_factory(model, backend)
 
         defaults = compute_summarization_defaults(model)
         trigger: ContextSize = (
@@ -618,11 +631,12 @@ def create_deep_agent_with_configured_summarization(
     """
     import deepagents.graph as deepagents_graph
 
-    summarization_factory = _build_deepagents_summarization_factory(config)
-
     with _DEEPAGENTS_SUMMARIZATION_FACTORY_LOCK:
         original_factory = deepagents_graph.create_summarization_middleware
         original_profile = deepagents_graph._harness_profile_for_model
+        summarization_factory = _build_deepagents_summarization_factory(
+            config, original_factory
+        )
 
         def profile_with_token_guard(model: Any, spec: str | None) -> Any:
             # DeepAgents builds its implicit general-purpose delegate from the
@@ -646,14 +660,13 @@ def create_deep_agent_with_configured_summarization(
 
             return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
 
-        if summarization_factory is not None:
-            # This replacement factory intentionally narrows the signature to
-            # the two positional arguments deepagents actually passes at this
-            # call site; the module-level function's broader keyword-only
-            # defaults are not exercised here.
-            deepagents_graph.create_summarization_middleware = (
-                summarization_factory  # type: ignore[assignment]
-            )
+        # This replacement factory intentionally narrows the signature to the
+        # two positional arguments deepagents actually passes at this call site;
+        # the module-level function's broader keyword-only defaults are not
+        # exercised here.
+        deepagents_graph.create_summarization_middleware = (
+            summarization_factory  # type: ignore[assignment]
+        )
         deepagents_graph._harness_profile_for_model = profile_with_token_guard
         try:
             return create_deep_agent(**kwargs)

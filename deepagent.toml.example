@@ -4,6 +4,14 @@ base_url = "http://127.0.0.1:11434"
 temperature = 0
 # Optional positive output-token limit for each response.
 # max_tokens = 4096
+# Optional input context window in tokens. Summarization then triggers at 85%
+# of it by default, and Ollama allocates it as num_ctx.
+# context_window = 32768
+# Optional summarization budget for agents on this model, overriding the
+# [agent] values. Must be smaller than context_window. Only profiles for this
+# same model inherit these, and not when they declare their own context_window.
+# summarization_trigger_tokens = 24000
+# summarization_keep_tokens = 4000
 name = "gpt-oss:20b"
 models = ["gpt-oss:20b", "gemma4:27b"]
 reasoning_effort = "medium"

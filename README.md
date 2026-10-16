@@ -548,6 +548,7 @@ Notes:
 - `provider` selects `ChatOllama`, `ChatOpenAI`, `ChatAnthropic`, `ChatBedrockConverse` (`provider = "bedrock"`), or `ChatAnthropicBedrock` (`provider = "anthropic_bedrock"`).
 - `provider = "claude"` is accepted as an alias for `provider = "anthropic"`.
 - Preferred shared fields are `base_url`, `name`, `temperature`, `max_tokens`, and `reasoning_effort`.
+- `context_window` is an optional input window in tokens. Summarization then triggers at 85% of it by default, and Ollama allocates it as `num_ctx`. `summarization_trigger_tokens` and `summarization_keep_tokens` set the summarization budget for agents on that profile, overriding the `[agent]` values. See [Context window and summarization budget](docs/configuration.md#context-window-and-summarization-budget).
 - `max_tokens` is an optional positive output-token limit. It maps to `max_completion_tokens` for Snowflake Cortex and OpenAI-compatible providers, `max_tokens` for Anthropic and Bedrock, and `num_predict` for Ollama.
 - If the model reaches this limit while producing a tool call, ChainAgents discards the incomplete call and tells the model to shorten or split it once. A second truncated tool call ends that run with a clear message; increasing `max_tokens` may help.
 - `repeat_penalty` is optional and currently applies to `provider = "ollama"`; when omitted, Ollama defaults are used.
@@ -966,8 +967,8 @@ Main `[agent]` additions:
 - `custom_instruction_file`: optional UTF-8 text file loaded as the main-agent custom instruction. Relative paths resolve from the active `deepagent.toml`. This is mutually exclusive with `custom_instruction`.
 - ChainAgents explicitly restores `TodoListMiddleware` for the main agent and local sync subagents because DeepAgents 0.7 no longer includes it by default.
 - DeepAgents still provides its own summarization middleware in the main agent and sync subagents.
-- `summarization_trigger_tokens`: optional positive integer token threshold for DeepAgents' built-in summarization middleware.
-- `summarization_keep_tokens`: optional positive integer token budget to keep after DeepAgents summarizes conversation history.
+- `summarization_trigger_tokens`: optional positive integer token threshold for DeepAgents' built-in summarization middleware. A model profile's own `summarization_trigger_tokens` overrides it for agents on that profile.
+- `summarization_keep_tokens`: optional positive integer token budget to keep after DeepAgents summarizes conversation history. A model profile's own `summarization_keep_tokens` overrides it for agents on that profile.
 - Legacy `summarization_middleware_enabled` entries are still parsed for compatibility, but ChainAgents no longer injects a second summarization middleware.
 
 ### Local Background Subagents
