@@ -162,6 +162,12 @@ class AgentRuntime:
                     else None
                 ),
                 on_stopped=self._on_live_agent_stopped,
+                artifact_registry=self.large_tool_result_artifacts,
+                turn_callbacks=(
+                    self._live_agent_turn_callbacks
+                    if getattr(config.langfuse, "enabled", False)
+                    else None
+                ),
             )
             self._exit_stack.push_async_callback(self.live_agents.close)
         self.user_input = ConversationInputController(
@@ -990,6 +996,11 @@ class AgentRuntime:
         delete_thread = getattr(self._live_agent_checkpointer(), "adelete_thread", None)
         if delete_thread is not None:
             await delete_thread(thread_id)
+
+    def _live_agent_turn_callbacks(self, record: LiveAgentRecord) -> list[Any]:
+        """Return the Langfuse callback for one live agent turn, if configured."""
+        handler = runtime_tracing.build_langfuse_callback_handler(self.config)
+        return [handler] if handler is not None else []
 
     def _live_agent_turn_context(
         self, record: LiveAgentRecord

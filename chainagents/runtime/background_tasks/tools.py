@@ -409,6 +409,30 @@ def create_background_task_tools(
         )
         return snapshot.to_payload()
 
+    visibility = (
+        ""
+        if manager.config.stream_activity
+        else (
+            " Their reasoning, tool calls and todo lists are not shown live; only "
+            "the final reports are."
+        )
+    )
+    foreground = (
+        " When the user asks for foreground or synchronous subagents, or wants to "
+        "watch their steps or todo lists, use the `task` tool instead."
+    )
+    spawn_background_task.description = (
+        "Launch an allowed local subagent as a background task and return its task "
+        "ID immediately; collect the report later with get_background_task."
+        + visibility
+        + foreground
+    )
+    run_subagent_batch.description = (
+        "Run independent child tasks concurrently as background tasks, wait for "
+        "all of them, and return all reports in order."
+        + visibility
+        + foreground
+    )
     return [
         spawn_background_task,
         run_subagent_batch,

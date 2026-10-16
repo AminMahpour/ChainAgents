@@ -78,6 +78,16 @@ A FastAPI application with a streaming endpoint. It uses the same
 request-size/resource limits — note these are not rate limits, so an
 external rate limiter is required in front of a public deployment.
 
+### Background task activity
+
+With `[agent.background_subagents].stream_activity = true`, a turn's NDJSON
+stream also carries live activity from the conversation's background tasks
+(including `run_subagent_batch` children) while the turn runs:
+`reasoning_delta`, `tool_call` and `tool_result` events whose `source` names
+the task (`scout`, `scout 2` for a second task of the same type, nested
+children as `scout / child`). Child response text and activity after the turn
+ends are not streamed; reports arrive through the background tools' results.
+
 ### Live agents
 
 When `[agent.live_agents]` is enabled, the HTTP API also exposes

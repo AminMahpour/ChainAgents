@@ -51,6 +51,7 @@ class Harness:
         graphs: list[Any] | None = None,
         delete: bool = False,
         delete_error: bool = False,
+        manager_options: dict[str, Any] | None = None,
         **config: Any,
     ) -> None:
         self.broker = MessageBroker(MessagingConfig(enabled=True))
@@ -76,6 +77,7 @@ class Harness:
             clock=lambda: self.now,
             wall_clock=lambda: self.now + self.suspended + WALL_OFFSET,
             delete_thread=delete_thread if delete else None,
+            **(manager_options or {}),
         )
         self.queue: asyncio.Queue[LiveAgentEvent] | None = None
 
@@ -175,6 +177,81 @@ async def test_reported_times_do_not_shift_after_host_suspend() -> None:
     after = h.manager.list(SESSION)[0]
     assert after["created_at_utc"] == before["created_at_utc"]
     assert after["last_active_at_utc"] == before["last_active_at_utc"]
+    await h.manager.close()
+
+
+@pytest.mark.anyio
+async def test_live_agent_turns_do_not_inherit_the_spawning_run_config() -> None:
+    """A spawn from inside a main-agent tool call must not join that run.
+
+    The worker task would otherwise copy LangChain's current run config, so
+    the live agent's model events stream into the main turn's callbacks.
+    """
+    from langchain_core.runnables.config import var_child_runnable_config
+
+    seen: list[object] = []
+
+    async def capture() -> str:
+        seen.append(var_child_runnable_config.get())
+        return "findings"
+
+    h = Harness(graphs=[FakeGraph([capture])])
+    token = var_child_runnable_config.set({"callbacks": ["main-turn-handler"]})
+    try:
+        await h.manager.spawn(
+            SESSION, SpawnRequest(template="researcher", initial_message="look into X")
+        )
+    finally:
+        var_child_runnable_config.reset(token)
+    await until(lambda: bool(h.inbox("main")))
+
+    assert seen == [None]
+    await h.manager.close()
+
+
+@pytest.mark.anyio
+async def test_live_agent_turns_run_in_their_conversation_artifact_scope() -> None:
+    """Large tool results from live agents belong to the owning conversation."""
+    from chainagents.runtime.artifacts import LargeToolResultArtifactRegistry
+
+    registry = LargeToolResultArtifactRegistry()
+    seen: list[object] = []
+
+    async def capture() -> str:
+        seen.append(registry.current_handle())
+        return "findings"
+
+    h = Harness(
+        graphs=[FakeGraph([capture])],
+        manager_options={"artifact_registry": registry},
+    )
+    await h.manager.spawn(
+        SESSION, SpawnRequest(template="researcher", initial_message="look into X")
+    )
+    await until(lambda: bool(h.inbox("main")))
+
+    assert seen == [registry.open_session(SESSION)]
+    assert registry.current_handle() == registry.open_session("")
+    await h.manager.close()
+
+
+@pytest.mark.anyio
+async def test_live_agent_turns_carry_tracing_callbacks() -> None:
+    """Tracing callbacks (e.g. Langfuse) are attached to each live agent turn."""
+    graph = FakeGraph(["findings"])
+    tracer = object()
+    h = Harness(
+        graphs=[graph],
+        manager_options={"turn_callbacks": lambda record: [tracer]},
+    )
+    await h.manager.spawn(
+        SESSION, SpawnRequest(template="researcher", initial_message="look into X")
+    )
+    await until(lambda: bool(h.inbox("main")))
+
+    config = graph.calls[0][1]
+    assert config["callbacks"] == [tracer]
+    assert config["metadata"]["langfuse_session_id"] == SESSION
     await h.manager.close()
 
 

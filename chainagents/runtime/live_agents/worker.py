@@ -70,6 +70,9 @@ class LiveAgentWorker:
         turn_context: Callable[[LiveAgentRecord], AbstractContextManager[Any]]
         | None = None,
         on_finished: Callable[[LiveAgentRecord, str], Awaitable[None]],
+        artifact_registry: Any | None = None,
+        artifact_handle: Any | None = None,
+        turn_callbacks: Callable[[LiveAgentRecord], list[Any]] | None = None,
     ) -> None:
         self.record = record
         self.graph = graph
@@ -81,6 +84,11 @@ class LiveAgentWorker:
         self.wall_clock = wall_clock
         self.turn_context = turn_context
         self.on_finished = on_finished
+        # The worker runs in a fresh context (see LiveAgentManager.spawn), so the
+        # conversation's artifact scope and tracing callbacks are reapplied here.
+        self.artifact_registry = artifact_registry
+        self.artifact_handle = artifact_handle
+        self.turn_callbacks = turn_callbacks
 
     async def run(self) -> None:
         record = self.record
@@ -136,6 +144,12 @@ class LiveAgentWorker:
         record = self.record
         address_token = _CURRENT_AGENT_ADDRESS.set(record.address)
         session_token = _CURRENT_MESSAGING_SESSION.set(record.session_id)
+        artifacts = self.artifact_registry
+        artifact_token = (
+            artifacts.activate(self.artifact_handle)
+            if artifacts is not None and self.artifact_handle is not None
+            else None
+        )
         try:
             context = (
                 self.turn_context(record) if self.turn_context else nullcontext()
@@ -152,22 +166,33 @@ class LiveAgentWorker:
                             for m in messages
                         ]
                     },
-                    {
-                        "configurable": {
-                            "thread_id": record.thread_id,
-                            SESSION_ID_KEY: record.session_id,
-                            AGENT_KIND_KEY: "live",
-                            AGENT_NAME_KEY: record.name,
-                            AGENT_INSTANCE_KEY: record.id,
-                        },
-                        "recursion_limit": self.recursion_limit,
-                    },
+                    self._run_config(),
                 )
         finally:
+            if artifacts is not None and artifact_token is not None:
+                artifacts.reset(artifact_token)
             _CURRENT_MESSAGING_SESSION.reset(session_token)
             _CURRENT_AGENT_ADDRESS.reset(address_token)
         text = _final_text(result)
         return text if text.strip() else NO_REPLY_TEXT
+
+    def _run_config(self) -> dict[str, Any]:
+        record = self.record
+        config: dict[str, Any] = {
+            "configurable": {
+                "thread_id": record.thread_id,
+                SESSION_ID_KEY: record.session_id,
+                AGENT_KIND_KEY: "live",
+                AGENT_NAME_KEY: record.name,
+                AGENT_INSTANCE_KEY: record.id,
+            },
+            "recursion_limit": self.recursion_limit,
+        }
+        callbacks = self.turn_callbacks(record) if self.turn_callbacks else []
+        if callbacks:
+            config["callbacks"] = callbacks
+            config["metadata"] = {"langfuse_session_id": record.session_id}
+        return config
 
     def _reply(self, batch: list[AgentMessage], text: str) -> None:
         record = self.record

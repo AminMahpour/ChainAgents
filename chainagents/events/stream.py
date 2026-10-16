@@ -173,6 +173,14 @@ def namespace_label(ns: tuple[str, ...], metadata: dict[str, Any]) -> str:
     return " / ".join(labels)
 
 
+def _delegation_namespace(ns: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the namespace of the ``task`` delegation that ``ns`` runs inside."""
+    for index in range(len(ns) - 1, -1, -1):
+        if ns[index].startswith("tools:"):
+            return ns[: index + 1]
+    return ns
+
+
 def iter_messages(value: Any) -> list[Any]:
     """Return message-like objects from nested LangGraph update payloads."""
     if value is None:
@@ -255,8 +263,31 @@ class AgentStreamEventAdapter:
         self.previous_tool_call_ids: dict[str, str] = {}
         self.tool_call_started: set[str] = set()
         self.agent_names_by_namespace: dict[tuple[str, ...], str] = {}
+        self.sources_by_delegation: dict[tuple[str, ...], str] = {}
+        self.allocated_sources: set[str] = set()
         self.unnamed_sources_by_namespace: dict[tuple[str, ...], str] = {}
         self.completed_tool_results: set[tuple[tuple[str, ...], str, str]] = set()
+
+    def _source_for_delegation(self, ns: tuple[str, ...], agent_name: str) -> str:
+        """Give each delegation its own source, numbering repeated agent names.
+
+        Parallel ``task`` calls to one subagent type all report the same
+        ``lc_agent_name``; without numbering, their reasoning, tool calls and
+        todo lists would merge under a single source.
+        """
+        delegation = _delegation_namespace(ns)
+        source = self.sources_by_delegation.get(delegation)
+        if source is None:
+            # Skip every label already given out, including literal agent names
+            # such as "worker 2", so distinct delegations never share a source.
+            source = agent_name
+            number = 1
+            while source in self.allocated_sources:
+                number += 1
+                source = f"{agent_name} {number}"
+            self.allocated_sources.add(source)
+            self.sources_by_delegation[delegation] = source
+        return source
 
     def _source_for_namespace(
         self, ns: tuple[str, ...], metadata: dict[str, Any] | None = None
@@ -264,7 +295,7 @@ class AgentStreamEventAdapter:
         """Keep an agent's display name across stream modes for one run."""
         agent_name = (metadata or {}).get("lc_agent_name")
         if agent_name:
-            source = str(agent_name)
+            source = self._source_for_delegation(ns, str(agent_name))
             self.agent_names_by_namespace[ns] = source
             return source
         cached_source = self.agent_names_by_namespace.get(ns)

@@ -857,6 +857,7 @@ def build_main_tools(
 # Default general-purpose delegate middleware slots that DeepAgents lets the
 # main agent's middleware override by name (its profile adds the token guards).
 _GENERAL_PURPOSE_INHERITED_MIDDLEWARE = frozenset({
+    "TodoListMiddleware",
     "FilesystemMiddleware",
     "SummarizationMiddleware",
     "PatchToolCallsMiddleware",
