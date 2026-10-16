@@ -365,3 +365,91 @@ model = "small"
     }
     assert ("qwen3:32b", ("tokens", 24000), ("tokens", 4000)) in budgets
     assert ("qwen3:4b", ("tokens", 6000), ("tokens", 1000)) in budgets
+
+
+# ------------------------------------------------- model switches and defaults
+
+
+SWITCHABLE = (
+    OLLAMA_MODEL
+    + """
+models = ["qwen3:32b", "qwen3:4b"]
+context_window = 32768
+summarization_trigger_tokens = 24000
+summarization_keep_tokens = 4000
+"""
+)
+
+
+def test_raw_model_choice_does_not_inherit_the_default_models_context(
+    tmp_path, monkeypatch
+) -> None:
+    config = _config(tmp_path, monkeypatch, SWITCHABLE)
+
+    other = deepagent_runtime.resolve_runtime_model_profile(config, "qwen3:4b")
+    model = deepagent_runtime.build_model(config, "medium", model_name="qwen3:4b")
+
+    assert (other.context_window, other.summarization_trigger_tokens) == (None, None)
+    assert other.summarization_keep_tokens is None
+    assert model.num_ctx is None
+
+
+def test_model_override_does_not_inherit_the_file_models_context(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DEEPAGENT_MODEL_NAME", "qwen3:4b")
+    config = _config(tmp_path, monkeypatch, SWITCHABLE)
+
+    default = deepagent_runtime.resolve_runtime_model_profile(config)
+
+    assert default.name == "qwen3:4b"
+    assert (default.context_window, default.summarization_trigger_tokens) == (None, None)
+    assert deepagent_runtime.build_model(config, "medium").num_ctx is None
+
+
+def test_same_model_choice_keeps_its_context(tmp_path, monkeypatch) -> None:
+    config = _config(tmp_path, monkeypatch, SWITCHABLE)
+
+    same = deepagent_runtime.resolve_runtime_model_profile(config, "qwen3:32b")
+
+    assert (same.context_window, same.summarization_trigger_tokens) == (32768, 24000)
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        # Default keep (10% = 1000) is not below an explicit trigger of 500.
+        (
+            "context_window = 10000\nsummarization_trigger_tokens = 500",
+            r"keep \(1000, default 10% of context_window\).*less than.*trigger \(500",
+        ),
+        # Explicit keep of 9000 is not below the default trigger (85% = 8500).
+        (
+            "context_window = 10000\nsummarization_keep_tokens = 9000",
+            r"keep \(9000.*less than.*trigger \(8500, default 85% of context_window\)",
+        ),
+    ],
+)
+def test_validation_uses_default_fractions_for_omitted_thresholds(
+    tmp_path, monkeypatch, fields: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _config(tmp_path, monkeypatch, OLLAMA_MODEL + f"\n[model.profiles.small]\n{fields}\n")
+
+
+def test_global_keep_can_complete_a_profile_budget(tmp_path, monkeypatch) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        OLLAMA_MODEL
+        + """
+[model.profiles.small]
+context_window = 10000
+summarization_trigger_tokens = 500
+
+[agent]
+summarization_keep_tokens = 300
+""",
+    )
+
+    assert config.extensions.summarization_keep_tokens == 300
