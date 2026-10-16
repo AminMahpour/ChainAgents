@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import builtins
 import logging
 import time
@@ -63,6 +64,8 @@ class LiveAgentManager:
         delete_thread: Callable[[str], Awaitable[None]] | None = None,
         turn_context: Callable[[LiveAgentRecord], AbstractContextManager[Any]]
         | None = None,
+        artifact_registry: Any | None = None,
+        turn_callbacks: Callable[[LiveAgentRecord], list[Any]] | None = None,
     ) -> None:
         self.config = config
         self.events = events if events is not None else LiveAgentEventBus()
@@ -72,6 +75,11 @@ class LiveAgentManager:
         self._wall_clock = wall_clock
         self._delete_thread = delete_thread
         self._turn_context = turn_context
+        # Workers start in a fresh context, so these are applied per turn: the
+        # owning conversation's large-result artifact scope, and tracing
+        # callbacks such as Langfuse.
+        self._artifact_registry = artifact_registry
+        self._turn_callbacks = turn_callbacks
         self._registry = LiveAgentRegistry(config, clock=clock, wall_clock=wall_clock)
         self._workers: dict[str, asyncio.Task[None]] = {}
         # One teardown task per agent id; doubles as the "torn down" marker.
@@ -176,9 +184,21 @@ class LiveAgentManager:
             wall_clock=self._wall_clock,
             turn_context=self._turn_context,
             on_finished=self._on_worker_finished,
+            artifact_registry=self._artifact_registry,
+            artifact_handle=(
+                self._artifact_registry.open_session(session_id)
+                if self._artifact_registry is not None
+                else None
+            ),
+            turn_callbacks=self._turn_callbacks,
         )
+        # A fresh context keeps the worker out of the spawning run: a spawn from
+        # a main-agent tool call would otherwise copy LangChain's run config and
+        # stream the live agent's model events into the main turn.
         task = asyncio.get_running_loop().create_task(
-            worker.run(), name=f"{WORKER_TASK_PREFIX}{record.id}"
+            worker.run(),
+            name=f"{WORKER_TASK_PREFIX}{record.id}",
+            context=contextvars.Context(),
         )
         self._workers[record.id] = task
         task.add_done_callback(lambda done: self._on_worker_done(record, done))
