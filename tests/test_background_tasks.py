@@ -4869,3 +4869,23 @@ def test_chainlit_local_notifier_continues_after_send_failure(monkeypatch) -> No
         await manager.close()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("stream_activity", [False, True])
+def test_background_tool_descriptions_steer_foreground_work_to_task(
+    stream_activity: bool,
+) -> None:
+    """Background tools say they run out of view and point to `task` instead."""
+    tools = create_background_task_tools(
+        manager=make_manager(stream_activity=stream_activity),
+        subagents={"worker": object()},
+        agent_path=(),
+        recursion_limit=20,
+    )
+    by_name = {tool.name: tool for tool in tools}
+
+    for name in ("spawn_background_task", "run_subagent_batch"):
+        description = by_name[name].description
+        assert "background task" in description, name
+        assert "`task` tool" in description, name
+        assert ("not shown live" in description) is not stream_activity, name
