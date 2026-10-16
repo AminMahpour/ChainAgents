@@ -55,7 +55,11 @@ New module `chainagents/runtime/context_usage.py` with
 
 `ContextUsageMiddleware(registry, extensions)` is added to every agent stack
 built by `build_agent_middleware` (main agent, configured subagents, live
-agents) and is inherited by DeepAgents' `general-purpose` delegate. DeepAgents
+agents). DeepAgents' `general-purpose` delegate inherits main-agent middleware
+only when it replaces one of the delegate's default slots, so the middleware is
+added to the delegate explicitly: through the harness-profile extra middleware
+for the implicit delegate, and through ChainAgents' explicit delegate spec when
+live agents are enabled. Each stack holds exactly one instance. DeepAgents
 merges it after its core stack, so it sees the request after summarization and
 argument truncation. Middleware in DeepAgents' tail (skills, memory, prompt
 caching) runs inside it; the `system` remainder rule below accounts for what
@@ -73,6 +77,13 @@ main agent's instances, and a background run reuses its sync subagent graph):
   sets it to the subagent's name).
 - Registry key: `configurable["chainagents_agent_instance"]` when set (the
   background task id or live agent id), else `kind:agent`.
+- Nested calls: the run-config identity keys describe only the run's own agent,
+  but LangGraph passes `configurable` on to nested `task` calls. When the
+  metadata's `lc_agent_name` is present and differs from
+  `chainagents_agent_name`, the caller is a nested subagent: `kind` is
+  `subagent`, `agent` is `lc_agent_name`, and the key is
+  `<chainagents_agent_instance>:<lc_agent_name>`. The session still comes
+  from `chainagents_session_id`.
 - Only `kind == "main"` emits stream events.
 
 On each `awrap_model_call` / `wrap_model_call`:
