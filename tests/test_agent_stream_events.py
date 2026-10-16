@@ -13,6 +13,7 @@ from chainagents.events.stream import (
     langgraph_part_from_event_chunk,
 )
 from deepagents import create_deep_agent
+import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessageChunk
 
@@ -353,6 +354,36 @@ def test_adapter_numbers_parallel_subagents_that_share_a_name() -> None:
     ]
     assert [event.source for event in again] == ["general-purpose"]
     assert [event.source for event in result] == ["general-purpose 2"]
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        # A literal "worker 2" agent first: the second worker delegation skips it.
+        (["worker 2", "worker", "worker"], ["worker 2", "worker", "worker 3"]),
+        # Generated "worker 2" first: the literal agent gets a distinct label.
+        (["worker", "worker", "worker 2"], ["worker", "worker 2", "worker 2 2"]),
+    ],
+)
+def test_adapter_keeps_generated_sources_distinct_from_literal_names(
+    names: list[str], expected: list[str]
+) -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    sources = []
+    for index, name in enumerate(names):
+        events = adapter.events_from_raw_event(
+            _raw_event(
+                (
+                    (f"tools:task-{index}",),
+                    "messages",
+                    (_ReasoningToken(f"step {index}"), {"lc_agent_name": name}),
+                )
+            )
+        )
+        sources.append(events[0].source)
+
+    assert sources == expected
 
 
 def test_adapter_keeps_equal_tool_call_ids_in_separate_namespaces() -> None:

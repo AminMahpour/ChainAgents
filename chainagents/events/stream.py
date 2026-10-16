@@ -261,7 +261,7 @@ class AgentStreamEventAdapter:
         self.tool_call_started: set[str] = set()
         self.agent_names_by_namespace: dict[tuple[str, ...], str] = {}
         self.sources_by_delegation: dict[tuple[str, ...], str] = {}
-        self.delegations_by_name: dict[str, int] = {}
+        self.allocated_sources: set[str] = set()
         self.unnamed_sources_by_namespace: dict[tuple[str, ...], str] = {}
         self.completed_tool_results: set[tuple[tuple[str, ...], str, str]] = set()
 
@@ -275,9 +275,14 @@ class AgentStreamEventAdapter:
         delegation = _delegation_namespace(ns)
         source = self.sources_by_delegation.get(delegation)
         if source is None:
-            count = self.delegations_by_name.get(agent_name, 0) + 1
-            self.delegations_by_name[agent_name] = count
-            source = agent_name if count == 1 else f"{agent_name} {count}"
+            # Skip every label already given out, including literal agent names
+            # such as "worker 2", so distinct delegations never share a source.
+            source = agent_name
+            number = 1
+            while source in self.allocated_sources:
+                number += 1
+                source = f"{agent_name} {number}"
+            self.allocated_sources.add(source)
             self.sources_by_delegation[delegation] = source
         return source
 
