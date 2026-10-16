@@ -179,6 +179,35 @@ async def test_reported_times_do_not_shift_after_host_suspend() -> None:
 
 
 @pytest.mark.anyio
+async def test_live_agent_turns_do_not_inherit_the_spawning_run_config() -> None:
+    """A spawn from inside a main-agent tool call must not join that run.
+
+    The worker task would otherwise copy LangChain's current run config, so
+    the live agent's model events stream into the main turn's callbacks.
+    """
+    from langchain_core.runnables.config import var_child_runnable_config
+
+    seen: list[object] = []
+
+    async def capture() -> str:
+        seen.append(var_child_runnable_config.get())
+        return "findings"
+
+    h = Harness(graphs=[FakeGraph([capture])])
+    token = var_child_runnable_config.set({"callbacks": ["main-turn-handler"]})
+    try:
+        await h.manager.spawn(
+            SESSION, SpawnRequest(template="researcher", initial_message="look into X")
+        )
+    finally:
+        var_child_runnable_config.reset(token)
+    await until(lambda: bool(h.inbox("main")))
+
+    assert seen == [None]
+    await h.manager.close()
+
+
+@pytest.mark.anyio
 async def test_spawn_initial_message_runs_first_turn() -> None:
     graph = FakeGraph(["findings"])
     h = Harness(graphs=[graph])

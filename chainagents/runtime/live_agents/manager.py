@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import builtins
 import logging
 import time
@@ -177,8 +178,13 @@ class LiveAgentManager:
             turn_context=self._turn_context,
             on_finished=self._on_worker_finished,
         )
+        # A fresh context keeps the worker out of the spawning run: a spawn from
+        # a main-agent tool call would otherwise copy LangChain's run config and
+        # stream the live agent's model events into the main turn.
         task = asyncio.get_running_loop().create_task(
-            worker.run(), name=f"{WORKER_TASK_PREFIX}{record.id}"
+            worker.run(),
+            name=f"{WORKER_TASK_PREFIX}{record.id}",
+            context=contextvars.Context(),
         )
         self._workers[record.id] = task
         task.add_done_callback(lambda done: self._on_worker_done(record, done))
