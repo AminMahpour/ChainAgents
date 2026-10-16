@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from chainagents.runtime.constants import (
@@ -340,6 +340,59 @@ def validate_context_settings(
             )
 
 
+# DeepAgents' summarization defaults when only the window is known.
+DEFAULT_TRIGGER_PERCENT = 85
+DEFAULT_KEEP_PERCENT = 10
+
+
+class ContextSettings(TypedDict):
+    """Context window and summarization budget of one model."""
+
+    context_window: int | None
+    summarization_trigger_tokens: int | None
+    summarization_keep_tokens: int | None
+
+
+def context_settings_for(
+    model: ModelDefaults, *, provider: str, name: str
+) -> ContextSettings:
+    """Return ``model``'s context settings while ``provider``/``name`` still name it.
+
+    A context window and its summarization budget belong to one model, so a
+    runtime override or a raw model choice that switches models drops them.
+    """
+    if provider == model.provider and name == model.name:
+        return ContextSettings(
+            context_window=model.context_window,
+            summarization_trigger_tokens=model.summarization_trigger_tokens,
+            summarization_keep_tokens=model.summarization_keep_tokens,
+        )
+    return ContextSettings(
+        context_window=None,
+        summarization_trigger_tokens=None,
+        summarization_keep_tokens=None,
+    )
+
+
+def _effective_threshold(
+    profile_value: int | None,
+    global_value: int | None,
+    window: int | None,
+    *,
+    label: str,
+    field_name: str,
+    default_percent: int,
+) -> tuple[int | None, str]:
+    """Return one effective threshold and a description of where it came from."""
+    if profile_value is not None:
+        return profile_value, f"set in {label}"
+    if global_value is not None:
+        return global_value, f"from [agent].{field_name}"
+    if window is not None:
+        return window * default_percent // 100, f"default {default_percent}% of context_window"
+    return None, ""
+
+
 def validate_global_summarization_budget(
     model_defaults: ModelDefaults,
     model_profiles: dict[str, ModelDefaults],
@@ -347,30 +400,52 @@ def validate_global_summarization_budget(
     trigger_tokens: int | None,
     keep_tokens: int | None,
 ) -> None:
-    """Reject global ``[agent]`` thresholds that overflow a profile's window.
+    """Reject effective summarization thresholds that cannot work for a profile.
 
-    The global thresholds apply to every model profile that does not set its own,
-    so each such profile must still satisfy the per-profile limits.
+    Each threshold resolves like the summarizer does: the profile's value, then
+    the global ``[agent]`` value, then DeepAgents' fraction of the window. The
+    effective keep must be below the effective trigger, and both below the
+    window, for every profile.
     """
     profiles = {"[model]": model_defaults} | {
         f"[model.profiles.{name}]": profile for name, profile in model_profiles.items()
     }
     for label, profile in profiles.items():
-        trigger = profile.summarization_trigger_tokens
-        keep = profile.summarization_keep_tokens
-        try:
-            validate_context_settings(
-                context_window=profile.context_window,
-                summarization_trigger_tokens=trigger if trigger is not None else trigger_tokens,
-                summarization_keep_tokens=keep if keep is not None else keep_tokens,
-                field_prefix="[agent]",
+        window = profile.context_window
+        trigger, trigger_source = _effective_threshold(
+            profile.summarization_trigger_tokens,
+            trigger_tokens,
+            window,
+            label=label,
+            field_name="summarization_trigger_tokens",
+            default_percent=DEFAULT_TRIGGER_PERCENT,
+        )
+        keep, keep_source = _effective_threshold(
+            profile.summarization_keep_tokens,
+            keep_tokens,
+            window,
+            label=label,
+            field_name="summarization_keep_tokens",
+            default_percent=DEFAULT_KEEP_PERCENT,
+        )
+        checks = (
+            ("trigger", trigger, trigger_source, "context_window", window, f"set in {label}"),
+            ("keep", keep, keep_source, "context_window", window, f"set in {label}"),
+            ("keep", keep, keep_source, "summarization trigger", trigger, trigger_source),
+        )
+        for name, value, source, limit_name, limit, limit_source in checks:
+            if value is None or limit is None or value < limit:
+                continue
+            hint = (
+                " Set summarization_trigger_tokens/summarization_keep_tokens there or "
+                "lower the [agent] value."
+                if "[agent]" in source or "[agent]" in limit_source
+                else ""
             )
-        except ValueError as exc:
             raise ValueError(
-                f"{exc} The global value applies to {label}; set "
-                f"summarization_trigger_tokens/summarization_keep_tokens there or "
-                f"lower the [agent] value."
-            ) from exc
+                f"The effective summarization {name} ({value}, {source}) must be less "
+                f"than {limit_name} ({limit}, {limit_source}) for {label}.{hint}"
+            )
 
 
 def normalize_repeat_penalty(value: Any | None) -> float | None:
@@ -971,6 +1046,9 @@ def resolve_model_profile_defaults(
             models=(),
             name_is_explicit=True,
             explicit_fields=base_model.explicit_fields | frozenset({"name", "models"}),
+            **context_settings_for(
+                base_model, provider=base_model.provider, name=selected_ref
+            ),
         )
     return base_model
 
