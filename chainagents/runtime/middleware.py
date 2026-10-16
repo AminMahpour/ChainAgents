@@ -25,6 +25,7 @@ import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.models as runtime_models
 from chainagents.runtime.config import RuntimeConfig
+from chainagents.runtime.context_usage import ContextUsageMiddleware, ContextUsageRegistry
 from chainagents.runtime.constants import (
     DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS,
     SUMMARIZATION_STATUS_EVENT_KIND,
@@ -674,6 +675,7 @@ def build_agent_middleware(
     source: str = "main-agent",
     project_root: Path | None = None,
     filesystem_tools: Sequence[str] | None = None,
+    context_usage: ContextUsageRegistry | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build agent middleware.
 
@@ -686,6 +688,8 @@ def build_agent_middleware(
         project_root: Project root used to resolve local paths.
         filesystem_tools: Explicit filesystem tool names; replaces the
             computed default list when given.
+        context_usage: Registry that receives each model call's context
+            usage, or None to skip measurement.
 
     Returns:
         The constructed agent middleware.
@@ -717,4 +721,8 @@ def build_agent_middleware(
             virtual_filesystem_tools=runtime_backends.backend_routes_workspace(backend),
         )
     )
+    if context_usage is not None and config is not None:
+        middleware.append(
+            ContextUsageMiddleware(registry=context_usage, extensions=config.extensions)
+        )
     return middleware

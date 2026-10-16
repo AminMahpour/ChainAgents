@@ -37,6 +37,12 @@ from chainagents.runtime.background_tasks.models import (
     _BackgroundTaskSubmission,
 )
 from chainagents.runtime.background_tasks.queues import await_preserving_cancellation
+from chainagents.runtime.context_usage import (
+    AGENT_INSTANCE_KEY,
+    AGENT_KIND_KEY,
+    AGENT_NAME_KEY,
+    SESSION_ID_KEY,
+)
 
 if TYPE_CHECKING:
     from chainagents.runtime.background_tasks.manager import BackgroundTaskManager
@@ -155,6 +161,10 @@ def create_background_task_tools(
                 "thread_id": f"{session_id}:background:{task_id}",
                 "checkpoint_ns": "",
                 "ls_agent_type": "background_subagent",
+                SESSION_ID_KEY: session_id,
+                AGENT_KIND_KEY: "background",
+                AGENT_NAME_KEY: subagent_type,
+                AGENT_INSTANCE_KEY: task_id,
             }
             if shared_checkpointer is not None:
                 configurable[_LANGGRAPH_CHECKPOINTER_KEY] = shared_checkpointer

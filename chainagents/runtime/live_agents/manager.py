@@ -63,6 +63,7 @@ class LiveAgentManager:
         delete_thread: Callable[[str], Awaitable[None]] | None = None,
         turn_context: Callable[[LiveAgentRecord], AbstractContextManager[Any]]
         | None = None,
+        on_stopped: Callable[[str, str], None] | None = None,
     ) -> None:
         self.config = config
         self.events = events if events is not None else LiveAgentEventBus()
@@ -72,6 +73,9 @@ class LiveAgentManager:
         self._wall_clock = wall_clock
         self._delete_thread = delete_thread
         self._turn_context = turn_context
+        # Called with (session_id, agent_id) once teardown has finalized the
+        # record; its exceptions are logged and never propagate.
+        self._on_stopped = on_stopped
         self._registry = LiveAgentRegistry(config, clock=clock, wall_clock=wall_clock)
         self._workers: dict[str, asyncio.Task[None]] = {}
         # One teardown task per agent id; doubles as the "torn down" marker.
@@ -413,6 +417,13 @@ class LiveAgentManager:
         record.stop_reason = reason
         record.mark_active(self._clock(), self._wall_clock())
         self._evict_terminal(record.session_id)
+        if self._on_stopped is not None:
+            try:
+                self._on_stopped(record.session_id, record.id)
+            except Exception:
+                logger.debug(
+                    "Live agent stop callback failed for %s", record.id, exc_info=True
+                )
         self._publish("stopped", record, {"reason": reason})
         return record
 
