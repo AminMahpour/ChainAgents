@@ -1319,6 +1319,42 @@ def _store_temporary_rag_uploads(
     return stored
 
 
+_FORWARDED_BACKGROUND_KINDS = frozenset({"reasoning_delta", "tool_call", "tool_result"})
+
+
+class _BackgroundActivityLabels:
+    """Give each background task one source label for a turn's stream.
+
+    Tasks of one subagent type are numbered (``scout``, ``scout 2``) so their
+    reasoning, tool calls and todo lists stay apart; nested children keep their
+    `` / child`` suffix.
+    """
+
+    def __init__(self) -> None:
+        self._labels: dict[str, str] = {}
+        self._counts: dict[str, int] = {}
+
+    def source(self, task_id: str, agent_name: str, event_source: str) -> str:
+        label = self._labels.get(task_id)
+        if label is None:
+            count = self._counts.get(agent_name, 0) + 1
+            self._counts[agent_name] = count
+            label = agent_name if count == 1 else f"{agent_name} {count}"
+            self._labels[task_id] = label
+        if event_source == agent_name:
+            return label
+        if event_source.startswith(f"{agent_name} / "):
+            return label + event_source[len(agent_name) :]
+        return f"{label} / {event_source}"
+
+
+def _background_activity_manager(runtime: Any) -> Any | None:
+    """Return the background task manager when its activity should stream."""
+    manager = getattr(runtime, "background_tasks", None)
+    config = getattr(manager, "config", None)
+    return manager if getattr(config, "stream_activity", False) else None
+
+
 async def _agent_stream_lines(
     runtime: Any,
     context: AgentRunContext,
@@ -1333,7 +1369,11 @@ async def _agent_stream_lines(
     if context.command_error:
         yield _json_line(_error_payload(context, context.command_error))
         return
-    renderer = NdjsonRenderer(context, issue_reflection_token=issue_reflection_token)
+    renderer = NdjsonRenderer(
+        context,
+        issue_reflection_token=issue_reflection_token,
+        background_activity=_background_activity_manager(runtime),
+    )
     try:
         async with aclosing(
             renderer.lines(TurnRunner(runtime), _turn_request(context))
@@ -1354,15 +1394,31 @@ class NdjsonRenderer(BaseTurnRenderer):
         context: AgentRunContext,
         *,
         issue_reflection_token: Callable[[str, ReflectionProposal], str],
+        background_activity: Any | None = None,
     ) -> None:
         self.context = context
         self.issue_reflection_token = issue_reflection_token
         self._lines: asyncio.Queue[str | None] = asyncio.Queue()
+        # Background task manager whose live activity joins this turn's stream,
+        # or None when `[agent.background_subagents].stream_activity` is off.
+        self._background_activity = background_activity
+        self._activity_labels = _BackgroundActivityLabels()
 
     async def lines(
         self, runner: TurnRunner, request: TurnRequest
     ) -> AsyncGenerator[str, None]:
         """Run the turn in a task and yield its lines as the consumer reads."""
+        manager = self._background_activity
+        activity = (
+            manager.subscribe_activity(self.context.thread_id)
+            if manager is not None
+            else None
+        )
+        forwarder = (
+            asyncio.create_task(self._forward_activity(activity))
+            if activity is not None
+            else None
+        )
         task = asyncio.create_task(runner.run(request, self))
         task.add_done_callback(lambda _task: self._lines.put_nowait(None))
         try:
@@ -1377,6 +1433,25 @@ class NdjsonRenderer(BaseTurnRenderer):
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
+            if forwarder is not None:
+                forwarder.cancel()
+                with suppress(asyncio.CancelledError):
+                    await forwarder
+            if manager is not None and activity is not None:
+                manager.unsubscribe_activity(self.context.thread_id, activity)
+
+    async def _forward_activity(self, activity: asyncio.Queue[Any]) -> None:
+        """Stream the conversation's live background task activity during the turn."""
+        while True:
+            item = await activity.get()
+            event = item.event
+            # Terminal snapshots arrive as tool results; child answers stay in
+            # their reports because clients append every response delta to the
+            # main answer.
+            if event is None or event.kind not in _FORWARDED_BACKGROUND_KINDS:
+                continue
+            source = self._activity_labels.source(item.task_id, item.agent_name, event.source)
+            await self._emit(_event_payload(replace(event, source=source), self.context))
 
     async def _emit(self, payload: dict[str, Any]) -> None:
         # Wait until the consumer has taken the line, like a pull-based stream.
