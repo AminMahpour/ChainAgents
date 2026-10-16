@@ -1770,6 +1770,8 @@ def _event_payload(event: AgentStreamEvent, context: AgentRunContext) -> dict[st
     if event.kind not in {"ui_message", "ui_remove"}:
         for key in ("ui_id", "ui_name", "ui_props", "ui_metadata"):
             payload.pop(key, None)
+    if event.kind != "context_usage":
+        payload.pop("context_usage", None)
     if event.kind == "clarification_requested":
         payload["options"] = list(event.ui_props.get("options") or [])
         payload["interrupt_id"] = event.ui_props.get("interrupt_id")
