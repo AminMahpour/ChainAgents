@@ -282,6 +282,7 @@ class RuntimeFeatureFlags(BaseModel):
     rag: bool
     images: bool
     live_agents: bool = False
+    context_usage: bool = False
 
 
 class RuntimeStarter(BaseModel):
@@ -524,6 +525,9 @@ def create_app(
                 rag=bool(config.rag_requested and config.rag is not None),
                 images=any("image" in option.modalities for option in model_options),
                 live_agents=live_agents_enabled,
+                context_usage=(
+                    getattr(active_runtime, "context_usage", None) is not None
+                ),
             ),
             starters=[
                 RuntimeStarter(
@@ -621,6 +625,18 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return snapshot.to_payload()
+
+    @app.get("/api/context-usage")
+    async def get_context_usage(
+        request: Request,
+        thread_id: str,
+    ) -> dict[str, object]:
+        """Return the latest context window usage per agent for one conversation."""
+        session_id = _required_text(thread_id, "thread_id")
+        registry = getattr(_runtime_from_request(request), "context_usage", None)
+        if registry is None:
+            raise HTTPException(status_code=404, detail="Context usage is unavailable.")
+        return {"agents": [s.to_payload() for s in registry.list(session_id)]}
 
     def _live_agents_from_request(request: Request) -> Any:
         manager = getattr(_runtime_from_request(request), "live_agents", None)

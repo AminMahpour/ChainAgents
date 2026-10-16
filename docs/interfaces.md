@@ -95,6 +95,21 @@ the same `/agents`, `/spawn`, `/msg`, and `/kill` commands as Chainlit. Live
 agents are not part of the LangGraph Agent Server graphs. See the README's
 Live Agents section.
 
+### Context usage
+
+`GET /api/context-usage?thread_id=...` returns
+`{"agents": [...]}` with the latest context window usage of each agent in the
+conversation. The main agent is listed first, then the others newest first
+(by `at_utc`). An unknown thread returns an empty list, and the endpoint
+returns 404 when the runtime has no context usage registry.
+`GET /api/status` reports `features.context_usage`.
+
+- The NDJSON stream carries a `context_usage` event for the main agent only;
+  its payload is under the `context_usage` field.
+- Background and live agent runs set four run-config keys so their usage is
+  attributed correctly: `chainagents_session_id`, `chainagents_agent_kind`,
+  `chainagents_agent_name` and `chainagents_agent_instance`.
+
 ## LangGraph Agent Server
 
 `langgraph.json` registers the `supervisor` and `async-researcher` graphs
