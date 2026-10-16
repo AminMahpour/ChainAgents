@@ -744,6 +744,7 @@ class AgentRuntime:
             )
             agent = runtime_middleware.create_deep_agent_with_configured_summarization(
                 self.config,
+                context_usage=self.context_usage,
                 **agent_kwargs,
             )
             agent = runtime_background_tasks.scope_background_session_invocation(

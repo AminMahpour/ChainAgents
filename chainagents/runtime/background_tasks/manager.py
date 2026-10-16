@@ -490,7 +490,7 @@ class BackgroundTaskManager:
             try:
                 self._on_task_finished(record.session_id, record.task_id, status)
             except Exception:
-                logger.debug(
+                logger.warning(
                     "Background task finish callback failed for %s",
                     record.task_id,
                     exc_info=True,

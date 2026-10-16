@@ -614,12 +614,16 @@ def _build_deepagents_summarization_factory(
 
 def create_deep_agent_with_configured_summarization(
     config: RuntimeConfig,
+    *,
+    context_usage: ContextUsageRegistry | None = None,
     **kwargs: Any,
 ) -> Any:
     """Create a DeepAgents graph while applying configured summarization thresholds.
 
     Args:
         config: Configuration object used by the operation.
+        context_usage: Registry that also measures DeepAgents' implicit
+            general-purpose delegate, or None to leave it unmeasured.
         kwargs: Keyword arguments passed to create_deep_agent.
 
     Returns:
@@ -647,6 +651,15 @@ def create_deep_agent_with_configured_summarization(
                     isinstance(item, RepeatedToolResultGuardMiddleware) for item in existing
                 ):
                     existing.append(RepeatedToolResultGuardMiddleware())
+                # Stacks that already carry one replace this copy by name.
+                if context_usage is not None and not any(
+                    isinstance(item, ContextUsageMiddleware) for item in existing
+                ):
+                    existing.append(
+                        ContextUsageMiddleware(
+                            registry=context_usage, extensions=config.extensions
+                        )
+                    )
                 return existing
 
             return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)

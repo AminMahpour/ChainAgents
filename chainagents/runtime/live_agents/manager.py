@@ -421,7 +421,7 @@ class LiveAgentManager:
             try:
                 self._on_stopped(record.session_id, record.id)
             except Exception:
-                logger.debug(
+                logger.warning(
                     "Live agent stop callback failed for %s", record.id, exc_info=True
                 )
         self._publish("stopped", record, {"reason": reason})
@@ -459,6 +459,7 @@ class LiveAgentManager:
         try:
             self._start_teardown(record, reason)
         except RuntimeError:  # event loop is shutting down
+            # No teardown runs here, so on_stopped is not called either.
             self._broker.close(record.session_id, record.address)
             record.status = "failed" if reason == "failed" else "stopped"
             record.stop_reason = reason

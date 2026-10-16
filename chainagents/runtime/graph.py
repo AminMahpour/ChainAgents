@@ -630,6 +630,7 @@ def _build_sync_subagent_spec(
         runnable_kwargs["checkpointer"] = context.checkpointer
     runnable = runtime_middleware.create_deep_agent_with_configured_summarization(
         config,
+        context_usage=context.context_usage,
         **runnable_kwargs,
     )
     if config.extensions.messaging.enabled and context.messaging_broker is not None:
@@ -862,6 +863,7 @@ _GENERAL_PURPOSE_INHERITED_MIDDLEWARE = frozenset({
     "SkillsMiddleware",
     "TokenLimitedToolCallMiddleware",
     "RepeatedToolResultGuardMiddleware",
+    "ChainAgentsContextUsage",
 })
 
 
@@ -1263,5 +1265,5 @@ def build_live_agent_graph(
     if checkpointer is not None:
         kwargs["checkpointer"] = checkpointer
     return runtime_middleware.create_deep_agent_with_configured_summarization(
-        config, **kwargs
+        config, context_usage=context_usage, **kwargs
     )

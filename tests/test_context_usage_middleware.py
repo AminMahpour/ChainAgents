@@ -132,6 +132,29 @@ def test_background_run_uses_owning_session(harness: _Harness) -> None:
     assert harness.registry.list("s1:background:t1") == []
 
 
+def test_nested_subagent_in_background_run_gets_its_own_entry(harness: _Harness) -> None:
+    harness.config["configurable"] = {
+        "thread_id": "s1:background:t1",
+        "chainagents_session_id": "s1",
+        "chainagents_agent_kind": "background",
+        "chainagents_agent_name": "researcher",
+        "chainagents_agent_instance": "t1",
+    }
+    harness.call(usage=_usage(500))
+    harness.config["metadata"] = {"lc_agent_name": "helper"}
+
+    harness.call(usage=_usage(700))
+
+    assert harness.writes == []
+    snapshots = {item.agent: item for item in harness.registry.list("s1")}
+    assert set(snapshots) == {"researcher", "helper"}
+    assert (snapshots["researcher"].kind, snapshots["researcher"].used) == ("background", 500)
+    assert (snapshots["helper"].kind, snapshots["helper"].used) == ("subagent", 700)
+    harness.registry.mark_ended("s1", "t1:helper", "finished")
+    statuses = {item.agent: item.status for item in harness.registry.list("s1")}
+    assert statuses == {"researcher": "active", "helper": "finished"}
+
+
 def test_missing_usage_keeps_estimates(harness: _Harness) -> None:
     harness.call(usage=None)
 

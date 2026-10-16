@@ -180,8 +180,18 @@ def _resolve_identity() -> _CallIdentity | None:
     if not session_id:
         return None
     subagent_name = metadata.get("lc_agent_name")
+    run_agent_name = configurable.get(AGENT_NAME_KEY)
+    if run_agent_name and subagent_name and subagent_name != run_agent_name:
+        # LangGraph passes the run's identity keys on to nested `task` calls.
+        instance = configurable.get(AGENT_INSTANCE_KEY) or run_agent_name
+        return _CallIdentity(
+            session_id=str(session_id),
+            key=f"{instance}:{subagent_name}",
+            agent=str(subagent_name),
+            kind="subagent",
+        )
     kind = configurable.get(AGENT_KIND_KEY) or ("subagent" if subagent_name else "main")
-    agent = configurable.get(AGENT_NAME_KEY) or ("main" if kind == "main" else subagent_name)
+    agent = run_agent_name or ("main" if kind == "main" else subagent_name)
     agent = str(agent or kind)
     key = configurable.get(AGENT_INSTANCE_KEY) or f"{kind}:{agent}"
     return _CallIdentity(session_id=str(session_id), key=str(key), agent=agent, kind=str(kind))

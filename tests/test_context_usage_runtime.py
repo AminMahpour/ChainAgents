@@ -36,11 +36,19 @@ description = "Small helper"
 system_prompt = "Help."
 """
 
+HELPER = """
+[[subagents.subagents]]
+name = "helper"
+description = "Inspects details"
+system_prompt = "Inspect."
+"""
+
 USAGE = {"input_tokens": 1200, "output_tokens": 10, "total_tokens": 1210}
 
 
-def _ai(content: str = "", **kwargs: Any) -> AIMessage:
-    return AIMessage(content=content, usage_metadata=USAGE, **kwargs)
+def _ai(content: str = "", *, input_tokens: int = 1200, **kwargs: Any) -> AIMessage:
+    usage = {**USAGE, "input_tokens": input_tokens, "total_tokens": input_tokens + 10}
+    return AIMessage(content=content, usage_metadata=usage, **kwargs)
 
 
 def _call(name: str, args: dict[str, Any], call_id: str) -> AIMessage:
@@ -69,6 +77,20 @@ def _route(messages: list[BaseMessage]) -> AIMessage:
     prompt = _first_human(messages)
     if prompt == "delegate":
         return _call("task", {"description": "look around", "subagent_type": "scout"}, "c1")
+    if prompt == "general":
+        return _call(
+            "task", {"description": "look around", "subagent_type": "general-purpose"}, "c1"
+        )
+    if prompt == "coordinate":
+        return _call("task", {"description": "inspect", "subagent_type": "helper"}, "c2")
+    if prompt == "inspect":
+        return _ai("helper report", input_tokens=300)
+    if prompt == "nested background":
+        return _call(
+            "spawn_background_task",
+            {"description": "coordinate", "subagent_type": "scout"},
+            "c1",
+        )
     if prompt == "background":
         return _call(
             "spawn_background_task",
@@ -138,6 +160,94 @@ async def test_main_and_subagent_snapshots_reach_the_registry(
         assert {event.context_usage["agent"] for event in usage_events} == {"main"}
     finally:
         await runtime.close()
+
+
+LIVE_AGENTS = """
+[agent.messaging]
+enabled = true
+
+[agent.live_agents]
+enabled = true
+idle_timeout_seconds = 0
+
+[[agent.live_agents.templates]]
+name = "researcher"
+description = "Reads sources."
+system_prompt = "Research."
+"""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("live_agents", [False, True], ids=["implicit", "explicit"])
+async def test_general_purpose_delegate_is_measured(
+    tmp_path, monkeypatch, fake_model, live_agents
+) -> None:
+    toml = OLLAMA_MODEL + (LIVE_AGENTS if live_agents else "")
+    runtime = await _runtime(tmp_path, monkeypatch, toml)
+    try:
+        await _turn(runtime, "thread-1", "general")
+
+        snapshots = runtime.context_usage.list("thread-1")
+        assert [(item.agent, item.kind) for item in snapshots] == [
+            ("main", "main"),
+            ("general-purpose", "subagent"),
+        ]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize("live_agents", [False, True], ids=["implicit", "explicit"])
+def test_every_runtime_stack_measures_once_and_exported_graphs_never(
+    tmp_path, monkeypatch, fake_model, live_agents
+) -> None:
+    import deepagents.graph as deepagents_graph
+    import deepagents.middleware.subagents as deepagents_subagents
+
+    import chainagents.runtime.graph as runtime_graph
+
+    stacks: list[tuple[str | None, list[str]]] = []
+
+    def spy(module: Any) -> None:
+        original = module.create_agent
+
+        def create_agent(*args: Any, **kwargs: Any) -> Any:
+            names = [item.name for item in kwargs.get("middleware") or ()]
+            stacks.append((kwargs.get("name"), names))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, "create_agent", create_agent)
+
+    spy(deepagents_graph)
+    spy(deepagents_subagents)
+    toml = (
+        OLLAMA_MODEL
+        + "[agent.background_subagents]\nenabled = true\n"
+        + (LIVE_AGENTS if live_agents else "")
+        + SCOUT
+        + "background = true\n"
+        + HELPER
+    )
+
+    async def build() -> None:
+        runtime = await _runtime(tmp_path, monkeypatch, toml)
+        try:
+            await runtime.get_agent("medium", thread_id="thread-1")
+        finally:
+            await runtime.close()
+
+    asyncio.run(build())
+    # Main, the compiled background scout, its helper and the delegates.
+    assert len(stacks) >= 4
+    assert "general-purpose" in {name for name, _ in stacks}
+    for _name, middleware in stacks:
+        assert middleware.count("ChainAgentsContextUsage") == 1, stacks
+
+    stacks.clear()
+    monkeypatch.setattr(runtime_graph.runtime_constants, "PROJECT_ROOT", tmp_path)
+    runtime_graph.create_configured_graph(include_async_subagents=True)
+    asyncio.run(runtime_graph.close_static_background_tasks())
+    assert stacks
+    assert all("ChainAgentsContextUsage" not in middleware for _, middleware in stacks)
 
 
 @pytest.mark.anyio
@@ -211,26 +321,39 @@ enabled = true
 
 
 @pytest.mark.anyio
-async def test_live_agent_snapshot_is_marked_stopped(
+async def test_nested_subagent_in_background_run_keeps_its_own_entry(
     tmp_path, monkeypatch, fake_model
 ) -> None:
     toml = (
         OLLAMA_MODEL
-        + """
-[agent.messaging]
-enabled = true
-
-[agent.live_agents]
-enabled = true
-idle_timeout_seconds = 0
-
-[[agent.live_agents.templates]]
-name = "researcher"
-description = "Reads sources."
-system_prompt = "Research."
-"""
+        + "[agent.background_subagents]\nenabled = true\n"
+        + SCOUT
+        + "background = true\n"
+        + HELPER
     )
     runtime = await _runtime(tmp_path, monkeypatch, toml)
+    try:
+        await _turn(runtime, "thread-1", "nested background")
+
+        def entries() -> dict[str, Any]:
+            return {item.agent: item for item in runtime.context_usage.list("thread-1")}
+
+        await _until(
+            lambda: getattr(entries().get("scout"), "status", None) == "finished"
+        )
+        snapshots = entries()
+        assert set(snapshots) == {"main", "scout", "helper"}
+        assert (snapshots["scout"].kind, snapshots["scout"].used) == ("background", 1200)
+        assert (snapshots["helper"].kind, snapshots["helper"].used) == ("subagent", 300)
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_live_agent_snapshot_is_marked_stopped(
+    tmp_path, monkeypatch, fake_model
+) -> None:
+    runtime = await _runtime(tmp_path, monkeypatch, OLLAMA_MODEL + LIVE_AGENTS)
     assert runtime.live_agents is not None
     try:
         record, _spec = await runtime.live_agents.spawn(
