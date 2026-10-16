@@ -626,11 +626,16 @@ def create_deep_agent_with_configured_summarization(
 
         def profile_with_token_guard(model: Any, spec: str | None) -> Any:
             # DeepAgents builds its implicit general-purpose delegate from the
-            # harness profile, rather than inheriting caller middleware.
+            # harness profile, rather than inheriting caller middleware. The
+            # todo list is restored here too: DeepAgents 0.7 no longer adds it.
             profile = original_profile(model, spec)
 
             def middleware_for_stacks() -> list[AgentMiddleware[Any, Any, Any]]:
-                existing = profile.materialize_extra_middleware()
+                existing: list[AgentMiddleware[Any, Any, Any]] = list(
+                    profile.materialize_extra_middleware()
+                )
+                if not any(isinstance(item, TodoListMiddleware) for item in existing):
+                    existing.append(TodoListMiddleware())
                 if not any(isinstance(item, TokenLimitedToolCallMiddleware) for item in existing):
                     existing.append(TokenLimitedToolCallMiddleware())
                 if not any(

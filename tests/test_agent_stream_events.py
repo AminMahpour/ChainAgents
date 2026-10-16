@@ -13,6 +13,7 @@ from chainagents.events.stream import (
     langgraph_part_from_event_chunk,
 )
 from deepagents import create_deep_agent
+import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessageChunk
 
@@ -326,6 +327,65 @@ def test_adapter_reuses_named_source_for_update_only_result() -> None:
     ]
 
 
+def test_adapter_numbers_parallel_subagents_that_share_a_name() -> None:
+    """Concurrent delegations to one subagent type must not share a source."""
+    adapter = AgentStreamEventAdapter(prompt="hello")
+    delegations = [("tools:task-a",), ("tools:task-b",), ("tools:task-c",)]
+
+    def reasoning(ns: tuple[str, ...], text: str) -> list[AgentStreamEvent]:
+        return adapter.events_from_raw_event(
+            _raw_event(
+                (ns, "messages", (_ReasoningToken(text), {"lc_agent_name": "general-purpose"}))
+            )
+        )
+
+    first = [reasoning(ns, "plan") for ns in delegations]
+    again = reasoning(delegations[0], "plan more")
+    result = adapter.events_from_raw_event(
+        _raw_event(
+            (delegations[1], "updates", {"tools": {"messages": [_ToolMessage("done")]}})
+        )
+    )
+
+    assert [events[0].source for events in first] == [
+        "general-purpose",
+        "general-purpose 2",
+        "general-purpose 3",
+    ]
+    assert [event.source for event in again] == ["general-purpose"]
+    assert [event.source for event in result] == ["general-purpose 2"]
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        # A literal "worker 2" agent first: the second worker delegation skips it.
+        (["worker 2", "worker", "worker"], ["worker 2", "worker", "worker 3"]),
+        # Generated "worker 2" first: the literal agent gets a distinct label.
+        (["worker", "worker", "worker 2"], ["worker", "worker 2", "worker 2 2"]),
+    ],
+)
+def test_adapter_keeps_generated_sources_distinct_from_literal_names(
+    names: list[str], expected: list[str]
+) -> None:
+    adapter = AgentStreamEventAdapter(prompt="hello")
+
+    sources = []
+    for index, name in enumerate(names):
+        events = adapter.events_from_raw_event(
+            _raw_event(
+                (
+                    (f"tools:task-{index}",),
+                    "messages",
+                    (_ReasoningToken(f"step {index}"), {"lc_agent_name": name}),
+                )
+            )
+        )
+        sources.append(events[0].source)
+
+    assert sources == expected
+
+
 def test_adapter_keeps_equal_tool_call_ids_in_separate_namespaces() -> None:
     adapter = AgentStreamEventAdapter(prompt="hello")
     namespaces = (("tools:first-task",), ("tools:second-task",))
@@ -343,9 +403,10 @@ def test_adapter_keeps_equal_tool_call_ids_in_separate_namespaces() -> None:
         for namespace in namespaces
     ]
 
+    # Both results are kept; separate delegations get separate sources.
     assert [event.source for batch in results for event in batch] == [
         "worker",
-        "worker",
+        "worker 2",
     ]
 
 
