@@ -13,6 +13,7 @@ StreamEventKind = Literal[
     "tool_call",
     "tool_result",
     "summarization_status",
+    "context_usage",
     "mcp_status",
     "ui_message",
     "ui_remove",
@@ -31,6 +32,7 @@ LANGGRAPH_STREAM_MODES = {
 # Stream modes every front end requests from ``agent.astream_events``.
 AGENT_STREAM_MODES = ["messages", "updates", "custom"]
 SUMMARIZATION_STATUS_KIND = "summarization_status"
+CONTEXT_USAGE_KIND = "context_usage"
 ANTHROPIC_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
 # Bedrock Converse streams reasoning as ``reasoning_content`` content blocks.
 BEDROCK_REASONING_BLOCK_TYPE = "reasoning_content"
@@ -62,6 +64,7 @@ class AgentStreamEvent:
     ui_name: str = ""
     ui_props: dict[str, Any] = field(default_factory=dict)
     ui_metadata: dict[str, Any] = field(default_factory=dict)
+    context_usage: dict[str, Any] | None = None
 
 
 def stringify_content(value: Any) -> str:
@@ -414,6 +417,17 @@ class AgentStreamEventAdapter:
             return self._events_from_ui_message(data)
         if data.get("type") == "remove-ui":
             return self._events_from_ui_remove(data)
+        if data.get("kind") == CONTEXT_USAGE_KIND:
+            snapshot = data.get("snapshot")
+            if not isinstance(snapshot, dict):
+                return []
+            return [
+                AgentStreamEvent(
+                    kind="context_usage",
+                    source="main-agent",
+                    context_usage=snapshot,
+                )
+            ]
         if data.get("kind") != SUMMARIZATION_STATUS_KIND:
             return []
 

@@ -30,6 +30,7 @@ from chainagents.rag.runtime import (
     create_search_workspace_knowledge_tool,
 )
 from chainagents.runtime.config import RuntimeConfig
+from chainagents.runtime.context_usage import ContextUsageRegistry
 from chainagents.runtime.constants import (
     AGENTS_MD_FILENAME,
     DEFAULT_REASONING_LEVEL,
@@ -406,6 +407,7 @@ class _SubagentBuildContext:
     session_id: str | None
     langsmith_tracing: runtime_tracing.LangSmithTracing | None
     messaging_broker: runtime_messaging.MessageBroker | None
+    context_usage: ContextUsageRegistry | None
 
     @classmethod
     def create(
@@ -423,6 +425,7 @@ class _SubagentBuildContext:
         session_id: str | None,
         langsmith_tracing: runtime_tracing.LangSmithTracing | None,
         messaging_broker: runtime_messaging.MessageBroker | None = None,
+        context_usage: ContextUsageRegistry | None = None,
     ) -> _SubagentBuildContext:
         """Build a context with the configured subagent registry and model builder."""
         return cls(
@@ -439,6 +442,7 @@ class _SubagentBuildContext:
             session_id=session_id,
             langsmith_tracing=langsmith_tracing,
             messaging_broker=messaging_broker,
+            context_usage=context_usage,
         )
 
     def background_task_tools(
@@ -534,7 +538,11 @@ def _build_sync_subagent_spec(
         model_name=effective_model.name,
         source=subagent.name,
         project_root=context.project_root,
+        context_usage=context.context_usage,
     )
+    # DeepAgents splices new-by-name middleware ahead of the profile tail, so
+    # these run outside the context-usage measurement point by design; moving
+    # them after it would skew the tools/system numbers.
     messaging_enabled = (
         config.extensions.messaging.enabled
         and subagent.messaging
@@ -625,6 +633,7 @@ def _build_sync_subagent_spec(
         runnable_kwargs["checkpointer"] = context.checkpointer
     runnable = runtime_middleware.create_deep_agent_with_configured_summarization(
         config,
+        context_usage=context.context_usage,
         **runnable_kwargs,
     )
     if config.extensions.messaging.enabled and context.messaging_broker is not None:
@@ -858,6 +867,7 @@ _GENERAL_PURPOSE_INHERITED_MIDDLEWARE = frozenset({
     "SkillsMiddleware",
     "TokenLimitedToolCallMiddleware",
     "RepeatedToolResultGuardMiddleware",
+    "ChainAgentsContextUsage",
 })
 
 
@@ -933,6 +943,7 @@ def build_agent_kwargs(
     langsmith_tracing: runtime_tracing.LangSmithTracing | None = None,
     messaging_broker: runtime_messaging.MessageBroker | None = None,
     live_agent_manager: LiveAgentManager | None = None,
+    context_usage: ContextUsageRegistry | None = None,
 ) -> dict[str, Any]:
     """Build the DeepAgents keyword arguments for a configured main agent.
 
@@ -964,6 +975,8 @@ def build_agent_kwargs(
         messaging_broker: Agent message broker, or None to use a shared one.
         live_agent_manager: Live agent manager whose tools, prompt and roster
             are added to the main agent, or None when live agents are off.
+        context_usage: Registry that receives every agent's context usage,
+            or None to skip measurement.
 
     Returns:
         Keyword arguments for ``create_deep_agent_with_configured_summarization``.
@@ -985,7 +998,11 @@ def build_agent_kwargs(
         model_name=model_name,
         source="main-agent",
         project_root=project_root,
+        context_usage=context_usage,
     )
+    # DeepAgents splices new-by-name middleware ahead of the profile tail, so
+    # these run outside the context-usage measurement point by design; moving
+    # them after it would skew the tools/system numbers.
     if config.extensions.messaging.enabled or config.extensions.user_input.enabled:
         if messaging_broker is None:
             global _STATIC_MESSAGE_BROKER
@@ -1037,6 +1054,7 @@ def build_agent_kwargs(
         session_id=session_id,
         langsmith_tracing=langsmith_tracing,
         messaging_broker=messaging_broker,
+        context_usage=context_usage,
     )
     subagent_specs = _build_subagent_specs(
         context,
@@ -1198,6 +1216,7 @@ def build_live_agent_graph(
     session_id: str,
     store: Any | None = None,
     checkpointer: Any | None = None,
+    context_usage: ContextUsageRegistry | None = None,
 ) -> Any:
     """Compile a restricted, long-lived live agent graph.
 
@@ -1231,7 +1250,11 @@ def build_live_agent_graph(
         source=f"live:{spec.name}",
         project_root=project_root,
         filesystem_tools=fs_tools,
+        context_usage=context_usage,
     )
+    # DeepAgents splices new-by-name middleware ahead of the profile tail, so
+    # these run outside the context-usage measurement point by design; moving
+    # them after it would skew the tools/system numbers.
     if hide_read_file:
         from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
 
@@ -1252,5 +1275,5 @@ def build_live_agent_graph(
     if checkpointer is not None:
         kwargs["checkpointer"] = checkpointer
     return runtime_middleware.create_deep_agent_with_configured_summarization(
-        config, **kwargs
+        config, context_usage=context_usage, **kwargs
     )

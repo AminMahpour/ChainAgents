@@ -64,6 +64,7 @@ class LiveAgentManager:
         delete_thread: Callable[[str], Awaitable[None]] | None = None,
         turn_context: Callable[[LiveAgentRecord], AbstractContextManager[Any]]
         | None = None,
+        on_stopped: Callable[[str, str], None] | None = None,
         artifact_registry: Any | None = None,
         turn_callbacks: Callable[[LiveAgentRecord], list[Any]] | None = None,
     ) -> None:
@@ -75,6 +76,9 @@ class LiveAgentManager:
         self._wall_clock = wall_clock
         self._delete_thread = delete_thread
         self._turn_context = turn_context
+        # Called with (session_id, agent_id) once teardown has finalized the
+        # record; its exceptions are logged and never propagate.
+        self._on_stopped = on_stopped
         # Workers start in a fresh context, so these are applied per turn: the
         # owning conversation's large-result artifact scope, and tracing
         # callbacks such as Langfuse.
@@ -433,6 +437,13 @@ class LiveAgentManager:
         record.stop_reason = reason
         record.mark_active(self._clock(), self._wall_clock())
         self._evict_terminal(record.session_id)
+        if self._on_stopped is not None:
+            try:
+                self._on_stopped(record.session_id, record.id)
+            except Exception:
+                logger.warning(
+                    "Live agent stop callback failed for %s", record.id, exc_info=True
+                )
         self._publish("stopped", record, {"reason": reason})
         return record
 
@@ -468,6 +479,7 @@ class LiveAgentManager:
         try:
             self._start_teardown(record, reason)
         except RuntimeError:  # event loop is shutting down
+            # No teardown runs here, so on_stopped is not called either.
             self._broker.close(record.session_id, record.address)
             record.status = "failed" if reason == "failed" else "stopped"
             record.stop_reason = reason

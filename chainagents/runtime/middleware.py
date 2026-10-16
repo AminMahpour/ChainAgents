@@ -25,11 +25,13 @@ import chainagents.runtime.backends as runtime_backends
 import chainagents.runtime.constants as runtime_constants
 import chainagents.runtime.models as runtime_models
 from chainagents.runtime.config import RuntimeConfig
+from chainagents.runtime.context_usage import ContextUsageMiddleware, ContextUsageRegistry
 from chainagents.runtime.constants import (
     DEFAULT_DEEPAGENT_FILESYSTEM_TOOLS,
     SUMMARIZATION_STATUS_EVENT_KIND,
     ReasoningLevel,
 )
+from chainagents.runtime.summarization_budget import configured_thresholds
 
 logger = logging.getLogger("chainagents.runtime.core")
 
@@ -585,13 +587,7 @@ def _build_deepagents_summarization_factory(
             compute_summarization_defaults,
         )
 
-        profile = getattr(model, "profile", None) or {}
-        trigger_tokens = profile.get(runtime_models.SUMMARIZATION_TRIGGER_TOKENS_KEY)
-        keep_tokens = profile.get(runtime_models.SUMMARIZATION_KEEP_TOKENS_KEY)
-        if trigger_tokens is None:
-            trigger_tokens = config.extensions.summarization_trigger_tokens
-        if keep_tokens is None:
-            keep_tokens = config.extensions.summarization_keep_tokens
+        trigger_tokens, keep_tokens = configured_thresholds(model, config.extensions)
         if trigger_tokens is None and keep_tokens is None:
             return default_factory(model, backend)
 
@@ -618,12 +614,16 @@ def _build_deepagents_summarization_factory(
 
 def create_deep_agent_with_configured_summarization(
     config: RuntimeConfig,
+    *,
+    context_usage: ContextUsageRegistry | None = None,
     **kwargs: Any,
 ) -> Any:
     """Create a DeepAgents graph while applying configured summarization thresholds.
 
     Args:
         config: Configuration object used by the operation.
+        context_usage: Registry that also measures DeepAgents' implicit
+            general-purpose delegate, or None to leave it unmeasured.
         kwargs: Keyword arguments passed to create_deep_agent.
 
     Returns:
@@ -656,6 +656,15 @@ def create_deep_agent_with_configured_summarization(
                     isinstance(item, RepeatedToolResultGuardMiddleware) for item in existing
                 ):
                     existing.append(RepeatedToolResultGuardMiddleware())
+                # Stacks that already carry one replace this copy by name.
+                if context_usage is not None and not any(
+                    isinstance(item, ContextUsageMiddleware) for item in existing
+                ):
+                    existing.append(
+                        ContextUsageMiddleware(
+                            registry=context_usage, extensions=config.extensions
+                        )
+                    )
                 return existing
 
             return dataclasses.replace(profile, extra_middleware=middleware_for_stacks)
@@ -684,6 +693,7 @@ def build_agent_middleware(
     source: str = "main-agent",
     project_root: Path | None = None,
     filesystem_tools: Sequence[str] | None = None,
+    context_usage: ContextUsageRegistry | None = None,
 ) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build agent middleware.
 
@@ -696,6 +706,8 @@ def build_agent_middleware(
         project_root: Project root used to resolve local paths.
         filesystem_tools: Explicit filesystem tool names; replaces the
             computed default list when given.
+        context_usage: Registry that receives each model call's context
+            usage, or None to skip measurement.
 
     Returns:
         The constructed agent middleware.
@@ -727,4 +739,8 @@ def build_agent_middleware(
             virtual_filesystem_tools=runtime_backends.backend_routes_workspace(backend),
         )
     )
+    if context_usage is not None and config is not None:
+        middleware.append(
+            ContextUsageMiddleware(registry=context_usage, extensions=config.extensions)
+        )
     return middleware

@@ -15,6 +15,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.runnables.config import ensure_config, merge_configs
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
@@ -442,9 +443,27 @@ class MessagingScopedRunnable(Runnable[Any, Any]):
     def __getattr__(self, name: str) -> Any:
         return getattr(self.runnable, name)
 
+    def with_config(
+        self, config: RunnableConfig | None = None, **kwargs: Any
+    ) -> Runnable[Any, Any]:
+        # Bind onto the wrapped graph: a RunnableBinding around this wrapper
+        # loses bound metadata (DeepAgents' `lc_agent_name`) to the caller's
+        # ambient config when LangChain merges configs per call.
+        return MessagingScopedRunnable(
+            self.runnable.with_config(config, **kwargs),
+            self.broker,
+            self.agent_name,
+            self.fixed_session_id,
+            participant=self.participant,
+        )
+
     def _enter(self, config: RunnableConfig | None) -> tuple[str, str, Any, Any]:
+        # DeepAgents' `task` tool passes only its own configurable keys, so
+        # merge them over the parent run's (ensure_config() is the ambient
+        # config) to keep its thread_id as the session in exported graphs.
+        call_config = merge_configs(ensure_config(), config)
         session = _session_id(
-            type("Run", (), {"config": config or {}})(), self.fixed_session_id
+            type("Run", (), {"config": call_config})(), self.fixed_session_id
         )
         parent = _CURRENT_AGENT_ADDRESS.get() or None
         address = f"{self.agent_name}:{uuid.uuid4().hex[:12]}"

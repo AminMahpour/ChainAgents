@@ -200,3 +200,47 @@ def test_messaging_rejects_configured_tool_name_collisions(tmp_path, name):
             build_model=lambda _level, _profile: object(),
             session_id="s", messaging_broker=MessageBroker(config.extensions.messaging),
         )
+
+
+def test_wrapped_subagent_without_fixed_session_uses_parent_thread():
+    """Exported graphs have no fixed session: the parent run's thread is used.
+
+    DeepAgents binds ``lc_agent_name`` on the wrapper and invokes it inside the
+    parent's ``task`` tool with only ``{"configurable": {"ls_agent_type": ...}}``.
+    """
+    from langchain_core.runnables import RunnableLambda
+    from langgraph.config import get_config
+    from langgraph.graph import START, StateGraph
+
+    from chainagents.runtime import messaging as runtime_messaging
+
+    broker = MessageBroker(MessagingConfig(enabled=True))
+    seen: dict[str, object] = {}
+
+    def node(state: dict) -> dict:
+        seen["session"] = runtime_messaging._CURRENT_MESSAGING_SESSION.get()
+        seen["agent"] = get_config()["metadata"].get("lc_agent_name")
+        return {"value": "ok"}
+
+    builder = StateGraph(dict)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    # Like create_deep_agent, the compiled graph binds an unnamed agent.
+    graph = builder.compile().with_config({"metadata": {"lc_agent_name": None}})
+    wrapper = runtime_messaging.MessagingScopedRunnable(
+        graph, broker, "scout", None
+    ).with_config({"metadata": {"lc_agent_name": "scout"}})
+
+    async def parent(_state):
+        return await wrapper.ainvoke(
+            {"value": ""}, {"configurable": {"ls_agent_type": "subagent"}}
+        )
+
+    result = asyncio.run(
+        RunnableLambda(parent).with_config(
+            {"metadata": {"lc_agent_name": None}}
+        ).ainvoke({}, {"configurable": {"thread_id": "T1"}})
+    )
+
+    assert result == {"value": "ok"}
+    assert seen == {"session": "T1", "agent": "scout"}

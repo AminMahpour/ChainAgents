@@ -9,7 +9,7 @@ import logging
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 
 from contextlib import asynccontextmanager
 
@@ -57,9 +57,13 @@ class BackgroundTaskManager:
         config: BackgroundSubagentConfig,
         *,
         artifact_registry: LargeToolResultArtifactRegistry | None = None,
+        on_task_finished: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self.config = config
         self.artifact_registry = artifact_registry
+        # Called with (session_id, task_id, status) once a task reaches a
+        # terminal status; its exceptions are logged and never propagate.
+        self._on_task_finished = on_task_finished
         self._lock = asyncio.Lock()
         self._records: dict[str, _BackgroundTaskRecord] = {}
         self._session_task_ids: dict[str, list[str]] = {}
@@ -482,6 +486,15 @@ class BackgroundTaskManager:
             record.activity_events,
             f" error={_truncate(error)}" if error else "",
         )
+        if self._on_task_finished is not None:
+            try:
+                self._on_task_finished(record.session_id, record.task_id, status)
+            except Exception:
+                logger.warning(
+                    "Background task finish callback failed for %s",
+                    record.task_id,
+                    exc_info=True,
+                )
         for completion_queue in subscribers:
             _put_evicting_oldest(completion_queue, snapshot)
         terminal_activity = BackgroundTaskActivity(

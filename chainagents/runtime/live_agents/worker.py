@@ -11,6 +11,12 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from chainagents.runtime.context_usage import (
+    AGENT_INSTANCE_KEY,
+    AGENT_KIND_KEY,
+    AGENT_NAME_KEY,
+    SESSION_ID_KEY,
+)
 from chainagents.runtime.live_agents.events import LiveAgentEvent, LiveAgentEventBus
 from chainagents.runtime.live_agents.registry import LiveAgentRecord
 from chainagents.runtime.messaging import (
@@ -173,7 +179,13 @@ class LiveAgentWorker:
     def _run_config(self) -> dict[str, Any]:
         record = self.record
         config: dict[str, Any] = {
-            "configurable": {"thread_id": record.thread_id},
+            "configurable": {
+                "thread_id": record.thread_id,
+                SESSION_ID_KEY: record.session_id,
+                AGENT_KIND_KEY: "live",
+                AGENT_NAME_KEY: record.name,
+                AGENT_INSTANCE_KEY: record.id,
+            },
             "recursion_limit": self.recursion_limit,
         }
         callbacks = self.turn_callbacks(record) if self.turn_callbacks else []

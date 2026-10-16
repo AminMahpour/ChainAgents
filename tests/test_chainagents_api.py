@@ -339,6 +339,7 @@ def test_status_reports_runtime_configuration() -> None:
             "rag": True,
             "images": False,
             "live_agents": False,
+            "context_usage": False,
         },
         "starters": [
             {

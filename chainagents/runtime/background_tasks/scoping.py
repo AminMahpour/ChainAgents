@@ -30,6 +30,16 @@ class _BackgroundInvocationScopedRunnable(Runnable[Any, Any]):
     def __init__(self, runnable: object) -> None:
         self.runnable = runnable
 
+    def with_config(
+        self, config: RunnableConfig | None = None, **kwargs: Any
+    ) -> Runnable[Any, Any]:
+        # Bind onto the wrapped graph: a RunnableBinding around this wrapper
+        # loses bound metadata (DeepAgents' `lc_agent_name`) to the caller's
+        # ambient config when LangChain merges configs per call.
+        return _BackgroundInvocationScopedRunnable(
+            self.runnable.with_config(config, **kwargs)  # type: ignore[attr-defined]
+        )
+
     def invoke(
         self,
         input: Any,

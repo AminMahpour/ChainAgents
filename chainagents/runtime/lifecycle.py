@@ -45,6 +45,7 @@ from chainagents.rag.runtime import (
 )
 from chainagents.runtime.config import RuntimeConfig
 from chainagents.runtime.constants import SYSTEM_PROMPT, ReasoningLevel
+from chainagents.runtime.context_usage import ContextUsageRegistry
 from chainagents.runtime.live_agents.config import ResolvedLiveAgentSpec
 from chainagents.runtime.live_agents.manager import LiveAgentManager
 from chainagents.runtime.live_agents.registry import LiveAgentRecord
@@ -134,9 +135,11 @@ class AgentRuntime:
             runtime_artifacts.LargeToolResultArtifactRegistry()
         )
         self._exit_stack.push_async_callback(self.close_all_mcp_sessions)
+        self.context_usage = ContextUsageRegistry()
         self.background_tasks = runtime_background_tasks.BackgroundTaskManager(
             config.extensions.background_subagents,
             artifact_registry=self.large_tool_result_artifacts,
+            on_task_finished=self._on_background_task_finished,
         )
         self._exit_stack.push_async_callback(self.background_tasks.close)
         broker_config = config.extensions.messaging
@@ -158,6 +161,7 @@ class AgentRuntime:
                     if self.langsmith_tracing is not None
                     else None
                 ),
+                on_stopped=self._on_live_agent_stopped,
                 artifact_registry=self.large_tool_result_artifacts,
                 turn_callbacks=(
                     self._live_agent_turn_callbacks
@@ -173,6 +177,16 @@ class AgentRuntime:
             config.extensions,
             project_root=self.project_root,
         )
+
+    def _on_background_task_finished(
+        self, session_id: str, task_id: str, _status: str
+    ) -> None:
+        """Mark a background task's context usage as finished, whatever its outcome."""
+        self.context_usage.mark_ended(session_id, task_id, "finished")
+
+    def _on_live_agent_stopped(self, session_id: str, agent_id: str) -> None:
+        """Mark a torn-down live agent's context usage as stopped."""
+        self.context_usage.mark_ended(session_id, agent_id, "stopped")
 
     async def save_reflection(self, proposal: ReflectionProposal) -> None:
         """Persist a confirmed lesson to configured memory and verify the full write.
@@ -732,9 +746,11 @@ class AgentRuntime:
                 langsmith_tracing=self.langsmith_tracing,
                 messaging_broker=self.message_broker,
                 live_agent_manager=self.live_agents,
+                context_usage=self.context_usage,
             )
             agent = runtime_middleware.create_deep_agent_with_configured_summarization(
                 self.config,
+                context_usage=self.context_usage,
                 **agent_kwargs,
             )
             agent = runtime_background_tasks.scope_background_session_invocation(
@@ -959,6 +975,7 @@ class AgentRuntime:
             session_id=session_id,
             store=self.store if stateful else None,
             checkpointer=self._live_agent_checkpointer(),
+            context_usage=self.context_usage,
         )
 
     def _live_agent_checkpointer(self) -> AsyncPostgresSaver | MemorySaver:
@@ -1124,6 +1141,10 @@ class AgentRuntime:
                             key: agent for key, agent in self._agents.items()
                             if key.thread_id != thread_id
                         }
+                except BaseException as exc:
+                    errors.append(exc)
+                try:
+                    self.context_usage.clear(thread_id)
                 except BaseException as exc:
                     errors.append(exc)
                 if len(errors) == 1:

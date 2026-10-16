@@ -127,7 +127,25 @@ def _build_both(
             await runtime.close()
 
     asyncio.run(exercise())
-    return static_calls, list(calls)
+    return static_calls, [_without_context_usage(kwargs) for kwargs in calls]
+
+
+def _without_context_usage(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop the runtime-only context usage middleware after checking it is there.
+
+    Only the live runtime owns a context usage registry, so exported graphs
+    never measure context usage; everything else must match.
+    """
+    names = [type(item).__name__ for item in kwargs["middleware"]]
+    assert names.count("ContextUsageMiddleware") == 1
+    return {
+        **kwargs,
+        "middleware": [
+            item
+            for item in kwargs["middleware"]
+            if type(item).__name__ != "ContextUsageMiddleware"
+        ],
+    }
 
 
 def test_static_and_live_assembly_build_the_same_agent_without_mcp(
