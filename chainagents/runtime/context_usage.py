@@ -122,7 +122,9 @@ class ContextUsageRegistry:
         entries[key] = snapshot
         entries.move_to_end(key)
         while len(entries) > MAX_AGENTS_PER_SESSION:
-            entries.popitem(last=False)
+            evicted, _ = entries.popitem(last=False)
+            # Summary state is per agent too; drop it so the cap bounds memory.
+            self._digests.get(session_id, {}).pop(evicted, None)
 
     def note_summary(self, session_id: str, key: str, digest: str) -> bool:
         """Record a summary digest; return True when it differs from the last one."""
@@ -140,10 +142,17 @@ class ContextUsageRegistry:
         return known[1] if known else None
 
     def mark_ended(self, session_id: str, key: str, status: str) -> None:
-        """Set the status of a stored snapshot without changing its eviction order."""
+        """End an agent instance and its nested children, keeping eviction order.
+
+        Nested subagents of a background task or live agent are stored under
+        ``<key>:<subagent>``; they cannot run once their owner has ended.
+        """
         entries = self._snapshots.get(session_id)
-        if entries is not None and key in entries:
-            entries[key] = replace(entries[key], status=status)
+        if entries is None:
+            return
+        for entry_key, snapshot in entries.items():
+            if entry_key == key or entry_key.startswith(f"{key}:"):
+                entries[entry_key] = replace(snapshot, status=status)
 
     def list(self, session_id: str) -> list[ContextUsageSnapshot]:
         """Return the session's snapshots: main first, then newest first."""
@@ -199,7 +208,12 @@ def _resolve_identity() -> _CallIdentity | None:
 
 def _model_name(model: Any) -> str:
     """Return the model's name, falling back to its class name."""
-    name = getattr(model, "model_name", None) or getattr(model, "model", None)
+    # ChatBedrockConverse names its model in `model_id`.
+    name = (
+        getattr(model, "model_name", None)
+        or getattr(model, "model", None)
+        or getattr(model, "model_id", None)
+    )
     return name if isinstance(name, str) and name else type(model).__name__
 
 

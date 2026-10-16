@@ -155,3 +155,38 @@ def test_snapshot_payload_has_spec_fields() -> None:
     }
     assert payload["categories"] == snapshot.categories
     assert payload["categories"] is not snapshot.categories
+
+
+def test_mark_ended_also_ends_the_instances_nested_children() -> None:
+    reg = ContextUsageRegistry()
+    reg.record("s", "t1", _snapshot("scout", "background"))
+    reg.record("s", "t1:helper", _snapshot("helper", "subagent"))
+    reg.record("s", "t10", _snapshot("other", "background"))
+
+    reg.mark_ended("s", "t1", "finished")
+
+    statuses = {s.agent: s.status for s in reg.list("s")}
+    assert statuses == {"scout": "finished", "helper": "finished", "other": "active"}
+
+
+def test_eviction_drops_the_evicted_agents_summary_state() -> None:
+    reg = ContextUsageRegistry()
+    reg.record("s", "a0", _snapshot("a0", "subagent"))
+    assert reg.note_summary("s", "a0", "digest") is True
+    for index in range(1, 51):
+        reg.record("s", f"a{index}", _snapshot(f"a{index}", "subagent"))
+
+    assert all(s.agent != "a0" for s in reg.list("s"))
+    assert reg.last_summarized("s", "a0") is None
+    assert reg.note_summary("s", "a0", "digest") is True
+
+
+def test_model_name_reads_bedrock_model_id() -> None:
+    from types import SimpleNamespace
+
+    from chainagents.runtime.context_usage import _model_name
+
+    bedrock = SimpleNamespace(model_id="us.anthropic.claude-sonnet-4-5-v1:0")
+
+    assert _model_name(bedrock) == "us.anthropic.claude-sonnet-4-5-v1:0"
+    assert _model_name(SimpleNamespace(model_name="gpt", model_id="x")) == "gpt"
