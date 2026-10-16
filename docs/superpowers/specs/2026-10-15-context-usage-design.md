@@ -1,9 +1,9 @@
 # Context Window Usage and Summarization Visibility — Design
 
 Date: 2026-10-15
-Status: Draft for review
+Status: Implemented
 Repos: ChainAgents (backend), SparxUI (frontend)
-Depends on: per-profile context window and summarization budget (PR #126)
+Depends on: per-profile context window and summarization budget (PR #126, merged)
 
 ## Goal
 
@@ -23,7 +23,9 @@ Success criteria:
 - When DeepAgents summarizes the main agent's history, the conversation shows a
   notice and the gauge drops.
 - Reopening a conversation restores the gauge.
-- Older backends, OpenAgents and the Chainlit/CLI/TUI interfaces are unaffected.
+- Older backends and OpenAgents are unaffected. Chainlit, the CLI and the TUI
+  are unchanged except that they also show the summarization notice
+  (`summarization_status`), which they already render.
 
 Non-goals: per-tool or per-message sizes, cost estimates, historical charts,
 changing summarization behavior, showing context usage in Chainlit, the CLI or
@@ -287,8 +289,8 @@ the gauge and popup visually in a browser.
 
 ## 5. Delivery
 
-- ChainAgents: branch `feat/context-usage`, based on
-  `feat/profile-context-window`, opened as a PR stacked on #126.
+- ChainAgents: branch `feat/context-usage`, PR #127 targeting `master`
+  (#126 is merged).
 - SparxUI: branch `dev/context-usage-gauge`, its own PR.
 - Merge order: ChainAgents first. SparxUI degrades gracefully against older
   backends, so the order is not strictly required.

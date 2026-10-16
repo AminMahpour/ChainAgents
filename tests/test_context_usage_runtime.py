@@ -77,6 +77,8 @@ def _route(messages: list[BaseMessage]) -> AIMessage:
     prompt = _first_human(messages)
     if prompt == "delegate":
         return _call("task", {"description": "look around", "subagent_type": "scout"}, "c1")
+    if prompt == "delegate scout":
+        return _call("task", {"description": "scout here", "subagent_type": "scout"}, "c1")
     if prompt == "general":
         return _call(
             "task", {"description": "look around", "subagent_type": "general-purpose"}, "c1"
@@ -85,6 +87,8 @@ def _route(messages: list[BaseMessage]) -> AIMessage:
         return _call("task", {"description": "inspect", "subagent_type": "helper"}, "c2")
     if prompt == "inspect":
         return _ai("helper report", input_tokens=300)
+    if prompt == "scout here":
+        return _ai("scout report", input_tokens=500)
     if prompt == "nested background":
         return _call(
             "spawn_background_task",
@@ -158,6 +162,38 @@ async def test_main_and_subagent_snapshots_reach_the_registry(
         usage_events = [event for event in events if event.kind == "context_usage"]
         assert usage_events
         assert {event.context_usage["agent"] for event in usage_events} == {"main"}
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "background = true\n",
+        "background = true\n[agent.messaging]\nenabled = true\n",
+        HELPER + "background = true\n",
+    ],
+    ids=["compiled", "messaging-scoped", "background-scoped"],
+)
+async def test_compiled_configured_subagent_delegated_via_task_keeps_its_own_entry(
+    tmp_path, monkeypatch, fake_model, extra
+) -> None:
+    # Each variant compiles the scout into its own graph (possibly wrapped),
+    # which the main agent then calls synchronously through the `task` tool.
+    toml = OLLAMA_MODEL + "[agent.background_subagents]\nenabled = true\n" + SCOUT + extra
+    runtime = await _runtime(tmp_path, monkeypatch, toml)
+    try:
+        events = await _turn(runtime, "thread-1", "delegate scout")
+
+        snapshots = {item.agent: item for item in runtime.context_usage.list("thread-1")}
+        assert set(snapshots) == {"main", "scout"}
+        assert (snapshots["scout"].kind, snapshots["scout"].used) == ("subagent", 500)
+        assert (snapshots["main"].kind, snapshots["main"].used) == ("main", 1200)
+        usage_events = [event for event in events if event.kind == "context_usage"]
+        assert usage_events
+        assert {event.context_usage["agent"] for event in usage_events} == {"main"}
+        assert {event.context_usage["used"] for event in usage_events} == {1200}
     finally:
         await runtime.close()
 

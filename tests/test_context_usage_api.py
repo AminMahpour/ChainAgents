@@ -21,13 +21,19 @@ def _snapshot(agent: str, kind: str, at_utc: str) -> ContextUsageSnapshot:
         model="test-model",
         window=1000,
         used=250,
-        categories={"messages": 250},
+        categories={
+            "system": 40,
+            "tools": 60,
+            "summary": 0,
+            "messages": 100,
+            "tool_results": 50,
+        },
         trigger=800,
         keep=100,
         exact=True,
         at_utc=at_utc,
         last_summarized_at_utc=None,
-        status="running",
+        status="active",
     )
 
 

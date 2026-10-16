@@ -540,6 +540,9 @@ def _build_sync_subagent_spec(
         project_root=context.project_root,
         context_usage=context.context_usage,
     )
+    # DeepAgents splices new-by-name middleware ahead of the profile tail, so
+    # these run outside the context-usage measurement point by design; moving
+    # them after it would skew the tools/system numbers.
     messaging_enabled = (
         config.extensions.messaging.enabled
         and subagent.messaging
@@ -997,6 +1000,9 @@ def build_agent_kwargs(
         project_root=project_root,
         context_usage=context_usage,
     )
+    # DeepAgents splices new-by-name middleware ahead of the profile tail, so
+    # these run outside the context-usage measurement point by design; moving
+    # them after it would skew the tools/system numbers.
     if config.extensions.messaging.enabled or config.extensions.user_input.enabled:
         if messaging_broker is None:
             global _STATIC_MESSAGE_BROKER
@@ -1246,6 +1252,9 @@ def build_live_agent_graph(
         filesystem_tools=fs_tools,
         context_usage=context_usage,
     )
+    # DeepAgents splices new-by-name middleware ahead of the profile tail, so
+    # these run outside the context-usage measurement point by design; moving
+    # them after it would skew the tools/system numbers.
     if hide_read_file:
         from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
 
