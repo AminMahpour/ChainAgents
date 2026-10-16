@@ -1385,3 +1385,12 @@ def test_pdf_render_includes_contents_page_numbers_and_bookmarks() -> None:
             outline_titles.append(item.title)
     assert "Overview" in outline_titles
     assert "Configure deepagent.toml" in outline_titles
+
+
+def test_pdf_contents_use_image_alt_text_for_image_headings() -> None:
+    html = response_exports.build_pdf_html_document(
+        "# ![Architecture](diagram.png)\n\n## Data ![flow](flow.png) path\n\n## ![](blank.png)\n"
+    )
+
+    texts = [text for _, _, text in _toc_entries(html)]
+    assert texts == ["Architecture", "Data flow path", "Section 3"]

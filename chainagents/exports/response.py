@@ -202,6 +202,7 @@ PDF_MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False}).enable("table"
 # Responses with at least this many level 1-3 headings get a contents section.
 PDF_TOC_MIN_HEADINGS = 3
 PDF_TOC_HEADING_RE = re.compile(r"<h([1-3])>(.*?)</h\1>", re.DOTALL)
+PDF_TOC_IMAGE_ALT_RE = re.compile(r'<img\b[^>]*?\balt="([^"]*)"[^>]*>', re.IGNORECASE)
 PDF_TEXT_REWRITE_SKIP_TAGS = frozenset({"code", "kbd", "pre", "samp"})
 PDF_HTML_TAG_RE = re.compile(r"(<[^>]+>)")
 PDF_HTML_TAG_NAME_RE = re.compile(r"^<\s*/?\s*([a-zA-Z][a-zA-Z0-9-]*)")
@@ -737,7 +738,9 @@ def _with_pdf_table_of_contents(body: str) -> str:
     def add_id(match: re.Match[str]) -> str:
         level, inner = match.group(1), match.group(2)
         anchor = f"toc-{next(counter)}"
-        title = re.sub(r"<[^>]+>", "", inner).strip()
+        # Images keep their (already escaped) alt text; other tags are dropped.
+        title = re.sub(r"<[^>]+>", "", PDF_TOC_IMAGE_ALT_RE.sub(r"\1", inner)).strip()
+        title = " ".join(title.split()) or f"Section {anchor.removeprefix('toc-')}"
         entries.append(
             f'<li class="pdf-toc-level-{level}"><a href="#{anchor}">{title}</a></li>'
         )
