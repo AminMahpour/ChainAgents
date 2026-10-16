@@ -1300,3 +1300,88 @@ async def test_send_pdf_export_reports_generation_errors(monkeypatch) -> None:
     assert render_threads and render_threads[0] != caller_thread
     assert sent_messages[0].author == "System"
     assert "PDF export requires WeasyPrint native libraries" in sent_messages[0].content
+
+
+# ---------------------------------------------------------- table of contents
+
+TOC_MARKDOWN = """# Overview
+
+Intro text.
+
+## Setup
+
+Install it.
+
+### Configure `deepagent.toml`
+
+Edit the file.
+
+## Setup
+
+A second section with the same title.
+
+#### Deep detail
+
+Not listed.
+"""
+
+
+def _toc_entries(html: str) -> list[tuple[str, str, str]]:
+    """Return (level class, href, text) for each contents entry."""
+    import re
+
+    nav = re.search(r'<nav class="pdf-toc">(.*?)</nav>', html, re.S)
+    assert nav, "no contents section"
+    return re.findall(
+        r'<li class="(pdf-toc-level-\d)"><a href="(#toc-\d+)">(.*?)</a></li>', nav.group(1)
+    )
+
+
+def test_pdf_html_lists_headings_in_a_contents_section() -> None:
+    html = response_exports.build_pdf_html_document(TOC_MARKDOWN)
+
+    assert _toc_entries(html) == [
+        ("pdf-toc-level-1", "#toc-1", "Overview"),
+        ("pdf-toc-level-2", "#toc-2", "Setup"),
+        ("pdf-toc-level-3", "#toc-3", "Configure deepagent.toml"),
+        ("pdf-toc-level-2", "#toc-4", "Setup"),
+    ]
+    assert '<h1 id="toc-1">Overview</h1>' in html
+    assert '<h2 id="toc-4">Setup</h2>' in html
+    assert "<h4>Deep detail</h4>" in html
+    assert html.index('<nav class="pdf-toc">') < html.index('<h1 id="toc-1">')
+
+
+def test_pdf_html_skips_contents_below_three_headings() -> None:
+    html = response_exports.build_pdf_html_document("# One\n\ntext\n\n## Two\n\nmore")
+
+    assert '<nav class="pdf-toc">' not in html
+    assert "<h1>One</h1>" in html
+
+
+def test_pdf_contents_escape_heading_text() -> None:
+    html = response_exports.build_pdf_html_document(
+        "# A & B\n\n## *Émphasis* <tag>\n\n## Ünïcode 日本語\n"
+    )
+
+    texts = [text for _, _, text in _toc_entries(html)]
+    assert texts == ["A &amp; B", "Émphasis &lt;tag&gt;", "Ünïcode 日本語"]
+
+
+def test_pdf_render_includes_contents_page_numbers_and_bookmarks() -> None:
+    pdf = PdfReader(BytesIO(response_exports.build_pdf_bytes(TOC_MARKDOWN)))
+
+    first_page = pdf.pages[0].extract_text()
+    assert "Contents" in first_page
+    assert "Overview" in first_page
+    assert any(char.isdigit() for char in first_page)
+    outline_titles = []
+    stack = list(pdf.outline)
+    while stack:
+        item = stack.pop(0)
+        if isinstance(item, list):
+            stack[:0] = item
+        else:
+            outline_titles.append(item.title)
+    assert "Overview" in outline_titles
+    assert "Configure deepagent.toml" in outline_titles
