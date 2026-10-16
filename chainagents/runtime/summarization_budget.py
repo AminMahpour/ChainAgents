@@ -10,6 +10,8 @@ from chainagents.runtime.types import ExtensionsConfig
 TRIGGER_FRACTION_PERCENT = 85
 KEEP_FRACTION_PERCENT = 10
 FALLBACK_TRIGGER_TOKENS = 170000
+# DeepAgents' input budget: this share of the window, minus reserved output.
+INPUT_BUDGET_PERCENT = 95
 
 
 def _profile(model: Any) -> dict[str, Any]:
@@ -58,6 +60,21 @@ def effective_threshold_tokens(
             trigger = window * TRIGGER_FRACTION_PERCENT // 100
         if keep is None:
             keep = window * KEEP_FRACTION_PERCENT // 100
+        # DeepAgents also summarizes once input exceeds 95% of the window minus
+        # the reserved output tokens, which can come before the trigger.
+        trigger = min(trigger, max(0, window * INPUT_BUDGET_PERCENT // 100 - _output_tokens(model)))
     elif trigger is None:
         trigger = FALLBACK_TRIGGER_TOKENS
     return trigger, keep
+
+
+def _output_tokens(model: Any) -> int:
+    """Return the output tokens a model reserves, as DeepAgents counts them."""
+    values = [
+        getattr(model, name, None)
+        for name in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+    ]
+    return max(
+        (value for value in values if isinstance(value, int) and not isinstance(value, bool)),
+        default=0,
+    )

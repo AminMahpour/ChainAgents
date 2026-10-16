@@ -73,3 +73,15 @@ def test_context_window_rejects_non_int_and_bool() -> None:
     assert context_window(_model({"max_input_tokens": True})) is None
     assert context_window(_model({"max_input_tokens": "16384"})) is None
     assert context_window(_model(None)) is None
+
+
+def test_trigger_is_clamped_to_the_reserved_input_budget() -> None:
+    """DeepAgents summarizes once input exceeds 95% of the window minus output."""
+    from types import SimpleNamespace
+
+    model = SimpleNamespace(profile={"max_input_tokens": 16384}, max_tokens=4096)
+
+    trigger, keep = effective_threshold_tokens(model, ExtensionsConfig(config_path=None))
+
+    assert trigger == 16384 * 95 // 100 - 4096
+    assert keep == 1638

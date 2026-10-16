@@ -156,7 +156,9 @@ class ContextUsageRegistry:
 
     def list(self, session_id: str) -> list[ContextUsageSnapshot]:
         """Return the session's snapshots: main first, then newest first."""
-        snapshots = list(self._snapshots.get(session_id, {}).values())
+        # Most recently updated first, so the stable sort keeps snapshots taken
+        # within the same second newest first.
+        snapshots = list(reversed(self._snapshots.get(session_id, {}).values()))
         snapshots.sort(key=lambda item: item.at_utc, reverse=True)
         snapshots.sort(key=lambda item: item.kind != "main")
         return snapshots

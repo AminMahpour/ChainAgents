@@ -190,3 +190,12 @@ def test_model_name_reads_bedrock_model_id() -> None:
 
     assert _model_name(bedrock) == "us.anthropic.claude-sonnet-4-5-v1:0"
     assert _model_name(SimpleNamespace(model_name="gpt", model_id="x")) == "gpt"
+
+
+def test_snapshots_from_the_same_second_list_newest_first() -> None:
+    reg = ContextUsageRegistry()
+    same_second = "2026-10-15T10:00:00+00:00"
+    reg.record("s", "a", _snapshot("first", "subagent", at_utc=same_second))
+    reg.record("s", "b", _snapshot("second", "subagent", at_utc=same_second))
+
+    assert [s.agent for s in reg.list("s")] == ["second", "first"]
