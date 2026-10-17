@@ -445,11 +445,11 @@ def _getaddrinfo_before_deadline(
     resolver.start()
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise PdfImageError("image download budget expired")
+        raise PdfImageError("image download time limit reached")
     try:
         result = results.get() if math.isinf(remaining) else results.get(timeout=remaining)
     except queue.Empty as exc:
-        raise PdfImageError("image download budget expired") from exc
+        raise PdfImageError("image download time limit reached") from exc
     if isinstance(result, OSError):
         raise result
     return result  # type: ignore[return-value]
@@ -544,6 +544,8 @@ def _request_pdf_image_url(
             transferred += len(chunk)
             if transferred > max_bytes:
                 raise PdfImageError("image exceeds the download size limit")
+            # The rate is checked only when a read returns, so a trickle is
+            # detected within about two windows; that stays inside the image cap.
             now = time.monotonic()
             window_bytes += len(chunk)
             if now - window_started >= PDF_IMAGE_STALL_WINDOW_SECONDS:
@@ -553,6 +555,10 @@ def _request_pdf_image_url(
                 window_bytes = 0
         if expired.is_set():
             raise PdfImageError("image download time limit reached")
+        if response.length:
+            # read1 reports an early EOF as b"" instead of IncompleteRead, so a
+            # body shorter than its Content-Length must be caught here.
+            raise _PdfImageConnectionError("image download failed")
         content = b"".join(chunks)
     except (OSError, http.client.HTTPException) as exc:
         raise _classify_request_error(
@@ -583,7 +589,7 @@ def _classify_request_error(
     """Split request failures into final errors and retryable connection errors."""
     if expired:
         return PdfImageError("image download time limit reached")
-    if isinstance(exc, ssl.SSLError):
+    if isinstance(exc, ssl.SSLCertVerificationError):
         return PdfImageError("image TLS verification failed")
     if isinstance(exc, (http.client.LineTooLong, http.client.InvalidURL)):
         return PdfImageError("image download failed")
