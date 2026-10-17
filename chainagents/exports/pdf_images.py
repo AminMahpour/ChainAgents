@@ -203,6 +203,66 @@ class PdfImageDownloadBudget:
             self._remaining_pixels += count
 
 
+class PdfImageHostLimiter:
+    """Thread-safe per-host concurrency limit shared by one PDF export.
+
+    The export scheduler takes a slot for each image's own host without
+    blocking; a download that redirects to another host takes a slot for that
+    host too, so redirect traffic and direct traffic share one count.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active: dict[str, int] = {}
+        self._changed = threading.Condition()
+
+    def try_acquire(self, host: str) -> bool:
+        with self._changed:
+            return self._take(host)
+
+    def acquire(self, host: str, *, deadline: float) -> bool:
+        """Wait for a slot until ``deadline``; return False if none came free."""
+        with self._changed:
+            while not self._take(host):
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    return False
+                self._changed.wait(
+                    None if math.isinf(remaining_seconds) else remaining_seconds
+                )
+            return True
+
+    def release(self, host: str) -> None:
+        with self._changed:
+            count = self._active.get(host, 0)
+            if count <= 0:
+                raise RuntimeError("PDF image host slot released without being held")
+            if count == 1:
+                del self._active[host]
+            else:
+                self._active[host] = count - 1
+            self._changed.notify_all()
+
+    def _take(self, host: str) -> bool:
+        count = self._active.get(host, 0)
+        if count >= self._limit:
+            return False
+        self._active[host] = count + 1
+        return True
+
+
+def pdf_image_host_key(url: str) -> str:
+    """Return the normalized hostname that per-host download limits count."""
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
+
+
 @dataclass(frozen=True)
 class _PdfHttpResponse:
     status: int
@@ -240,13 +300,52 @@ def download_pdf_image(
     max_pixels: int = PDF_IMAGE_MAX_PIXELS,
     budget: PdfImageDownloadBudget | None = None,
     per_image_seconds: float = PDF_IMAGE_PER_IMAGE_SECONDS,
+    host_limiter: PdfImageHostLimiter | None = None,
 ) -> PdfImageResource:
-    """Download and validate one public HTTP(S) image with bounded retries."""
+    """Download and validate one public HTTP(S) image with bounded retries.
+
+    With ``host_limiter``, the caller already holds a slot for ``url``'s host;
+    each redirect to another host waits for a slot on that host as well, and
+    every slot taken here is released before returning.
+    """
     download_budget = (
         budget if budget is not None else PdfImageDownloadBudget(deadline, max_bytes)
     )
     export_deadline = min(deadline, download_budget.deadline)
     image_deadline = min(export_deadline, time.monotonic() + per_image_seconds)
+    held_hosts = {pdf_image_host_key(url)}
+    acquired_hosts: list[str] = []
+    try:
+        return _download_pdf_image_hops(
+            url,
+            export_deadline=export_deadline,
+            image_deadline=image_deadline,
+            max_bytes=max_bytes,
+            max_pixels=max_pixels,
+            budget=download_budget,
+            host_limiter=host_limiter,
+            held_hosts=held_hosts,
+            acquired_hosts=acquired_hosts,
+        )
+    finally:
+        if host_limiter is not None:
+            for host in acquired_hosts:
+                host_limiter.release(host)
+
+
+def _download_pdf_image_hops(
+    url: str,
+    *,
+    export_deadline: float,
+    image_deadline: float,
+    max_bytes: int,
+    max_pixels: int,
+    budget: PdfImageDownloadBudget,
+    host_limiter: PdfImageHostLimiter | None,
+    held_hosts: set[str],
+    acquired_hosts: list[str],
+) -> PdfImageResource:
+    """Follow redirects with a retry budget shared by every hop of one image."""
     attempts = 0
     current_url = url
     for redirect_count in range(PDF_IMAGE_MAX_REDIRECTS + 1):
@@ -258,7 +357,7 @@ def download_pdf_image(
                     current_url,
                     deadline=image_deadline,
                     max_bytes=max_bytes,
-                    budget=download_budget,
+                    budget=budget,
                 )
             except PdfImageRetryableError as exc:
                 wait = (
@@ -288,12 +387,18 @@ def download_pdf_image(
             if not location or redirect_count >= PDF_IMAGE_MAX_REDIRECTS:
                 raise PdfImageError("image redirect limit exceeded")
             current_url = urljoin(normalized_url, location)
+            redirect_host = pdf_image_host_key(current_url)
+            if host_limiter is not None and redirect_host not in held_hosts:
+                if not host_limiter.acquire(redirect_host, deadline=image_deadline):
+                    raise PdfImageError("image download time limit reached")
+                held_hosts.add(redirect_host)
+                acquired_hosts.append(redirect_host)
             continue
         return _validate_pdf_image(
             response.content,
             max_bytes=max_bytes,
             max_pixels=max_pixels,
-            budget=download_budget,
+            budget=budget,
         )
     raise PdfImageError("image redirect limit exceeded")
 

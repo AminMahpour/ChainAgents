@@ -24,7 +24,6 @@ from concurrent.futures import (
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlsplit
 
 import chainlit as cl
 from chainlit.element import Element, File, Pdf
@@ -36,10 +35,12 @@ from chainagents.exports.pdf_images import (
     PDF_IMAGE_MAX_PIXELS,
     PdfImageDownloadBudget,
     PdfImageError,
+    PdfImageHostLimiter,
     PdfImageResource,
     _pdf_image_log_identifier as _pdf_image_log_identifier,
     decode_pdf_data_image as _decode_pdf_data_image,
     download_pdf_image as _download_pdf_image,
+    pdf_image_host_key,
 )
 from chainagents.runtime.types import ChainlitResponseActionConfig
 
@@ -877,7 +878,7 @@ def _prepare_pdf_image_resources(
     # only when its host has a free slot, so queued images for a busy host
     # never hold a worker that another host's image could use.
     queued = list(remote_urls)
-    active_by_host: dict[str, int] = {}
+    host_limiter = PdfImageHostLimiter(PDF_IMAGE_PER_HOST_CONCURRENCY)
     in_flight: dict[Future[PdfImageResource], tuple[str, str]] = {}
     # Worker threads start lazily on submit, so data-only documents spawn none.
     executor = ThreadPoolExecutor(
@@ -889,17 +890,19 @@ def _prepare_pdf_image_resources(
         index = 0
         while index < len(queued) and len(in_flight) < PDF_IMAGE_DOWNLOAD_CONCURRENCY:
             url = queued[index]
-            host = _pdf_image_host_key(url)
-            if active_by_host.get(host, 0) >= PDF_IMAGE_PER_HOST_CONCURRENCY:
+            host = pdf_image_host_key(url)
+            # Non-blocking: a busy host (including one busy with redirected
+            # downloads from other origins) is skipped, never waited on here.
+            if not host_limiter.try_acquire(host):
                 index += 1
                 continue
             del queued[index]
-            active_by_host[host] = active_by_host.get(host, 0) + 1
             future = executor.submit(
                 _download_pdf_image_task,
                 url,
                 deadline=deadline,
                 budget=budget,
+                host_limiter=host_limiter,
             )
             in_flight[future] = (url, host)
 
@@ -924,7 +927,7 @@ def _prepare_pdf_image_resources(
                 break
             for future in done:
                 url, host = in_flight.pop(future)
-                active_by_host[host] -= 1
+                host_limiter.release(host)
                 error = future.exception()
                 outcomes[url] = future.result() if error is None else error
             submit_ready()
@@ -984,14 +987,6 @@ def _pdf_image_attributes(tag: str) -> dict[str, str]:
     }
 
 
-def _pdf_image_host_key(url: str) -> str:
-    """Return the hostname used to share a per-host download limit."""
-    try:
-        return (urlsplit(url).hostname or "").lower()
-    except ValueError:
-        return ""
-
-
 def _decode_pdf_data_image_with_budget(
     url: str,
     budget: PdfImageDownloadBudget,
@@ -1022,6 +1017,7 @@ def _download_pdf_image_task(
     *,
     deadline: float,
     budget: PdfImageDownloadBudget,
+    host_limiter: PdfImageHostLimiter,
 ) -> PdfImageResource:
     """Download one remote image and charge its retained bytes."""
     import time
@@ -1041,6 +1037,7 @@ def _download_pdf_image_task(
         max_bytes=max_bytes,
         max_pixels=max_pixels,
         budget=image_budget,
+        host_limiter=host_limiter,
     )
     # Decompression and normalization can retain more bytes than were
     # transferred; charge the difference against the shared budget.

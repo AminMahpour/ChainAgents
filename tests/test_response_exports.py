@@ -1932,6 +1932,130 @@ def test_pdf_image_budget_reservation_fails_immediately_without_contention() -> 
     assert budget.remaining_bytes == 10
 
 
+def test_prepare_pdf_images_limits_redirect_target_host(monkeypatch) -> None:
+    """Origins that redirect to one CDN must share that CDN's host limit."""
+    lock = threading.Lock()
+    active_cdn = 0
+    max_cdn = 0
+    image = _png_bytes()
+    urls = [f"https://origin{index}.example.test/{index}.png" for index in range(4)]
+
+    monkeypatch.setattr(
+        pdf_images,
+        "_resolve_public_image_url",
+        lambda url, **_kwargs: (url, url.split("/")[2], 443, ("203.0.113.10",)),
+    )
+
+    def request(url: str, **_kwargs: Any) -> Any:
+        nonlocal active_cdn, max_cdn
+        host = url.split("/")[2]
+        if host.startswith("origin"):
+            name = url.rsplit("/", 1)[-1]
+            return _status_response(302, {"location": f"https://cdn.example.test/{name}"})
+        with lock:
+            active_cdn += 1
+            max_cdn = max(max_cdn, active_cdn)
+        time.sleep(0.1)
+        with lock:
+            active_cdn -= 1
+        return pdf_images._PdfHttpResponse(200, {}, image)
+
+    monkeypatch.setattr(pdf_images, "_request_pdf_image_url", request)
+
+    _rendered, resources = response_exports._prepare_pdf_image_resources(
+        _image_document(urls)
+    )
+
+    assert set(resources) == set(urls)
+    assert max_cdn <= response_exports.PDF_IMAGE_PER_HOST_CONCURRENCY
+
+
+def test_pdf_image_host_limiter_bounds_each_host() -> None:
+    """The shared limiter must cap each host and time out blocked acquires."""
+    limiter = pdf_images.PdfImageHostLimiter(1)
+
+    assert limiter.try_acquire("cdn.example.test")
+    assert not limiter.try_acquire("cdn.example.test")
+    assert limiter.try_acquire("other.example.test")
+    assert not limiter.acquire("cdn.example.test", deadline=time.monotonic() + 0.05)
+
+    acquired: list[bool] = []
+    waiter = threading.Thread(
+        target=lambda: acquired.append(
+            limiter.acquire("cdn.example.test", deadline=time.monotonic() + 5)
+        ),
+        daemon=True,
+    )
+    waiter.start()
+    time.sleep(0.05)
+    limiter.release("cdn.example.test")
+    waiter.join(timeout=2)
+
+    assert acquired == [True]
+
+
+def test_pdf_image_redirect_waits_for_target_host_slot(monkeypatch) -> None:
+    """A redirect to a saturated host fails at the image time limit."""
+    limiter = pdf_images.PdfImageHostLimiter(1)
+    assert limiter.try_acquire("origin.example.test")  # held by the scheduler
+    assert limiter.try_acquire("cdn.example.test")  # held by another image
+    monkeypatch.setattr(
+        pdf_images,
+        "_resolve_public_image_url",
+        lambda url, **_kwargs: (url, url.split("/")[2], 443, ("203.0.113.10",)),
+    )
+    requested: list[str] = []
+
+    def request(url: str, **_kwargs: Any) -> Any:
+        requested.append(url)
+        return _status_response(302, {"location": "https://cdn.example.test/a.png"})
+
+    monkeypatch.setattr(pdf_images, "_request_pdf_image_url", request)
+
+    with pytest.raises(pdf_images.PdfImageError, match="time limit"):
+        pdf_images.download_pdf_image(
+            "https://origin.example.test/a.png",
+            deadline=float("inf"),
+            per_image_seconds=0.1,
+            host_limiter=limiter,
+        )
+
+    assert requested == ["https://origin.example.test/a.png"]
+    limiter.release("cdn.example.test")
+    # The download released nothing it did not acquire.
+    assert not limiter.try_acquire("origin.example.test")
+    assert limiter.try_acquire("cdn.example.test")
+
+
+def test_pdf_image_redirect_releases_acquired_host_slots(monkeypatch) -> None:
+    """Slots taken for redirect targets are returned when the image finishes."""
+    limiter = pdf_images.PdfImageHostLimiter(1)
+    assert limiter.try_acquire("origin.example.test")
+    image = _png_bytes()
+    monkeypatch.setattr(
+        pdf_images,
+        "_resolve_public_image_url",
+        lambda url, **_kwargs: (url, url.split("/")[2], 443, ("203.0.113.10",)),
+    )
+
+    def request(url: str, **_kwargs: Any) -> Any:
+        if "origin" in url:
+            return _status_response(302, {"location": "https://cdn.example.test/a.png"})
+        assert not limiter.try_acquire("cdn.example.test")
+        return pdf_images._PdfHttpResponse(200, {}, image)
+
+    monkeypatch.setattr(pdf_images, "_request_pdf_image_url", request)
+
+    pdf_images.download_pdf_image(
+        "https://origin.example.test/a.png",
+        deadline=float("inf"),
+        host_limiter=limiter,
+    )
+
+    assert limiter.try_acquire("cdn.example.test")
+    assert not limiter.try_acquire("origin.example.test")
+
+
 def test_pdf_image_budget_consume_is_atomic() -> None:
     """Concurrent consumers must never overdraw the shared byte budget."""
     budget = pdf_images.PdfImageDownloadBudget(float("inf"), 5_000)
