@@ -14,6 +14,7 @@ import unicodedata
 import uuid
 import weakref
 from collections.abc import Iterable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_for_futures
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -26,9 +27,11 @@ from markdown_it import MarkdownIt
 from chainagents.exports.generated_files import GeneratedFileDescriptor
 from chainagents.exports.pdf_images import (
     PDF_IMAGE_MAX_BYTES,
+    PDF_IMAGE_MAX_PIXELS,
     PdfImageDownloadBudget,
     PdfImageError,
     PdfImageResource,
+    _pdf_image_log_identifier as _pdf_image_log_identifier,
     decode_pdf_data_image as _decode_pdf_data_image,
     download_pdf_image as _download_pdf_image,
 )
@@ -47,6 +50,8 @@ MAX_PDF_REMOTE_IMAGES = 20
 MAX_PDF_REMOTE_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_PDF_REMOTE_IMAGE_PIXELS = 50_000_000
 PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS = 30.0
+PDF_IMAGE_DOWNLOAD_CONCURRENCY = 4
+PDF_IMAGE_PER_HOST_CONCURRENCY = 2
 HOMEBREW_LIBRARY_PATH = Path("/opt/homebrew/lib")
 PDF_EXPORT_DEPENDENCY_ERROR = (
     "PDF export requires WeasyPrint and its native runtime libraries. "
@@ -852,57 +857,76 @@ def _prepare_pdf_image_resources(
         elif not source.lower().startswith(("http://", "https://", "data:image/")):
             failures.add(source)
 
-    resources: dict[str, PdfImageResource] = {}
+    selected = urls[:MAX_PDF_REMOTE_IMAGES]
+    failures.update(urls[MAX_PDF_REMOTE_IMAGES:])
     deadline = time.monotonic() + PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS
-    budget = PdfImageDownloadBudget(deadline, MAX_PDF_REMOTE_IMAGE_BYTES)
-    total_pixels = 0
-    for index, url in enumerate(urls):
-        if index >= MAX_PDF_REMOTE_IMAGES:
-            failures.add(url)
-            continue
-        remaining_bytes = min(
-            PDF_IMAGE_MAX_BYTES,
-            budget.remaining_bytes,
-        )
-        if remaining_bytes <= 0:
-            failures.add(url)
-            continue
-        remaining_pixels = MAX_PDF_REMOTE_IMAGE_PIXELS - total_pixels
-        if remaining_pixels <= 0:
-            failures.update(urls[index:])
-            break
-        try:
-            previous_remaining = budget.remaining_bytes
+    budget = PdfImageDownloadBudget(
+        deadline,
+        MAX_PDF_REMOTE_IMAGE_BYTES,
+        MAX_PDF_REMOTE_IMAGE_PIXELS,
+    )
+    remote_urls = [url for url in selected if not url.lower().startswith("data:image/")]
+    host_slots = {
+        host: threading.BoundedSemaphore(PDF_IMAGE_PER_HOST_CONCURRENCY)
+        for host in {_pdf_image_host_key(url) for url in remote_urls}
+    }
+    outcomes: dict[str, PdfImageResource | BaseException] = {}
+    futures: dict[str, Future[PdfImageResource]] = {}
+    # Worker threads start lazily on submit, so data-only documents spawn none.
+    executor = ThreadPoolExecutor(
+        max_workers=PDF_IMAGE_DOWNLOAD_CONCURRENCY,
+        thread_name_prefix="pdf-image",
+    )
+    try:
+        for url in selected:
             if url.lower().startswith("data:image/"):
-                resource = _decode_pdf_data_image(
-                    url,
-                    max_bytes=remaining_bytes,
-                    max_pixels=remaining_pixels,
-                )
-            else:
-                resource = _download_pdf_image(
-                    url,
-                    deadline=deadline,
-                    max_bytes=remaining_bytes,
-                    max_pixels=remaining_pixels,
-                    budget=budget,
-                )
-            transferred_bytes = previous_remaining - budget.remaining_bytes
-            retained_difference = len(resource.content) - transferred_bytes
-            if retained_difference > 0:
-                budget.consume(retained_difference)
-            if total_pixels + resource.pixel_count > MAX_PDF_REMOTE_IMAGE_PIXELS:
-                raise PdfImageError("PDF image pixel budget exceeded")
-        except PdfImageError as exc:
+                try:
+                    outcomes[url] = _decode_pdf_data_image_with_budget(url, budget)
+                except PdfImageError as exc:
+                    outcomes[url] = exc
+                continue
+            futures[url] = executor.submit(
+                _download_pdf_image_task,
+                url,
+                deadline=deadline,
+                budget=budget,
+                host_slot=host_slots[_pdf_image_host_key(url)],
+            )
+        if futures:
+            done, _pending = wait_for_futures(
+                futures.values(),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+            for url, future in futures.items():
+                if future not in done:
+                    outcomes[url] = PdfImageError("image download budget expired")
+                    continue
+                error = future.exception()
+                outcomes[url] = future.result() if error is None else error
+    finally:
+        # Do not wait for stragglers: each stays bounded by its own image
+        # deadline and none of them writes to the resources collected below.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    resources: dict[str, PdfImageResource] = {}
+    for url in selected:
+        outcome = outcomes[url]
+        if isinstance(outcome, PdfImageResource):
+            resources[url] = outcome
+            continue
+        failures.add(url)
+        if isinstance(outcome, PdfImageError):
             logger.warning(
                 "Unable to include PDF image %s: %s",
                 _pdf_image_log_identifier(url),
-                exc,
+                outcome,
             )
-            failures.add(url)
-            continue
-        resources[url] = resource
-        total_pixels += resource.pixel_count
+        else:
+            logger.warning(
+                "Unable to include PDF image %s: unexpected %s",
+                _pdf_image_log_identifier(url),
+                type(outcome).__name__,
+            )
 
     def replace_failed_image(match: re.Match[str]) -> str:
         tag = match.group(0)
@@ -933,14 +957,109 @@ def _pdf_image_attributes(tag: str) -> dict[str, str]:
     }
 
 
-def _pdf_image_log_identifier(source: str) -> str:
-    """Return a bounded image identifier without query tokens or data payloads."""
-    if source.lower().startswith("data:"):
-        return source.partition(",")[0][:80]
-    parsed = urlsplit(source)
-    if parsed.scheme and parsed.hostname:
-        return f"{parsed.scheme.lower()}://{parsed.hostname}"[:160]
-    return "invalid-image-source"
+def _pdf_image_host_key(url: str) -> str:
+    """Return the hostname used to share a per-host download limit."""
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _decode_pdf_data_image_with_budget(
+    url: str,
+    budget: PdfImageDownloadBudget,
+) -> PdfImageResource:
+    """Decode one data URI and charge its retained bytes and pixels."""
+    max_bytes = min(PDF_IMAGE_MAX_BYTES, budget.remaining_bytes)
+    if max_bytes <= 0:
+        raise PdfImageError("PDF image download budget exceeded")
+    max_pixels = min(PDF_IMAGE_MAX_PIXELS, budget.remaining_pixels)
+    if max_pixels <= 0:
+        raise PdfImageError("PDF image pixel budget exceeded")
+    resource = _decode_pdf_data_image(
+        url,
+        max_bytes=max_bytes,
+        max_pixels=max_pixels,
+        budget=budget,
+    )
+    try:
+        budget.consume(len(resource.content))
+    except PdfImageError:
+        budget.refund_pixels(resource.pixel_count)
+        raise
+    return resource
+
+
+def _download_pdf_image_task(
+    url: str,
+    *,
+    deadline: float,
+    budget: PdfImageDownloadBudget,
+    host_slot: threading.BoundedSemaphore,
+) -> PdfImageResource:
+    """Download one remote image inside its host slot and charge retained bytes."""
+    import time
+
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0 or not host_slot.acquire(timeout=remaining_seconds):
+        raise PdfImageError("image download budget expired")
+    try:
+        max_bytes = min(PDF_IMAGE_MAX_BYTES, budget.remaining_bytes)
+        if max_bytes <= 0:
+            raise PdfImageError("PDF image download budget exceeded")
+        max_pixels = min(PDF_IMAGE_MAX_PIXELS, budget.remaining_pixels)
+        if max_pixels <= 0:
+            raise PdfImageError("PDF image pixel budget exceeded")
+        image_budget = _CountingPdfImageBudget(budget)
+        resource = _download_pdf_image(
+            url,
+            deadline=deadline,
+            max_bytes=max_bytes,
+            max_pixels=max_pixels,
+            budget=image_budget,
+        )
+        # Decompression and normalization can retain more bytes than were
+        # transferred; charge the difference against the shared budget.
+        retained_difference = len(resource.content) - image_budget.consumed_bytes
+        if retained_difference > 0:
+            try:
+                budget.consume(retained_difference)
+            except PdfImageError:
+                budget.refund_pixels(image_budget.consumed_pixels)
+                raise
+        return resource
+    finally:
+        host_slot.release()
+
+
+class _CountingPdfImageBudget(PdfImageDownloadBudget):
+    """Per-image view of the shared export budget that counts its own usage."""
+
+    def __init__(self, shared: PdfImageDownloadBudget) -> None:
+        super().__init__(shared.deadline, 0, 0)
+        self._shared = shared
+        self.consumed_bytes = 0
+        self.consumed_pixels = 0
+
+    @property
+    def remaining_bytes(self) -> int:
+        return self._shared.remaining_bytes
+
+    @property
+    def remaining_pixels(self) -> int:
+        return self._shared.remaining_pixels
+
+    def consume(self, size: int) -> None:
+        self._shared.consume(size)
+        self.consumed_bytes += size
+
+    def consume_pixels(self, count: int) -> None:
+        self._shared.consume_pixels(count)
+        self.consumed_pixels += count
+
+    def refund_pixels(self, count: int) -> None:
+        self._shared.refund_pixels(count)
+        self.consumed_pixels -= count
 
 
 def _pdf_url_fetcher(resources: dict[str, PdfImageResource]) -> object:

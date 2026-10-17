@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from PIL import Image
@@ -500,6 +500,7 @@ def test_prepare_pdf_images_limits_unique_downloads(monkeypatch) -> None:
 
 def test_prepare_pdf_images_limits_total_download_bytes(monkeypatch) -> None:
     """Several valid images must share one aggregate in-memory byte budget."""
+    monkeypatch.setattr(response_exports, "PDF_IMAGE_DOWNLOAD_CONCURRENCY", 1)
     allowed_sizes: list[int] = []
 
     def download(_url: str, *, max_bytes: int, **_kwargs: Any) -> Any:
@@ -523,6 +524,7 @@ def test_prepare_pdf_images_limits_total_download_bytes(monkeypatch) -> None:
 
 def test_prepare_pdf_images_counts_failed_downloads_against_total(monkeypatch) -> None:
     """Invalid image bodies must still consume the export's transfer budget."""
+    monkeypatch.setattr(response_exports, "PDF_IMAGE_DOWNLOAD_CONCURRENCY", 1)
     allowed_sizes: list[int] = []
 
     def download(
@@ -551,6 +553,7 @@ def test_prepare_pdf_images_counts_failed_downloads_against_total(monkeypatch) -
 
 def test_prepare_pdf_images_counts_expanded_resource_bytes(monkeypatch) -> None:
     """Retained decoded bytes must count toward the aggregate memory budget."""
+    monkeypatch.setattr(response_exports, "PDF_IMAGE_DOWNLOAD_CONCURRENCY", 1)
     allowed_sizes: list[int] = []
 
     def download(
@@ -630,11 +633,12 @@ def test_prepare_pdf_images_redacts_source_in_warning(monkeypatch, caplog) -> No
 
 def test_prepare_pdf_images_limits_aggregate_pixels(monkeypatch) -> None:
     """Pixel exhaustion must stop later images before their pixels are decoded."""
-    calls = 0
-
-    def download(*_args: Any, **_kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
+    def download(
+        *_args: Any,
+        budget: pdf_images.PdfImageDownloadBudget,
+        **_kwargs: Any,
+    ) -> Any:
+        budget.consume_pixels(25_000_000)
         return response_exports.PdfImageResource(
             _png_bytes(),
             "image/png",
@@ -649,9 +653,712 @@ def test_prepare_pdf_images_limits_aggregate_pixels(monkeypatch) -> None:
 
     rendered, resources = response_exports._prepare_pdf_image_resources(document)
 
-    assert calls == 2
     assert len(resources) == 2
     assert rendered.count("Image unavailable:") == 1
+
+
+@pytest.fixture
+def retry_waits(monkeypatch) -> list[float]:
+    """Record retry sleeps instead of sleeping, with deterministic jitter."""
+    waits: list[float] = []
+    monkeypatch.setattr(pdf_images, "_sleep_before_retry", waits.append)
+    monkeypatch.setattr(pdf_images, "_retry_jitter", lambda: 0.5)
+    return waits
+
+
+def _fake_public_resolution(
+    monkeypatch,
+    addresses: tuple[str, ...] = ("203.0.113.10",),
+) -> list[str]:
+    calls: list[str] = []
+
+    def resolve(url: str, **_kwargs: Any) -> tuple[str, str, int, tuple[str, ...]]:
+        calls.append(url)
+        return url, "images.example.test", 443, addresses
+
+    monkeypatch.setattr(pdf_images, "_resolve_public_image_url", resolve)
+    return calls
+
+
+def _scripted_requests(monkeypatch, outcomes: list[Any]) -> list[str]:
+    calls: list[str] = []
+
+    def request(*_args: Any, address: str, **_kwargs: Any) -> Any:
+        calls.append(address)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(pdf_images, "_request_pdf_image_url", request)
+    return calls
+
+
+def _image_response() -> Any:
+    return pdf_images._PdfHttpResponse(200, {}, _png_bytes())
+
+
+def _status_response(status: int, headers: dict[str, str] | None = None) -> Any:
+    return pdf_images._PdfHttpResponse(status, headers or {}, b"")
+
+
+def test_pdf_image_download_retries_rate_limited_response(
+    monkeypatch, retry_waits
+) -> None:
+    """A 429 must be retried after the server's Retry-After delay."""
+    _fake_public_resolution(monkeypatch)
+    calls = _scripted_requests(
+        monkeypatch,
+        [_status_response(429, {"retry-after": "1"}), _image_response()],
+    )
+
+    resource = pdf_images.download_pdf_image(
+        "https://images.example.test/figure.png",
+        deadline=float("inf"),
+    )
+
+    assert resource.mime_type == "image/png"
+    assert len(calls) == 2
+    assert retry_waits == [1.0]
+
+
+def test_pdf_image_parse_retry_after_accepts_seconds_and_dates() -> None:
+    """Retry-After may be delta seconds or an HTTP-date."""
+    from email.utils import formatdate
+
+    now = 1_700_000_000.0
+    assert pdf_images._parse_retry_after("3", now=now) == 3.0
+    assert pdf_images._parse_retry_after(
+        formatdate(now + 2, usegmt=True), now=now
+    ) == pytest.approx(2.0, abs=1.0)
+    assert pdf_images._parse_retry_after(
+        formatdate(now - 120, usegmt=True), now=now
+    ) == 0.0
+    assert pdf_images._parse_retry_after("soon, maybe", now=now) is None
+    assert pdf_images._parse_retry_after(None, now=now) is None
+
+
+def test_pdf_image_download_gives_up_after_bounded_retries(
+    monkeypatch, retry_waits
+) -> None:
+    """Persistent 503 responses must stop after the attempt limit."""
+    _fake_public_resolution(monkeypatch)
+    calls = _scripted_requests(monkeypatch, [_status_response(503)] * 3)
+
+    with pytest.raises(pdf_images.PdfImageError, match="HTTP 503"):
+        pdf_images.download_pdf_image(
+            "https://images.example.test/figure.png",
+            deadline=float("inf"),
+        )
+
+    assert len(calls) == 3
+    assert retry_waits == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("status", [404, 403, 401, 400])
+def test_pdf_image_download_does_not_retry_client_errors(
+    monkeypatch, retry_waits, status: int
+) -> None:
+    """Permanent client errors must fail on the first response."""
+    _fake_public_resolution(monkeypatch)
+    calls = _scripted_requests(
+        monkeypatch, [_status_response(status), _image_response()]
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match=f"HTTP {status}"):
+        pdf_images.download_pdf_image(
+            "https://images.example.test/figure.png",
+            deadline=float("inf"),
+        )
+
+    assert len(calls) == 1
+    assert retry_waits == []
+
+
+def test_pdf_image_download_skips_retry_after_beyond_cap(
+    monkeypatch, retry_waits
+) -> None:
+    """A long Retry-After must not be shortened into an early retry."""
+    _fake_public_resolution(monkeypatch)
+    calls = _scripted_requests(
+        monkeypatch,
+        [_status_response(429, {"retry-after": "60"}), _image_response()],
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="HTTP 429"):
+        pdf_images.download_pdf_image(
+            "https://images.example.test/figure.png",
+            deadline=float("inf"),
+        )
+
+    assert len(calls) == 1
+    assert retry_waits == []
+
+
+def test_pdf_image_download_skips_retry_past_image_time_cap(
+    monkeypatch, retry_waits
+) -> None:
+    """A retry that cannot finish inside the per-image cap must not start."""
+    monkeypatch.setattr(
+        pdf_images,
+        "time",
+        SimpleNamespace(monotonic=lambda: 100.0, time=time.time, sleep=time.sleep),
+    )
+    _fake_public_resolution(monkeypatch)
+    calls = _scripted_requests(
+        monkeypatch, [_status_response(503), _image_response()]
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="HTTP 503"):
+        pdf_images.download_pdf_image(
+            "https://images.example.test/figure.png",
+            deadline=float("inf"),
+            per_image_seconds=1.0,
+        )
+
+    assert len(calls) == 1
+    assert retry_waits == []
+
+
+def test_pdf_image_download_retries_connection_resets_on_each_address(
+    monkeypatch, retry_waits
+) -> None:
+    """A retry must again try every validated address before giving up."""
+    _fake_public_resolution(monkeypatch, ("2001:4860:4860::8888", "8.8.8.8"))
+    calls = _scripted_requests(
+        monkeypatch,
+        [
+            pdf_images._PdfImageConnectionError("image download failed"),
+            pdf_images._PdfImageConnectionError("image download failed"),
+            _image_response(),
+        ],
+    )
+
+    resource = pdf_images.download_pdf_image(
+        "https://images.example.test/figure.png",
+        deadline=float("inf"),
+    )
+
+    assert resource.mime_type == "image/png"
+    assert calls == ["2001:4860:4860::8888", "8.8.8.8", "2001:4860:4860::8888"]
+    assert retry_waits == [0.5]
+
+
+def test_pdf_image_download_does_not_retry_resolution_failure(
+    monkeypatch, retry_waits
+) -> None:
+    """DNS and SSRF failures are final and must never reach a request."""
+    resolutions: list[str] = []
+
+    def resolve(url: str, **_kwargs: Any) -> Any:
+        resolutions.append(url)
+        raise pdf_images.PdfImageError("image host could not be resolved")
+
+    monkeypatch.setattr(pdf_images, "_resolve_public_image_url", resolve)
+    monkeypatch.setattr(
+        pdf_images,
+        "_request_pdf_image_url",
+        lambda *_args, **_kwargs: pytest.fail("unresolved host must not be requested"),
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="could not be resolved"):
+        pdf_images.download_pdf_image(
+            "https://images.example.test/figure.png",
+            deadline=float("inf"),
+        )
+
+    assert len(resolutions) == 1
+    assert retry_waits == []
+
+
+def test_pdf_image_download_does_not_retry_size_limit(
+    monkeypatch, retry_waits
+) -> None:
+    """Oversized bodies are final failures."""
+    _fake_public_resolution(monkeypatch)
+    calls = _scripted_requests(
+        monkeypatch,
+        [
+            pdf_images.PdfImageError("image exceeds the download size limit"),
+            _image_response(),
+        ],
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="size limit"):
+        pdf_images.download_pdf_image(
+            "https://images.example.test/figure.png",
+            deadline=float("inf"),
+        )
+
+    assert len(calls) == 1
+    assert retry_waits == []
+
+
+def test_pdf_image_download_retry_revalidates_destination(
+    monkeypatch, retry_waits
+) -> None:
+    """A retry must re-run DNS resolution and the public-address policy."""
+    resolutions: list[str] = []
+
+    def resolve(url: str, **_kwargs: Any) -> Any:
+        resolutions.append(url)
+        if len(resolutions) == 1:
+            return url, "images.example.test", 443, ("203.0.113.10",)
+        raise pdf_images.PdfImageError("image host resolved outside the public internet")
+
+    monkeypatch.setattr(pdf_images, "_resolve_public_image_url", resolve)
+    calls = _scripted_requests(
+        monkeypatch, [_status_response(503), _image_response()]
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="public internet"):
+        pdf_images.download_pdf_image(
+            "https://images.example.test/figure.png",
+            deadline=float("inf"),
+        )
+
+    assert len(resolutions) == 2
+    assert len(calls) == 1
+    assert retry_waits == [0.5]
+
+
+def test_pdf_image_download_logs_redacted_retry(
+    monkeypatch, retry_waits, caplog
+) -> None:
+    """Retry logs must identify the host without leaking signed URL tokens."""
+    import logging
+
+    secret = "super-secret-token"
+    caplog.set_level(logging.DEBUG, logger="chainagents.exports.pdf_images")
+    _fake_public_resolution(monkeypatch)
+    _scripted_requests(monkeypatch, [_status_response(503), _image_response()])
+
+    pdf_images.download_pdf_image(
+        f"https://images.example.test/figure.png?token={secret}",
+        deadline=float("inf"),
+    )
+
+    assert "attempt 2/3" in caplog.text
+    assert "https://images.example.test" in caplog.text
+    assert secret not in caplog.text
+
+
+class _FakeClock:
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _RecordingTimer:
+    instances: ClassVar[list[_RecordingTimer]] = []
+
+    def __init__(self, interval: float, function: Any, args: Any = (), kwargs: Any = None) -> None:
+        self.interval = interval
+        self.daemon = False
+        _RecordingTimer.instances.append(self)
+
+    def start(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        pass
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+
+class _ScriptedHttpResponse:
+    def __init__(
+        self,
+        clock: _FakeClock,
+        chunks: list[bytes],
+        *,
+        delay: float,
+        status: int = 200,
+    ) -> None:
+        self.status = status
+        self._clock = clock
+        self._chunks = list(chunks)
+        self._delay = delay
+
+    def getheaders(self) -> list[tuple[str, str]]:
+        return []
+
+    def read1(self, size: int) -> bytes:
+        if not self._chunks:
+            return b""
+        self._clock.now += self._delay
+        return self._chunks.pop(0)[:size]
+
+
+def _install_fake_http(
+    monkeypatch,
+    clock: _FakeClock,
+    *,
+    response: _ScriptedHttpResponse | None = None,
+    request_error: BaseException | None = None,
+) -> list[Any]:
+    connections: list[Any] = []
+
+    class FakeConnection:
+        def __init__(self, host: str, port: int | None = None, timeout: float | None = None) -> None:
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+            self.sock = _FakeSocket()
+            connections.append(self)
+
+        def request(self, *_args: Any, **_kwargs: Any) -> None:
+            if request_error is not None:
+                raise request_error
+
+        def getresponse(self) -> Any:
+            return response
+
+        def close(self) -> None:
+            pass
+
+    _RecordingTimer.instances = []
+    monkeypatch.setattr(pdf_images.http.client, "HTTPConnection", FakeConnection)
+    monkeypatch.setattr(
+        pdf_images,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic, time=time.time, sleep=time.sleep),
+    )
+    monkeypatch.setattr(
+        pdf_images,
+        "threading",
+        SimpleNamespace(
+            Timer=_RecordingTimer,
+            Event=threading.Event,
+            Lock=threading.Lock,
+            Thread=threading.Thread,
+        ),
+    )
+    return connections
+
+
+def _request_fake_image(clock: _FakeClock, *, deadline_seconds: float = 30.0) -> Any:
+    deadline = clock.now + deadline_seconds
+    return pdf_images._request_pdf_image_url(
+        "http://images.example.test/figure.png",
+        host="images.example.test",
+        port=80,
+        address="203.0.113.10",
+        max_bytes=pdf_images.PDF_IMAGE_MAX_BYTES,
+        deadline=deadline,
+        budget=pdf_images.PdfImageDownloadBudget(deadline, 25 * 1024 * 1024),
+    )
+
+
+def test_pdf_image_request_aborts_stalled_body(monkeypatch) -> None:
+    """A trickling body must not consume the whole export budget."""
+    clock = _FakeClock()
+    _install_fake_http(
+        monkeypatch,
+        clock,
+        response=_ScriptedHttpResponse(clock, [b"x" * 100] * 20, delay=3.0),
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="stalled") as excinfo:
+        _request_fake_image(clock)
+
+    assert not isinstance(excinfo.value, pdf_images.PdfImageRetryableError)
+
+
+def test_pdf_image_request_accepts_slow_steady_body(monkeypatch) -> None:
+    """A slow body that keeps making progress must still complete."""
+    clock = _FakeClock()
+    _install_fake_http(
+        monkeypatch,
+        clock,
+        response=_ScriptedHttpResponse(clock, [b"x" * 8192] * 5, delay=4.0),
+    )
+
+    result = _request_fake_image(clock)
+
+    assert result.status == 200
+    assert len(result.content) == 5 * 8192
+
+
+def test_pdf_image_request_timer_uses_image_deadline(monkeypatch) -> None:
+    """The hard-close timer must fire at the per-image deadline."""
+    clock = _FakeClock()
+    connections = _install_fake_http(
+        monkeypatch,
+        clock,
+        response=_ScriptedHttpResponse(clock, [b"x" * 10], delay=0.0),
+    )
+
+    _request_fake_image(clock, deadline_seconds=12.5)
+
+    assert [timer.interval for timer in _RecordingTimer.instances] == [12.5]
+    assert connections[0].timeout == pdf_images.PDF_IMAGE_TIMEOUT_SECONDS
+
+
+def test_pdf_image_request_treats_tls_failure_as_final(monkeypatch) -> None:
+    """Certificate failures must not be retried as connection errors."""
+    import ssl
+
+    clock = _FakeClock()
+    _install_fake_http(
+        monkeypatch,
+        clock,
+        request_error=ssl.SSLCertVerificationError("certificate verify failed"),
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="TLS") as excinfo:
+        _request_fake_image(clock)
+
+    assert not isinstance(excinfo.value, pdf_images.PdfImageRetryableError)
+
+
+def test_pdf_image_request_treats_connection_reset_as_retryable(monkeypatch) -> None:
+    """Connection resets must remain eligible for address fallback and retry."""
+    clock = _FakeClock()
+    _install_fake_http(
+        monkeypatch,
+        clock,
+        request_error=ConnectionResetError("reset by peer"),
+    )
+
+    with pytest.raises(pdf_images._PdfImageConnectionError):
+        _request_fake_image(clock)
+
+
+def _image_document(urls: list[str]) -> str:
+    return "".join(
+        f'<img src="{url}" alt="image {index}" />' for index, url in enumerate(urls)
+    )
+
+
+def test_prepare_pdf_images_hung_image_does_not_block_others(monkeypatch) -> None:
+    """One hung download must cost only its own image."""
+    release = threading.Event()
+    urls = [f"https://host{index}.example.test/{index}.png" for index in range(4)]
+
+    def download(url: str, **_kwargs: Any) -> Any:
+        if url == urls[1]:
+            release.wait(5)
+        return response_exports.PdfImageResource(_png_bytes(), "image/png")
+
+    monkeypatch.setattr(response_exports, "PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    started = time.monotonic()
+    try:
+        rendered, resources = response_exports._prepare_pdf_image_resources(
+            _image_document(urls)
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert set(resources) == {urls[0], urls[2], urls[3]}
+    assert rendered.count("Image unavailable:") == 1
+    assert "Image unavailable: image 1" in rendered
+    assert elapsed < 2.0
+
+
+def test_prepare_pdf_images_downloads_in_parallel(monkeypatch) -> None:
+    """Independent images must download concurrently."""
+    barrier = threading.Barrier(4)
+    urls = [f"https://host{index}.example.test/{index}.png" for index in range(4)]
+
+    def download(_url: str, **_kwargs: Any) -> Any:
+        barrier.wait(timeout=2)
+        return response_exports.PdfImageResource(_png_bytes(), "image/png")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(
+        _image_document(urls)
+    )
+
+    assert set(resources) == set(urls)
+    assert "Image unavailable:" not in rendered
+
+
+def test_prepare_pdf_images_limits_per_host_concurrency(monkeypatch) -> None:
+    """One host must not receive more than two concurrent downloads."""
+    lock = threading.Lock()
+    active_by_host: dict[str, int] = {}
+    max_by_host: dict[str, int] = {}
+    active_total = 0
+    max_total = 0
+    urls = [
+        f"https://host{index % 3}.example.test/{index}.png" for index in range(9)
+    ]
+
+    def download(url: str, **_kwargs: Any) -> Any:
+        nonlocal active_total, max_total
+        host = url.split("/")[2]
+        with lock:
+            active_by_host[host] = active_by_host.get(host, 0) + 1
+            max_by_host[host] = max(max_by_host.get(host, 0), active_by_host[host])
+            active_total += 1
+            max_total = max(max_total, active_total)
+        time.sleep(0.05)
+        with lock:
+            active_by_host[host] -= 1
+            active_total -= 1
+        return response_exports.PdfImageResource(_png_bytes(), "image/png")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+
+    _rendered, resources = response_exports._prepare_pdf_image_resources(
+        _image_document(urls)
+    )
+
+    assert len(resources) == 9
+    assert max(max_by_host.values()) <= response_exports.PDF_IMAGE_PER_HOST_CONCURRENCY
+    assert max_total <= response_exports.PDF_IMAGE_DOWNLOAD_CONCURRENCY
+    assert max_total >= 2
+
+
+def test_prepare_pdf_images_keeps_source_order(monkeypatch, caplog) -> None:
+    """Resources and warnings must follow source order, not completion order."""
+    urls = [f"https://host{index}.example.test/{index}.png" for index in range(4)]
+
+    def download(url: str, **_kwargs: Any) -> Any:
+        index = urls.index(url)
+        time.sleep((len(urls) - index) * 0.05)
+        if index % 2:
+            raise response_exports.PdfImageError(f"failure {index}")
+        return response_exports.PdfImageResource(_png_bytes(), "image/png")
+
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+
+    rendered, resources = response_exports._prepare_pdf_image_resources(
+        _image_document(urls)
+    )
+
+    assert list(resources) == [urls[0], urls[2]]
+    messages = [record.getMessage() for record in caplog.records]
+    failures = [message for message in messages if "failure" in message]
+    assert [message.rsplit(" ", 1)[-1] for message in failures] == ["1", "3"]
+    assert rendered.index("image 1") < rendered.index("image 3")
+
+
+def test_prepare_pdf_images_enforces_byte_budget_concurrently(monkeypatch) -> None:
+    """Concurrent downloads must share the aggregate byte budget exactly."""
+    created: list[pdf_images.PdfImageDownloadBudget] = []
+    observed: list[int] = []
+    chunk = 1024 * 1024
+
+    class RecordingBudget(pdf_images.PdfImageDownloadBudget):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    def download(
+        _url: str,
+        *,
+        max_bytes: int,
+        budget: pdf_images.PdfImageDownloadBudget,
+        **_kwargs: Any,
+    ) -> Any:
+        consumed = 0
+        while consumed < max_bytes:
+            size = min(chunk, max_bytes - consumed)
+            budget.consume(size)
+            consumed += size
+            observed.append(budget.remaining_bytes)
+            time.sleep(0.001)
+        return response_exports.PdfImageResource(bytes(consumed), "image/png")
+
+    monkeypatch.setattr(response_exports, "PdfImageDownloadBudget", RecordingBudget)
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    urls = [f"https://host{index}.example.test/{index}.png" for index in range(6)]
+
+    _rendered, resources = response_exports._prepare_pdf_image_resources(
+        _image_document(urls)
+    )
+
+    retained = sum(len(resource.content) for resource in resources.values())
+    assert retained <= response_exports.MAX_PDF_REMOTE_IMAGE_BYTES
+    assert min(observed) >= 0
+    assert created[0].remaining_bytes >= 0
+
+
+def test_pdf_image_budget_consume_is_atomic() -> None:
+    """Concurrent consumers must never overdraw the shared byte budget."""
+    budget = pdf_images.PdfImageDownloadBudget(float("inf"), 5_000)
+    successes = 0
+    successes_lock = threading.Lock()
+    previous_interval = sys.getswitchinterval()
+
+    def consume() -> None:
+        nonlocal successes
+        for _ in range(1_000):
+            try:
+                budget.consume(1)
+            except pdf_images.PdfImageError:
+                continue
+            with successes_lock:
+                successes += 1
+
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=consume) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+    finally:
+        sys.setswitchinterval(previous_interval)
+
+    assert successes == 5_000
+    assert budget.remaining_bytes == 0
+
+
+def test_pdf_image_validation_reserves_pixels_before_decode(monkeypatch) -> None:
+    """The aggregate pixel budget must be checked before pixels are decoded."""
+    monkeypatch.setattr(
+        pdf_images,
+        "_normalize_pdf_raster_mode",
+        lambda *_args, **_kwargs: pytest.fail("image must not be decoded"),
+    )
+    budget = pdf_images.PdfImageDownloadBudget(
+        float("inf"), 1024 * 1024, remaining_pixels=100
+    )
+
+    with pytest.raises(pdf_images.PdfImageError, match="pixel budget"):
+        pdf_images._validate_pdf_image(_png_bytes(width=48, height=32), budget=budget)
+
+    assert budget.remaining_pixels == 100
+
+
+def test_pdf_image_validation_charges_and_refunds_pixels() -> None:
+    """Valid images keep their pixel reservation; invalid ones refund it."""
+    budget = pdf_images.PdfImageDownloadBudget(
+        float("inf"), 1024 * 1024, remaining_pixels=10_000
+    )
+
+    resource = pdf_images._validate_pdf_image(_png_bytes(width=48, height=32), budget=budget)
+
+    assert resource.pixel_count == 48 * 32
+    assert budget.remaining_pixels == 10_000 - 48 * 32
+
+    output = BytesIO()
+    Image.new("RGB", (10, 10), "#2563eb").save(output, format="JPEG")
+    with pytest.raises(pdf_images.PdfImageError):
+        pdf_images._validate_pdf_image(output.getvalue()[:-2], budget=budget)
+    assert budget.remaining_pixels == 10_000 - 48 * 32
+
+    encoded = base64.b64encode(_png_bytes(width=10, height=10)).decode("ascii")
+    pdf_images.decode_pdf_data_image(f"data:image/png;base64,{encoded}", budget=budget)
+    assert budget.remaining_pixels == 10_000 - 48 * 32 - 100
+    with pytest.raises(pdf_images.PdfImageError, match="pixel budget"):
+        budget.consume_pixels(10_000)
+    budget.refund_pixels(100)
+    assert budget.remaining_pixels == 10_000 - 48 * 32
 
 
 def test_pdf_image_validation_uses_first_gif_frame() -> None:
