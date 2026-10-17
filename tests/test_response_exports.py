@@ -2002,9 +2002,10 @@ def test_pdf_image_host_limiter_bounds_each_host() -> None:
 
 
 def test_pdf_image_redirect_waits_for_target_host_slot(monkeypatch) -> None:
-    """A redirect to a saturated host fails at the image time limit."""
+    """A redirect to a saturated host gives up its old slot, then hits the time limit."""
     limiter = pdf_images.PdfImageHostLimiter(1)
-    assert limiter.try_acquire("origin.example.test")  # held by the scheduler
+    assert limiter.try_acquire("origin.example.test")  # handed over by the scheduler
+    slot = pdf_images.PdfImageHostSlot(limiter, "origin.example.test")
     assert limiter.try_acquire("cdn.example.test")  # held by another image
     monkeypatch.setattr(
         pdf_images,
@@ -2024,20 +2025,21 @@ def test_pdf_image_redirect_waits_for_target_host_slot(monkeypatch) -> None:
             "https://origin.example.test/a.png",
             deadline=float("inf"),
             per_image_seconds=0.1,
-            host_limiter=limiter,
+            host_slot=slot,
         )
 
     assert requested == ["https://origin.example.test/a.png"]
-    limiter.release("cdn.example.test")
-    # The download released nothing it did not acquire.
-    assert not limiter.try_acquire("origin.example.test")
-    assert limiter.try_acquire("cdn.example.test")
+    assert slot.host is None
+    # The origin slot was released while waiting; the CDN slot is untouched.
+    assert limiter.try_acquire("origin.example.test")
+    assert not limiter.try_acquire("cdn.example.test")
 
 
-def test_pdf_image_redirect_releases_acquired_host_slots(monkeypatch) -> None:
-    """Slots taken for redirect targets are returned when the image finishes."""
+def test_pdf_image_redirect_moves_host_slot_to_each_hop(monkeypatch) -> None:
+    """A download holds only the current hop's host slot."""
     limiter = pdf_images.PdfImageHostLimiter(1)
     assert limiter.try_acquire("origin.example.test")
+    slot = pdf_images.PdfImageHostSlot(limiter, "origin.example.test")
     image = _png_bytes()
     monkeypatch.setattr(
         pdf_images,
@@ -2049,6 +2051,8 @@ def test_pdf_image_redirect_releases_acquired_host_slots(monkeypatch) -> None:
         if "origin" in url:
             return _status_response(302, {"location": "https://cdn.example.test/a.png"})
         assert not limiter.try_acquire("cdn.example.test")
+        assert limiter.try_acquire("origin.example.test")
+        limiter.release("origin.example.test")
         return pdf_images._PdfHttpResponse(200, {}, image)
 
     monkeypatch.setattr(pdf_images, "_request_pdf_image_url", request)
@@ -2056,11 +2060,93 @@ def test_pdf_image_redirect_releases_acquired_host_slots(monkeypatch) -> None:
     pdf_images.download_pdf_image(
         "https://origin.example.test/a.png",
         deadline=float("inf"),
-        host_limiter=limiter,
+        host_slot=slot,
     )
 
+    assert slot.host == "cdn.example.test"
+    slot.release()
+    assert slot.host is None
     assert limiter.try_acquire("cdn.example.test")
-    assert not limiter.try_acquire("origin.example.test")
+
+
+def test_prepare_pdf_images_survives_cross_host_redirect_cycle(monkeypatch) -> None:
+    """Images on X redirecting to Y and on Y redirecting to X must not deadlock."""
+    image = _png_bytes()
+    urls = [
+        "https://x.example.test/1.png",
+        "https://x.example.test/2.png",
+        "https://y.example.test/1.png",
+        "https://y.example.test/2.png",
+    ]
+
+    monkeypatch.setattr(
+        pdf_images,
+        "_resolve_public_image_url",
+        lambda url, **_kwargs: (url, url.split("/")[2], 443, ("203.0.113.10",)),
+    )
+
+    def request(url: str, **_kwargs: Any) -> Any:
+        host, path = url.split("/")[2], url.split("/", 3)[3]
+        if not path.startswith("final/"):
+            # Slow first hop: the scheduler hands out every origin slot before
+            # any download redirects, so all four images contend at once.
+            time.sleep(0.1)
+            target = "y.example.test" if host.startswith("x") else "x.example.test"
+            return _status_response(
+                302, {"location": f"https://{target}/final/{host[0]}{path}"}
+            )
+        time.sleep(0.05)
+        return pdf_images._PdfHttpResponse(200, {}, image)
+
+    monkeypatch.setattr(pdf_images, "_request_pdf_image_url", request)
+    monkeypatch.setattr(response_exports, "PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS", 2.0)
+    started = time.monotonic()
+
+    _rendered, resources = response_exports._prepare_pdf_image_resources(
+        _image_document(urls)
+    )
+
+    assert set(resources) == set(urls)
+    assert time.monotonic() - started < 2.0
+
+
+def test_prepare_pdf_images_releases_slots_of_cancelled_tasks(monkeypatch) -> None:
+    """Tasks cancelled before starting must return their scheduler-acquired slot."""
+    release = threading.Event()
+    created: list[pdf_images.PdfImageHostLimiter] = []
+    real_executor = response_exports.ThreadPoolExecutor
+
+    class RecordingLimiter(pdf_images.PdfImageHostLimiter):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    def download(_url: str, **_kwargs: Any) -> Any:
+        release.wait(5)
+        return response_exports.PdfImageResource(_png_bytes(), "image/png")
+
+    monkeypatch.setattr(response_exports, "PdfImageHostLimiter", RecordingLimiter)
+    # One worker but two submissions: the second waits in the executor queue
+    # and is cancelled at the deadline without ever running.
+    monkeypatch.setattr(
+        response_exports,
+        "ThreadPoolExecutor",
+        lambda **kwargs: real_executor(**{**kwargs, "max_workers": 1}),
+    )
+    monkeypatch.setattr(response_exports, "PDF_IMAGE_DOWNLOAD_BUDGET_SECONDS", 0.3)
+    monkeypatch.setattr(response_exports, "_download_pdf_image", download)
+    urls = [f"https://host{index}.example.test/{index}.png" for index in range(2)]
+    try:
+        rendered, _resources = response_exports._prepare_pdf_image_resources(
+            _image_document(urls)
+        )
+        limiter = created[0]
+        assert limiter.try_acquire("host1.example.test")
+        assert limiter.try_acquire("host1.example.test")
+    finally:
+        release.set()
+
+    assert rendered.count("Image unavailable:") == 2
 
 
 def test_prepare_pdf_images_late_image_waits_for_active_reservations(

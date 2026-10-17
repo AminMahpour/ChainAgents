@@ -36,6 +36,7 @@ from chainagents.exports.pdf_images import (
     PdfImageDownloadBudget,
     PdfImageError,
     PdfImageHostLimiter,
+    PdfImageHostSlot,
     PdfImageResource,
     _pdf_image_log_identifier as _pdf_image_log_identifier,
     decode_pdf_data_image as _decode_pdf_data_image,
@@ -955,7 +956,7 @@ def _prepare_pdf_image_resources(
     # never hold a worker that another host's image could use.
     queued = list(remote_urls)
     host_limiter = PdfImageHostLimiter(PDF_IMAGE_PER_HOST_CONCURRENCY)
-    in_flight: dict[Future[PdfImageResource], tuple[str, str]] = {}
+    in_flight: dict[Future[PdfImageResource], tuple[str, PdfImageHostSlot]] = {}
     # Worker threads start lazily on submit, so data-only documents spawn none.
     executor = ThreadPoolExecutor(
         max_workers=PDF_IMAGE_DOWNLOAD_CONCURRENCY,
@@ -973,14 +974,16 @@ def _prepare_pdf_image_resources(
                 index += 1
                 continue
             del queued[index]
+            # The task owns the slot from here and releases it when it ends.
+            slot = PdfImageHostSlot(host_limiter, host)
             future = executor.submit(
                 _download_pdf_image_task,
                 url,
                 deadline=deadline,
                 budget=budget,
-                host_limiter=host_limiter,
+                host_slot=slot,
             )
-            in_flight[future] = (url, host)
+            in_flight[future] = (url, slot)
 
     try:
         submit_ready()
@@ -1002,8 +1005,7 @@ def _prepare_pdf_image_resources(
             if not done:
                 break
             for future in done:
-                url, host = in_flight.pop(future)
-                host_limiter.release(host)
+                url, _slot = in_flight.pop(future)
                 error = future.exception()
                 outcomes[url] = future.result() if error is None else error
             submit_ready()
@@ -1011,6 +1013,10 @@ def _prepare_pdf_image_resources(
         # Do not wait for stragglers: each stays bounded by its own image
         # deadline and none of them writes to the resources collected below.
         executor.shutdown(wait=False, cancel_futures=True)
+        # A task cancelled before it started never took ownership of its slot.
+        for future, (_url, slot) in in_flight.items():
+            if future.cancelled():
+                slot.release()
     for url in remote_urls:
         outcomes.setdefault(url, PdfImageError("image download budget expired"))
 
@@ -1093,9 +1099,24 @@ def _download_pdf_image_task(
     *,
     deadline: float,
     budget: PdfImageDownloadBudget,
-    host_limiter: PdfImageHostLimiter,
+    host_slot: PdfImageHostSlot,
 ) -> PdfImageResource:
-    """Download one remote image and charge its retained bytes."""
+    """Download one remote image, charge its retained bytes, release its slot."""
+    try:
+        return _download_pdf_image_in_slot(
+            url, deadline=deadline, budget=budget, host_slot=host_slot
+        )
+    finally:
+        host_slot.release()
+
+
+def _download_pdf_image_in_slot(
+    url: str,
+    *,
+    deadline: float,
+    budget: PdfImageDownloadBudget,
+    host_slot: PdfImageHostSlot,
+) -> PdfImageResource:
     import time
 
     if time.monotonic() >= deadline:
@@ -1118,7 +1139,7 @@ def _download_pdf_image_task(
         max_bytes=max_bytes,
         max_pixels=max_pixels,
         budget=image_budget,
-        host_limiter=host_limiter,
+        host_slot=host_slot,
     )
     # Decompression and normalization can retain more bytes than were
     # transferred; charge the difference against the shared budget.
