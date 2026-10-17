@@ -17,7 +17,6 @@ import socket
 import ssl
 import threading
 import time
-import warnings
 import zlib
 from dataclasses import dataclass
 from datetime import UTC
@@ -749,41 +748,46 @@ def _validate_pdf_image(
     reserved_pixels = 0
     try:
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(BytesIO(content)) as image:
-                    image_format = str(image.format or "").upper()
-                    if image_format not in _RASTER_MIME_TYPES:
-                        raise PdfImageError("image format is not supported")
-                    if image.width * image.height > min(PDF_IMAGE_MAX_PIXELS, max_pixels):
-                        raise PdfImageError("image dimensions exceed the pixel limit")
-                    pixel_count = image.width * image.height
-                    if budget is not None:
-                        budget.consume_pixels(pixel_count)
-                        reserved_pixels = pixel_count
-                    if image_format == "GIF":
-                        image.seek(0)
-                        output = BytesIO()
-                        image.convert("RGBA").save(output, format="PNG")
-                        normalized = output.getvalue()
-                        if len(normalized) > max_bytes:
-                            raise PdfImageError("image exceeds the download size limit")
-                        return PdfImageResource(normalized, "image/png", pixel_count)
-                    image.verify()
-                if image_format == "JPEG" and not content.rstrip().endswith(b"\xff\xd9"):
-                    raise PdfImageError("image content is invalid")
-                with Image.open(BytesIO(content)) as decoded_image:
-                    decoded_image.load()
-                    normalized_raster = _normalize_pdf_raster_mode(
-                        decoded_image,
-                        max_bytes=max_bytes,
-                    )
-                    if normalized_raster is not None:
-                        return PdfImageResource(normalized_raster, "image/png", pixel_count)
+            # No warnings.catch_warnings() here: it swaps the process-global
+            # filter list and is not thread-safe, so parallel validations could
+            # leave DecompressionBombWarning configured as an error. The explicit
+            # pixel check below (25M) sits far under Pillow's bomb threshold
+            # (about 89M warns, 179M raises DecompressionBombError), so every
+            # image that is decoded has already passed a stricter limit.
+            with Image.open(BytesIO(content)) as image:
+                image_format = str(image.format or "").upper()
+                if image_format not in _RASTER_MIME_TYPES:
+                    raise PdfImageError("image format is not supported")
+                if image.width * image.height > min(PDF_IMAGE_MAX_PIXELS, max_pixels):
+                    raise PdfImageError("image dimensions exceed the pixel limit")
+                pixel_count = image.width * image.height
+                if budget is not None:
+                    budget.consume_pixels(pixel_count)
+                    reserved_pixels = pixel_count
+                if image_format == "GIF":
+                    image.seek(0)
+                    output = BytesIO()
+                    image.convert("RGBA").save(output, format="PNG")
+                    normalized = output.getvalue()
+                    if len(normalized) > max_bytes:
+                        raise PdfImageError("image exceeds the download size limit")
+                    return PdfImageResource(normalized, "image/png", pixel_count)
+                image.verify()
+            if image_format == "JPEG" and not content.rstrip().endswith(b"\xff\xd9"):
+                raise PdfImageError("image content is invalid")
+            with Image.open(BytesIO(content)) as decoded_image:
+                decoded_image.load()
+                normalized_raster = _normalize_pdf_raster_mode(
+                    decoded_image,
+                    max_bytes=max_bytes,
+                )
+                if normalized_raster is not None:
+                    return PdfImageResource(normalized_raster, "image/png", pixel_count)
         except PdfImageError:
             raise
         except (
             Image.DecompressionBombError,
+            # Still raised if the process runs with warnings turned into errors.
             Image.DecompressionBombWarning,
             UnidentifiedImageError,
             OSError,

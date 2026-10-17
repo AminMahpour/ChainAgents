@@ -1774,6 +1774,79 @@ def test_pdf_image_budget_rejects_negative_amounts(operation: str) -> None:
     assert view.consumed_pixels == 0
 
 
+def _png_header_only(width: int, height: int) -> bytes:
+    """Return a PNG whose header declares a size without any pixel data."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+
+
+def test_pdf_image_validation_does_not_mutate_global_warning_filters(
+    monkeypatch,
+) -> None:
+    """Validation must not rewrite the process-wide warning filter list."""
+    import warnings
+
+    original_filters = list(warnings.filters)
+    seen_filters: list[list[Any]] = []
+    real_open = pdf_images.Image.open
+
+    def recording_open(*args: Any, **kwargs: Any) -> Any:
+        seen_filters.append(list(warnings.filters))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(pdf_images.Image, "open", recording_open)
+
+    pdf_images._validate_pdf_image(_png_bytes())
+
+    assert seen_filters
+    assert all(filters == original_filters for filters in seen_filters)
+    assert list(warnings.filters) == original_filters
+
+
+def test_pdf_image_concurrent_validation_keeps_filters_and_rejects_bombs() -> None:
+    """Parallel validations leave warning state intact and still reject bombs."""
+    import warnings
+
+    original_filters = list(warnings.filters)
+    payloads = [
+        _png_bytes(),
+        _png_header_only(10_000, 10_000),
+        _png_header_only(20_000, 20_000),
+    ] * 4
+    results: list[str] = []
+    results_lock = threading.Lock()
+
+    def validate(content: bytes) -> None:
+        try:
+            pdf_images._validate_pdf_image(content)
+            outcome = "ok"
+        except pdf_images.PdfImageError:
+            outcome = "rejected"
+        with results_lock:
+            results.append(outcome)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", pdf_images.Image.DecompressionBombWarning)
+        inner_filters = list(warnings.filters)
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            list(executor.map(validate, payloads))
+        assert list(warnings.filters) == inner_filters
+
+    assert list(warnings.filters) == original_filters
+    assert sorted(results) == ["ok"] * 4 + ["rejected"] * 8
+
+
 def test_pdf_image_budget_consume_is_atomic() -> None:
     """Concurrent consumers must never overdraw the shared byte budget."""
     budget = pdf_images.PdfImageDownloadBudget(float("inf"), 5_000)
