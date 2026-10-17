@@ -5,18 +5,21 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import email.utils
 import http.client
 import ipaddress
+import logging
 import math
 import queue
+import random
 import re
 import socket
 import ssl
 import threading
 import time
-import warnings
 import zlib
 from dataclasses import dataclass
+from datetime import UTC
 from io import BytesIO
 from typing import cast
 from urllib.parse import quote, unquote, unquote_to_bytes, urljoin, urlsplit, urlunsplit
@@ -48,7 +51,15 @@ PDF_SVG_MAX_INHERITANCE_DEPTH = 128
 PDF_IMAGE_MAX_REDIRECTS = 3
 PDF_IMAGE_TIMEOUT_SECONDS = 5.0
 PDF_IMAGE_USER_AGENT = "ChainAgents-PDF/1.0"
+PDF_IMAGE_PER_IMAGE_SECONDS = 15.0
+PDF_IMAGE_MAX_ATTEMPTS = 3
+PDF_IMAGE_RETRY_BASE_SECONDS = 0.5
+PDF_IMAGE_RETRY_AFTER_MAX_SECONDS = 5.0
+PDF_IMAGE_MIN_ATTEMPT_SECONDS = 1.0
+PDF_IMAGE_STALL_WINDOW_SECONDS = 5.0
+PDF_IMAGE_STALL_MIN_BYTES = 4096
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 _RASTER_MIME_TYPES = {
     "GIF": "image/gif",
     "JPEG": "image/jpeg",
@@ -77,13 +88,26 @@ _SVG_STYLESHEET_PRESENTATION_RE = re.compile(
     re.IGNORECASE,
 )
 _PDF_RASTER_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
+_RETRY_AFTER_SECONDS_RE = re.compile(r"\d+", re.ASCII)
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
+_CONTENT_LENGTH_MAX_DIGITS = 18
+
+logger = logging.getLogger(__name__)
 
 
 class PdfImageError(ValueError):
     """An image cannot be safely included in a response PDF."""
 
 
-class _PdfImageConnectionError(PdfImageError):
+class PdfImageRetryableError(PdfImageError):
+    """A transient failure that a later attempt may not repeat."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class _PdfImageConnectionError(PdfImageRetryableError):
     """A validated address could not complete an HTTP request."""
 
 
@@ -96,17 +120,199 @@ class PdfImageResource:
     pixel_count: int = 0
 
 
-@dataclass
-class PdfImageDownloadBudget:
-    """Shared wall-clock and transferred-byte budget for one PDF export."""
+def _require_non_negative(amount: int) -> None:
+    if amount < 0:
+        raise ValueError("PDF image budget amounts must not be negative")
 
-    deadline: float
-    remaining_bytes: int
+
+class PdfImageDownloadBudget:
+    """Thread-safe wall-clock, byte and pixel budget shared by one PDF export."""
+
+    def __init__(
+        self,
+        deadline: float,
+        remaining_bytes: int,
+        remaining_pixels: int = PDF_IMAGE_MAX_PIXELS,
+    ) -> None:
+        self.deadline = deadline
+        self._remaining_bytes = remaining_bytes
+        self._remaining_pixels = remaining_pixels
+        self._active_reservations = 0
+        self._reserved_unused = 0
+        self._lock = threading.Lock()
+        self._settled = threading.Condition(self._lock)
+
+    @property
+    def remaining_bytes(self) -> int:
+        with self._lock:
+            return self._remaining_bytes
+
+    @property
+    def unconsumed_bytes(self) -> int:
+        """Bytes not yet transferred: unreserved plus still-unread reservations.
+
+        Active reservations may hand their unread part back, so this is the
+        most one more image could still obtain; ``remaining_bytes`` alone would
+        count other images' pending reservations as already spent.
+        """
+        with self._lock:
+            return self._remaining_bytes + self._reserved_unused
+
+    @property
+    def remaining_pixels(self) -> int:
+        with self._lock:
+            return self._remaining_pixels
 
     def consume(self, size: int) -> None:
-        if size > self.remaining_bytes:
-            raise PdfImageError("PDF image download budget exceeded")
-        self.remaining_bytes -= size
+        _require_non_negative(size)
+        with self._lock:
+            if size > self._remaining_bytes:
+                raise PdfImageError("PDF image download budget exceeded")
+            self._remaining_bytes -= size
+
+    def reserve(self, size: int, *, deadline: float = math.inf) -> None:
+        """Set aside bytes for a declared body until settle_reservation.
+
+        While other reservations are active they may still return unused
+        bytes, so a reservation that does not fit yet waits for them to settle
+        (until ``deadline``). It fails only when nothing else is reserved and
+        the bytes still do not fit.
+        """
+        _require_non_negative(size)
+        with self._settled:
+            while size > self._remaining_bytes:
+                if self._active_reservations == 0:
+                    raise PdfImageError("PDF image download budget exceeded")
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    raise PdfImageError("image download time limit reached")
+                self._settled.wait(
+                    None if math.isinf(remaining_seconds) else remaining_seconds
+                )
+            self._remaining_bytes -= size
+            self._reserved_unused += size
+            self._active_reservations += 1
+
+    def draw_reservation(self, size: int) -> None:
+        """Mark reserved bytes as transferred."""
+        _require_non_negative(size)
+        with self._lock:
+            if size > self._reserved_unused:
+                raise RuntimeError("PDF image reservation overdrawn")
+            self._reserved_unused -= size
+
+    def settle_reservation(self, unused: int) -> None:
+        """End one reservation, returning the bytes its body did not use."""
+        _require_non_negative(unused)
+        with self._settled:
+            if self._active_reservations == 0 or unused > self._reserved_unused:
+                raise RuntimeError("no active PDF image reservation to settle")
+            self._remaining_bytes += unused
+            self._reserved_unused -= unused
+            self._active_reservations -= 1
+            self._settled.notify_all()
+
+    def consume_pixels(self, count: int) -> None:
+        _require_non_negative(count)
+        with self._lock:
+            if count > self._remaining_pixels:
+                raise PdfImageError("PDF image pixel budget exceeded")
+            self._remaining_pixels -= count
+
+    def refund_pixels(self, count: int) -> None:
+        _require_non_negative(count)
+        with self._lock:
+            self._remaining_pixels += count
+
+
+class PdfImageHostLimiter:
+    """Thread-safe per-host concurrency limit shared by one PDF export.
+
+    The export scheduler takes a slot for each image's own host without
+    blocking; a download that redirects to another host takes a slot for that
+    host too, so redirect traffic and direct traffic share one count.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active: dict[str, int] = {}
+        self._changed = threading.Condition()
+
+    def try_acquire(self, host: str) -> bool:
+        with self._changed:
+            return self._take(host)
+
+    def acquire(self, host: str, *, deadline: float) -> bool:
+        """Wait for a slot until ``deadline``; return False if none came free."""
+        with self._changed:
+            while not self._take(host):
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    return False
+                self._changed.wait(
+                    None if math.isinf(remaining_seconds) else remaining_seconds
+                )
+            return True
+
+    def release(self, host: str) -> None:
+        with self._changed:
+            count = self._active.get(host, 0)
+            if count <= 0:
+                raise RuntimeError("PDF image host slot released without being held")
+            if count == 1:
+                del self._active[host]
+            else:
+                self._active[host] = count - 1
+            self._changed.notify_all()
+
+    def _take(self, host: str) -> bool:
+        count = self._active.get(host, 0)
+        if count >= self._limit:
+            return False
+        self._active[host] = count + 1
+        return True
+
+
+class PdfImageHostSlot:
+    """The one host slot a single image download holds at a time.
+
+    The scheduler acquires the slot for the image's own host and hands it
+    over; a redirect to another host gives that slot up before waiting for
+    the next one, so downloads never hold one host while waiting on another
+    (which could deadlock cross-host redirect cycles). The owner releases
+    whatever is held when the download ends. Not shared between threads.
+    """
+
+    def __init__(self, limiter: PdfImageHostLimiter, host: str) -> None:
+        self._limiter = limiter
+        self.host: str | None = host
+
+    def move_to(self, host: str, *, deadline: float) -> bool:
+        """Hold ``host`` instead; return False if no slot frees before deadline."""
+        if host == self.host:
+            return True
+        self.release()
+        if not self._limiter.acquire(host, deadline=deadline):
+            return False
+        self.host = host
+        return True
+
+    def release(self) -> None:
+        if self.host is not None:
+            host, self.host = self.host, None
+            self._limiter.release(host)
+
+
+def pdf_image_host_key(url: str) -> str:
+    """Return the normalized hostname that per-host download limits count."""
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
 
 
 @dataclass(frozen=True)
@@ -145,51 +351,177 @@ def download_pdf_image(
     max_bytes: int = PDF_IMAGE_MAX_BYTES,
     max_pixels: int = PDF_IMAGE_MAX_PIXELS,
     budget: PdfImageDownloadBudget | None = None,
+    per_image_seconds: float = PDF_IMAGE_PER_IMAGE_SECONDS,
+    host_slot: PdfImageHostSlot | None = None,
 ) -> PdfImageResource:
-    """Download and validate one public HTTP(S) image."""
-    download_budget = budget or PdfImageDownloadBudget(deadline, max_bytes)
+    """Download and validate one public HTTP(S) image with bounded retries.
+
+    With ``host_slot`` (holding ``url``'s host), each redirect to another host
+    moves the slot to that host, waiting until the image deadline for it to
+    free. The caller still owns the slot and releases it afterwards.
+    """
+    download_budget = (
+        budget if budget is not None else PdfImageDownloadBudget(deadline, max_bytes)
+    )
+    export_deadline = min(deadline, download_budget.deadline)
+    image_deadline = min(export_deadline, time.monotonic() + per_image_seconds)
+    attempts = 0
     current_url = url
     for redirect_count in range(PDF_IMAGE_MAX_REDIRECTS + 1):
-        if time.monotonic() >= deadline:
-            raise PdfImageError("image download budget expired")
-        normalized_url, host, port, addresses = _resolve_public_image_url(
-            current_url,
-            deadline=download_budget.deadline,
-        )
-        response: _PdfHttpResponse | None = None
-        last_connection_error: _PdfImageConnectionError | None = None
-        for address in addresses:
+        while True:
+            _raise_if_past_deadline(export_deadline, image_deadline)
+            attempts += 1
             try:
-                response = _request_pdf_image_url(
-                    normalized_url,
-                    host=host,
-                    port=port,
-                    address=address,
+                normalized_url, response = _fetch_pdf_image_hop(
+                    current_url,
+                    deadline=image_deadline,
                     max_bytes=max_bytes,
                     budget=download_budget,
                 )
-            except _PdfImageConnectionError as exc:
-                last_connection_error = exc
-                if time.monotonic() >= download_budget.deadline:
-                    raise PdfImageError("image download budget expired") from exc
+            except PdfImageRetryableError as exc:
+                wait = (
+                    _retry_wait(attempts, exc.retry_after)
+                    if attempts < PDF_IMAGE_MAX_ATTEMPTS
+                    else None
+                )
+                if (
+                    wait is None
+                    or time.monotonic() + wait + PDF_IMAGE_MIN_ATTEMPT_SECONDS
+                    > image_deadline
+                ):
+                    raise
+                logger.debug(
+                    "Retrying PDF image %s (attempt %d/%d) after %.2fs: %s",
+                    _pdf_image_log_identifier(current_url),
+                    attempts + 1,
+                    PDF_IMAGE_MAX_ATTEMPTS,
+                    wait,
+                    exc,
+                )
+                _sleep_before_retry(wait)
                 continue
             break
-        if response is None:
-            raise last_connection_error or PdfImageError("image download failed")
         if response.status in _REDIRECT_STATUSES:
             location = response.headers.get("location", "").strip()
             if not location or redirect_count >= PDF_IMAGE_MAX_REDIRECTS:
                 raise PdfImageError("image redirect limit exceeded")
             current_url = urljoin(normalized_url, location)
+            if host_slot is not None and not host_slot.move_to(
+                pdf_image_host_key(current_url), deadline=image_deadline
+            ):
+                raise PdfImageError("image download time limit reached")
             continue
-        if not 200 <= response.status < 300:
-            raise PdfImageError(f"image server returned HTTP {response.status}")
         return _validate_pdf_image(
             response.content,
             max_bytes=max_bytes,
             max_pixels=max_pixels,
+            budget=download_budget,
         )
     raise PdfImageError("image redirect limit exceeded")
+
+
+def _fetch_pdf_image_hop(
+    url: str,
+    *,
+    deadline: float,
+    max_bytes: int,
+    budget: PdfImageDownloadBudget,
+) -> tuple[str, _PdfHttpResponse]:
+    """Resolve, validate and request one redirect hop across its addresses."""
+    normalized_url, host, port, addresses = _resolve_public_image_url(
+        url,
+        deadline=deadline,
+    )
+    response: _PdfHttpResponse | None = None
+    last_connection_error: _PdfImageConnectionError | None = None
+    for address in addresses:
+        try:
+            response = _request_pdf_image_url(
+                normalized_url,
+                host=host,
+                port=port,
+                address=address,
+                max_bytes=max_bytes,
+                deadline=deadline,
+                budget=budget,
+            )
+        except _PdfImageConnectionError as exc:
+            last_connection_error = exc
+            if time.monotonic() >= deadline:
+                raise PdfImageError("image download time limit reached") from exc
+            continue
+        break
+    if response is None:
+        raise last_connection_error or PdfImageError("image download failed")
+    if response.status in _REDIRECT_STATUSES or 200 <= response.status < 300:
+        return normalized_url, response
+    message = f"image server returned HTTP {response.status}"
+    if response.status in _RETRYABLE_STATUSES:
+        raise PdfImageRetryableError(
+            message,
+            retry_after=_parse_retry_after(
+                response.headers.get("retry-after"),
+                now=time.time(),
+            ),
+        )
+    raise PdfImageError(message)
+
+
+def _raise_if_past_deadline(export_deadline: float, image_deadline: float) -> None:
+    now = time.monotonic()
+    if now >= export_deadline:
+        raise PdfImageError("image download budget expired")
+    if now >= image_deadline:
+        raise PdfImageError("image download time limit reached")
+
+
+def _retry_wait(attempt: int, retry_after: float | None) -> float | None:
+    """Return the backoff before the next attempt, or None to stop retrying."""
+    if retry_after is not None and retry_after > PDF_IMAGE_RETRY_AFTER_MAX_SECONDS:
+        return None
+    backoff = PDF_IMAGE_RETRY_BASE_SECONDS * 2 ** (attempt - 1) * (0.5 + _retry_jitter())
+    return max(backoff, retry_after or 0.0)
+
+
+def _retry_jitter() -> float:
+    return random.random()
+
+
+def _sleep_before_retry(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _parse_retry_after(value: str | None, *, now: float) -> float | None:
+    """Parse a Retry-After header as delta seconds or an HTTP-date."""
+    if value is None:
+        return None
+    value = value.strip()
+    if _RETRY_AFTER_SECONDS_RE.fullmatch(value):
+        try:
+            return float(int(value))
+        except OverflowError:
+            return math.inf
+    try:
+        retry_at = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    return max(0.0, retry_at.timestamp() - now)
+
+
+def _pdf_image_log_identifier(source: str) -> str:
+    """Return a bounded image identifier without query tokens or data payloads."""
+    if source.lower().startswith("data:"):
+        return source.partition(",")[0][:80]
+    try:
+        parsed = urlsplit(source)
+        hostname = parsed.hostname
+    except ValueError:
+        return "invalid-image-source"
+    if parsed.scheme and hostname:
+        return f"{parsed.scheme.lower()}://{hostname}"[:160]
+    return "invalid-image-source"
 
 
 def _resolve_public_image_url(
@@ -278,11 +610,11 @@ def _getaddrinfo_before_deadline(
     resolver.start()
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise PdfImageError("image download budget expired")
+        raise PdfImageError("image download time limit reached")
     try:
         result = results.get() if math.isinf(remaining) else results.get(timeout=remaining)
     except queue.Empty as exc:
-        raise PdfImageError("image download budget expired") from exc
+        raise PdfImageError("image download time limit reached") from exc
     if isinstance(result, OSError):
         raise result
     return result  # type: ignore[return-value]
@@ -295,6 +627,7 @@ def _request_pdf_image_url(
     port: int,
     address: str,
     max_bytes: int,
+    deadline: float,
     budget: PdfImageDownloadBudget,
 ) -> _PdfHttpResponse:
     """Request one already-resolved URL without another DNS lookup."""
@@ -319,16 +652,20 @@ def _request_pdf_image_url(
     if parsed.query:
         path = f"{path}?{parsed.query}"
     content = b""
+    transferred = 0
+    reserved_bytes = 0
+    holding_reservation = False
+    expired = threading.Event()
     deadline_timer: threading.Timer | None = None
     try:
-        remaining_seconds = budget.deadline - time.monotonic()
+        remaining_seconds = deadline - time.monotonic()
         if remaining_seconds <= 0:
-            raise PdfImageError("image download budget expired")
+            raise PdfImageError("image download time limit reached")
         connection.timeout = min(PDF_IMAGE_TIMEOUT_SECONDS, remaining_seconds)
         deadline_timer = threading.Timer(
             remaining_seconds,
             _close_expired_connection,
-            args=(connection,),
+            args=(connection, expired),
         )
         deadline_timer.daemon = True
         deadline_timer.start()
@@ -342,39 +679,73 @@ def _request_pdf_image_url(
             },
         )
         response = connection.getresponse()
-        headers = {key.lower(): value for key, value in response.getheaders()}
+        raw_headers = response.getheaders()
+        headers = {key.lower(): value for key, value in raw_headers}
         if response.status in _REDIRECT_STATUSES or not 200 <= response.status < 300:
             return _PdfHttpResponse(response.status, headers, b"")
-        declared_length = headers.get("content-length")
-        if declared_length:
-            try:
-                content_length = int(declared_length)
-            except ValueError as exc:
-                raise PdfImageError("image has an invalid content length") from exc
+        content_length = _declared_content_length(raw_headers)
+        if content_length is not None:
             if content_length > max_bytes:
                 raise PdfImageError("image exceeds the download size limit")
+            # Claim the declared transfer size before reading, so parallel
+            # downloads cannot each stream part of a body the shared budget
+            # cannot finish. Content-Length counts transferred (possibly
+            # compressed) bytes, which is exactly what the budget charges;
+            # decompression growth is charged by the caller afterwards.
+            budget.reserve(content_length, deadline=deadline)
+            holding_reservation = True
+            reserved_bytes = content_length
         chunks: list[bytes] = []
-        transferred = 0
+        window_started = time.monotonic()
+        window_bytes = 0
         while True:
-            remaining_seconds = budget.deadline - time.monotonic()
+            remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
-                raise PdfImageError("image download budget expired")
+                raise PdfImageError("image download time limit reached")
             if connection.sock is not None:
                 connection.sock.settimeout(
                     min(PDF_IMAGE_TIMEOUT_SECONDS, remaining_seconds)
                 )
-            chunk = response.read(min(64 * 1024, max_bytes + 1 - transferred))
+            # read1 returns as soon as any data arrives, so a trickling server
+            # cannot keep this loop blocked inside one large read.
+            chunk = response.read1(min(64 * 1024, max_bytes + 1 - transferred))
             if not chunk:
                 break
-            budget.consume(len(chunk))
+            from_reservation = min(reserved_bytes, len(chunk))
+            if from_reservation:
+                budget.draw_reservation(from_reservation)
+            reserved_bytes -= from_reservation
+            if len(chunk) > from_reservation:
+                budget.consume(len(chunk) - from_reservation)
             chunks.append(chunk)
             transferred += len(chunk)
             if transferred > max_bytes:
                 raise PdfImageError("image exceeds the download size limit")
+            # The rate is checked only when a read returns, so a trickle is
+            # detected within about two windows; that stays inside the image cap.
+            now = time.monotonic()
+            window_bytes += len(chunk)
+            if now - window_started >= PDF_IMAGE_STALL_WINDOW_SECONDS:
+                if window_bytes < PDF_IMAGE_STALL_MIN_BYTES:
+                    raise PdfImageError("image download stalled")
+                window_started = now
+                window_bytes = 0
+        if expired.is_set():
+            raise PdfImageError("image download time limit reached")
+        if response.length:
+            # read1 reports an early EOF as b"" instead of IncompleteRead, so a
+            # body shorter than its Content-Length must be caught here.
+            raise _PdfImageConnectionError("image download failed")
         content = b"".join(chunks)
     except (OSError, http.client.HTTPException) as exc:
-        raise _PdfImageConnectionError("image download failed") from exc
+        raise _classify_request_error(
+            exc,
+            expired=expired.is_set() or time.monotonic() >= deadline,
+            received_body=transferred > 0,
+        ) from exc
     finally:
+        if holding_reservation:
+            budget.settle_reservation(reserved_bytes)
         if deadline_timer is not None:
             deadline_timer.cancel()
         connection.close()
@@ -388,8 +759,56 @@ def _request_pdf_image_url(
     return _PdfHttpResponse(response.status, headers, content)
 
 
-def _close_expired_connection(connection: http.client.HTTPConnection) -> None:
-    """Interrupt a request that remains active past the export deadline."""
+def _declared_content_length(raw_headers: list[tuple[str, str]]) -> int | None:
+    """Return the body's declared length, rejecting malformed or conflicting values.
+
+    Only plain ASCII digits are accepted: a sign, separators or embedded spaces
+    would let a hostile server declare a negative size and inflate the shared
+    budget, and disagreeing duplicates could make the reservation differ from
+    the length http.client actually reads.
+    """
+    values = {
+        value.strip() for key, value in raw_headers if key.lower() == "content-length"
+    }
+    if not values:
+        return None
+    if len(values) != 1:
+        raise PdfImageError("image has an invalid content length")
+    value = values.pop()
+    # Far more digits than any real image size would hit Python's int-string
+    # conversion limit (a plain ValueError) before reaching the size check.
+    if len(value) > _CONTENT_LENGTH_MAX_DIGITS or not _CONTENT_LENGTH_RE.fullmatch(value):
+        raise PdfImageError("image has an invalid content length")
+    return int(value)
+
+
+def _classify_request_error(
+    exc: OSError | http.client.HTTPException,
+    *,
+    expired: bool,
+    received_body: bool,
+) -> PdfImageError:
+    """Split request failures into final errors and retryable connection errors."""
+    if expired:
+        return PdfImageError("image download time limit reached")
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return PdfImageError("image TLS verification failed")
+    if isinstance(exc, (http.client.LineTooLong, http.client.InvalidURL)):
+        return PdfImageError("image download failed")
+    if isinstance(exc, TimeoutError) and received_body:
+        # Silence after part of the body arrived is a stall, not a fresh
+        # connection problem; retrying would only trickle again.
+        return PdfImageError("image download stalled")
+    return _PdfImageConnectionError("image download failed")
+
+
+def _close_expired_connection(
+    connection: http.client.HTTPConnection,
+    expired: threading.Event | None = None,
+) -> None:
+    """Interrupt a request that remains active past the image deadline."""
+    if expired is not None:
+        expired.set()
     sock = connection.sock
     if sock is not None:
         with contextlib.suppress(OSError):
@@ -426,6 +845,7 @@ def decode_pdf_data_image(
     *,
     max_bytes: int = PDF_IMAGE_MAX_BYTES,
     max_pixels: int = PDF_IMAGE_MAX_PIXELS,
+    budget: PdfImageDownloadBudget | None = None,
 ) -> PdfImageResource:
     """Decode and validate one bounded image data URI."""
     header, separator, payload = url.partition(",")
@@ -450,6 +870,7 @@ def decode_pdf_data_image(
         content,
         max_bytes=max_bytes,
         max_pixels=max_pixels,
+        budget=budget,
     )
 
 
@@ -458,8 +879,14 @@ def _validate_pdf_image(
     *,
     max_bytes: int = PDF_IMAGE_MAX_BYTES,
     max_pixels: int = PDF_IMAGE_MAX_PIXELS,
+    budget: PdfImageDownloadBudget | None = None,
 ) -> PdfImageResource:
-    """Validate supported image bytes and normalize animated GIFs."""
+    """Validate supported image bytes and normalize animated GIFs.
+
+    When a budget is given, raster pixels are reserved from it after the
+    dimensions are read and before any pixel data is decoded, and refunded
+    if validation then fails.
+    """
     if not content:
         raise PdfImageError("image response was empty")
     stripped = content.removeprefix(b"\xef\xbb\xbf").lstrip()
@@ -469,9 +896,15 @@ def _validate_pdf_image(
         (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")
     ):
         return _validate_svg_image(content)
+    reserved_pixels = 0
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            # No warnings.catch_warnings() here: it swaps the process-global
+            # filter list and is not thread-safe, so parallel validations could
+            # leave DecompressionBombWarning configured as an error. The explicit
+            # pixel check below (25M) sits far under Pillow's bomb threshold
+            # (about 89M warns, 179M raises DecompressionBombError), so every
+            # image that is decoded has already passed a stricter limit.
             with Image.open(BytesIO(content)) as image:
                 image_format = str(image.format or "").upper()
                 if image_format not in _RASTER_MIME_TYPES:
@@ -479,6 +912,9 @@ def _validate_pdf_image(
                 if image.width * image.height > min(PDF_IMAGE_MAX_PIXELS, max_pixels):
                     raise PdfImageError("image dimensions exceed the pixel limit")
                 pixel_count = image.width * image.height
+                if budget is not None:
+                    budget.consume_pixels(pixel_count)
+                    reserved_pixels = pixel_count
                 if image_format == "GIF":
                     image.seek(0)
                     output = BytesIO()
@@ -498,18 +934,23 @@ def _validate_pdf_image(
                 )
                 if normalized_raster is not None:
                     return PdfImageResource(normalized_raster, "image/png", pixel_count)
-    except PdfImageError:
+        except PdfImageError:
+            raise
+        except (
+            Image.DecompressionBombError,
+            # Still raised if the process runs with warnings turned into errors.
+            Image.DecompressionBombWarning,
+            UnidentifiedImageError,
+            OSError,
+            SyntaxError,
+            ValueError,
+        ) as exc:
+            raise PdfImageError("image content is invalid") from exc
+        return PdfImageResource(content, _RASTER_MIME_TYPES[image_format], pixel_count)
+    except BaseException:
+        if budget is not None and reserved_pixels:
+            budget.refund_pixels(reserved_pixels)
         raise
-    except (
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        UnidentifiedImageError,
-        OSError,
-        SyntaxError,
-        ValueError,
-    ) as exc:
-        raise PdfImageError("image content is invalid") from exc
-    return PdfImageResource(content, _RASTER_MIME_TYPES[image_format], pixel_count)
 
 
 def _normalize_pdf_raster_mode(
