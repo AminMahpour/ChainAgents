@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import math
 import os
 import re
 import sys
@@ -1074,13 +1075,13 @@ class _CountingPdfImageBudget(PdfImageDownloadBudget):
         self._shared.consume(size)
         self.consumed_bytes += size
 
-    def reserve(self, size: int) -> None:
-        self._shared.reserve(size)
+    def reserve(self, size: int, *, deadline: float = math.inf) -> None:
+        self._shared.reserve(size, deadline=deadline)
         self.consumed_bytes += size
 
-    def release(self, size: int) -> None:
-        self._shared.release(size)
-        self.consumed_bytes -= size
+    def settle_reservation(self, unused: int) -> None:
+        self._shared.settle_reservation(unused)
+        self.consumed_bytes -= unused
 
     def consume_pixels(self, count: int) -> None:
         self._shared.consume_pixels(count)

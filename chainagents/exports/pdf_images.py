@@ -137,7 +137,9 @@ class PdfImageDownloadBudget:
         self.deadline = deadline
         self._remaining_bytes = remaining_bytes
         self._remaining_pixels = remaining_pixels
+        self._active_reservations = 0
         self._lock = threading.Lock()
+        self._settled = threading.Condition(self._lock)
 
     @property
     def remaining_bytes(self) -> int:
@@ -156,14 +158,37 @@ class PdfImageDownloadBudget:
                 raise PdfImageError("PDF image download budget exceeded")
             self._remaining_bytes -= size
 
-    def reserve(self, size: int) -> None:
-        """Set aside bytes for a declared body; unused bytes go back via release."""
-        self.consume(size)
+    def reserve(self, size: int, *, deadline: float = math.inf) -> None:
+        """Set aside bytes for a declared body until settle_reservation.
 
-    def release(self, size: int) -> None:
+        While other reservations are active they may still return unused
+        bytes, so a reservation that does not fit yet waits for them to settle
+        (until ``deadline``). It fails only when nothing else is reserved and
+        the bytes still do not fit.
+        """
         _require_non_negative(size)
-        with self._lock:
-            self._remaining_bytes += size
+        with self._settled:
+            while size > self._remaining_bytes:
+                if self._active_reservations == 0:
+                    raise PdfImageError("PDF image download budget exceeded")
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    raise PdfImageError("image download time limit reached")
+                self._settled.wait(
+                    None if math.isinf(remaining_seconds) else remaining_seconds
+                )
+            self._remaining_bytes -= size
+            self._active_reservations += 1
+
+    def settle_reservation(self, unused: int) -> None:
+        """End one reservation, returning the bytes its body did not use."""
+        _require_non_negative(unused)
+        with self._settled:
+            if self._active_reservations == 0:
+                raise RuntimeError("no active PDF image reservation to settle")
+            self._remaining_bytes += unused
+            self._active_reservations -= 1
+            self._settled.notify_all()
 
     def consume_pixels(self, count: int) -> None:
         _require_non_negative(count)
@@ -507,6 +532,7 @@ def _request_pdf_image_url(
     content = b""
     transferred = 0
     reserved_bytes = 0
+    holding_reservation = False
     expired = threading.Event()
     deadline_timer: threading.Timer | None = None
     try:
@@ -544,7 +570,8 @@ def _request_pdf_image_url(
             # cannot finish. Content-Length counts transferred (possibly
             # compressed) bytes, which is exactly what the budget charges;
             # decompression growth is charged by the caller afterwards.
-            budget.reserve(content_length)
+            budget.reserve(content_length, deadline=deadline)
+            holding_reservation = True
             reserved_bytes = content_length
         chunks: list[bytes] = []
         window_started = time.monotonic()
@@ -593,8 +620,8 @@ def _request_pdf_image_url(
             received_body=transferred > 0,
         ) from exc
     finally:
-        if reserved_bytes:
-            budget.release(reserved_bytes)
+        if holding_reservation:
+            budget.settle_reservation(reserved_bytes)
         if deadline_timer is not None:
             deadline_timer.cancel()
         connection.close()

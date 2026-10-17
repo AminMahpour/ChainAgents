@@ -1053,6 +1053,7 @@ def _install_fake_http(
             Timer=_RecordingTimer,
             Event=threading.Event,
             Lock=threading.Lock,
+            Condition=threading.Condition,
             Thread=threading.Thread,
         ),
     )
@@ -1755,7 +1756,7 @@ def test_pdf_image_request_accepts_matching_duplicate_content_length(
 
 @pytest.mark.parametrize(
     "operation",
-    ["consume", "reserve", "release", "consume_pixels", "refund_pixels"],
+    ["consume", "reserve", "settle_reservation", "consume_pixels", "refund_pixels"],
 )
 def test_pdf_image_budget_rejects_negative_amounts(operation: str) -> None:
     """No caller may inflate the shared byte or pixel budget."""
@@ -1845,6 +1846,90 @@ def test_pdf_image_concurrent_validation_keeps_filters_and_rejects_bombs() -> No
 
     assert list(warnings.filters) == original_filters
     assert sorted(results) == ["ok"] * 4 + ["rejected"] * 8
+
+
+def _start_reservation(
+    budget: pdf_images.PdfImageDownloadBudget,
+    size: int,
+    *,
+    deadline: float,
+) -> tuple[threading.Thread, list[Any]]:
+    outcome: list[Any] = []
+
+    def reserve() -> None:
+        try:
+            budget.reserve(size, deadline=deadline)
+            outcome.append("reserved")
+        except pdf_images.PdfImageError as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=reserve, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def test_pdf_image_budget_reservation_waits_for_active_reservations() -> None:
+    """A reservation that may fit after others settle must wait, not fail."""
+    budget = pdf_images.PdfImageDownloadBudget(float("inf"), 100)
+    budget.reserve(60)
+    budget.reserve(40)
+
+    thread, outcome = _start_reservation(budget, 50, deadline=time.monotonic() + 5)
+    time.sleep(0.05)
+    assert outcome == []
+
+    budget.settle_reservation(50)  # the first body used only 10 of its 60 bytes
+    thread.join(timeout=2)
+
+    assert outcome == ["reserved"]
+    assert budget.remaining_bytes == 0
+    budget.settle_reservation(0)
+    budget.settle_reservation(0)
+    assert budget.remaining_bytes == 0
+
+
+def test_pdf_image_budget_reservation_fails_once_others_settle() -> None:
+    """A reservation that can never fit must fail after others settle, not hang."""
+    budget = pdf_images.PdfImageDownloadBudget(float("inf"), 100)
+    budget.reserve(80)
+
+    thread, outcome = _start_reservation(budget, 50, deadline=time.monotonic() + 5)
+    time.sleep(0.05)
+    assert outcome == []
+
+    budget.settle_reservation(0)
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], pdf_images.PdfImageError)
+    assert "budget exceeded" in str(outcome[0])
+    assert budget.remaining_bytes == 20
+
+
+def test_pdf_image_budget_reservation_wait_stops_at_deadline() -> None:
+    """Waiting for other reservations must end at the image deadline."""
+    budget = pdf_images.PdfImageDownloadBudget(float("inf"), 100)
+    budget.reserve(80)
+
+    thread, outcome = _start_reservation(budget, 50, deadline=time.monotonic() + 0.1)
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert "time limit" in str(outcome[0])
+    budget.settle_reservation(80)
+    assert budget.remaining_bytes == 100
+
+
+def test_pdf_image_budget_reservation_fails_immediately_without_contention() -> None:
+    """With no other reservation active, an oversized reservation fails at once."""
+    budget = pdf_images.PdfImageDownloadBudget(float("inf"), 10)
+
+    with pytest.raises(pdf_images.PdfImageError, match="budget exceeded"):
+        budget.reserve(11, deadline=float("inf"))
+
+    assert budget.remaining_bytes == 10
 
 
 def test_pdf_image_budget_consume_is_atomic() -> None:
