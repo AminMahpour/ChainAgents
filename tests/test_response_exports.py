@@ -1698,6 +1698,80 @@ def test_prepare_pdf_images_reserves_declared_sizes_concurrently(monkeypatch) ->
     )
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [("Content-Length", "-1000000")],
+        [("Content-Length", "1_000")],
+        [("Content-Length", "+5")],
+        [("Content-Length", "1 0")],
+        [("Content-Length", "")],
+        [("Content-Length", "10"), ("Content-Length", "20")],
+    ],
+)
+def test_pdf_image_request_rejects_invalid_content_length(
+    monkeypatch, headers: list[tuple[str, str]]
+) -> None:
+    """Malformed declared lengths must fail before any budget change or body read."""
+    clock = _FakeClock()
+    response = _ScriptedHttpResponse(
+        clock, [b"x" * 1000], delay=0.0, headers=headers
+    )
+    _install_fake_http(monkeypatch, clock, response=response)
+    budget = pdf_images.PdfImageDownloadBudget(float("inf"), 1_000)
+
+    with pytest.raises(pdf_images.PdfImageError, match="invalid content length") as excinfo:
+        _request_fake_image(clock, budget=budget)
+
+    assert not isinstance(excinfo.value, pdf_images.PdfImageRetryableError)
+    assert len(response._chunks) == 1
+    assert budget.remaining_bytes == 1_000
+
+
+def test_pdf_image_request_accepts_matching_duplicate_content_length(
+    monkeypatch,
+) -> None:
+    """Repeated identical Content-Length headers describe one consistent body."""
+    clock = _FakeClock()
+    _install_fake_http(
+        monkeypatch,
+        clock,
+        response=_ScriptedHttpResponse(
+            clock,
+            [b"x" * 10],
+            delay=0.0,
+            headers=[("Content-Length", "10"), ("content-length", " 10 ")],
+        ),
+    )
+    budget = pdf_images.PdfImageDownloadBudget(float("inf"), 1_000)
+
+    result = _request_fake_image(clock, budget=budget)
+
+    assert len(result.content) == 10
+    assert budget.remaining_bytes == 990
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["consume", "reserve", "release", "consume_pixels", "refund_pixels"],
+)
+def test_pdf_image_budget_rejects_negative_amounts(operation: str) -> None:
+    """No caller may inflate the shared byte or pixel budget."""
+    shared = pdf_images.PdfImageDownloadBudget(
+        float("inf"), 1_000, remaining_pixels=1_000
+    )
+    view = response_exports._CountingPdfImageBudget(shared)
+
+    for budget in (shared, view):
+        with pytest.raises(ValueError):
+            getattr(budget, operation)(-1)
+
+    assert shared.remaining_bytes == 1_000
+    assert shared.remaining_pixels == 1_000
+    assert view.consumed_bytes == 0
+    assert view.consumed_pixels == 0
+
+
 def test_pdf_image_budget_consume_is_atomic() -> None:
     """Concurrent consumers must never overdraw the shared byte budget."""
     budget = pdf_images.PdfImageDownloadBudget(float("inf"), 5_000)

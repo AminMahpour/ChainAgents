@@ -90,6 +90,7 @@ _SVG_STYLESHEET_PRESENTATION_RE = re.compile(
 )
 _PDF_RASTER_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
 _RETRY_AFTER_SECONDS_RE = re.compile(r"\d+", re.ASCII)
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,11 @@ class PdfImageResource:
     pixel_count: int = 0
 
 
+def _require_non_negative(amount: int) -> None:
+    if amount < 0:
+        raise ValueError("PDF image budget amounts must not be negative")
+
+
 class PdfImageDownloadBudget:
     """Thread-safe wall-clock, byte and pixel budget shared by one PDF export."""
 
@@ -144,6 +150,7 @@ class PdfImageDownloadBudget:
             return self._remaining_pixels
 
     def consume(self, size: int) -> None:
+        _require_non_negative(size)
         with self._lock:
             if size > self._remaining_bytes:
                 raise PdfImageError("PDF image download budget exceeded")
@@ -154,16 +161,19 @@ class PdfImageDownloadBudget:
         self.consume(size)
 
     def release(self, size: int) -> None:
+        _require_non_negative(size)
         with self._lock:
             self._remaining_bytes += size
 
     def consume_pixels(self, count: int) -> None:
+        _require_non_negative(count)
         with self._lock:
             if count > self._remaining_pixels:
                 raise PdfImageError("PDF image pixel budget exceeded")
             self._remaining_pixels -= count
 
     def refund_pixels(self, count: int) -> None:
+        _require_non_negative(count)
         with self._lock:
             self._remaining_pixels += count
 
@@ -521,15 +531,12 @@ def _request_pdf_image_url(
             },
         )
         response = connection.getresponse()
-        headers = {key.lower(): value for key, value in response.getheaders()}
+        raw_headers = response.getheaders()
+        headers = {key.lower(): value for key, value in raw_headers}
         if response.status in _REDIRECT_STATUSES or not 200 <= response.status < 300:
             return _PdfHttpResponse(response.status, headers, b"")
-        declared_length = headers.get("content-length")
-        if declared_length:
-            try:
-                content_length = int(declared_length)
-            except ValueError as exc:
-                raise PdfImageError("image has an invalid content length") from exc
+        content_length = _declared_content_length(raw_headers)
+        if content_length is not None:
             if content_length > max_bytes:
                 raise PdfImageError("image exceeds the download size limit")
             # Claim the declared transfer size before reading, so parallel
@@ -599,6 +606,27 @@ def _request_pdf_image_url(
         max_bytes=max_bytes,
     )
     return _PdfHttpResponse(response.status, headers, content)
+
+
+def _declared_content_length(raw_headers: list[tuple[str, str]]) -> int | None:
+    """Return the body's declared length, rejecting malformed or conflicting values.
+
+    Only plain ASCII digits are accepted: a sign, separators or embedded spaces
+    would let a hostile server declare a negative size and inflate the shared
+    budget, and disagreeing duplicates could make the reservation differ from
+    the length http.client actually reads.
+    """
+    values = {
+        value.strip() for key, value in raw_headers if key.lower() == "content-length"
+    }
+    if not values:
+        return None
+    if len(values) != 1:
+        raise PdfImageError("image has an invalid content length")
+    value = values.pop()
+    if not _CONTENT_LENGTH_RE.fullmatch(value):
+        raise PdfImageError("image has an invalid content length")
+    return int(value)
 
 
 def _classify_request_error(
