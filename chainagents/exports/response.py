@@ -1100,12 +1100,17 @@ def _download_pdf_image_task(
 
     if time.monotonic() >= deadline:
         raise PdfImageError("image download budget expired")
-    max_bytes = min(PDF_IMAGE_MAX_BYTES, budget.remaining_bytes)
+    # Cap by bytes not yet transferred rather than by remaining_bytes, which
+    # already excludes other images' active reservations: those may still be
+    # handed back, and reserve()/consume() enforce the shared total anyway.
+    max_bytes = min(PDF_IMAGE_MAX_BYTES, budget.unconsumed_bytes)
     if max_bytes <= 0:
         raise PdfImageError("PDF image download budget exceeded")
-    max_pixels = min(PDF_IMAGE_MAX_PIXELS, budget.remaining_pixels)
-    if max_pixels <= 0:
+    if budget.remaining_pixels <= 0:
         raise PdfImageError("PDF image pixel budget exceeded")
+    # The aggregate pixel total is enforced when validation reserves pixels,
+    # so the per-image cap is not frozen at a start-time snapshot.
+    max_pixels = PDF_IMAGE_MAX_PIXELS
     image_budget = _CountingPdfImageBudget(budget)
     resource = _download_pdf_image(
         url,
@@ -1151,6 +1156,13 @@ class _CountingPdfImageBudget(PdfImageDownloadBudget):
     def reserve(self, size: int, *, deadline: float = math.inf) -> None:
         self._shared.reserve(size, deadline=deadline)
         self.consumed_bytes += size
+
+    def draw_reservation(self, size: int) -> None:
+        self._shared.draw_reservation(size)
+
+    @property
+    def unconsumed_bytes(self) -> int:
+        return self._shared.unconsumed_bytes
 
     def settle_reservation(self, unused: int) -> None:
         self._shared.settle_reservation(unused)

@@ -138,6 +138,7 @@ class PdfImageDownloadBudget:
         self._remaining_bytes = remaining_bytes
         self._remaining_pixels = remaining_pixels
         self._active_reservations = 0
+        self._reserved_unused = 0
         self._lock = threading.Lock()
         self._settled = threading.Condition(self._lock)
 
@@ -145,6 +146,17 @@ class PdfImageDownloadBudget:
     def remaining_bytes(self) -> int:
         with self._lock:
             return self._remaining_bytes
+
+    @property
+    def unconsumed_bytes(self) -> int:
+        """Bytes not yet transferred: unreserved plus still-unread reservations.
+
+        Active reservations may hand their unread part back, so this is the
+        most one more image could still obtain; ``remaining_bytes`` alone would
+        count other images' pending reservations as already spent.
+        """
+        with self._lock:
+            return self._remaining_bytes + self._reserved_unused
 
     @property
     def remaining_pixels(self) -> int:
@@ -178,15 +190,25 @@ class PdfImageDownloadBudget:
                     None if math.isinf(remaining_seconds) else remaining_seconds
                 )
             self._remaining_bytes -= size
+            self._reserved_unused += size
             self._active_reservations += 1
+
+    def draw_reservation(self, size: int) -> None:
+        """Mark reserved bytes as transferred."""
+        _require_non_negative(size)
+        with self._lock:
+            if size > self._reserved_unused:
+                raise RuntimeError("PDF image reservation overdrawn")
+            self._reserved_unused -= size
 
     def settle_reservation(self, unused: int) -> None:
         """End one reservation, returning the bytes its body did not use."""
         _require_non_negative(unused)
         with self._settled:
-            if self._active_reservations == 0:
+            if self._active_reservations == 0 or unused > self._reserved_unused:
                 raise RuntimeError("no active PDF image reservation to settle")
             self._remaining_bytes += unused
+            self._reserved_unused -= unused
             self._active_reservations -= 1
             self._settled.notify_all()
 
@@ -695,6 +717,8 @@ def _request_pdf_image_url(
             if not chunk:
                 break
             from_reservation = min(reserved_bytes, len(chunk))
+            if from_reservation:
+                budget.draw_reservation(from_reservation)
             reserved_bytes -= from_reservation
             if len(chunk) > from_reservation:
                 budget.consume(len(chunk) - from_reservation)

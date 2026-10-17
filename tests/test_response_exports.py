@@ -1756,7 +1756,14 @@ def test_pdf_image_request_accepts_matching_duplicate_content_length(
 
 @pytest.mark.parametrize(
     "operation",
-    ["consume", "reserve", "settle_reservation", "consume_pixels", "refund_pixels"],
+    [
+        "consume",
+        "reserve",
+        "draw_reservation",
+        "settle_reservation",
+        "consume_pixels",
+        "refund_pixels",
+    ],
 )
 def test_pdf_image_budget_rejects_negative_amounts(operation: str) -> None:
     """No caller may inflate the shared byte or pixel budget."""
@@ -2054,6 +2061,98 @@ def test_pdf_image_redirect_releases_acquired_host_slots(monkeypatch) -> None:
 
     assert limiter.try_acquire("cdn.example.test")
     assert not limiter.try_acquire("origin.example.test")
+
+
+def test_prepare_pdf_images_late_image_waits_for_active_reservations(
+    monkeypatch,
+) -> None:
+    """An image started while others hold reservations must not be capped by them."""
+    mib = 1024 * 1024
+    image = _png_bytes()
+    small_body = image
+    late_body = image + bytes(6 * mib - len(image))
+    release_holders = threading.Event()
+    late_headers_sent = threading.Event()
+
+    def body_for(host: str) -> bytes | None:
+        if host.startswith("holder"):
+            return None
+        return late_body if host.startswith("late") else small_body
+
+    class HoldingResponse:
+        status = 200
+
+        def __init__(self, host: str) -> None:
+            self._host = host
+            self._body = body_for(host)
+            self._offset = 0
+            declared = 10 * mib if self._body is None else len(self._body)
+            self._declared = declared
+            self.length: int | None = declared
+            self._reads = 0
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return [("Content-Length", str(self._declared))]
+
+        def read1(self, amount: int) -> bytes:
+            if self._body is None:
+                self._reads += 1
+                if self._reads == 1:
+                    release_holders.wait(5)
+                    self.length = self._declared - 10
+                    return b"x" * 10
+                raise TimeoutError("holder went silent")
+            chunk = self._body[self._offset : self._offset + amount]
+            self._offset += len(chunk)
+            self.length = len(self._body) - self._offset
+            return chunk
+
+    class FakeConnection:
+        def __init__(self, host: str, port: int | None = None, timeout: float | None = None) -> None:
+            self.sock = _FakeSocket()
+            self.timeout = timeout
+            self._host = ""
+
+        def request(self, _method: str, _path: str, headers: dict[str, str]) -> None:
+            self._host = headers["Host"]
+
+        def getresponse(self) -> Any:
+            if self._host.startswith("late"):
+                late_headers_sent.set()
+            return HoldingResponse(self._host)
+
+        def close(self) -> None:
+            pass
+
+    def release_after_late_reserve() -> None:
+        late_headers_sent.wait(5)
+        time.sleep(0.2)  # let the late image reach reserve() and start waiting
+        release_holders.set()
+
+    monkeypatch.setattr(pdf_images.http.client, "HTTPConnection", FakeConnection)
+    monkeypatch.setattr(
+        pdf_images,
+        "_resolve_public_image_url",
+        lambda url, **_kwargs: (url, url.split("/")[2], 80, ("203.0.113.10",)),
+    )
+    monkeypatch.setattr(response_exports, "PDF_IMAGE_DOWNLOAD_CONCURRENCY", 3)
+    urls = [
+        "http://holder0.example.test/a.png",
+        "http://holder1.example.test/b.png",
+        "http://small.example.test/c.png",
+        "http://late.example.test/d.png",
+    ]
+    releaser = threading.Thread(target=release_after_late_reserve, daemon=True)
+    releaser.start()
+    try:
+        _rendered, resources = response_exports._prepare_pdf_image_resources(
+            _image_document(urls)
+        )
+    finally:
+        release_holders.set()
+        releaser.join(timeout=5)
+
+    assert set(resources) == {urls[2], urls[3]}
 
 
 def test_pdf_image_budget_consume_is_atomic() -> None:
