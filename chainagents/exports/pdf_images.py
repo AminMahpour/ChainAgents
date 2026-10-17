@@ -149,6 +149,14 @@ class PdfImageDownloadBudget:
                 raise PdfImageError("PDF image download budget exceeded")
             self._remaining_bytes -= size
 
+    def reserve(self, size: int) -> None:
+        """Set aside bytes for a declared body; unused bytes go back via release."""
+        self.consume(size)
+
+    def release(self, size: int) -> None:
+        with self._lock:
+            self._remaining_bytes += size
+
     def consume_pixels(self, count: int) -> None:
         with self._lock:
             if count > self._remaining_pixels:
@@ -488,6 +496,7 @@ def _request_pdf_image_url(
         path = f"{path}?{parsed.query}"
     content = b""
     transferred = 0
+    reserved_bytes = 0
     expired = threading.Event()
     deadline_timer: threading.Timer | None = None
     try:
@@ -523,6 +532,13 @@ def _request_pdf_image_url(
                 raise PdfImageError("image has an invalid content length") from exc
             if content_length > max_bytes:
                 raise PdfImageError("image exceeds the download size limit")
+            # Claim the declared transfer size before reading, so parallel
+            # downloads cannot each stream part of a body the shared budget
+            # cannot finish. Content-Length counts transferred (possibly
+            # compressed) bytes, which is exactly what the budget charges;
+            # decompression growth is charged by the caller afterwards.
+            budget.reserve(content_length)
+            reserved_bytes = content_length
         chunks: list[bytes] = []
         window_started = time.monotonic()
         window_bytes = 0
@@ -539,7 +555,10 @@ def _request_pdf_image_url(
             chunk = response.read1(min(64 * 1024, max_bytes + 1 - transferred))
             if not chunk:
                 break
-            budget.consume(len(chunk))
+            from_reservation = min(reserved_bytes, len(chunk))
+            reserved_bytes -= from_reservation
+            if len(chunk) > from_reservation:
+                budget.consume(len(chunk) - from_reservation)
             chunks.append(chunk)
             transferred += len(chunk)
             if transferred > max_bytes:
@@ -567,6 +586,8 @@ def _request_pdf_image_url(
             received_body=transferred > 0,
         ) from exc
     finally:
+        if reserved_bytes:
+            budget.release(reserved_bytes)
         if deadline_timer is not None:
             deadline_timer.cancel()
         connection.close()

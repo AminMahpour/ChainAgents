@@ -1074,6 +1074,14 @@ class _CountingPdfImageBudget(PdfImageDownloadBudget):
         self._shared.consume(size)
         self.consumed_bytes += size
 
+    def reserve(self, size: int) -> None:
+        self._shared.reserve(size)
+        self.consumed_bytes += size
+
+    def release(self, size: int) -> None:
+        self._shared.release(size)
+        self.consumed_bytes -= size
+
     def consume_pixels(self, count: int) -> None:
         self._shared.consume_pixels(count)
         self.consumed_pixels += count
