@@ -160,8 +160,49 @@ th {
   background: #f3f4f6;
   font-weight: 600;
 }
+
+.pdf-toc {
+  break-after: page;
+}
+
+.pdf-toc-title {
+  font-size: 14pt;
+  font-weight: 600;
+  margin: 0 0 0.6em;
+}
+
+.pdf-toc ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pdf-toc li {
+  margin: 0 0 0.25em;
+}
+
+.pdf-toc-level-2 {
+  padding-left: 1.2em;
+}
+
+.pdf-toc-level-3 {
+  padding-left: 2.4em;
+}
+
+.pdf-toc a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.pdf-toc a::after {
+  content: leader(".") target-counter(attr(href), page);
+}
 """
 PDF_MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False}).enable("table")
+# Responses with at least this many level 1-3 headings get a contents section.
+PDF_TOC_MIN_HEADINGS = 3
+PDF_TOC_HEADING_RE = re.compile(r"<h([1-3])>(.*?)</h\1>", re.DOTALL)
+PDF_TOC_IMAGE_ALT_RE = re.compile(r'<img\b[^>]*?\balt="([^"]*)"[^>]*>', re.IGNORECASE)
 PDF_TEXT_REWRITE_SKIP_TAGS = frozenset({"code", "kbd", "pre", "samp"})
 PDF_HTML_TAG_RE = re.compile(r"(<[^>]+>)")
 PDF_HTML_TAG_NAME_RE = re.compile(r"^<\s*/?\s*([a-zA-Z][a-zA-Z0-9-]*)")
@@ -666,6 +707,7 @@ def build_pdf_html_document(text: str) -> str:
     normalized_text = _normalize_pdf_markdown_text(text.strip() or "\u00a0")
     body = PDF_MARKDOWN_RENDERER.render(normalized_text)
     body = _rewrite_pdf_html_text_nodes(body)
+    body = _with_pdf_table_of_contents(body)
     return f"""<!doctype html>
 <html>
 <head>
@@ -677,6 +719,40 @@ def build_pdf_html_document(text: str) -> str:
 </body>
 </html>
 """
+
+
+def _with_pdf_table_of_contents(body: str) -> str:
+    """Prefix a linked contents section when the body has enough headings.
+
+    Level 1-3 headings get numbered ids (safe for duplicate and non-Latin
+    titles); the contents entries link to them, WeasyPrint fills in their page
+    numbers, and the ids also give the PDF a bookmark outline. The heading text
+    is already HTML-escaped by the Markdown renderer, so only tags are stripped.
+    """
+    headings = PDF_TOC_HEADING_RE.findall(body)
+    if len(headings) < PDF_TOC_MIN_HEADINGS:
+        return body
+    counter = iter(range(1, len(headings) + 1))
+    entries: list[str] = []
+
+    def add_id(match: re.Match[str]) -> str:
+        level, inner = match.group(1), match.group(2)
+        anchor = f"toc-{next(counter)}"
+        # Images keep their (already escaped) alt text; other tags are dropped.
+        title = re.sub(r"<[^>]+>", "", PDF_TOC_IMAGE_ALT_RE.sub(r"\1", inner)).strip()
+        title = " ".join(title.split()) or f"Section {anchor.removeprefix('toc-')}"
+        entries.append(
+            f'<li class="pdf-toc-level-{level}"><a href="#{anchor}">{title}</a></li>'
+        )
+        return f'<h{level} id="{anchor}">{inner}</h{level}>'
+
+    body = PDF_TOC_HEADING_RE.sub(add_id, body)
+    contents = (
+        '<nav class="pdf-toc"><p class="pdf-toc-title">Contents</p><ol>'
+        + "".join(entries)
+        + "</ol></nav>\n"
+    )
+    return contents + body
 
 
 def _normalize_pdf_markdown_text(text: str) -> str:
