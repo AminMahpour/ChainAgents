@@ -91,6 +91,7 @@ _SVG_STYLESHEET_PRESENTATION_RE = re.compile(
 _PDF_RASTER_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
 _RETRY_AFTER_SECONDS_RE = re.compile(r"\d+", re.ASCII)
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
+_CONTENT_LENGTH_MAX_DIGITS = 18
 
 logger = logging.getLogger(__name__)
 
@@ -624,7 +625,9 @@ def _declared_content_length(raw_headers: list[tuple[str, str]]) -> int | None:
     if len(values) != 1:
         raise PdfImageError("image has an invalid content length")
     value = values.pop()
-    if not _CONTENT_LENGTH_RE.fullmatch(value):
+    # Far more digits than any real image size would hit Python's int-string
+    # conversion limit (a plain ValueError) before reaching the size check.
+    if len(value) > _CONTENT_LENGTH_MAX_DIGITS or not _CONTENT_LENGTH_RE.fullmatch(value):
         raise PdfImageError("image has an invalid content length")
     return int(value)
 

@@ -1707,6 +1707,8 @@ def test_prepare_pdf_images_reserves_declared_sizes_concurrently(monkeypatch) ->
         [("Content-Length", "1 0")],
         [("Content-Length", "")],
         [("Content-Length", "10"), ("Content-Length", "20")],
+        # Beyond Python's int-string conversion limit (4300 digits).
+        [("Content-Length", "9" * 5000)],
     ],
 )
 def test_pdf_image_request_rejects_invalid_content_length(
